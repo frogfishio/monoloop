@@ -101,6 +101,25 @@ entries. Specs under `doc/` remain normative; this file captures *why*.
 - **Implication**: Architecture gates must fail imports that violate product vs
   testkit and component non-responsibilities.
 
+## 2026-08 — Loop empty-tool path + independent fan-out
+
+- **Decision**: First Loop ships with EmptyToolRegistry/NoToolRuntime; composition
+  uses an EventDistributor so Console and Loop each get a private subscription.
+- **Rationale**: Prove tool reaction without effects; prove Console failure cannot
+  steal Loop events.
+- **Implication**: Ready tools emit exactly one unavailable OutboundToolResult;
+  text never dispatches; duplicate Ready is idempotent.
+
+## 2026-08 — Interpreter reassembles; console only prints complete units
+
+- **Decision**: Interpreter owns dialect framing + sentence/tool assembly; console
+  renderer lives in `monoloop-testkit` and only consumes canonical events.
+- **Rationale**: Grok ACP streams are rambling deltas; product truth is complete
+  sentences and complete tool requests. Presentation must not re-parse or invent
+  completeness.
+- **Implication**: Partial chunks never become console lines; tool waiting never
+  exposes partial arguments; terminator at chunk end waits for next byte or seal.
+
 ## 2026-08 — Connector crate split + proxy
 
 - **Decision**: Implement Component 01 as `monoloop-contracts` + `monoloop-connector`

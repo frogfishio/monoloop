@@ -1,0 +1,17 @@
+[package]
+name = "monoloop-loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Minimal extensible Loop: lossless canonical subscription, empty-capable tools"
+
+[dependencies]
+monoloop-contracts = { path = "../monoloop-contracts" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time"] }

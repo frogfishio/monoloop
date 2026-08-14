@@ -1,0 +1,27 @@
+[package]
+name = "monoloop-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Test kit: console renderer, fixtures, and composition helpers (not a product component)"
+
+[dependencies]
+bytes = { workspace = true }
+monoloop-contracts = { path = "../monoloop-contracts" }
+monoloop-connector = { path = "../monoloop-connector" }
+monoloop-interpreter = { path = "../monoloop-interpreter" }
+monoloop-loop = { path = "../monoloop-loop" }
+pulldown-cmark = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time"] }
+monoloop-connector-grok = { path = "../monoloop-connector-grok" }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
+http = { workspace = true }

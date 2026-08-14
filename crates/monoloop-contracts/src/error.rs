@@ -1,4 +1,4 @@
-//! Closed connector error families (safe diagnostics only).
+//! Closed connector and interpreter error families (safe diagnostics only).
 
 use thiserror::Error;
 
@@ -36,8 +36,6 @@ pub enum ConnectorErrorKind {
 }
 
 /// Connector error with safe, bounded diagnostics.
-///
-/// Never contains credentials, raw bodies, prompts, or unrestricted endpoints.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("{kind:?}: {message}")]
 pub struct ConnectorError {
@@ -98,5 +96,88 @@ impl ConnectorError {
     /// Session operation failed.
     pub fn session_failed(message: impl Into<String>) -> Self {
         Self::new(ConnectorErrorKind::SessionFailed, message)
+    }
+}
+
+/// Interpreter error classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpreterErrorKind {
+    /// Unsupported dialect.
+    UnsupportedDialect,
+    /// Dialect binding mismatch.
+    DialectBindingMismatch,
+    /// Malformed frame.
+    MalformedFrame,
+    /// Frame/buffer limit exceeded.
+    FrameLimitExceeded,
+    /// Unsupported semantic event.
+    UnsupportedSemanticEvent,
+    /// Malformed semantic payload.
+    MalformedSemanticPayload,
+    /// Sentence assembly limit.
+    SentenceLimitExceeded,
+    /// Structure limit.
+    StructureLimitExceeded,
+    /// Tool identity missing/conflict.
+    ToolIdentityError,
+    /// Tool limit exceeded.
+    ToolLimitExceeded,
+    /// Output backpressure exceeded.
+    OutputBackpressureExceeded,
+    /// Connector ended unexpectedly.
+    ConnectorEndedUnexpectedly,
+    /// Cancelled.
+    Cancelled,
+    /// Invariant violation.
+    InvariantViolation,
+    /// Configuration invalid.
+    ConfigurationInvalid,
+}
+
+/// Interpreter error with safe diagnostics.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("{kind:?}: {message}")]
+pub struct InterpreterError {
+    /// Closed error family.
+    pub kind: InterpreterErrorKind,
+    /// Bounded safe message.
+    pub message: String,
+}
+
+impl InterpreterError {
+    /// Construct a typed error.
+    pub fn new(kind: InterpreterErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// Unsupported dialect.
+    pub fn unsupported_dialect(message: impl Into<String>) -> Self {
+        Self::new(InterpreterErrorKind::UnsupportedDialect, message)
+    }
+
+    /// Malformed frame.
+    pub fn malformed_frame(message: impl Into<String>) -> Self {
+        Self::new(InterpreterErrorKind::MalformedFrame, message)
+    }
+
+    /// Limit exceeded.
+    pub fn limit(message: impl Into<String>) -> Self {
+        Self::new(InterpreterErrorKind::FrameLimitExceeded, message)
+    }
+
+    /// Cancelled.
+    pub fn cancelled() -> Self {
+        Self::new(InterpreterErrorKind::Cancelled, "interpretation cancelled")
+    }
+
+    /// Output backpressure.
+    pub fn backpressure() -> Self {
+        Self::new(
+            InterpreterErrorKind::OutputBackpressureExceeded,
+            "canonical output queue full",
+        )
     }
 }

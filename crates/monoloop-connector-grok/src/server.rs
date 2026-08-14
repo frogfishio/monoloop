@@ -130,6 +130,7 @@ async fn open_as_raw_connection(
             connect_deadline: request.limits.connect_deadline,
             ..Default::default()
         },
+        raw_dump: None,
     };
     // Allow non-loopback only if explicitly... we keep fail-closed defaults.
     let _ = &mut config;
@@ -345,6 +346,8 @@ pub struct GrokServerHandle {
     pub health: GrokServerHealth,
     /// Server completion (connection-wide).
     pub completion: GrokServerCompletion,
+    /// Opt-in raw dump collector (shared with config if enabled).
+    pub raw_dump: Option<std::sync::Arc<crate::raw_dump::RawDumpCollector>>,
     #[allow(dead_code)]
     inner: Arc<ServerInner>,
 }
@@ -457,6 +460,8 @@ pub(crate) struct ServerInner {
     health: GrokServerHealth,
     control: Arc<ServerControlFlags>,
     closed: AtomicBool,
+    /// Opt-in exact inbound wire dump.
+    raw_dump: Option<std::sync::Arc<crate::raw_dump::RawDumpCollector>>,
 }
 
 enum WriteCmd {
@@ -725,6 +730,7 @@ async fn connect_server(
     let (write_tx, write_rx) = mpsc::channel::<WriteCmd>(64);
     let (end_tx, end_rx) = oneshot::channel();
     let health = GrokServerHealth::default();
+    let raw_dump = config.raw_dump.clone();
     let inner = Arc::new(ServerInner {
         write_tx: write_tx.clone(),
         pending: Mutex::new(HashMap::new()),
@@ -734,6 +740,7 @@ async fn connect_server(
         health: health.clone(),
         control: Arc::clone(&control),
         closed: AtomicBool::new(false),
+        raw_dump,
     });
 
     tokio::spawn(run_connection(
@@ -770,6 +777,7 @@ async fn connect_server(
         completion: GrokServerCompletion {
             rx: Mutex::new(Some(end_rx)),
         },
+        raw_dump: inner.raw_dump.clone(),
         inner,
     })
 }
@@ -868,6 +876,10 @@ async fn run_connection(
                             debug!("inbound message exceeds max_message_bytes");
                             continue;
                         }
+                        // Exact wire dump of what Grok sent (opt-in).
+                        if let Some(dump) = inner.raw_dump.as_ref() {
+                            dump.record_inbound(&bytes);
+                        }
                         owner.bytes_received += bytes.len() as u64;
                         if let Err(e) = handle_inbound(&inner, bytes).await {
                             debug!(error = %e, "inbound handling error");
@@ -876,6 +888,9 @@ async fn run_connection(
                     Some(Ok(Message::Binary(bin))) => {
                         if bin.len() > max_message_bytes {
                             continue;
+                        }
+                        if let Some(dump) = inner.raw_dump.as_ref() {
+                            dump.record_inbound(&bin);
                         }
                         owner.bytes_received += bin.len() as u64;
                         let bytes = Bytes::from(bin.to_vec());

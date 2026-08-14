@@ -16,13 +16,26 @@ Long-term facts that should persist across sessions.
 - Initial Connector: **Grok Build** — ACP/JSON-RPC 2.0 over authenticated WebSocket;
   one server, many sessions; correlation ID = Grok `sessionId`.
 
-## Implementation status (Connector slice)
+## Implementation status
 
-- Workspace crates: `monoloop-contracts`, `monoloop-connector`, `monoloop-connector-grok`.
+- Workspace crates: `monoloop-contracts`, `monoloop-connector`, `monoloop-connector-grok`,
+  `monoloop-interpreter`, `monoloop-loop`, `monoloop-testkit` (test-only).
 - `ConnectorProxy` routes `endpoint_ref` prefixes (e.g. `grok:ws://…`) to backends.
 - `FakeConnector` is deterministic in-process (echo/scripted/pair) for tests.
 - Grok profile: `connect` → `initialize` → `session/new` | explicit `session/load`;
   secrets via `SecretResolver` only; non-loopback fail-closed by default.
+- Interpreter: raw bytes (any fragmentation) → complete `CanonicalUnitEvent`s only;
+  ACP `session/update` text chunks + tool_call lifecycle; sentence segmenter waits
+  rather than emitting partials; abrupt EOF does not promote incomplete text.
+- Loop: lossless subscription; dispatches only on complete ToolRequestReady;
+  EmptyToolRegistry → ToolUnavailable + OutboundToolResult; NoToolRuntime never started.
+- Testkit Driver: Interpreter → EventDistributor → independent Console + Loop
+  subscriptions (never one shared receiver).
+- Raw dump (opt-in): `RawDumpCollector` on `GrokServerConfig::with_raw_dump` captures
+  exact inbound WebSocket payloads before demux; pipeline uses `PipelineParams::with_raw_dump()`.
+- HTML review (testkit): `PipelineParams::with_html_dump(path)` builds
+  complete public_response sentences → Markdown → HTML plus a canonical event
+  timeline, for visual checks that interpretation serialises correctly.
 
 ## Gotchas
 

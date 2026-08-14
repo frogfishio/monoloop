@@ -20,27 +20,27 @@ product definition. The test kit proves the kernel without becoming product.
 - [x] Abstract Connector + FakeConnector + ConnectorProxy + cancel/terminal tests
 - [x] Grok Build ACP/WebSocket connector (initialize, session/new, session/load,
       multi-session demux, secret boundary, mock-server tests)
-- [ ] Full CONNECTOR.md / GROK_BUILD_CONNECTOR.md acceptance matrices
-- [ ] monoloop-interpreter
-- [ ] monoloop-loop + testkit Driver
+- [x] monoloop-interpreter — ACP + test dialects; sentence assembly; tool lifecycle;
+      fragmentation-invariant; no partial token/tool-arg escape
+- [x] monoloop-testkit console renderer (append-only) for printing canonical events
+- [x] monoloop-loop — EmptyToolRegistry / NoToolRuntime; ToolRequestReady only
+- [x] Event distributor + Driver pipeline (Interpreter → Console ∥ Loop)
+- [ ] Full CONNECTOR.md / INTERPRETER.md / THE_LOOP.md acceptance matrices
+- [ ] Live Grok integration e2e (optional)
 
 ## Implementation roadmap (suggested order)
 
-1. ~~**Workspace + monoloop-contracts**~~ — done (IDs, dialect, errors, limits).
-2. ~~**monoloop-connector**~~ — abstract contract, FakeConnector, ConnectorProxy.
+1. ~~**Workspace + monoloop-contracts**~~ — done.
+2. ~~**monoloop-connector**~~ — abstract, Fake, Proxy.
 3. ~~**Grok Build connector profile (initial)**~~ — WebSocket ACP; multi-session.
-4. **Harden connector** — remaining race/load suites, reconnect policy, permission
-   server-request handling, architecture import gates.
-5. **monoloop-interpreter** — factory, assembly pipeline, deterministic test dialect;
-   fragmentation invariance; no-token contract tests.
-6. **Canonical event distribution** — run-scoped bounded fan-out (Loop lossless;
-   optional observers independent).
-7. **monoloop-loop** — empty registry / no runtime; ToolRequestReady-only dispatch.
-8. **monoloop-testkit Driver** — end-to-end composition with fakes; empty-tool path.
-9. **Outbound encoder seam** — dialect encoding in testkit first.
-10. **monoloop-conformance** — full acceptance matrices from each component doc.
-11. **Later (explicit decision required)** — real tools, authz, durable receipts,
-    additional Channel profiles, host Context Engine integration (one-way).
+4. ~~**monoloop-interpreter (initial)**~~ — reassemble → complete canonical events.
+5. ~~**Console renderer (testkit)**~~ — append-only human projection.
+6. ~~**monoloop-loop + distributor + Driver**~~ — empty-tool path end-to-end.
+7. **Harden all components** — race/load suites, Markdown structures, permission
+   requests, architecture import gates.
+8. **Outbound encoder seam** — dialect encoding in testkit first.
+9. **monoloop-conformance** — full acceptance matrices.
+10. **Later** — real tools, authz, durable receipts, more Channel profiles.
 
 ## Non-goals (near term)
 

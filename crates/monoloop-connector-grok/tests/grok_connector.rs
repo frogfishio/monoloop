@@ -7,7 +7,7 @@ use monoloop_connector::{
 };
 use monoloop_connector_grok::{
     EncodedAcpSessionMessage, GrokConnector, GrokServerConfig, GrokSessionConfig,
-    GrokSessionLoadConfig, InMemorySecretResolver, SecretRef,
+    GrokSessionLoadConfig, InMemorySecretResolver, RawDumpCollector, SecretRef,
 };
 use monoloop_contracts::GrokSessionId;
 use std::sync::Arc;
@@ -73,6 +73,106 @@ async fn initialize_session_new_and_prompt_roundtrip() {
     let msg: serde_json::Value = serde_json::from_slice(&update).expect("json");
     assert_eq!(msg["method"], "session/update");
     assert_eq!(msg["params"]["sessionId"], session.session_id.as_str());
+}
+
+#[tokio::test]
+async fn raw_dump_captures_exact_inbound_from_grok() {
+    let secret = "raw-dump-secret";
+    let addr = common::mock_acp_server::start_mock_acp_server(secret).await;
+    let secrets = Arc::new(InMemorySecretResolver::new());
+    secrets.insert("S", secret);
+
+    let dump = Arc::new(RawDumpCollector::enabled());
+    let connector = GrokConnector::new(secrets);
+    let config = GrokServerConfig::loopback(addr.port(), SecretRef::new("S"))
+        .unwrap()
+        .with_raw_dump(Arc::clone(&dump));
+
+    let server = connector
+        .connect(config)
+        .unwrap()
+        .opened
+        .await
+        .unwrap()
+        .unwrap();
+
+    let session = server
+        .sessions
+        .begin_new(GrokSessionConfig::default())
+        .unwrap()
+        .opened
+        .await
+        .unwrap()
+        .unwrap();
+
+    let exchange = session
+        .input
+        .begin_send(EncodedAcpSessionMessage {
+            method: "session/prompt".into(),
+            params: serde_json::json!({
+                "prompt": [{ "type": "text", "text": "hi" }]
+            }),
+        })
+        .unwrap();
+    let _ = exchange.response.await.unwrap().unwrap();
+    let _ = session.output.receive().await.unwrap().unwrap();
+
+    // Allow demux path to finish recording.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let snap = dump.snapshot();
+    assert!(
+        snap.frames.len() >= 3,
+        "expected initialize + session/new + session/update (+ prompt result); got {}\n{}",
+        snap.frames.len(),
+        snap.format_text()
+    );
+
+    // Exact expected markers from the mock ACP server (what Grok "sends us").
+    assert!(
+        snap.contains_str("protocolVersion") || snap.contains_str("agentCapabilities"),
+        "missing initialize result in raw dump:\n{}",
+        snap.format_text()
+    );
+    assert!(
+        snap.contains_str("sessionId"),
+        "missing sessionId in raw dump:\n{}",
+        snap.format_text()
+    );
+    assert!(
+        snap.contains_str("session/update"),
+        "missing session/update in raw dump:\n{}",
+        snap.format_text()
+    );
+    assert!(
+        snap.contains_str("agent_message_chunk") || snap.contains_str("hello"),
+        "missing agent message content in raw dump:\n{}",
+        snap.format_text()
+    );
+    assert!(
+        snap.contains_str("stopReason") || snap.contains_str("end_turn"),
+        "missing prompt terminal result in raw dump:\n{}",
+        snap.format_text()
+    );
+
+    // Frames are valid JSON-RPC objects (exact wire payloads, not re-encoded).
+    let values = snap.json_values();
+    assert!(
+        values.len() >= 3,
+        "could not parse frames as JSON: {}",
+        snap.format_text()
+    );
+    assert!(
+        values.iter().any(|v| v.get("result").is_some() || v.get("method").is_some()),
+        "unexpected JSON shapes: {values:?}"
+    );
+
+    // Handle exposes the same collector.
+    assert!(server.raw_dump.is_some());
+    assert_eq!(
+        server.raw_dump.as_ref().unwrap().snapshot().frames.len(),
+        snap.frames.len()
+    );
 }
 
 #[tokio::test]

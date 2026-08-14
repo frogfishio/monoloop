@@ -1,7 +1,9 @@
 //! Grok server and session configuration (no prompt bodies).
 
+use crate::raw_dump::RawDumpCollector;
 use crate::secret::SecretRef;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -54,6 +56,11 @@ pub struct GrokServerConfig {
     pub allow_non_loopback: bool,
     /// Limits.
     pub limits: GrokConnectorLimits,
+    /// Optional raw inbound dump (exact WebSocket payloads from Grok).
+    ///
+    /// Opt-in only. When set, every complete inbound frame is recorded **before**
+    /// demux. Secrets used for auth are never stored here.
+    pub raw_dump: Option<Arc<RawDumpCollector>>,
 }
 
 impl GrokServerConfig {
@@ -66,7 +73,14 @@ impl GrokServerConfig {
             expected_acp_version: "1".into(),
             allow_non_loopback: false,
             limits: GrokConnectorLimits::default(),
+            raw_dump: None,
         })
+    }
+
+    /// Enable raw inbound dump with default bounds.
+    pub fn with_raw_dump(mut self, dump: Arc<RawDumpCollector>) -> Self {
+        self.raw_dump = Some(dump);
+        self
     }
 
     /// Validate security policy for the endpoint (fail closed for non-loopback).

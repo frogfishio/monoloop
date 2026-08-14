@@ -11,12 +11,16 @@
 mod config;
 mod error;
 mod jsonrpc;
+mod raw_dump;
 mod secret;
 mod server;
 mod session;
 
 pub use config::{
     GrokConnectorLimits, GrokServerConfig, GrokSessionConfig, GrokSessionLoadConfig,
+};
+pub use raw_dump::{
+    RawDumpCollector, RawDumpFrame, RawDumpParams, RawDumpSnapshot,
 };
 pub use error::GrokConnectorError;
 pub use secret::{EnvSecretResolver, InMemorySecretResolver, SecretRef, SecretResolver};
