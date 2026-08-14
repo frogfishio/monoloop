@@ -1,23 +1,28 @@
-# Monoloop — Product architecture
+# Monoloop — Shared contracts and test-kit composition
 
-**Status:** Foundational product specification
+**Status:** Foundational integration specification
 
 **Product:** Monoloop
 
-**Product kind:** Stateless asynchronous canonical request/response processor
+**Product kind:** Three-component asynchronous Rust kernel
 
-**Component specifications:**
+**Product component specifications:**
 
 - [Component 01 — Connector](CONNECTOR.md)
 - [Component 02 — Interpreter](INTERPRETER.md)
-- [Component 03 — Console Renderer](CONSOLE_RENDERER.md) — test only
-- [Component 04 — The Loop](THE_LOOP.md)
-- [Component 05 — Console Input](CONSOLE_INPUT.md) — test only
+- [Component 03 — The Loop](THE_LOOP.md)
+
+**Test-kit specifications:**
+
+- [Test Kit and Driver](TEST_KIT.md)
+- [Console Renderer](CONSOLE_RENDERER.md)
+- [Console Input](CONSOLE_INPUT.md)
+
+**Initial Connector profile:**
+
+- [Grok Build Network Connector](GROK_BUILD_CONNECTOR.md)
 
 **Parent index:** [README.md](README.md)
-
-**Production cognitive integration:**
-[Cognitive Runtime ↔ Monoloop](../CONTEXT_COMPILER/COGNITIVE_RUNTIME_MONOLOOP.md)
 
 The words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, and
 **MAY** are normative requirements.
@@ -26,28 +31,36 @@ The words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, and
 
 ## 1. Product definition
 
-Monoloop does one thing:
+Monoloop is exactly three independently testable Rust components:
 
-> Correctly delegate one canonical request to one explicitly selected channel,
-> receive the channel response, process any configured tool exchanges, and
-> convert the entire interaction into a provider-neutral canonical event-driven
-> result.
+```text
+Connector -> Interpreter -> minimal extensible Loop
+```
 
-Monoloop is the one response processor shared by every supported channel.
+The Connector moves dialect-labelled bytes and owns connection/session routing
+required by its transport profile. The Interpreter converts inbound dialect
+events into provider-neutral canonical events. The Loop consumes those events
+through the smallest useful extensible event-driven state machine.
 
 It is not a chat application, an agent, a prompt engine, a memory system, a task
 system, a model router, or a persistence service.
 
-## 2. Product outcome
+The Driver described in this document is test-kit composition. It demonstrates
+the three components together but is not a fourth component, a production
+runtime, or a mandatory facade. A later host may compose the components through
+its own driver while preserving their contracts.
 
-For each accepted request Monoloop returns immediately with a run handle:
+## 2. Test composition outcome
+
+The test Driver demonstrates the three components by returning immediately with
+a run handle for each accepted conformance request:
 
 ```rust
-pub trait Monoloop: Send + Sync {
+pub trait TestDriver: Send + Sync {
     fn process(
         &self,
         request: MonoloopRequest,
-    ) -> Result<MonoloopRun, MonoloopError>;
+    ) -> Result<MonoloopRun, TestDriverError>;
 }
 
 pub struct MonoloopRun {
@@ -60,22 +73,25 @@ pub struct MonoloopRun {
 ```
 
 The run emits canonical events in real time and resolves exactly once with a
-terminal processing result.
+terminal processing result. This facade belongs to `monoloop-testkit`; it is not
+a required public facade over the three product components.
 
-## 3. Statelessness
+## 3. Durability and in-memory state
 
-Monoloop retains no product state between runs.
+Monoloop performs no durable persistence of its own. Its components may retain
+bounded in-memory operational state for as long as their explicitly owned
+instances require.
 
-It has no:
+The kernel has no:
 
-- conversation or provider history;
-- session memory;
+- Monoloop-owned conversation or provider history;
+- durable Monoloop-owned session storage;
 - user/project memory;
 - task, plan, review, or working state;
 - durable current request;
 - database or file store;
 - model-routing history;
-- global current channel/session/run; or
+- implicit global current channel/session/run; or
 - background consolidation.
 
 One active run necessarily owns bounded transient state:
@@ -89,8 +105,17 @@ One active run necessarily owns bounded transient state:
 - cancellation and terminal coordination; and
 - safe counters/diagnostics.
 
-Every item is scoped to `MonoloopRunId` and destroyed when the run terminates.
-This transient state does not violate stateless product semantics.
+Every run-owned item is scoped to `MonoloopRunId` and destroyed when the run
+terminates. In addition, a long-lived Connector may retain a bounded in-memory
+table that correlates externally owned session IDs with live routing,
+configuration, and pending-operation state. For the initial Grok Build profile,
+the Grok-provided `sessionId` is the session correlation identity. Monoloop does
+not create a second session identity and does not durably persist the table.
+
+The external Grok Build instance remains authoritative for the resumable
+conversation. Losing the local in-memory table loses local attachment/routing
+knowledge; recovery requires an explicit known Grok `sessionId` and
+`session/load`, never inference from a most-recent session.
 
 ## 4. Concurrency model
 
@@ -116,6 +141,7 @@ MonoloopRequest
     run_id
     request_id
     selected_channel
+    external_session_id?
     canonical_input
     tool_configuration
     limits
@@ -130,6 +156,15 @@ provider-native JSON object or raw wire body.
 
 The caller explicitly selects `selected_channel`. Monoloop does not rank,
 recommend, or choose channels.
+
+`external_session_id`, when present, is the bounded opaque identity supplied by
+the external system and selected by the caller. It permits the selected Channel
+to load or address that resumable session. For Grok Build it is exactly Grok's
+`sessionId`. When absent, an explicitly requested new-session operation may ask
+the Connector profile to create a session and accept the authoritative identity
+returned by the external system. The Connector may retain that identity in its
+bounded in-memory routing table; it never invents a competing identity or
+selects a most-recent session.
 
 `caller_correlation` is bounded opaque data returned unchanged in run events and
 the terminal result. It grants no authority and cannot alter run behavior.
@@ -171,6 +206,44 @@ future channel
 The selected Channel determines how canonical outbound products become dialect
 bytes and which Interpreter decodes the returned dialect bytes. Its internal
 parts remain separate components.
+
+### 6.1 Externally owned resumable sessions
+
+A Connector profile MAY create or load an externally owned resumable session
+and retain its correlation/routing state in memory. This is explicit Connector
+state, not Monoloop-owned conversation history.
+
+```text
+External application (initially Grok Build)
+    creates and returns the authoritative session identity
+    owns conversation state, resumability and any durable representation
+    hosts many logical sessions in one long-lived server instance
+
+Grok Connector instance
+    connects once to the configured authenticated server
+    requests session/new or explicit session/load
+    keeps a bounded in-memory table keyed by Grok sessionId
+    owns routing, correlation and pending-operation state only
+```
+
+The same external session may therefore receive multiple requests while the
+Connector is live. After Connector restart it may be resumed only when the
+caller explicitly supplies the Grok session ID through the supported load
+contract. Monoloop has no ambient "current Grok session", "current Cursor
+session", or most-recent-session fallback.
+
+Different Grok sessions progress concurrently. Requests that mutate one Grok
+session are serialized unless negotiated capabilities explicitly declare them
+safe to run concurrently. Monoloop never infers concurrency safety from timing.
+
+An external session may outlive a Monoloop run or local network connection. A
+Connector detaching its local route does not claim to close or delete the Grok
+session.
+
+Transport reuse is an implementation detail and carries no semantic authority.
+An HTTP Channel may use several independent connections in one run; a process
+Channel may retain one attached stream for the run; and a pooled physical
+connection may be reused without thereby reusing an LLM conversation.
 
 ## 7. Outbound encoder seam
 
@@ -221,7 +294,7 @@ caller
               -> abstract ToolRegistry/ToolRuntime
               -> OutboundToolResult
               -> continuation policy
-                   +-> inline: outbound dialect encoder -> Connector raw input
+                   +-> inline: outbound dialect encoder -> next Channel exchange
                    +-> caller-controlled: terminal continuation evidence
   -> canonical terminal events
   -> MonoloopRunEnd
@@ -230,10 +303,11 @@ caller
 
 No component may bypass this flow with a provider-specific side channel.
 
-## 9. Run coordinator
+## 9. Test Driver coordinator
 
-Monoloop contains a minimal per-run coordinator. It owns composition and
-lifecycle, not cognition.
+The test kit contains a minimal per-run Driver coordinator. It owns test
+composition and lifecycle, not cognition. It is not a Monoloop product
+component, and production hosts are not required to depend on it.
 
 It:
 
@@ -336,7 +410,8 @@ Monoloop lifecycle/diagnostic events
 ```
 
 Every event carries `MonoloopRunId` in its run envelope plus its component-local
-identities.
+identities and the explicitly supplied external session identity when present.
+For the initial Grok Build profile, that value is Grok's `sessionId` unchanged.
 
 The run stream contains fully assembled canonical events. It never publishes
 Connector byte chunks, provider tokens, partial text, or partial tool payloads.
@@ -376,8 +451,12 @@ When The Loop emits `OutboundToolResult`, the coordinator:
 3. applies the request's immutable continuation policy.
 
 For `inline_tool_continuation`, the coordinator selects the already bound input
-dialect encoder, encodes the complete result, writes it to the same owned
-Channel exchange when supported, and resumes receiving canonical output.
+dialect encoder, encodes the complete result, and asks the Channel to perform
+its declared next exchange. A bidirectional process Channel may write through
+the current run-owned connection. An HTTP request/response Channel may open a
+new run-owned connection. All such connections and Interpretations remain
+explicitly correlated to the same run and are destroyed or detached during its
+bounded teardown.
 
 For `caller_controlled`, the coordinator does not write the tool result back for
 another model decision. It drains owned work, emits the complete result, and
@@ -409,7 +488,7 @@ unavailable result can be encoded and returned. Under caller-controlled
 continuation, it is returned to the caller as terminal continuation evidence.
 Monoloop never pretends the tool succeeded.
 
-This behavior is required for the initial product qualification.
+This behavior is required for the initial test-kit qualification.
 
 ## 17. Response completion
 
@@ -440,6 +519,7 @@ MonoloopRunEnd
     run_id
     request_id
     channel_id
+    external_session_id?
     dialect_binding
     kind
     canonical_event_count
@@ -541,18 +621,20 @@ There is also a process composition limit on concurrent runs and aggregate
 resources. Exceeding a limit is explicit and bounded; Monoloop never grows an
 unbounded queue to remain apparently responsive.
 
-## 23. No persistence
+## 23. No Monoloop-owned persistence
 
-Monoloop does not open a database, file, history log, cache, session store, or
-checkpoint repository.
+Monoloop does not open its own database, history log, cache, session store, or
+checkpoint repository. An external application such as Grok Build may persist
+the sessions it owns; that persistence is outside Monoloop.
 
 Canonical events may be consumed by a caller that chooses to persist a higher-
 level product. That consumer is outside Monoloop.
 
 Console JSONL output is diagnostic output, not product persistence.
 
-No run can be resumed after process loss. The caller may start a new request
-with a new run identity.
+A test Driver run is not resumed after process loss. An externally owned Grok
+session may be explicitly loaded again by its known Grok `sessionId`; this is
+external-session attachment, not recovery of a Monoloop run.
 
 ## 24. No prompt engine
 
@@ -582,9 +664,10 @@ future intelligent routing.
 
 ## 26. No presentation dependency
 
-Console Input and Console Renderer are test adapters.
+The Driver, Console Input, and Console Renderer are test-kit adapters.
 
-Monoloop Core MUST compile and pass its complete non-console suite without:
+All three Monoloop product components MUST compile and pass their complete
+non-console suites without:
 
 - terminal detection;
 - stdin/stdout/stderr;
@@ -604,6 +687,8 @@ Requirements:
 
 - Channel configuration and dialect binding are explicit;
 - credentials remain in Connector/Channel configuration boundaries;
+- external session identities and server credentials remain opaque, are never
+  logged, and grant authority only to explicitly addressed operations;
 - raw payloads are not logged or persisted;
 - tool requests do not execute without an available abstract tool and later
   authorization contract;
@@ -663,13 +748,17 @@ payloads, paths, credentials, and provider error bodies are excluded.
 
 ## 30. Required tests
 
-### 30.1 Statelessness
+### 30.1 Run isolation and session routing
 
-- A completed run leaves no request/session/conversation state.
+- A completed run leaves no run request, event, Loop, or tool state.
 - A new run cannot observe prior canonical events or tool actions.
 - Equal request text does not cause implicit reuse.
-- No database/file/cache API is reachable from Monoloop Core.
-- Process restart requires a new run rather than hidden recovery.
+- A known Grok `sessionId` can address the Connector's in-memory session route.
+- After routing state loss, resumption requires explicit `session/load` with a
+  known Grok `sessionId`.
+- No most-recent or ambient-current session selection exists.
+- No database/file/cache API is reachable from any Monoloop product component.
+- Connector restart never performs hidden session recovery.
 
 ### 30.2 Channel selection
 
@@ -730,9 +819,10 @@ payloads, paths, credentials, and provider error bodies are excluded.
 
 ### 30.8 Architecture
 
-- Monoloop Core does not import host agent, product UI, Kanban, DAL, Residiuum,
-  context compiler, memory, router, or concrete tool modules.
-- Console adapters are absent from the Core dependency graph.
+- The three Monoloop product components do not import host agent, product UI,
+  Kanban, DAL, Residiuum, context compiler, memory, router, or concrete tool
+  modules.
+- Console adapters are absent from every product-component dependency graph.
 - Connector contains no encoder/interpreter logic.
 - Interpreter contains no Loop/tool execution logic.
 - The Loop contains no concrete tool/encoder/Connector calls.
@@ -742,13 +832,14 @@ payloads, paths, credentials, and provider error bodies are excluded.
 
 ## 31. Acceptance criteria
 
-Monoloop is accepted only when:
+The three-component kernel and its test-kit qualification are accepted only
+when:
 
 1. one canonical request and explicit Channel produce one isolated run;
 2. real-time output consists solely of fully assembled canonical units and
    truthful lifecycle states;
-3. one implementation processes at least an HTTP streaming Channel, a
-   process/agent Channel, and the deterministic test Channel;
+3. the initial real Connector communicates with one Grok Build server over
+   authenticated ACP/JSON-RPC WebSocket and supports multiple sessions;
 4. arbitrary transport fragmentation does not affect canonical output;
 5. tool requests dispatch only after complete assembly;
 6. the empty tool configuration causes zero external effects and one truthful
@@ -760,17 +851,23 @@ Monoloop is accepted only when:
 9. cancellation terminates every owned path within bounds and exactly once;
 10. many concurrent runs remain identity- and resource-isolated;
 11. every queue, buffer, table, execution, and deadline is bounded;
-12. terminal cleanup retains no run/session/conversation state;
-13. Monoloop has no persistence, memory, router, prompt compiler, task system,
-    agent, host runtime, product UI, or concrete-tool dependency;
-14. console input/output can be removed without changing Core;
+12. terminal cleanup retains no run state while the Connector retains only its
+    explicitly bounded in-memory external-session routing table;
+13. Monoloop has no durable session persistence, provider conversation copy,
+    router, prompt compiler, task system, agent, host runtime, product UI, or
+    concrete-tool dependency;
+14. the Driver and console input/output can be removed without changing any of
+    the three product components;
 15. architecture gates enforce all component dependency directions;
-16. all component and product suites pass without partial or “shaped”
-    qualification; and
+16. all component and test-kit suites pass without partial or “shaped”
+    qualification;
 17. caller-controlled continuation returns complete tool evidence without
-    creating an uncompiled model continuation.
+    creating an uncompiled model continuation; and
+18. externally owned sessions are created or loaded explicitly, correlated by
+    the external system's authoritative session ID, and never selected through
+    ambient or most-recent state.
 
-## 32. Product package boundary
+## 32. Package boundary
 
 The preferred logical packaging is:
 
@@ -787,37 +884,39 @@ monoloop-interpreter
 monoloop-loop
     tool-reactive Loop and abstract tool ports
 
-monoloop-core
-    run coordinator, Channel composition and public facade
-
-monoloop-console
-    test-only Console Input and Console Renderer
+monoloop-testkit
+    Driver, outbound fixtures, Console Input and Console Renderer
 
 monoloop-conformance
-    deterministic Channel/Connector/dialect/tool fixtures and qualification
+    deterministic Connector/dialect/tool fixtures and qualification
 ```
 
-Physical crate consolidation is permitted initially, but dependency rules and
-public seams apply from the first implementation.
+There is no required `monoloop-core` coordinator crate. Physical crate
+consolidation is permitted initially, but dependency rules and public seams
+apply from the first implementation. None of the three product components may
+depend on `monoloop-testkit`.
 
 ## 33. Prohibited shortcuts
 
 - Store conversation history “temporarily.”
-- Put prompt augmentation into Console Input or coordinator.
+- Put prompt augmentation into Console Input or the test Driver.
 - Put request encoding into Connector.
 - Let Console and Loop compete for one receiver.
 - Feed Interpreter fragments directly to UI or tool execution.
-- Hard-code OpenAI, Grok Build, Cursor, or tool behavior into Core.
+- Hard-code Grok Build behavior outside its Connector profile and dialect
+  implementation.
 - Treat remote EOF, final text, or Interpreter completion as sufficient run
   success.
 - Add a database for diagnostics or resumability.
 - Use global current session/channel/tool state.
 - Retry through another Channel implicitly.
-- Claim statelessness while retaining hidden provider sessions between runs.
+- Hide session selection behind a most-recent-session or ambient-current-session
+  heuristic.
 - Make console adapters required dependencies of the product.
 
 ## 34. Governing rule
 
-> Monoloop accepts one canonical request and one explicitly selected Channel. It
-> processes the complete interaction into canonical real-time events, returns
-> one truthful terminal result, and forgets everything.
+> Monoloop is a Connector, an Interpreter, and the smallest extensible Loop.
+> State is explicit, bounded, in memory unless owned externally, and correlated
+> by identities supplied by the responsible protocol. Drivers and console
+> adapters exist only to test those three components.

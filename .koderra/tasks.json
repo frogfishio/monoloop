@@ -1,0 +1,12 @@
+[
+  {
+    "id": "current",
+    "title": "Current Work",
+    "tasks": []
+  },
+  {
+    "id": "backlog",
+    "title": "Backlog",
+    "tasks": []
+  }
+]

@@ -6,7 +6,7 @@
 
 **System:** Ground-zero cognitive runtime
 
-**Component kind:** Abstract transport boundary
+**Component kind:** Abstract transport and explicit session-routing boundary
 
 **Implementations:** LLM connector, Grok Build connector, Cursor connector, and
 future connectors
@@ -20,8 +20,10 @@ The words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, and
 
 ## 1. Purpose
 
-A Connector provides a raw ordered path between the runtime and one external
-system.
+A Connector provides an ordered dialect-labelled path between the runtime and
+one external system. A transport profile may additionally perform the minimum
+protocol-envelope work required to authenticate, negotiate, create/load
+sessions, and route messages by explicit session identity.
 
 It exposes:
 
@@ -31,7 +33,8 @@ It exposes:
 4. an out-of-band early cancellation/termination control; and
 5. one unambiguous terminal transport outcome.
 
-That is the complete semantic responsibility of this component.
+That is the complete protocol responsibility of this component. It does not
+interpret assistant content, reasoning, tools, plans, or other model semantics.
 
 ```text
                     raw dialect-encoded input
@@ -45,14 +48,15 @@ runtime  ---------------- cancel / terminate ----------> connection control
 runtime  <--------------- terminal outcome ------------- connection
 ```
 
-The Connector moves bytes. It does not understand the conversation, model,
-agent, tool, task, turn, or user-visible meaning of those bytes.
+The Connector moves bytes and explicit routing envelopes. It does not
+understand the conversation, model, agent, tool, task, turn, or user-visible
+meaning of semantic payloads.
 
 ## 2. Architectural decision
 
 The Connector is a transport adapter, not an LLM abstraction.
 
-An LLM HTTP API, Grok Build process, Cursor ACP process, local model socket, and
+An LLM HTTP API, Grok Build server, Cursor ACP process, local model socket, and
 future remote service may require different transport implementations. Once
 opened, every implementation presents the same host-neutral contract:
 
@@ -67,13 +71,20 @@ RawConnection
 ```
 
 Downstream components select encoders and decoders from the dialect binding.
-They—not the Connector—interpret model events or decide execution state.
+They—not the Connector—interpret model events or decide execution state. A
+Connector profile may decode only bounded framing and routing fields, such as a
+JSON-RPC request ID and Grok `sessionId`, when required to isolate logical
+sessions sharing one server transport.
 
 ## 3. Responsibilities
 
 The Connector MUST:
 
 - establish the configured transport connection;
+- perform declared transport/protocol authentication and initialization;
+- create or load an explicitly requested external session when the profile
+  requires it;
+- retain bounded in-memory session correlation and routing state;
 - expose ordered input bytes;
 - expose ordered output bytes;
 - report the selected input/output dialects;
@@ -101,10 +112,10 @@ The Connector MUST NOT:
 - build, augment, summarize, or inspect prompts;
 - choose a provider, model, route, profile, or reasoning level;
 - encode semantic requests;
-- decode or normalize semantic output;
+- decode or normalize semantic payload content;
 - recognize assistant text, thinking, tool calls, usage, or model errors;
 - decide that a model invocation or user turn completed;
-- maintain provider conversation history;
+- maintain its own copy of provider conversation history;
 - assign activity, task, turn, decision, or model-invocation identity;
 - execute tools or approve effects;
 - retry a semantic operation;
@@ -112,11 +123,13 @@ The Connector MUST NOT:
 - update product or cognitive state;
 - emit product UI presentation blocks;
 - start Tasker, specialists, subagents, or another model invocation; or
-- infer meaning from byte contents.
+- infer semantic meaning from payload contents.
 
-The fact that an output byte sequence visually resembles JSON, Markdown, an
-error, a tool call, or a completion marker does not permit the Connector to
-interpret it.
+The fact that an output payload visually resembles Markdown, an error, a tool
+call, or a completion marker does not permit the Connector to interpret it.
+Parsing a declared JSON-RPC/ACP envelope solely to authenticate, correlate a
+request, or route an explicitly identified session is permitted and must not
+promote semantic fields into Connector state.
 
 ## 5. Connector and connection
 
@@ -129,11 +142,15 @@ independent connections. It contains no ambient current connection.
 
 ### 5.2 RawConnection
 
-One live transport instance created for one caller-owned operation. It owns the
-transport resources associated with that connection only.
+One live logical transport attachment created for one caller-owned scope. It
+may carry several ordered operations when its declared profile supports that
+behavior. It owns the logical connection resources associated with that scope.
 
-Two connections created by the same Connector do not share input, output,
-cancellation state, terminal state, or mutable buffers.
+Two logical connections created by the same Connector do not share input,
+output, cancellation state, terminal state, or mutable per-connection buffers.
+A profile may use a shared bounded physical transport and session-routing table,
+but correlation, backpressure, cancellation, and terminal outcomes remain
+logically isolated.
 
 ## 6. Conceptual interface
 
@@ -157,6 +174,7 @@ pub struct PendingRawConnection {
 
 pub struct OpenedRawConnection {
     pub connection_id: ConnectionId,
+    pub external_session_id: Option<ExternalSessionId>,
     pub dialect: DialectBinding,
     pub input: RawInput,
     pub output: RawOutput,
@@ -174,6 +192,10 @@ therefore available while opening is blocked.
 `RawInput`, `RawOutput`, `ConnectionControl`, and `ConnectionCompletion` MAY be
 cloneable handles where needed, but their ownership and concurrency semantics
 must be explicit.
+
+`external_session_id` is present for a logical connection attached to an
+externally identified session. For the Grok Build profile it is exactly the
+Grok-returned `sessionId`.
 
 The public interface contains no host runtime, product UI, provider-native, Tauri, MCP,
 ACP implementation, database, or UI type.
@@ -194,6 +216,10 @@ The identity exists only for correlation and control. It does not imply:
 
 The execution component that opens the connection binds `ConnectionId` to its
 own higher-level identity.
+
+`ConnectionId` and external session identity are distinct. The former
+correlates one local logical transport attachment; the latter correlates the
+externally owned resumable session across requests or reconnections.
 
 There is no process-global “current connection.”
 
@@ -475,6 +501,7 @@ policy supplied when opened.
 ```text
 connection_id
 endpoint/configuration reference
+external session identity?
 credential reference?
 required dialect family/version range
 connect deadline
@@ -485,6 +512,13 @@ caller trace context?
 
 It does not contain a prompt, task, conversation, agent role, Kanban record,
 model-routing decision, or product UI block.
+
+An external session identity is an opaque value returned by the external system
+and chosen explicitly by the caller when loading or addressing an existing
+session. For Grok Build it is Grok's `sessionId`. The Connector does not
+interpret the conversation or select an implicit session. A profile may retain
+the explicit session correlation in its bounded in-memory routing table, but
+never makes it the ambient current session.
 
 `begin_open` returns a pending handle synchronously, making its control path
 available before connection establishment can block. Cancellation or
@@ -530,10 +564,16 @@ Initial expected implementations:
 
 ### 20.2 Grok Build connector
 
-- attaches to the configured Grok Build transport;
-- exposes its raw stdin/stdout, socket, ACP, or JSONL payload boundary;
-- reports the actual negotiated dialect; and
-- does not infer work packages or tool events.
+- implements the [Grok Build Network Connector
+  Profile](GROK_BUILD_CONNECTOR.md);
+- attaches over authenticated WebSocket to one configured long-lived Grok Build
+  server;
+- supports many logical sessions addressed by Grok's returned `sessionId`;
+- sends initial session configuration through ACP `session/new`;
+- retains bounded in-memory session routing and pending-operation state;
+- reports the actual negotiated ACP/JSON-RPC dialect; and
+- does not interpret agent messages, thoughts, plans, work packages, or tool
+  events.
 
 ### 20.3 Cursor connector
 
@@ -567,6 +607,24 @@ still report connection termination separately from process termination.
 
 Claims such as “Cursor was killed” require supervisor evidence, not merely a
 closed pipe.
+
+The same rule applies to resumable external sessions:
+
+```text
+External Application / Process Supervisor
+    returns authoritative session identity
+    owns conversation state, resumability, process and durable continuity
+
+Connector
+    keeps a bounded in-memory routing table keyed by external session identity
+    moves bytes and explicit routing envelopes
+```
+
+Closing a Connector connection does not claim that the external session ended.
+While live, the Connector may route later requests through its explicitly keyed
+in-memory session table. After that table is lost, a later connection may
+reattach only when its caller supplies the external session identity again. The
+Connector never selects a last or most-recent session implicitly.
 
 ## 22. Backpressure and resource bounds
 
@@ -624,7 +682,8 @@ invariant_violation
 
 Errors include connection identity, safe transport classification, retry
 knowledge where mechanically certain, and redacted diagnostics. They never
-persist raw bodies, headers, credentials, prompts, or provider error content.
+persist raw bodies, headers, credentials, external session identities, prompts,
+or provider error content.
 
 A dialect-level error received as bytes remains bytes until decoded downstream.
 
@@ -655,8 +714,11 @@ added, belongs to an explicit secured higher-level facility.
 Required behavior:
 
 - transport credentials remain opaque and redacted;
+- external session identities remain opaque and redacted;
 - TLS/pipe/socket security requirements fail closed;
 - cancellation cannot target another connection identity;
+- an external session identity cannot be substituted with or inferred from
+  another connection;
 - connector instances do not share mutable connection state;
 - raw data is not copied into diagnostics;
 - local pipes/files have appropriate ownership and permissions; and
@@ -679,6 +741,12 @@ The design supports many simultaneous connections:
 
 Completion order has no relationship to higher-level activity priority or turn
 order.
+
+The initial Rust implementation runs on a multi-threaded async runtime. All
+network I/O, queue waits, control paths, session routing, and completion waits
+are non-blocking async operations. No synchronization guard is held across
+network I/O, and unavoidable blocking work is isolated on a bounded blocking
+facility rather than an async worker.
 
 ## 28. Required tests
 
@@ -716,6 +784,9 @@ order.
 - Terminate produces one `terminated` terminal outcome.
 - Terminate/failure and terminate/EOF races follow §16.
 - Closing transport does not claim an external process was killed.
+- Closing transport does not claim an externally owned session ended.
+- A new connection can reattach to a supervised external session only with an
+  explicitly supplied external session identity.
 
 ### 28.5 Lifecycle and completion
 
@@ -758,10 +829,14 @@ Component 01 is accepted only when:
 6. transport termination is never represented as semantic turn completion;
 7. all buffering and cleanup are bounded;
 8. simultaneous connections remain isolated;
-9. no persistence, parsing, routing, state, tool, or UI responsibility exists;
+9. no durable persistence, semantic payload interpretation, provider
+   conversation copy, tool, or UI responsibility exists;
 10. a process-backed connector does not counterfeit process termination;
-11. architecture tests enforce the dependency boundary; and
-12. all required transport, cancellation, race, and load tests pass without a
+11. a Connector retains only bounded in-memory correlation/routing state for an
+    external resumable session and never owns its conversation or durable
+    representation;
+12. architecture tests enforce the dependency boundary; and
+13. all required transport, cancellation, race, and load tests pass without a
     partial or “shaped” qualification.
 
 ## 30. Deferred enrichment

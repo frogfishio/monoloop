@@ -1,6 +1,6 @@
-# Component 03 — Console Renderer
+# Test Kit — Console Renderer
 
-**Status:** Foundational component specification
+**Status:** Foundational test-adapter specification
 
 **Product:** [Monoloop](MONOLOOP.md)
 
@@ -168,6 +168,7 @@ Every rendered canonical record includes the identities present in its event:
 renderer_id?          optional in human output, required in JSONL
 connection_id
 interpretation_id
+external_session_id?
 flow_id?
 lane_id?
 lane_ordinal?
@@ -176,13 +177,15 @@ unit_generation?
 causal_parent_id?
 ```
 
+For the Grok Build profile, `external_session_id` is Grok's `sessionId` and is
+the session correlation identity shown by the test renderer.
+
 If a later event distributor supplies an explicit host envelope, the renderer
 may additionally display:
 
 ```text
 host_id?
 project_id?
-session_id?
 turn_id?
 activity_id?
 ```
@@ -663,7 +666,7 @@ credentials, or unbounded writer errors.
 
 ## 29. Acceptance criteria
 
-Component 03 is accepted only when:
+The Console Renderer test adapter is accepted only when:
 
 1. it renders the full Component 02 canonical vocabulary;
 2. complete sentence events appear in real time without waiting for response
@@ -685,7 +688,8 @@ Component 03 is accepted only when:
 
 ## 30. First vertical qualification
 
-Components 01–03 form the first executable ground-zero slice:
+Components 01–02 plus this test adapter form the first observable transport and
+interpretation slice:
 
 ```text
 one or more real/fake Connectors

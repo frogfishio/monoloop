@@ -131,6 +131,7 @@ pub trait InterpreterFactory: Send + Sync {
 pub struct StartInterpretation {
     pub interpretation_id: InterpretationId,
     pub connection_id: ConnectionId,
+    pub external_session_id: Option<ExternalSessionId>,
     pub dialect: DialectBinding,
     pub limits: InterpretationLimits,
 }
@@ -151,6 +152,10 @@ The exact Rust interface may vary. Required semantics:
 - instances share no mutable semantic buffers;
 - all channels are bounded; and
 - the interpretation ID is correlation identity only, not activity authority.
+
+`external_session_id`, when present, is supplied by the Connector envelope. For
+the Grok Build profile it is the Grok-returned `sessionId`. The Interpreter
+propagates it unchanged and never invents, parses, or selects a session.
 
 An implementation may consume `RawOutput` directly rather than expose an input
 handle, provided the same ownership and testing boundaries remain explicit.
@@ -226,6 +231,7 @@ Every event carries:
 canonical_event_id
 interpretation_id
 connection_id
+external_session_id?
 flow_id
 lane_id
 lane_ordinal
@@ -954,6 +960,8 @@ The complete runtime is async from the first implementation:
 - one slow connection cannot block another Interpretation;
 - connection, interpretation, flow, lane, and unit identity accompany every
   event rather than relying on task-local or global current state;
+- an explicitly supplied external session identity accompanies every event for
+  a session-based Connector profile;
 - shared registries, if later introduced, store handles only and do not merge
   assembly state; and
 - cancellation and shutdown are propagated asynchronously without polling UI
@@ -961,6 +969,11 @@ The complete runtime is async from the first implementation:
 
 “Async” does not permit uncontrolled task spawning. Every task has an owner,
 bounded input, cancellation path, terminal result, and cleanup responsibility.
+
+The Rust implementation is safe on a multi-threaded async runtime. It performs
+no blocking waits and holds no synchronization guard across an await. Separate
+Interpretations can execute on different runtime workers without sharing
+mutable assembly state.
 
 ## 35. Observability
 
@@ -1059,6 +1072,8 @@ IDs, and provider bodies are not metric labels or default logs.
 - Cleanup releases every pending assembler after terminal state.
 - Hundreds of connections/sessions stream canonical events concurrently without
   shared current-state leakage.
+- Interleaved Grok sessions preserve their supplied Grok `sessionId` on every
+  canonical event.
 - A blocked consumer backpressures only its owned path, not unrelated
   Interpretations.
 

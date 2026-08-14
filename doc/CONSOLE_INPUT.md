@@ -1,6 +1,6 @@
-# Component 05 — Console Input
+# Test Kit — Console Input
 
-**Status:** Foundational component specification
+**Status:** Foundational test-adapter specification
 
 **Product:** [Monoloop](MONOLOOP.md)
 
@@ -416,7 +416,7 @@ The fake must model:
 
 ## 18. Acceptance criteria
 
-Component 05 is accepted only when:
+The Console Input test adapter is accepted only when:
 
 1. one complete terminal submission creates one complete canonical request;
 2. every request explicitly names one preconfigured Channel;
@@ -430,7 +430,7 @@ Component 05 is accepted only when:
    rendering, persistence, routing, or prompting logic;
 10. deterministic non-TTY tests prove input framing, fidelity, isolation,
     cancellation, and shutdown; and
-11. the production Monoloop core has no dependency on Console Input.
+11. none of the three Monoloop product components depends on Console Input.
 
 ## 19. Initial deliverable
 
@@ -443,7 +443,8 @@ The initial implementation contains only:
 - bounded asynchronous handoff;
 - exact-run control registration in the test harness;
 - deterministic fake-reader qualification; and
-- a thin executable that composes Console Input, Monoloop, and Console Renderer.
+- a thin executable that composes Console Input, the test Driver, the selected
+  Monoloop components, and Console Renderer.
 
 It contains no terminal UI framework, history, completion, rich editing,
 configuration editor, slash commands, or application integration.

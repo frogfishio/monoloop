@@ -1,0 +1,17 @@
+[package]
+name = "monoloop-connector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Abstract Connector contract, shared transport handles, FakeConnector, and ConnectorProxy"
+
+[dependencies]
+bytes = { workspace = true }
+monoloop-contracts = { path = "../monoloop-contracts" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time"] }

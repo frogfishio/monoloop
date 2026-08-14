@@ -1,4 +1,4 @@
-# Component 04 — The Loop
+# Component 03 — The Loop
 
 **Status:** Foundational component specification
 
@@ -9,7 +9,7 @@
 **Consumes:** [Component 02 — Interpreter](INTERPRETER.md) canonical events
 through an independent lossless subscription
 
-**Parallel observer:** [Component 03 — Console Renderer](CONSOLE_RENDERER.md)
+**Parallel test observer:** [Console Renderer](CONSOLE_RENDERER.md)
 
 **Produces:** Typed loop/tool lifecycle events and canonical outbound tool
 results
@@ -81,7 +81,7 @@ shared between runs or survive its owning run.
 
 ## 4. Initial scope
 
-Component 04 implements:
+Component 03 implements:
 
 - loop instance lifecycle;
 - lossless canonical event consumption;
@@ -95,10 +95,11 @@ Component 04 implements:
 - loop events, health, and terminal reporting; and
 - empty-tool behavior.
 
-It does not implement the complete Channel exchange. In Monoloop composition,
-the run coordinator owns exchange continuation and a separate outbound encoder
-owns dialect encoding. Prompt construction and higher-product completion remain
-outside Monoloop entirely.
+It does not implement the complete Channel exchange. In the initial test
+composition, the Driver owns exchange continuation and a separate outbound
+encoder owns dialect encoding. A later production host may provide equivalent
+composition. Prompt construction and higher-product completion remain outside
+Monoloop entirely.
 
 ## 5. Explicit non-responsibilities
 
@@ -169,6 +170,7 @@ LoopScope
     loop_id
     accepted_interpretation_ids[]
     accepted_connection_ids[]
+    accepted_external_session_ids[]
     host_scope_ref?
 ```
 
@@ -176,6 +178,11 @@ A scope may contain one or several explicitly admitted Interpretations, but
 every admitted Interpretation and connection MUST belong to the same
 `monoloop_run_id`. This supports a single run involving multiple connections
 without creating an ambient current connection or a cross-run Loop.
+
+When the Connector supplies an external session identity, the Loop admits and
+validates it explicitly. For Grok Build this is Grok's `sessionId`; The Loop
+propagates it for correlation but assigns it no authority beyond the configured
+scope.
 
 The Loop rejects events outside its scope. It never expands scope because an
 event happens to arrive on its subscription.
@@ -200,7 +207,7 @@ one accepted canonical event
     -> future subscribers         independently bounded
 ```
 
-Component 04 does not implement or own the process-wide distributor. It requires
+Component 03 does not implement or own the process-wide distributor. It requires
 a `CanonicalEventSubscription` with:
 
 ```text
@@ -248,6 +255,7 @@ Before applying an event, The Loop validates:
 
 - subscription scope;
 - interpretation and connection membership;
+- external session membership when present;
 - canonical schema version;
 - delivery sequence continuity;
 - unit identity;
@@ -482,7 +490,8 @@ pub enum LoopOutputEvent {
 ```
 
 All outputs carry Loop, source interpretation, tool action, request generation,
-and execution identity where applicable.
+execution identity where applicable, plus the explicitly supplied external
+session identity when present.
 
 Output publication is asynchronous, in-memory, bounded, and immediate after
 each accepted state transition.
@@ -496,6 +505,7 @@ OutboundToolResult
     loop_id
     source_interpretation_id
     source_connection_id
+    external_session_id?
     tool_action_id
     request_generation
     tool_execution_id?
@@ -518,9 +528,9 @@ execution_lost
 The result is provider-neutral. The Loop does not serialize it as OpenAI,
 Anthropic, ACP, Cursor, Grok Build, JSONL, or any other dialect.
 
-Monoloop's separate outbound Encoder consumes this product and its run
-coordinator writes the encoded bytes through the Connector input. Neither
-responsibility enters The Loop.
+The test kit's separate outbound Encoder consumes this product and its Driver
+writes the encoded bytes through the Connector input. A later host may provide
+the same seams. Neither responsibility enters The Loop.
 
 ## 22. Output publication rule
 
@@ -602,8 +612,8 @@ Cancellation:
 - releases the subscription and output handles; and
 - resolves Loop completion exactly once.
 
-The Loop does not directly cancel Connector connections. A future execution
-coordinator may signal both from one higher-level cancellation decision.
+The Loop does not directly cancel Connector connections. The test Driver or a
+future host may signal both from one higher-level cancellation decision.
 
 ## 27. Subscription gap and loss
 
@@ -687,7 +697,7 @@ destroyed. Nothing is retained for a later Monoloop run.
 
 ## 30. In-memory durability boundary
 
-All Component 04 state is in memory:
+All Component 03 state is in memory:
 
 - event deduplication;
 - action state machines;
@@ -697,7 +707,7 @@ All Component 04 state is in memory:
 - observations; and
 - outbound result staging.
 
-Component 04 performs no database or file write.
+Component 03 performs no database or file write.
 
 A process crash may lose Loop state and in-flight tool knowledge. The initial
 component makes no crash recovery or exactly-once-effect claim. Those guarantees
@@ -722,6 +732,11 @@ The complete design is asynchronous from the first implementation:
 
 Every spawned task has an owner, bounded inputs, cancellation, a terminal result,
 and cleanup responsibility. Detached fire-and-forget execution is prohibited.
+
+The Rust implementation is safe on a multi-threaded async runtime. It performs
+no blocking waits and holds no synchronization guard across an await. Separate
+Loop instances and independent tool executions may progress on different
+runtime workers while each Loop retains one serialized state owner.
 
 ## 32. Limits
 
@@ -907,7 +922,7 @@ Using deterministic fake tools only:
 
 ## 37. Acceptance criteria
 
-Component 04 is accepted only when:
+Component 03 is accepted only when:
 
 1. it consumes a distinct lossless canonical subscription;
 2. only a complete `ToolRequestReady` can trigger resolution;
@@ -962,9 +977,9 @@ The slice proves:
 - no product UI, host agent, persistence, concrete tools, or prompt engine is
   required.
 
-This Component 01–04 slice alone does not send the outbound result back to the
-external system. Monoloop product composition supplies the separate canonical
-Encoder seam and run coordinator needed to do so.
+This Component 01–03 slice alone does not send the outbound result back to the
+external system. The test Driver's outbound Encoder seam, or an equivalent
+future host composition, supplies that behavior.
 
 ## 39. Deferred work
 
@@ -975,10 +990,10 @@ Explicitly deferred:
 - authorization, approval, capabilities, and sandboxing;
 - durable command/effect receipts and crash recovery;
 - retry and scheduling policy beyond bounded FIFO;
-- outbound dialect encoding and Connector input, which belong to Monoloop's
-  encoder/coordinator boundaries;
-- Channel continuation and invocation lifecycle, which belongs to the Monoloop
-  run coordinator;
+- outbound dialect encoding and Connector input, which belong to the test
+  Driver or future host composition;
+- Channel continuation and invocation lifecycle, which belong to the test
+  Driver or future host coordinator;
 - context/prompt compilation;
 - product/task/turn state;
 - event distributor implementation;
