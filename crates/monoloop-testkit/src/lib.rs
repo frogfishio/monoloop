@@ -13,7 +13,8 @@ mod html_report;
 mod pipeline;
 
 pub use chat_projector::{
-    project_chat, ChatLine, ChatProjection, ChatRole, ProjectedTool, ProjectionStrategy,
+    project_chat, project_chat_with, ChatLine, ChatProjection, ChatRole, ProjectChatOptions,
+    ProjectedTool, ProjectionConfidence, ProjectionStrategy,
 };
 pub use console::{
     ConsoleRenderRecord, ConsoleRenderer, ConsoleRendererConfig, ConsoleSink, StdoutSink,

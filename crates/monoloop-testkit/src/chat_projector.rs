@@ -2,9 +2,25 @@
 //!
 //! **Test kit only.** This is a *report*, not ground truth.
 //!
-//! The Interpreter event order remains authoritative (tools-first dumps, bare
-//! generations, incomplete assemblies). This projector rearranges complete
-//! units into a chat-like flow humans prefer:
+//! ## Design (scalable / universal)
+//!
+//! **Always correct core — chronological chat**
+//!
+//! Walk complete units in Interpreter emit order, map channels to chat roles,
+//! collapse consecutive same-role text. No invented speech, no tool↔sentence
+//! claims. Works for every mix of agent / thinking / tool / status.
+//!
+//! **Optional structural zip (gated)**
+//!
+//! Only when *all* of these hold:
+//! 1. Every tool first-sight precedes every public-response sentence (tools-first dump)
+//! 2. Public text contains numbered list items (`1. …`, `2. …`)
+//! 3. Count of those list items **equals** the tool count
+//!
+//! Then: preamble → thinking/status → ordinal `(tool[i], step[i])` → epilogue.
+//! Pairing is **index-only** — no CREATE/READ/keyword matching.
+//!
+//! If any gate fails → chronological. Prefer honesty over a pretty but wrong weave.
 //!
 //! ```text
 //! AGENT:    I'll take care of that.
@@ -14,11 +30,6 @@
 //! TOOL:     Write path/to/file.txt
 //! AGENT:    Done; file is ready.
 //! ```
-//!
-//! When the dialect emitted all tools before any public text (common with
-//! Grok Build), the projector pairs tools with later step sentences by ordinal
-//! so the narrative reads naturally. That pairing is **heuristic** and may not
-//! match wall-clock order.
 
 use monoloop_contracts::{
     CanonicalUnit, InterpreterOutputEvent, TextChannel, ToolRequestState, UnitState,
@@ -28,10 +39,35 @@ use std::collections::HashMap;
 /// Strategy used to lay out the projected chat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionStrategy {
-    /// Walk emit order; only add chat chrome (no reordering).
+    /// Emit-order layout with chat chrome. Universal default.
     ChronologicalChat,
-    /// Tools completed before public text: pair tools with later step sentences.
-    NarrativeReassembly,
+    /// Tools-first dump + equal numbered steps → ordinal tool/step zip only.
+    StructuralOrdinalZip,
+}
+
+/// Confidence of the projection relative to Interpreter emit order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionConfidence {
+    /// Layout follows emit order (no reordering of tools vs text).
+    EmitOrder,
+    /// Tools/steps reordered under structural gates; still no invented content.
+    StructuralReorder,
+}
+
+/// Options for [`project_chat_with`].
+#[derive(Clone, Debug)]
+pub struct ProjectChatOptions {
+    /// When true (default), allow [`ProjectionStrategy::StructuralOrdinalZip`]
+    /// if structural gates pass. When false, always chronological.
+    pub allow_structural_zip: bool,
+}
+
+impl Default for ProjectChatOptions {
+    fn default() -> Self {
+        Self {
+            allow_structural_zip: true,
+        }
+    }
 }
 
 /// Role of a projected chat line.
@@ -54,7 +90,7 @@ pub struct ProjectedTool {
     pub action_id: String,
     /// Display title (often path-aware from the dialect).
     pub title: String,
-    /// Short verb hint (`Write`, `Read`, `Execute`, …).
+    /// Short display verb (`Write`, `Read`, first token, …) — cosmetic only.
     pub verb: String,
     /// Request args JSON when ready (bounded later by the HTML layer).
     pub args: Option<String>,
@@ -73,7 +109,7 @@ pub struct ChatLine {
     pub text: String,
     /// Tool payload when `role == Tool`.
     pub tool: Option<ProjectedTool>,
-    /// True when this line was placed by narrative reassembly (not pure emit order).
+    /// True when this line was placed by structural zip (not pure emit order).
     pub reordered: bool,
 }
 
@@ -82,6 +118,10 @@ pub struct ChatLine {
 pub struct ChatProjection {
     /// Layout strategy chosen for this run.
     pub strategy: ProjectionStrategy,
+    /// Confidence relative to emit order.
+    pub confidence: ProjectionConfidence,
+    /// Why this strategy was chosen (short, for UI / tests).
+    pub strategy_reason: String,
     /// Projected lines in display order.
     pub lines: Vec<ChatLine>,
     /// Plain-text chat transcript for terminals / logs.
@@ -93,22 +133,38 @@ pub struct ChatProjection {
 }
 
 const DISCLAIMER: &str = "Chat projection is a human-readable report, not ground truth. \
-It may reorder tools relative to later summary text. Use the event-order interleaved \
-stream and canonical timeline for exact Interpreter emit order.";
+Default layout follows Interpreter emit order. Structural ordinal zip (when shown) \
+only reorders tools against later numbered list steps when counts match — it does \
+not invent speech. Use the event-order interleaved stream and canonical timeline \
+for exact emit order.";
 
-/// Project canonical Interpreter events into a chat-like flow.
+/// Project canonical Interpreter events into a chat-like flow (default options).
 pub fn project_chat(events: &[InterpreterOutputEvent]) -> ChatProjection {
+    project_chat_with(events, &ProjectChatOptions::default())
+}
+
+/// Project with explicit options.
+pub fn project_chat_with(
+    events: &[InterpreterOutputEvent],
+    opts: &ProjectChatOptions,
+) -> ChatProjection {
     let extracted = extract(events);
-    let strategy = choose_strategy(&extracted);
+    let (strategy, reason) = choose_strategy(&extracted, opts);
+    let confidence = match strategy {
+        ProjectionStrategy::ChronologicalChat => ProjectionConfidence::EmitOrder,
+        ProjectionStrategy::StructuralOrdinalZip => ProjectionConfidence::StructuralReorder,
+    };
     let lines = match strategy {
-        ProjectionStrategy::NarrativeReassembly => assemble_narrative(&extracted),
+        ProjectionStrategy::StructuralOrdinalZip => assemble_structural_zip(&extracted),
         ProjectionStrategy::ChronologicalChat => assemble_chronological(&extracted),
     };
-    let lines = merge_consecutive_agent(&lines);
-    let plain_text = render_plain(&lines, strategy);
-    let html = render_html(&lines, strategy);
+    let lines = merge_consecutive_same_role(&lines);
+    let plain_text = render_plain(&lines, strategy, confidence, &reason);
+    let html = render_html(&lines, strategy, confidence, &reason);
     ChatProjection {
         strategy,
+        confidence,
+        strategy_reason: reason,
         lines,
         plain_text,
         html,
@@ -119,15 +175,15 @@ pub fn project_chat(events: &[InterpreterOutputEvent]) -> ChatProjection {
 // ── extraction ──────────────────────────────────────────────────────────────
 
 struct Extracted {
-    /// Event-order blocks (text or first-sight tool), used for chronological mode.
+    /// Event-order blocks (text or first-sight tool).
     chrono: Vec<ChronoBlock>,
-    /// Tools in first-sight order, upgraded to latest terminal generation.
+    /// Tools in first-sight order, upgraded to latest generation.
     tools: Vec<ProjectedTool>,
     /// Public response sentences in emit order.
     public: Vec<String>,
-    /// Reasoning-summary sentences.
+    /// Reasoning-summary sentences (also present in chrono).
     reasoning: Vec<String>,
-    /// Status narration sentences.
+    /// Status narration sentences (also present in chrono).
     status: Vec<String>,
     /// True if every tool first-sight precedes every public sentence.
     tools_before_public: bool,
@@ -189,9 +245,7 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
                 let projected = projected_tool(t, snap.unit_state);
                 let id = projected.action_id.clone();
                 if let Some(&idx) = tool_index.get(&id) {
-                    // Prefer terminal / later generation for the card contents.
                     tools[idx] = projected.clone();
-                    // Update chrono slot if present.
                     if let Some(ChronoBlock::Tool(slot)) = chrono.iter_mut().find(|b| match b {
                         ChronoBlock::Tool(p) => p.action_id == id,
                         _ => false,
@@ -210,8 +264,7 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
 
     let tools_before_public = !tools.is_empty()
         && !public.is_empty()
-        && !tool_after_public
-        && chrono.iter().any(|b| matches!(b, ChronoBlock::Tool(_)));
+        && !tool_after_public;
 
     Extracted {
         chrono,
@@ -227,11 +280,8 @@ fn projected_tool(
     t: &monoloop_contracts::ToolActionEvent,
     unit_state: UnitState,
 ) -> ProjectedTool {
-    let title = t
-        .tool_name
-        .clone()
-        .unwrap_or_else(|| "tool".into());
-    let verb = infer_verb(&title, t.request_payload.as_deref());
+    let title = t.tool_name.clone().unwrap_or_else(|| "tool".into());
+    let verb = display_verb(&title, t.request_payload.as_deref());
     let state = {
         let base = match t.request_state {
             ToolRequestState::Ready => "ready",
@@ -255,7 +305,8 @@ fn projected_tool(
     }
 }
 
-fn infer_verb(title: &str, args: Option<&str>) -> String {
+/// Cosmetic label for tool cards only — never used for pairing.
+fn display_verb(title: &str, args: Option<&str>) -> String {
     let lower = title.to_ascii_lowercase();
     if lower.starts_with("write") || lower.contains("write `") {
         return "Write".into();
@@ -280,7 +331,6 @@ fn infer_verb(title: &str, args: Option<&str>) -> String {
             return "Read".into();
         }
     }
-    // First token of title as fallback.
     title
         .split_whitespace()
         .next()
@@ -288,34 +338,62 @@ fn infer_verb(title: &str, args: Option<&str>) -> String {
         .to_string()
 }
 
-fn choose_strategy(ex: &Extracted) -> ProjectionStrategy {
-    // Narrative reassembly when tools finished first and we have step-like
-    // summary text to weave with them — the classic "tools then dump" shape.
-    let has_steps = ex.public.iter().any(|s| is_step_sentence(s));
-    if ex.tools_before_public && has_steps && !ex.tools.is_empty() {
-        ProjectionStrategy::NarrativeReassembly
-    } else {
-        ProjectionStrategy::ChronologicalChat
+// ── strategy ────────────────────────────────────────────────────────────────
+
+fn choose_strategy(
+    ex: &Extracted,
+    opts: &ProjectChatOptions,
+) -> (ProjectionStrategy, String) {
+    if !opts.allow_structural_zip {
+        return (
+            ProjectionStrategy::ChronologicalChat,
+            "structural zip disabled by options".into(),
+        );
     }
+
+    if !ex.tools_before_public {
+        return (
+            ProjectionStrategy::ChronologicalChat,
+            "emit-order chat (tools not strictly before public text, or no tools/text)"
+                .into(),
+        );
+    }
+
+    let list_steps = count_list_steps(&ex.public);
+    let n_tools = ex.tools.len();
+
+    if list_steps == 0 {
+        return (
+            ProjectionStrategy::ChronologicalChat,
+            "tools-first dump without numbered list steps — chronological (no safe zip)"
+                .into(),
+        );
+    }
+
+    if list_steps != n_tools {
+        return (
+            ProjectionStrategy::ChronologicalChat,
+            format!(
+                "tools-first but list steps ({list_steps}) ≠ tools ({n_tools}) — \
+                 chronological (refuse mis-pairing)"
+            ),
+        );
+    }
+
+    (
+        ProjectionStrategy::StructuralOrdinalZip,
+        format!(
+            "tools-first + {n_tools} numbered steps matching tool count — \
+             ordinal zip only (no keyword pairing)"
+        ),
+    )
+}
+
+fn count_list_steps(public: &[String]) -> usize {
+    public.iter().filter(|s| looks_like_list_item(s.trim())).count()
 }
 
 // ── assembly ────────────────────────────────────────────────────────────────
-
-fn is_step_sentence(s: &str) -> bool {
-    let t = s.trim();
-    if looks_like_list_item(t) {
-        return true;
-    }
-    // Bold step labels without a leading number (legacy bad splits).
-    const LABELS: &[&str] = &[
-        "**CREATE**",
-        "**READ**",
-        "**UPDATE**",
-        "**DELETE**",
-        "**WRITE**",
-    ];
-    LABELS.iter().any(|l| t.starts_with(l) || t.contains(&format!(" {l}")))
-}
 
 fn looks_like_list_item(s: &str) -> bool {
     let b = s.as_bytes();
@@ -323,17 +401,18 @@ fn looks_like_list_item(s: &str) -> bool {
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
     }
+    // Require "N." or "N. " form (digit run + period). Content may follow.
     i > 0 && i < b.len() && b[i] == b'.'
 }
 
-fn split_public(public: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
+fn split_public_by_list_items(public: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut preamble = Vec::new();
     let mut steps = Vec::new();
     let mut epilogue = Vec::new();
     let mut seen_step = false;
 
     for s in public {
-        if is_step_sentence(s) {
+        if looks_like_list_item(s.trim()) {
             seen_step = true;
             steps.push(s.clone());
         } else if !seen_step {
@@ -345,147 +424,41 @@ fn split_public(public: &[String]) -> (Vec<String>, Vec<String>, Vec<String>) {
     (preamble, steps, epilogue)
 }
 
-fn assemble_narrative(ex: &Extracted) -> Vec<ChatLine> {
+fn assemble_structural_zip(ex: &Extracted) -> Vec<ChatLine> {
     let mut lines = Vec::new();
-    let (preamble, steps, epilogue) = split_public(&ex.public);
+    let (preamble, steps, epilogue) = split_public_by_list_items(&ex.public);
 
-    for s in &preamble {
-        lines.push(ChatLine {
-            role: ChatRole::Agent,
-            text: s.clone(),
-            tool: None,
-            reordered: true,
-        });
-    }
+    // Reasoning/status that appeared in the stream: for tools-first dumps they
+    // usually sit with tools or after; surface them before the weave as context.
     for s in &ex.reasoning {
-        lines.push(ChatLine {
-            role: ChatRole::Thinking,
-            text: s.clone(),
-            tool: None,
-            reordered: true,
-        });
+        lines.push(line(ChatRole::Thinking, s.clone(), None, true));
     }
     for s in &ex.status {
-        lines.push(ChatLine {
-            role: ChatRole::Status,
-            text: s.clone(),
-            tool: None,
-            reordered: true,
-        });
+        lines.push(line(ChatRole::Status, s.clone(), None, true));
+    }
+    for s in &preamble {
+        lines.push(line(ChatRole::Agent, s.clone(), None, true));
     }
 
-    let (pairs, leftover_steps) = pair_tools_with_steps(&ex.tools, &steps);
-    for (tool, step) in pairs {
-        lines.push(ChatLine {
-            role: ChatRole::Tool,
-            text: String::new(),
-            tool: Some(tool),
-            reordered: true,
-        });
-        if let Some(step) = step {
-            lines.push(ChatLine {
-                role: ChatRole::Agent,
-                text: step,
-                tool: None,
-                reordered: true,
-            });
-        }
-    }
-    for s in leftover_steps {
-        lines.push(ChatLine {
-            role: ChatRole::Agent,
-            text: s,
-            tool: None,
-            reordered: true,
-        });
+    // Gates guarantee steps.len() == tools.len().
+    for (tool, step) in ex.tools.iter().zip(steps.iter()) {
+        lines.push(line(
+            ChatRole::Tool,
+            String::new(),
+            Some(tool.clone()),
+            true,
+        ));
+        lines.push(line(ChatRole::Agent, step.clone(), None, true));
     }
 
     for s in &epilogue {
-        lines.push(ChatLine {
-            role: ChatRole::Agent,
-            text: s.clone(),
-            tool: None,
-            reordered: true,
-        });
+        lines.push(line(ChatRole::Agent, s.clone(), None, true));
     }
     lines
 }
 
-/// Pair tools with steps (keyword match, then ordinal). Returns leftover steps.
-fn pair_tools_with_steps(
-    tools: &[ProjectedTool],
-    steps: &[String],
-) -> (Vec<(ProjectedTool, Option<String>)>, Vec<String>) {
-    let mut used_steps = vec![false; steps.len()];
-    let mut out: Vec<(ProjectedTool, Option<String>)> = Vec::new();
-
-    for (i, tool) in tools.iter().enumerate() {
-        let mut chosen: Option<usize> = None;
-        let keys = step_keys_for_tool(tool);
-        for (j, step) in steps.iter().enumerate() {
-            if used_steps[j] {
-                continue;
-            }
-            let upper = step.to_ascii_uppercase();
-            if keys.iter().any(|k| upper.contains(k)) {
-                chosen = Some(j);
-                break;
-            }
-        }
-        if chosen.is_none() && i < steps.len() && !used_steps[i] {
-            chosen = Some(i);
-        }
-        if chosen.is_none() {
-            chosen = used_steps.iter().position(|&u| !u);
-        }
-        let step_text = chosen.map(|j| {
-            used_steps[j] = true;
-            steps[j].clone()
-        });
-        out.push((tool.clone(), step_text));
-    }
-
-    let leftover: Vec<String> = steps
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| !used_steps[*j])
-        .map(|(_, s)| s.clone())
-        .collect();
-    (out, leftover)
-}
-
-fn step_keys_for_tool(tool: &ProjectedTool) -> Vec<&'static str> {
-    let v = tool.verb.to_ascii_uppercase();
-    let title = tool.title.to_ascii_uppercase();
-    let mut keys = Vec::new();
-    if v == "WRITE" || title.contains("WRITE") {
-        keys.push("CREATE");
-        keys.push("UPDATE");
-        keys.push("WRITE");
-    }
-    if v == "READ" || title.contains("READ") {
-        keys.push("READ");
-    }
-    if v == "EXECUTE" || title.contains("EXECUTE") || title.contains("RM ") || title.contains("`RM")
-    {
-        keys.push("DELETE");
-        keys.push("REMOVE");
-    }
-    if v == "DELETE" {
-        keys.push("DELETE");
-    }
-    // command: rm → DELETE
-    if let Some(a) = &tool.args {
-        if a.contains("\"rm ") || a.contains("rm /") || a.contains("\"command\":\"rm") {
-            keys.push("DELETE");
-        }
-    }
-    keys
-}
-
 fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
     let mut lines = Vec::new();
-    // Merge consecutive same-channel text into one bubble for readability.
     let mut pending_role: Option<ChatRole> = None;
     let mut pending_text: Vec<String> = Vec::new();
 
@@ -494,12 +467,7 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
                  lines: &mut Vec<ChatLine>| {
         if let Some(r) = role.take() {
             if !buf.is_empty() {
-                lines.push(ChatLine {
-                    role: r,
-                    text: join_soft(buf),
-                    tool: None,
-                    reordered: false,
-                });
+                lines.push(line(r, join_soft(buf), None, false));
                 buf.clear();
             }
         }
@@ -522,17 +490,31 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
             }
             ChronoBlock::Tool(t) => {
                 flush(&mut pending_role, &mut pending_text, &mut lines);
-                lines.push(ChatLine {
-                    role: ChatRole::Tool,
-                    text: String::new(),
-                    tool: Some(t.clone()),
-                    reordered: false,
-                });
+                lines.push(line(
+                    ChatRole::Tool,
+                    String::new(),
+                    Some(t.clone()),
+                    false,
+                ));
             }
         }
     }
     flush(&mut pending_role, &mut pending_text, &mut lines);
     lines
+}
+
+fn line(
+    role: ChatRole,
+    text: String,
+    tool: Option<ProjectedTool>,
+    reordered: bool,
+) -> ChatLine {
+    ChatLine {
+        role,
+        text,
+        tool,
+        reordered,
+    }
 }
 
 fn join_soft(parts: &[String]) -> String {
@@ -555,13 +537,13 @@ fn join_soft(parts: &[String]) -> String {
     out
 }
 
-/// Collapse adjacent agent bubbles into one for chat readability.
-fn merge_consecutive_agent(lines: &[ChatLine]) -> Vec<ChatLine> {
+/// Collapse adjacent same-role non-tool bubbles for readability.
+fn merge_consecutive_same_role(lines: &[ChatLine]) -> Vec<ChatLine> {
     let mut out: Vec<ChatLine> = Vec::new();
     for line in lines {
-        if line.role == ChatRole::Agent {
+        if line.role != ChatRole::Tool {
             if let Some(prev) = out.last_mut() {
-                if prev.role == ChatRole::Agent {
+                if prev.role == line.role && prev.tool.is_none() && line.tool.is_none() {
                     if !prev.text.is_empty() && !line.text.is_empty() {
                         if looks_like_list_item(line.text.trim()) {
                             prev.text.push('\n');
@@ -582,13 +564,19 @@ fn merge_consecutive_agent(lines: &[ChatLine]) -> Vec<ChatLine> {
 
 // ── render ──────────────────────────────────────────────────────────────────
 
-fn render_plain(lines: &[ChatLine], strategy: ProjectionStrategy) -> String {
+fn render_plain(
+    lines: &[ChatLine],
+    strategy: ProjectionStrategy,
+    confidence: ProjectionConfidence,
+    reason: &str,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "=== CHAT PROJECTION ({strategy:?}) — not ground truth ===\n"
+        "=== CHAT PROJECTION ({strategy:?} / {confidence:?}) — not ground truth ===\n"
     ));
     out.push_str(DISCLAIMER);
-    out.push_str("\n\n");
+    out.push_str("\n");
+    out.push_str(&format!("reason: {reason}\n\n"));
     for line in lines {
         match (&line.role, &line.tool) {
             (ChatRole::Agent, _) => {
@@ -619,16 +607,29 @@ fn render_plain(lines: &[ChatLine], strategy: ProjectionStrategy) -> String {
     out
 }
 
-fn render_html(lines: &[ChatLine], strategy: ProjectionStrategy) -> String {
+fn render_html(
+    lines: &[ChatLine],
+    strategy: ProjectionStrategy,
+    confidence: ProjectionConfidence,
+    reason: &str,
+) -> String {
+    let conf_class = match confidence {
+        ProjectionConfidence::EmitOrder => "conf-emit",
+        ProjectionConfidence::StructuralReorder => "conf-structural",
+    };
     let mut out = String::new();
     out.push_str(&format!(
-        "<div class=\"chat-projection\" data-strategy=\"{strategy:?}\">\n"
+        "<div class=\"chat-projection {conf_class}\" data-strategy=\"{strategy:?}\" \
+         data-confidence=\"{confidence:?}\">\n"
     ));
     out.push_str("<div class=\"chat-disclaimer\">");
     out.push_str(&escape(DISCLAIMER));
     out.push_str("</div>\n");
     out.push_str(&format!(
-        "<p class=\"chat-strategy\">Strategy: <code>{strategy:?}</code></p>\n"
+        "<p class=\"chat-strategy\">Strategy: <code>{strategy:?}</code> · \
+         Confidence: <code>{confidence:?}</code><br/>\
+         <span class=\"chat-reason\">{}</span></p>\n",
+        escape(reason)
     ));
     out.push_str("<div class=\"chat-flow\">\n");
 
@@ -716,8 +717,6 @@ fn agent_bubble(text: &str, reordered: bool) -> String {
 }
 
 fn md_html(md: &str) -> String {
-    // Local minimal conversion: reuse pulldown via crate-level helper would create
-    // a cycle if html_report imports us — call pulldown directly.
     use pulldown_cmark::{html, Options, Parser};
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -802,44 +801,66 @@ mod tests {
     }
 
     #[test]
-    fn tools_first_narrative_pairs_with_steps() {
+    fn tools_first_equal_list_steps_structural_zip() {
         let events = vec![
             tool_ev("a1", "Write `file.txt`", 1),
             tool_ev("a2", "Read `file.txt`", 2),
             tool_ev("a3", "Execute `rm file.txt`", 3),
-            text_ev("I'll run the CRUD steps, starting with create.", 4),
-            text_ev("CRUD exercise on `file.txt` only:", 5),
-            text_ev("1. **CREATE** — Wrote the file.", 6),
-            text_ev("2. **READ** — File contained x.", 7),
-            text_ev("3. **DELETE** — Removed the file.", 8),
-            text_ev("No other files were touched.", 9),
+            text_ev("I'll run the steps.", 4),
+            text_ev("1. **CREATE** — Wrote the file.", 5),
+            text_ev("2. **READ** — File contained x.", 6),
+            text_ev("3. **DELETE** — Removed the file.", 7),
+            text_ev("No other files were touched.", 8),
         ];
         let p = project_chat(&events);
-        assert_eq!(p.strategy, ProjectionStrategy::NarrativeReassembly);
-        assert!(p.plain_text.contains("not ground truth"));
-        // Preamble first.
+        assert_eq!(p.strategy, ProjectionStrategy::StructuralOrdinalZip);
+        assert_eq!(p.confidence, ProjectionConfidence::StructuralReorder);
+        assert!(p.strategy_reason.contains("ordinal zip"));
+        // Preamble, then tool/step pairs.
         assert_eq!(p.lines[0].role, ChatRole::Agent);
         assert!(p.lines[0].text.contains("I'll run"));
-        // Then tool, agent step, tool, agent step…
         let roles: Vec<ChatRole> = p.lines.iter().map(|l| l.role).collect();
         assert!(
             roles.windows(2).any(|w| w == [ChatRole::Tool, ChatRole::Agent]),
-            "expected tool then step narration: {roles:?}"
+            "expected tool then step: {roles:?}"
         );
-        // Write before CREATE step text in plain.
+        // Ordinal: first tool before first step text.
         let plain = &p.plain_text;
-        let write_pos = plain.find("Write").expect("Write");
-        let create_pos = plain.find("CREATE").expect("CREATE");
-        let read_pos = plain.find("TOOL: Read").or_else(|| plain.find("Read `")).expect("Read tool");
-        let delete_pos = plain.find("DELETE").expect("DELETE");
-        assert!(write_pos < create_pos);
-        assert!(create_pos < read_pos || write_pos < read_pos);
-        assert!(delete_pos > write_pos);
-        // Epilogue last-ish.
+        assert!(plain.find("Write").unwrap() < plain.find("CREATE").unwrap());
         assert!(plain.contains("No other files were touched"));
-        assert!(p.html.contains("chat-projection"));
-        assert!(p.html.contains("Agent"));
-        assert!(p.html.contains("Tool"));
+    }
+
+    #[test]
+    fn tools_first_mismatched_counts_stays_chronological() {
+        let events = vec![
+            tool_ev("a1", "Write `file.txt`", 1),
+            tool_ev("a2", "Read `file.txt`", 2),
+            text_ev("Only one step listed:", 3),
+            text_ev("1. Did something.", 4),
+        ];
+        let p = project_chat(&events);
+        assert_eq!(p.strategy, ProjectionStrategy::ChronologicalChat);
+        assert_eq!(p.confidence, ProjectionConfidence::EmitOrder);
+        assert!(p.strategy_reason.contains("≠") || p.strategy_reason.contains("refuse"));
+        // All tools before text in emit order.
+        let roles: Vec<_> = p.lines.iter().map(|l| l.role).collect();
+        assert_eq!(
+            roles,
+            vec![ChatRole::Tool, ChatRole::Tool, ChatRole::Agent]
+        );
+        assert!(p.lines.iter().all(|l| !l.reordered));
+    }
+
+    #[test]
+    fn tools_first_free_prose_stays_chronological() {
+        let events = vec![
+            tool_ev("a1", "search", 1),
+            tool_ev("a2", "Write `x`", 2),
+            text_ev("I searched and then wrote the file. Looks good.", 3),
+        ];
+        let p = project_chat(&events);
+        assert_eq!(p.strategy, ProjectionStrategy::ChronologicalChat);
+        assert!(p.strategy_reason.contains("without numbered list"));
     }
 
     #[test]
@@ -853,7 +874,7 @@ mod tests {
         ];
         let p = project_chat(&events);
         assert_eq!(p.strategy, ProjectionStrategy::ChronologicalChat);
-        // Order preserved: agent, tool, agent, tool, agent.
+        assert_eq!(p.confidence, ProjectionConfidence::EmitOrder);
         let roles: Vec<_> = p.lines.iter().map(|l| l.role).collect();
         assert_eq!(
             roles,
@@ -869,10 +890,40 @@ mod tests {
     }
 
     #[test]
+    fn force_chronological_option() {
+        let events = vec![
+            tool_ev("a1", "Write `f`", 1),
+            text_ev("1. Wrote it.", 2),
+        ];
+        let p = project_chat_with(
+            &events,
+            &ProjectChatOptions {
+                allow_structural_zip: false,
+            },
+        );
+        assert_eq!(p.strategy, ProjectionStrategy::ChronologicalChat);
+        assert!(p.strategy_reason.contains("disabled"));
+    }
+
+    #[test]
+    fn text_only_is_one_agent_bubble() {
+        let p = project_chat(&[
+            text_ev("Hello.", 1),
+            text_ev("World.", 2),
+        ]);
+        assert_eq!(p.strategy, ProjectionStrategy::ChronologicalChat);
+        assert_eq!(p.lines.len(), 1);
+        assert_eq!(p.lines[0].role, ChatRole::Agent);
+        assert!(p.lines[0].text.contains("Hello"));
+        assert!(p.lines[0].text.contains("World"));
+    }
+
+    #[test]
     fn disclaimer_always_present() {
         let p = project_chat(&[text_ev("Hello.", 1)]);
         assert!(p.disclaimer.contains("not ground truth"));
         assert!(p.plain_text.contains("not ground truth"));
         assert!(p.html.contains("chat-disclaimer"));
+        assert!(p.html.contains("EmitOrder") || p.html.contains("conf-emit"));
     }
 }

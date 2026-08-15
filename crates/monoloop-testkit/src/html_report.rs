@@ -727,6 +727,9 @@ details { margin-top: 0.75rem; color: var(--muted); }
   margin-bottom: 0.75rem;
 }
 .chat-strategy { color: var(--muted); font-size: 0.85rem; }
+.chat-reason { color: var(--muted); font-size: 0.82rem; }
+.chat-projection.conf-emit .chat-strategy code:first-of-type { color: #7dcea0; }
+.chat-projection.conf-structural .chat-strategy code:first-of-type { color: #f0c27a; }
 .chat-flow { display: flex; flex-direction: column; gap: 0.55rem; }
 .chat-line {
   border-radius: 10px;
