@@ -67,14 +67,17 @@ println!("{}", report.raw_dump.unwrap().format_text());
 ### Live Grok Build CRUD (event sequence)
 
 ```bash
-# Terminal A
-grok agent --always-approve serve --bind 127.0.0.1:2419 --secret monoloop-live-test
+# Detached serve (do not block a parent agent on `grok serve`)
+./scripts/grok-serve-detached.sh
 
-# Terminal B (repo root)
 export GROK_AGENT_SECRET=monoloop-live-test
+# Optional: bound prompt wait (defaults: crud 180s, analyze 120s)
+# export GROK_PROMPT_TIMEOUT_SECS=300
 cargo run -p monoloop-testkit --example live_grok_crud
+# or: cargo run -p monoloop-testkit --example live_grok_analyze
 open target/live_grok_crud.html
-# also: target/live_grok_crud.sequence.txt  target/live_grok_crud.raw.txt
+
+./scripts/grok-serve-stop.sh
 
 # Re-assemble HTML from a saved raw dump (no live Grok needed):
 cargo run -p monoloop-testkit --example replay_raw_html -- target/live_grok_crud.raw.txt
