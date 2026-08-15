@@ -4,12 +4,13 @@
 //! canonical units — it does not re-parse raw Grok bytes or invent completeness.
 //!
 //! Layout:
-//! 1. **Interleaved document** — event-order stream of tool actions + public
-//!    response text (Markdown → HTML), so tools sit where they occurred relative
-//!    to the narrative (or before it, if Grok tools-first).
-//! 2. **Text-only assembly** — sentences joined for pure prose review.
-//! 3. **Event timeline** — every canonical unit generation with correlation.
+//! 1. **Chat projection** — human-digestible reassembly (report, not ground truth).
+//! 2. **Interleaved document** — event-order stream of tool actions + public
+//!    response text (Markdown → HTML); Interpreter emit order.
+//! 3. **Text-only assembly** — sentences joined for pure prose review.
+//! 4. **Event timeline** — every canonical unit generation with correlation.
 
+use crate::chat_projector::{project_chat, ChatProjection};
 use monoloop_contracts::{
     BoundaryKind, CanonicalUnit, InterpretationEnd, InterpreterOutputEvent, StructureKind,
     TextChannel, ToolRequestState, UnitState,
@@ -24,6 +25,8 @@ pub struct HtmlReportParams {
     pub include_timeline: bool,
     /// Include reasoning-summary channel in a separate document section.
     pub include_reasoning: bool,
+    /// Include creative chat projection (human-digestible, not ground truth).
+    pub include_chat_projection: bool,
     /// Show tool request payloads in the timeline (bounded).
     pub show_tool_payloads: bool,
     /// Max chars of tool payload shown.
@@ -37,6 +40,7 @@ impl Default for HtmlReportParams {
         Self {
             include_timeline: true,
             include_reasoning: true,
+            include_chat_projection: true,
             show_tool_payloads: true,
             max_payload_chars: 800,
             title: "Monoloop interpretation review".into(),
@@ -53,6 +57,8 @@ pub struct HtmlReport {
     pub document_html: String,
     /// Event-order interleaved document (tools + text) as HTML.
     pub interleaved_html: String,
+    /// Human-digestible chat projection (report, not ground truth).
+    pub chat_projection: ChatProjection,
     /// Full self-contained HTML page (document + timeline + CSS).
     pub full_page_html: String,
     /// Number of complete public_response sentences used.
@@ -290,6 +296,7 @@ pub fn build_html_report(
     let assembled_markdown = join_sentences_as_markdown(&public_sentences);
     let document_html = markdown_to_html(&assembled_markdown);
     let interleaved_html = render_interleaved(&interleaved, params);
+    let chat_projection = project_chat(events);
 
     let reasoning_md = if params.include_reasoning && !reasoning_sentences.is_empty() {
         join_sentences_as_markdown(&reasoning_sentences)
@@ -309,6 +316,7 @@ pub fn build_html_report(
         &assembled_markdown,
         &document_html,
         &interleaved_html,
+        &chat_projection,
         &reasoning_html,
         &timeline,
         end,
@@ -318,6 +326,7 @@ pub fn build_html_report(
         assembled_markdown,
         document_html,
         interleaved_html,
+        chat_projection,
         full_page_html,
         sentence_count,
         timeline_rows,
@@ -462,6 +471,7 @@ fn render_full_page(
     assembled_md: &str,
     document_html: &str,
     interleaved_html: &str,
+    chat: &ChatProjection,
     reasoning_html: &str,
     timeline: &[TimelineRow],
     end: Option<&InterpretationEnd>,
@@ -470,8 +480,8 @@ fn render_full_page(
     body.push_str(&format!("<h1>{}</h1>\n", escape_html(&params.title)));
     body.push_str(
         "<p class=\"meta\">Built from <strong>canonical Interpreter events only</strong> \
-         — not a re-parse of raw Grok wire bytes. Use this to verify sentence assembly, \
-         list markers, and tool interleaving.</p>\n",
+         — not a re-parse of raw Grok wire bytes. Sections below mix a human-facing \
+         chat projection (report) with exact event-order views (ground truth).</p>\n",
     );
 
     if let Some(e) = end {
@@ -482,8 +492,26 @@ fn render_full_page(
         ));
     }
 
+    if params.include_chat_projection {
+        body.push_str("<section id=\"chat\">\n");
+        body.push_str("<h2>Chat projection <span class=\"badge-report\">report</span></h2>\n");
+        body.push_str(
+            "<p class=\"meta\">Human-digestible reassembly of agent / thinking / tool \
+             surfaces. May reorder tools against later summary text. \
+             <strong>Not ground truth.</strong></p>\n",
+        );
+        body.push_str(&chat.html);
+        body.push_str("<details><summary>Plain-text chat transcript</summary>\n");
+        body.push_str("<pre class=\"md-source\">");
+        body.push_str(&escape_html(&chat.plain_text));
+        body.push_str("</pre></details>\n");
+        body.push_str("</section>\n");
+    }
+
     body.push_str("<section id=\"interleaved\">\n");
-    body.push_str("<h2>Interleaved stream (event order)</h2>\n");
+    body.push_str(
+        "<h2>Interleaved stream <span class=\"badge-truth\">event order</span></h2>\n",
+    );
     body.push_str(
         "<p class=\"meta\">Tools appear at first sighting (card updates to terminal state). \
          Text blocks flush between tools. This is the order the Interpreter emitted units.</p>\n",
@@ -676,6 +704,73 @@ details { margin-top: 0.75rem; color: var(--muted); }
   word-break: break-word;
 }
 .stream-text { margin: 0.75rem 0; }
+.badge-report, .badge-truth {
+  font-size: 0.7rem;
+  font-weight: 600;
+  vertical-align: middle;
+  margin-left: 0.35rem;
+  padding: 0.12rem 0.45rem;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.badge-report { background: #5c3d1e; color: #f0c27a; border: 1px solid #c9a227; }
+.badge-truth { background: #1e3a2f; color: #7dcea0; border: 1px solid #3d7a5c; }
+.chat-projection { margin: 0.5rem 0 1rem; }
+.chat-disclaimer {
+  background: #3a2a14;
+  border: 1px solid #c9a227;
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+  color: #f0c27a;
+  font-size: 0.88rem;
+  margin-bottom: 0.75rem;
+}
+.chat-strategy { color: var(--muted); font-size: 0.85rem; }
+.chat-flow { display: flex; flex-direction: column; gap: 0.55rem; }
+.chat-line {
+  border-radius: 10px;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+.chat-line.agent { border-left: 4px solid var(--accent); }
+.chat-line.thinking {
+  border-left: 4px solid #8b7ec8;
+  opacity: 0.95;
+  font-style: italic;
+}
+.chat-line.tool { border-left: 4px solid var(--tool); }
+.chat-line.status { border-left: 4px solid var(--muted); }
+.chat-line.reordered { box-shadow: inset 0 0 0 1px rgba(201, 162, 39, 0.25); }
+.chat-role {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+}
+.chat-body p { margin: 0 0 0.5rem; }
+.chat-body p:last-child { margin-bottom: 0; }
+.chat-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+.chat-tool-card { font-size: 0.92rem; }
+.chat-tool-verb { color: var(--tool); font-weight: 700; margin-right: 0.35rem; }
+.chat-tool-title { font-weight: 600; }
+.chat-tool-term { color: #7dcea0; font-weight: 600; margin-left: 0.35rem; }
+.chat-tool-state { color: var(--muted); font-size: 0.8rem; margin-left: 0.35rem; }
+.chat-tool-args {
+  margin: 0.4rem 0 0;
+  padding: 0.45rem 0.55rem;
+  background: var(--code);
+  border-radius: 4px;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 "#;
 
 fn escape_html(s: &str) -> String {
@@ -810,6 +905,8 @@ mod tests {
             report.full_page_html.contains("Text-only assembly")
                 || report.full_page_html.contains("Interleaved stream")
         );
+        assert!(report.full_page_html.contains("Chat projection"));
+        assert!(report.chat_projection.disclaimer.contains("not ground truth"));
         assert!(report.timeline_rows >= 3);
     }
 

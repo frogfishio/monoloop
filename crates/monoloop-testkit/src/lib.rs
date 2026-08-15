@@ -5,12 +5,16 @@
 
 #![deny(missing_docs)]
 
+mod chat_projector;
 mod console;
 mod distribute;
 mod driver;
 mod html_report;
 mod pipeline;
 
+pub use chat_projector::{
+    project_chat, ChatLine, ChatProjection, ChatRole, ProjectedTool, ProjectionStrategy,
+};
 pub use console::{
     ConsoleRenderRecord, ConsoleRenderer, ConsoleRendererConfig, ConsoleSink, StdoutSink,
     SyncMemorySink,

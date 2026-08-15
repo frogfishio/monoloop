@@ -98,7 +98,8 @@ let report = run_bytes_pipeline_with_params(
     PipelineParams::with_html_dump("target/interpretation.html"),
 ).await;
 // Open target/interpretation.html in a browser:
-// - Interleaved stream (tools + text in event order)
+// - Chat projection (human-digestible reassembly — report, not ground truth)
+// - Interleaved stream (tools + text in event order — ground truth)
 // - Text-only assembly (sentences → MD → HTML; list markers attached)
 // - Canonical event timeline (every unit generation)
 ```
