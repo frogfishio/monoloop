@@ -4,10 +4,11 @@
 //! canonical units — it does not re-parse raw Grok bytes or invent completeness.
 //!
 //! Layout:
-//! 1. **Assembled document** — public response sentences joined as Markdown, then
-//!    rendered to HTML (markdown → HTML) so you can see if serialisation reads right.
-//! 2. **Event timeline** — every canonical unit generation with correlation, for
-//!    spotting missing tools, partial escapes, or order issues.
+//! 1. **Interleaved document** — event-order stream of tool actions + public
+//!    response text (Markdown → HTML), so tools sit where they occurred relative
+//!    to the narrative (or before it, if Grok tools-first).
+//! 2. **Text-only assembly** — sentences joined for pure prose review.
+//! 3. **Event timeline** — every canonical unit generation with correlation.
 
 use monoloop_contracts::{
     BoundaryKind, CanonicalUnit, InterpretationEnd, InterpreterOutputEvent, StructureKind,
@@ -48,14 +49,31 @@ impl Default for HtmlReportParams {
 pub struct HtmlReport {
     /// Markdown assembled from complete public_response sentences only.
     pub assembled_markdown: String,
-    /// Markdown → HTML for the assembled document body.
+    /// Markdown → HTML for text-only assembly.
     pub document_html: String,
+    /// Event-order interleaved document (tools + text) as HTML.
+    pub interleaved_html: String,
     /// Full self-contained HTML page (document + timeline + CSS).
     pub full_page_html: String,
     /// Number of complete public_response sentences used.
     pub sentence_count: usize,
     /// Number of timeline rows.
     pub timeline_rows: usize,
+}
+
+/// One block in the interleaved document stream (event order).
+#[derive(Clone, Debug)]
+enum DocBlock {
+    /// Complete public-response sentence (Markdown source).
+    Text(String),
+    /// Tool lifecycle snapshot for the document (usually terminal generation).
+    Tool {
+        action_id: String,
+        name: String,
+        state: String,
+        args: Option<String>,
+        terminal: Option<String>,
+    },
 }
 
 /// Build an HTML report from interpreter output events (canonical only).
@@ -65,8 +83,13 @@ pub fn build_html_report(
 ) -> HtmlReport {
     let mut public_sentences: Vec<String> = Vec::new();
     let mut reasoning_sentences: Vec<String> = Vec::new();
+    let mut interleaved: Vec<DocBlock> = Vec::new();
     let mut timeline: Vec<TimelineRow> = Vec::new();
     let mut end: Option<&InterpretationEnd> = None;
+    // Last terminal/complete tool generation per action (for interleaved view).
+    let mut tool_latest: std::collections::HashMap<String, DocBlock> =
+        std::collections::HashMap::new();
+    let mut tool_order: Vec<String> = Vec::new();
 
     for ev in events {
         match ev {
@@ -77,6 +100,7 @@ pub fn build_html_report(
                         match t.channel {
                             TextChannel::PublicResponse => {
                                 public_sentences.push(t.content.clone());
+                                interleaved.push(DocBlock::Text(t.content.clone()));
                             }
                             TextChannel::PublicReasoningSummary => {
                                 reasoning_sentences.push(t.content.clone());
@@ -100,7 +124,7 @@ pub fn build_html_report(
                         });
                     }
                     CanonicalUnit::Tool(t) => {
-                        let name = t.tool_name.as_deref().unwrap_or("?");
+                        let name = t.tool_name.as_deref().unwrap_or("?").to_string();
                         let mut body = format!(
                             "request={:?} exec={:?} result={:?}",
                             t.request_state, t.execution_state, t.result_state
@@ -108,19 +132,62 @@ pub fn build_html_report(
                         if let Some(ref w) = t.waiting_for {
                             body.push_str(&format!(" waiting_for={w}"));
                         }
-                        if params.show_tool_payloads {
-                            if let Some(ref p) = t.request_payload {
-                                if t.request_state == ToolRequestState::Ready {
-                                    body.push_str(" args=");
-                                    body.push_str(&truncate(p, params.max_payload_chars));
+                        let args = if params.show_tool_payloads {
+                            t.request_payload.as_ref().and_then(|p| {
+                                if t.request_state == ToolRequestState::Ready
+                                    || t.terminal_outcome.is_some()
+                                {
+                                    Some(truncate(p, params.max_payload_chars))
+                                } else {
+                                    None
                                 }
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(ref p) = args {
+                            body.push_str(" args=");
+                            body.push_str(p);
+                        }
+                        let action_id = t.tool_action_id.as_str().to_string();
+                        let terminal = t.terminal_outcome.map(|o| format!("{o:?}"));
+                        let state = tool_state_label(t.request_state, snap.unit_state);
+                        // Interleaved: keep one card per action, prefer terminal generation.
+                        let block = DocBlock::Tool {
+                            action_id: action_id.clone(),
+                            name: name.clone(),
+                            state: state.clone(),
+                            args: args.clone(),
+                            terminal: terminal.clone(),
+                        };
+                        if !tool_latest.contains_key(&action_id) {
+                            tool_order.push(action_id.clone());
+                            // Insert tool card in stream position of first sighting.
+                            interleaved.push(block.clone());
+                        } else {
+                            // Update the in-stream card in place.
+                            if let Some(DocBlock::Tool { .. }) =
+                                interleaved.iter_mut().find(|b| match b {
+                                    DocBlock::Tool { action_id: id, .. } => id == &action_id,
+                                    _ => false,
+                                })
+                            {
+                                *interleaved
+                                    .iter_mut()
+                                    .find(|b| match b {
+                                        DocBlock::Tool { action_id: id, .. } => id == &action_id,
+                                        _ => false,
+                                    })
+                                    .unwrap() = block.clone();
                             }
                         }
+                        tool_latest.insert(action_id.clone(), block);
+
                         timeline.push(TimelineRow {
                             lifecycle: unit_ev.lifecycle_label().to_string(),
                             kind: "tool".into(),
-                            state: tool_state_label(t.request_state, snap.unit_state),
-                            label: name.to_string(),
+                            state,
+                            label: name,
                             correlation: format!(
                                 "c:{} i:{} action:{} g:{}",
                                 short(snap.connection_id.as_str()),
@@ -217,8 +284,12 @@ pub fn build_html_report(
         }
     }
 
+    let _ = tool_order; // order tracked via interleaved stream
+    let _ = tool_latest;
+
     let assembled_markdown = join_sentences_as_markdown(&public_sentences);
     let document_html = markdown_to_html(&assembled_markdown);
+    let interleaved_html = render_interleaved(&interleaved, params);
 
     let reasoning_md = if params.include_reasoning && !reasoning_sentences.is_empty() {
         join_sentences_as_markdown(&reasoning_sentences)
@@ -237,6 +308,7 @@ pub fn build_html_report(
         params,
         &assembled_markdown,
         &document_html,
+        &interleaved_html,
         &reasoning_html,
         &timeline,
         end,
@@ -245,10 +317,74 @@ pub fn build_html_report(
     HtmlReport {
         assembled_markdown,
         document_html,
+        interleaved_html,
         full_page_html,
         sentence_count,
         timeline_rows,
     }
+}
+
+fn render_interleaved(blocks: &[DocBlock], params: &HtmlReportParams) -> String {
+    let mut out = String::new();
+    let mut text_buf: Vec<String> = Vec::new();
+
+    let flush_text = |buf: &mut Vec<String>, out: &mut String| {
+        if buf.is_empty() {
+            return;
+        }
+        let md = join_sentences_as_markdown(buf);
+        let html = markdown_to_html(&md);
+        out.push_str("<div class=\"prose stream-text\">\n");
+        out.push_str(&html);
+        out.push_str("</div>\n");
+        buf.clear();
+    };
+
+    for b in blocks {
+        match b {
+            DocBlock::Text(s) => text_buf.push(s.clone()),
+            DocBlock::Tool {
+                action_id,
+                name,
+                state,
+                args,
+                terminal,
+            } => {
+                flush_text(&mut text_buf, &mut out);
+                out.push_str("<div class=\"tool-card\">\n");
+                out.push_str(&format!(
+                    "<div class=\"tool-hdr\"><span class=\"tool-name\">{}</span> \
+                     <span class=\"tool-state\">{}</span>",
+                    escape_html(name),
+                    escape_html(state)
+                ));
+                if let Some(t) = terminal {
+                    out.push_str(&format!(
+                        " <span class=\"tool-term\">→ {}</span>",
+                        escape_html(t)
+                    ));
+                }
+                out.push_str(&format!(
+                    " <span class=\"tool-id\">{}</span></div>\n",
+                    escape_html(action_id)
+                ));
+                if params.show_tool_payloads {
+                    if let Some(a) = args {
+                        out.push_str(&format!(
+                            "<pre class=\"tool-args\">{}</pre>\n",
+                            escape_html(a)
+                        ));
+                    }
+                }
+                out.push_str("</div>\n");
+            }
+        }
+    }
+    flush_text(&mut text_buf, &mut out);
+    if out.is_empty() {
+        out.push_str("<p class=\"empty\"><em>(no interleaved content)</em></p>\n");
+    }
+    out
 }
 
 /// Write the full HTML page to `path` (parent dirs created as needed).
@@ -265,15 +401,37 @@ pub fn write_html_report(path: impl AsRef<Path>, report: &HtmlReport) -> std::io
 /// Join complete sentences into a single Markdown document body.
 ///
 /// Sentences are already canonical; we only serialise them for visual review.
-/// Consecutive sentences are separated by a blank line so Markdown treats them
-/// as paragraphs (readable HTML after conversion).
+/// - Ordered-list items (`1. …`) stay single-spaced from the previous block.
+/// - Other sentences get a blank line so Markdown forms paragraphs.
 pub fn join_sentences_as_markdown(sentences: &[String]) -> String {
-    sentences
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let mut out = String::new();
+    for s in sentences {
+        let t = s.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str(t);
+            continue;
+        }
+        if looks_like_md_list_item(t) {
+            out.push('\n');
+            out.push_str(t);
+        } else {
+            out.push_str("\n\n");
+            out.push_str(t);
+        }
+    }
+    out
+}
+
+fn looks_like_md_list_item(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    i > 0 && i < b.len() && b[i] == b'.'
 }
 
 /// Convert Markdown to HTML (pulldown-cmark). Safe for untrusted text content.
@@ -303,6 +461,7 @@ fn render_full_page(
     params: &HtmlReportParams,
     assembled_md: &str,
     document_html: &str,
+    interleaved_html: &str,
     reasoning_html: &str,
     timeline: &[TimelineRow],
     end: Option<&InterpretationEnd>,
@@ -311,8 +470,8 @@ fn render_full_page(
     body.push_str(&format!("<h1>{}</h1>\n", escape_html(&params.title)));
     body.push_str(
         "<p class=\"meta\">Built from <strong>canonical Interpreter events only</strong> \
-         — not a re-parse of raw Grok wire bytes. Use this to verify sentence assembly \
-         and tool lifecycle serialisation.</p>\n",
+         — not a re-parse of raw Grok wire bytes. Use this to verify sentence assembly, \
+         list markers, and tool interleaving.</p>\n",
     );
 
     if let Some(e) = end {
@@ -323,10 +482,20 @@ fn render_full_page(
         ));
     }
 
-    body.push_str("<section id=\"document\">\n");
-    body.push_str("<h2>Assembled document</h2>\n");
+    body.push_str("<section id=\"interleaved\">\n");
+    body.push_str("<h2>Interleaved stream (event order)</h2>\n");
     body.push_str(
-        "<p class=\"meta\">Public response sentences → Markdown (blank-line separated) → HTML.</p>\n",
+        "<p class=\"meta\">Tools appear at first sighting (card updates to terminal state). \
+         Text blocks flush between tools. This is the order the Interpreter emitted units.</p>\n",
+    );
+    body.push_str(interleaved_html);
+    body.push_str("</section>\n");
+
+    body.push_str("<section id=\"document\">\n");
+    body.push_str("<h2>Text-only assembly</h2>\n");
+    body.push_str(
+        "<p class=\"meta\">Public response sentences only → Markdown → HTML \
+         (no tools). Good for checking list/sentence segmentation.</p>\n",
     );
     if document_html.trim().is_empty() {
         body.push_str("<p class=\"empty\"><em>(no complete public_response sentences)</em></p>\n");
@@ -335,7 +504,7 @@ fn render_full_page(
         body.push_str(document_html);
         body.push_str("</div>\n");
     }
-    body.push_str("<details><summary>Source Markdown (assembled)</summary>\n");
+    body.push_str("<details><summary>Source Markdown (text-only)</summary>\n");
     body.push_str("<pre class=\"md-source\">");
     body.push_str(&escape_html(assembled_md));
     body.push_str("</pre></details>\n");
@@ -484,6 +653,29 @@ details { margin-top: 0.75rem; color: var(--muted); }
 .ev-tool .kind, .ev-tool .label { color: var(--tool); }
 .ev-diag .kind { color: var(--diag); }
 .ev-end { border-color: var(--accent); }
+.tool-card {
+  background: var(--panel);
+  border: 1px solid var(--tool);
+  border-left: 4px solid var(--tool);
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+  margin: 0.65rem 0;
+}
+.tool-hdr { font-size: 0.9rem; display: flex; flex-wrap: wrap; gap: 0.4rem 0.75rem; }
+.tool-name { color: var(--tool); font-weight: 700; }
+.tool-state { color: var(--muted); }
+.tool-term { color: #7dcea0; font-weight: 600; }
+.tool-id { color: var(--muted); font-family: ui-monospace, monospace; font-size: 0.78rem; }
+.tool-args {
+  margin: 0.45rem 0 0;
+  padding: 0.5rem 0.6rem;
+  background: var(--code);
+  border-radius: 4px;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.stream-text { margin: 0.75rem 0; }
 "#;
 
 fn escape_html(s: &str) -> String {
@@ -614,7 +806,81 @@ mod tests {
         assert!(report.assembled_markdown.contains("Second sentence!"));
         assert!(report.document_html.contains("Hello") || report.document_html.contains("world"));
         assert!(report.full_page_html.contains("Canonical event timeline"));
-        assert!(report.full_page_html.contains("Assembled document"));
+        assert!(
+            report.full_page_html.contains("Text-only assembly")
+                || report.full_page_html.contains("Interleaved stream")
+        );
         assert!(report.timeline_rows >= 3);
+    }
+
+    #[test]
+    fn join_keeps_ordered_list_items_adjacent() {
+        let md = join_sentences_as_markdown(&[
+            "Intro create.".into(),
+            "CRUD exercise only:".into(),
+            "1. **CREATE** — Wrote the file.".into(),
+            "2. **READ** — File contained x.".into(),
+            "No other files were touched.".into(),
+        ]);
+        assert!(md.contains("1. **CREATE**"));
+        assert!(md.contains("\n2. **READ**"));
+        // List items are single-newline separated (valid MD ordered list).
+        assert!(!md.contains("1. **CREATE** — Wrote the file.\n\n2."));
+        let html = markdown_to_html(&md);
+        assert!(
+            html.contains("<ol>") || html.contains("<li>"),
+            "expected ordered list html: {html}"
+        );
+        assert!(
+            !html.contains("<li></li>"),
+            "empty list items mean bare markers: {html}"
+        );
+    }
+
+    #[test]
+    fn interleaved_places_tools_before_later_text() {
+        use monoloop_contracts::{
+            ToolActionEvent, ToolActionId, ToolExecutionState, ToolRequestState, ToolResultState,
+            ToolTerminalOutcome,
+        };
+        let tool = InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(
+            CanonicalUnitSnapshot {
+                unit_id: UnitId::new("t1"),
+                unit_generation: 1,
+                unit_state: UnitState::Complete,
+                interpretation_id: InterpretationId::new("i1"),
+                connection_id: ConnectionId::new("c1"),
+                external_session_id: None,
+                flow_id: FlowId::main(),
+                lane_id: LaneId::response(),
+                lane_ordinal: 1,
+                causal_parent_id: None,
+                unit: CanonicalUnit::Tool(ToolActionEvent {
+                    tool_action_id: ToolActionId::new("call-1"),
+                    tool_name: Some("write".into()),
+                    request_state: ToolRequestState::Ready,
+                    execution_state: ToolExecutionState::Terminal,
+                    result_state: ToolResultState::Complete,
+                    request_payload: Some(r#"{"file":"x"}"#.into()),
+                    result_payload: None,
+                    waiting_for: None,
+                    terminal_outcome: Some(ToolTerminalOutcome::Success),
+                }),
+            },
+        ));
+        let events = vec![
+            tool,
+            text_ev("1. **CREATE** — Wrote the file.", 2),
+            text_ev("Done.", 3),
+        ];
+        let report = build_html_report(&events, &HtmlReportParams::default());
+        let inter = &report.interleaved_html;
+        let tool_pos = inter.find("tool-card").expect("tool card");
+        let text_pos = inter.find("CREATE").expect("text");
+        assert!(
+            tool_pos < text_pos,
+            "tools-first stream should place tool card before summary text"
+        );
+        assert!(report.assembled_markdown.contains("1. **CREATE**"));
     }
 }

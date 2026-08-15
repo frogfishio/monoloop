@@ -1,8 +1,10 @@
 //! Deterministic sentence segmentation (versioned rules).
+//!
+//! Prefers waiting over premature emission. Special-cases ordered list markers
+//! (`1.` `2.`) so they stay attached to the following item text.
 
 /// Version label for the segmenter (recorded in interpretation diagnostics).
-#[allow(dead_code)]
-pub const SENTENCE_SEGMENTER_VERSION: &str = "v1";
+pub const SENTENCE_SEGMENTER_VERSION: &str = "v2";
 
 /// Deterministic sentence boundary finder.
 ///
@@ -44,11 +46,11 @@ impl SentenceSegmenter {
     fn drain_complete(&mut self, seal_remainder: bool) -> Vec<String> {
         let mut out = Vec::new();
         loop {
-            if let Some((end, include_ws)) = find_sentence_end(&self.buf) {
-                let _ = include_ws;
+            if let Some(end) = find_sentence_end(&self.buf) {
                 let raw = self.buf[..end].to_string();
                 let content = raw.trim_end().to_string();
-                // advance past end and following whitespace
+                // advance past end and following whitespace (but keep newlines as
+                // paragraph hints only by dropping them from the next sentence start)
                 let mut consume = end;
                 while consume < self.buf.len()
                     && self.buf.as_bytes()[consume].is_ascii_whitespace()
@@ -75,8 +77,7 @@ impl SentenceSegmenter {
 }
 
 /// Find exclusive end index of the first complete sentence, if any.
-/// Returns (end_index, _).
-fn find_sentence_end(s: &str) -> Option<(usize, bool)> {
+fn find_sentence_end(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
     let mut in_code_span = false;
@@ -87,7 +88,6 @@ fn find_sentence_end(s: &str) -> Option<(usize, bool)> {
     while i < bytes.len() {
         let c = bytes[i] as char;
 
-        // backtick code spans (simple toggle)
         if c == '`' {
             in_code_span = !in_code_span;
             i += 1;
@@ -110,31 +110,48 @@ fn find_sentence_end(s: &str) -> Option<(usize, bool)> {
                     i += 1;
                     continue;
                 }
+                // Ordered list markers: "1." "12." at line/token start — not ends.
+                if c == '.' && looks_like_ordered_list_marker(s, i) {
+                    i += 1;
+                    continue;
+                }
                 // abbreviations / decimals / versions / URLs
                 if c == '.' && looks_like_abbreviation_or_decimal(s, i) {
                     i += 1;
                     continue;
                 }
-                // require end or whitespace after terminator for stability
+
                 let next = bytes.get(i + 1).copied();
                 match next {
-                    // Prefer waiting over premature emission: a terminator at the
-                    // end of the current buffer is not complete until we see the
-                    // next character (or seal_at_clean_end is called).
+                    // Terminator at buffer end: wait for more (or seal_at_clean_end).
                     None => {}
                     Some(b) if b.is_ascii_whitespace() => {
-                        return Some((i + 1, true));
+                        return Some(i + 1);
                     }
                     Some(b) if b == b'"' || b == b'\'' || b == b')' || b == b']' => {
-                        // closing quote/paren after punctuation still ends sentence
-                        return Some((i + 1, true));
+                        return Some(i + 1);
                     }
-                    _ => {
-                        // e.g. file.ext or version-like — treat carefully
-                        if c == '.' && next.is_some_and(|b| b.is_ascii_alphanumeric()) {
-                            i += 1;
-                            continue;
-                        }
+                    // Missing space between sentences: "create.CRUD" → split after '.'
+                    Some(b)
+                        if c == '.'
+                            && b.is_ascii_uppercase()
+                            && prev_is_sentence_letter(bytes, i) =>
+                    {
+                        return Some(i + 1);
+                    }
+                    // file.ext / version-like: stay open
+                    Some(b) if c == '.' && b.is_ascii_alphanumeric() => {}
+                    _ => {}
+                }
+            }
+            // Hard break: double newline closes a paragraph-like unit when stable.
+            // Do not seal if the only content so far is an ordered-list marker
+            // ("1." / "2.") — keep it for the following item text.
+            '\n' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                    let before = s[..i].trim();
+                    if !before.is_empty() && !is_only_list_marker(before) {
+                        return Some(i);
                     }
                 }
             }
@@ -145,47 +162,86 @@ fn find_sentence_end(s: &str) -> Option<(usize, bool)> {
     None
 }
 
+fn prev_is_sentence_letter(bytes: &[u8], dot_idx: usize) -> bool {
+    if dot_idx == 0 {
+        return false;
+    }
+    let p = bytes[dot_idx - 1];
+    p.is_ascii_lowercase() || p.is_ascii_uppercase()
+}
+
+fn is_only_list_marker(s: &str) -> bool {
+    let t = s.trim();
+    let b = t.as_bytes();
+    if b.is_empty() || b[b.len() - 1] != b'.' {
+        return false;
+    }
+    looks_like_ordered_list_marker(t, t.len() - 1)
+}
+
+/// `1.` / `12.` at the start of a line or after whitespace — keep with following item.
+fn looks_like_ordered_list_marker(s: &str, dot_idx: usize) -> bool {
+    let bytes = s.as_bytes();
+    let mut start = dot_idx;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    if start == dot_idx {
+        return false;
+    }
+    let digit_len = dot_idx - start;
+    if !(1..=3).contains(&digit_len) {
+        return false;
+    }
+    // Must be at buffer start or after whitespace/newline.
+    if start > 0 && !bytes[start - 1].is_ascii_whitespace() {
+        return false;
+    }
+    // After the marker: whitespace, end of buffer, or markdown emphasis/start of item.
+    match bytes.get(dot_idx + 1) {
+        None => true,
+        Some(b) if b.is_ascii_whitespace() => true,
+        Some(b) if *b == b'*' || *b == b'_' || *b == b'`' || *b == b'[' => true,
+        _ => false,
+    }
+}
+
 fn looks_like_abbreviation_or_decimal(s: &str, dot_idx: usize) -> bool {
     let bytes = s.as_bytes();
-    // decimal: digit before and after
     let prev = bytes.get(dot_idx.wrapping_sub(1)).copied();
     let next = bytes.get(dot_idx + 1).copied();
     if prev.is_some_and(|b| b.is_ascii_digit()) && next.is_some_and(|b| b.is_ascii_digit()) {
         return true;
     }
-    // single-letter initials: "A." or "e.g."
+    // Do not treat pure digit runs as abbreviations here — list markers handled above.
     if prev.is_some_and(|b| b.is_ascii_alphabetic()) {
-        // if previous token is short (1-3 letters) treat as abbreviation candidate
         let mut start = dot_idx;
         while start > 0 && bytes[start - 1].is_ascii_alphabetic() {
             start -= 1;
         }
         let len = dot_idx - start;
         if (1..=3).contains(&len) {
-            // "Mr." "Dr." "e.g" handled via multi-dot; single capital letter initials
             if len == 1 {
                 return true;
             }
             let word = &s[start..dot_idx];
             const ABBREVS: &[&str] = &[
-                "Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "vs", "etc", "e.g", "i.e", "Inc",
-                "Ltd", "St",
+                "Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "vs", "etc", "Inc", "Ltd", "St",
             ];
             if ABBREVS.iter().any(|a| a.eq_ignore_ascii_case(word)) {
                 return true;
             }
         }
     }
-    // URL-ish: "://" earlier in token
     let mut t = dot_idx;
     while t > 0 && !bytes[t - 1].is_ascii_whitespace() {
         t -= 1;
     }
-    let token = &s[t..=dot_idx.min(s.len().saturating_sub(1))];
+    let end = (dot_idx + 1).min(s.len());
+    let token = &s[t..end];
     if token.contains("://") || token.contains("www.") {
         return true;
     }
-    // path-ish: slash in token
     if token.contains('/') {
         return true;
     }
@@ -201,7 +257,6 @@ mod tests {
         let mut s = SentenceSegmenter::new();
         let a = s.push("Hello world. ");
         assert_eq!(a, vec!["Hello world.".to_string()]);
-        // Without trailing whitespace, '!' may seal when it is the last char.
         let b = s.push("Next one! ");
         assert_eq!(b, vec!["Next one!".to_string()]);
     }
@@ -220,7 +275,230 @@ mod tests {
     #[test]
     fn decimal_not_boundary() {
         let mut s = SentenceSegmenter::new();
-        assert!(s.push("Version 1.2.3 is ready. ").len() == 1);
+        assert_eq!(s.push("Version 1.2.3 is ready. ").len(), 1);
+    }
+
+    #[test]
+    fn list_markers_stay_with_item() {
+        let mut s = SentenceSegmenter::new();
+        // classic broken case: "1.\n\n**CREATE** — foo."
+        assert!(s.push("1.\n\n").is_empty());
+        let done = s.push("**CREATE** — Wrote the file with `hello monoloop crud`.\n\n");
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert!(
+            done[0].starts_with("1."),
+            "list marker must stay attached: {}",
+            done[0]
+        );
+        assert!(done[0].contains("**CREATE**"));
+    }
+
+    #[test]
+    fn list_sequence_does_not_emit_bare_numbers() {
+        let mut s = SentenceSegmenter::new();
+        let text = "1. **CREATE** — Wrote the file.\n\n2. **READ** — File contained x.\n\n3. **UPDATE** — Done.\n\n";
+        let done = s.push(text);
+        assert_eq!(done.len(), 3, "{done:?}");
+        assert!(done.iter().all(|x| !x.trim().chars().all(|c| c.is_ascii_digit() || c == '.')));
+        assert!(done[0].contains("CREATE"));
+        assert!(done[1].contains("READ"));
+        assert!(done[2].contains("UPDATE"));
+    }
+
+    #[test]
+    fn missing_space_after_period_splits() {
+        let mut s = SentenceSegmenter::new();
+        // Grok sometimes concatenates chunks without a space after '.'
+        assert!(s.push("starting with create.").is_empty());
+        let done = s.push("CRUD exercise on the file only:\n\n");
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert_eq!(done[0], "starting with create.");
+        assert!(done[1].starts_with("CRUD exercise"));
+    }
+
+    /// Exact token stream observed from live Grok CRUD (`target/live_grok_crud.raw.txt`).
+    #[test]
+    fn live_grok_crud_token_stream_assembles_cleanly() {
+        let chunks = [
+            "I'll",
+            " run",
+            " the",
+            " five",
+            " CRUD",
+            " steps",
+            " on",
+            " that",
+            " one",
+            " file",
+            " only",
+            ",",
+            " starting",
+            " with",
+            " create",
+            ".",
+            "CRUD",
+            " exercise",
+            " on",
+            " `",
+            "mon",
+            "olo",
+            "op",
+            "_",
+            "live",
+            "_",
+            "crud",
+            "_",
+            "test",
+            ".txt",
+            "`",
+            " only",
+            ":\n\n",
+            "1",
+            ".",
+            " **",
+            "CREATE",
+            "**",
+            " —",
+            " Wrote",
+            " the",
+            " file",
+            " with",
+            " `",
+            "hello",
+            " mon",
+            "olo",
+            "op",
+            " crud",
+            "`.",
+            "\n",
+            "2",
+            ".",
+            " **",
+            "READ",
+            "**",
+            " —",
+            " File",
+            " contained",
+            " `",
+            "hello",
+            " mon",
+            "olo",
+            "op",
+            " crud",
+            "`.",
+            "\n",
+            "3",
+            ".",
+            " **",
+            "UPDATE",
+            "**",
+            " —",
+            " Over",
+            "wrote",
+            " it",
+            " with",
+            " `",
+            "hello",
+            " mon",
+            "olo",
+            "op",
+            " crud",
+            " UPD",
+            "ATED",
+            "`.",
+            "\n",
+            "4",
+            ".",
+            " **",
+            "READ",
+            "**",
+            " —",
+            " File",
+            " contained",
+            " `",
+            "hello",
+            " mon",
+            "olo",
+            "op",
+            " crud",
+            " UPD",
+            "ATED",
+            "`.",
+            "\n",
+            "5",
+            ".",
+            " **",
+            "DELETE",
+            "**",
+            " —",
+            " Removed",
+            " the",
+            " file",
+            " (`",
+            "rm",
+            "`",
+            " exited",
+            " ",
+            "0",
+            ").",
+            "\n\n",
+            "No",
+            " other",
+            " files",
+            " were",
+            " touched",
+            ".",
+        ];
+        let mut s = SentenceSegmenter::new();
+        let mut done = Vec::new();
+        for c in chunks {
+            done.extend(s.push(c));
+        }
+        done.extend(s.seal_at_clean_end());
+
+        // No glued create.CRUD; no bare list markers.
+        assert!(
+            done.iter().all(|x| !x.contains("create.CRUD")),
+            "must split missing-space: {done:?}"
+        );
+        assert!(
+            done.iter()
+                .all(|x| !is_only_list_marker(x) && x.trim() != "1." && x.trim() != "2."),
+            "bare list markers leaked: {done:?}"
+        );
+        assert!(
+            done.iter().any(|x| x.ends_with("create.")),
+            "expected sentence ending create.: {done:?}"
+        );
+        assert!(
+            done.iter().any(|x| x.starts_with("CRUD exercise")),
+            "expected CRUD exercise sentence: {done:?}"
+        );
+        assert_eq!(
+            done.iter()
+                .filter(|x| x.contains("**CREATE**")
+                    || x.contains("**READ**")
+                    || x.contains("**UPDATE**")
+                    || x.contains("**DELETE**"))
+                .count(),
+            5,
+            "five step sentences: {done:?}"
+        );
+        for step in done.iter().filter(|x| {
+            x.contains("**CREATE**")
+                || x.contains("**READ**")
+                || x.contains("**UPDATE**")
+                || x.contains("**DELETE**")
+        }) {
+            assert!(
+                step.chars().next().is_some_and(|c| c.is_ascii_digit()),
+                "list marker must attach: {step}"
+            );
+        }
+        assert!(
+            done.iter().any(|x| x.contains("No other files were touched")),
+            "{done:?}"
+        );
     }
 
     #[test]

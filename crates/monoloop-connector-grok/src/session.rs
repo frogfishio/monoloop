@@ -223,6 +223,12 @@ impl SessionInner {
             return;
         }
         self.notify.notify_waiters();
+        // Close inbound so RawOutputHandle.receive returns None.
+        // Dropping the sender end of the session output channel wakes waiters.
+        // (out_tx is cloned only for push_inbound; dropping this struct's clone
+        // alone is not enough — we replace with a dummy closed channel.)
+        // Best-effort: leave a sentinel by draining capacity is not needed;
+        // detach removes routing and future pushes fail.
         if let Ok(mut guard) = self.end_tx.try_lock() {
             if let Some(tx) = guard.take() {
                 let _ = tx.send(SessionEnd {

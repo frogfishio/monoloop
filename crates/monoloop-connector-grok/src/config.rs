@@ -66,7 +66,8 @@ pub struct GrokServerConfig {
 impl GrokServerConfig {
     /// Build config for a loopback endpoint.
     pub fn loopback(port: u16, secret_ref: SecretRef) -> Result<Self, url::ParseError> {
-        let endpoint = Url::parse(&format!("ws://127.0.0.1:{port}"))?;
+        // Grok agent serve advertises ws://127.0.0.1:PORT/ws
+        let endpoint = Url::parse(&format!("ws://127.0.0.1:{port}/ws"))?;
         Ok(Self {
             websocket_endpoint: endpoint,
             authentication_secret_ref: secret_ref,
@@ -127,31 +128,47 @@ pub struct GrokSessionConfig {
 
 impl GrokSessionConfig {
     /// Serialize parameters for `session/new` (no prompt field).
+    ///
+    /// Matches the Grok ACP client shape: `cwd`, `mcpServers` (always present),
+    /// and optional `_meta` (yoloMode / agentProfile live under `_meta`, not top-level).
     pub fn to_params(&self) -> serde_json::Value {
         let mut map = serde_json::Map::new();
         if let Some(cwd) = &self.cwd {
             map.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
         }
-        if !self.mcp_servers.is_empty() {
-            map.insert(
-                "mcpServers".into(),
-                serde_json::Value::Array(self.mcp_servers.clone()),
-            );
-        }
+        // ACP clients always send mcpServers (may be empty).
+        map.insert(
+            "mcpServers".into(),
+            serde_json::Value::Array(self.mcp_servers.clone()),
+        );
+
+        let mut meta = match &self.extension_metadata {
+            Some(serde_json::Value::Object(m)) => m.clone(),
+            Some(other) => {
+                let mut m = serde_json::Map::new();
+                m.insert("value".into(), other.clone());
+                m
+            }
+            None => serde_json::Map::new(),
+        };
         if let Some(mode) = &self.permission_mode {
-            map.insert(
-                "permissionMode".into(),
-                serde_json::Value::String(mode.clone()),
+            // Map friendly labels into Grok's _meta.yoloMode rather than a top-level field.
+            let yolo = matches!(
+                mode.as_str(),
+                "always-approve" | "always_approve" | "yolo" | "bypassPermissions"
             );
+            if yolo {
+                meta.insert("yoloMode".into(), serde_json::Value::Bool(true));
+            }
         }
         if let Some(profile) = &self.agent_profile {
-            map.insert(
+            meta.insert(
                 "agentProfile".into(),
                 serde_json::Value::String(profile.clone()),
             );
         }
-        if let Some(meta) = &self.extension_metadata {
-            map.insert("_meta".into(), meta.clone());
+        if !meta.is_empty() {
+            map.insert("_meta".into(), serde_json::Value::Object(meta));
         }
         serde_json::Value::Object(map)
     }

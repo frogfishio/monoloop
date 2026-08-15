@@ -133,9 +133,14 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
         "tool_call" | "tool_call_update" => {
             out.extend(map_tool_call(update, kind == "tool_call_update"));
         }
-        "available_commands_update" | "current_mode_update" | "plan" => {
-            // Not canonical text; ignore or diagnostic.
-        }
+        // Known non-content / lifecycle updates — observe silently (no diagnostic noise).
+        "available_commands_update"
+        | "current_mode_update"
+        | "plan"
+        | "user_message_chunk"
+        | "session_info_update"
+        | "config_option_update"
+        | "available_commands" => {}
         other if !other.is_empty() => {
             out.push(AcpFragment::Diagnostic {
                 message: format!("unsupported sessionUpdate: {other}"),

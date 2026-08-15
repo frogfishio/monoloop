@@ -64,6 +64,27 @@ let report = run_bytes_pipeline_with_params(
 println!("{}", report.raw_dump.unwrap().format_text());
 ```
 
+### Live Grok Build CRUD (event sequence)
+
+```bash
+# Terminal A
+grok agent --always-approve serve --bind 127.0.0.1:2419 --secret monoloop-live-test
+
+# Terminal B (repo root)
+export GROK_AGENT_SECRET=monoloop-live-test
+cargo run -p monoloop-testkit --example live_grok_crud
+open target/live_grok_crud.html
+# also: target/live_grok_crud.sequence.txt  target/live_grok_crud.raw.txt
+
+# Re-assemble HTML from a saved raw dump (no live Grok needed):
+cargo run -p monoloop-testkit --example replay_raw_html -- target/live_grok_crud.raw.txt
+open target/live_grok_crud.replay.html
+```
+
+Connects to `ws://127.0.0.1:2419/ws`, creates a session with `cwd` = this project,
+asks Grok to CRUD `monoloop_live_crud_test.txt`, and dumps the canonical event
+sequence + raw wire frames + HTML review.
+
 ### HTML interpretation review (canonical → Markdown → HTML)
 
 Visual check that complete sentences/tools serialise correctly (test kit only):
@@ -77,7 +98,8 @@ let report = run_bytes_pipeline_with_params(
     PipelineParams::with_html_dump("target/interpretation.html"),
 ).await;
 // Open target/interpretation.html in a browser:
-// - Assembled document (sentences → MD → HTML)
+// - Interleaved stream (tools + text in event order)
+// - Text-only assembly (sentences → MD → HTML; list markers attached)
 // - Canonical event timeline (every unit generation)
 ```
 

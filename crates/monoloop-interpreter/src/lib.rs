@@ -17,7 +17,7 @@ mod stream;
 pub use acp::AcpDialect;
 pub use engine::{Interpretation, InterpretationInput, StartInterpretation};
 pub use factory::{DefaultInterpreterFactory, InterpreterFactory, SupportLevel};
-pub use sentence::SentenceSegmenter;
+pub use sentence::{SentenceSegmenter, SENTENCE_SEGMENTER_VERSION};
 pub use stream::CanonicalEventStream;
 
 pub use monoloop_contracts::{

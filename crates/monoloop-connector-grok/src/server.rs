@@ -697,14 +697,14 @@ async fn connect_server(
     }
 
     let mut url = config.websocket_endpoint.clone();
-    // Auth: query token for WebSocket clients that cannot set headers.
+    // Auth: query token + headers (Grok agent serve accepts both styles).
     {
         let mut pairs = url
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect::<Vec<_>>();
-        pairs.retain(|(k, _)| k != "token");
-        pairs.push(("token".into(), secret));
+        pairs.retain(|(k, _)| k != "token" && k != "secret");
+        pairs.push(("token".into(), secret.clone()));
         let query = pairs
             .into_iter()
             .map(|(k, v)| format!("{k}={v}"))
@@ -713,7 +713,21 @@ async fn connect_server(
         url.set_query(Some(&query));
     }
 
-    let connect = connect_async(url.as_str());
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url.as_str().into_client_request().map_err(|_| {
+        GrokConnectorError::configuration("invalid websocket endpoint for request")
+    })?;
+    if let Ok(val) = secret.parse() {
+        request.headers_mut().insert("X-Secret-Key", val);
+    }
+    if let Ok(val) = format!("Bearer {secret}").parse() {
+        request.headers_mut().insert("Authorization", val);
+    }
+    // Drop secret from stack ASAP — do not log url/request (contains secret).
+    drop(secret);
+    let _ = config.websocket_endpoint.host_str();
+
+    let connect = connect_async(request);
     let (ws, _resp) = timeout(config.limits.connect_deadline, connect)
         .await
         .map_err(|_| {
@@ -722,10 +736,9 @@ async fn connect_server(
                 "websocket connect deadline exceeded",
             ))
         })?
-        .map_err(|_| GrokConnectorError::connection("websocket connect failed"))?;
-
-    // Drop secret from stack ASAP (url still has it — do not log url).
-    let _ = config.websocket_endpoint.host_str();
+        .map_err(|e| {
+            GrokConnectorError::connection(format!("websocket connect failed: {e}"))
+        })?;
 
     let (write_tx, write_rx) = mpsc::channel::<WriteCmd>(64);
     let (end_tx, end_rx) = oneshot::channel();
@@ -752,10 +765,18 @@ async fn connect_server(
         config.expected_acp_version.clone(),
     ));
 
-    // initialize handshake
+    // initialize handshake — ACP uses numeric protocolVersion (e.g. 1).
+    let protocol_version: serde_json::Value = config
+        .expected_acp_version
+        .parse::<u64>()
+        .map(serde_json::Value::from)
+        .unwrap_or_else(|_| serde_json::Value::String(config.expected_acp_version.clone()));
     let init_params = serde_json::json!({
-        "protocolVersion": config.expected_acp_version,
-        "clientCapabilities": {},
+        "protocolVersion": protocol_version,
+        "clientCapabilities": {
+            "fs": { "readTextFile": true, "writeTextFile": true },
+            "terminal": true
+        },
         "clientInfo": {
             "name": "monoloop-connector-grok",
             "version": env!("CARGO_PKG_VERSION")

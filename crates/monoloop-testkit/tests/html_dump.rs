@@ -40,7 +40,11 @@ async fn html_assembles_markdown_from_complete_sentences() {
         html.document_html
     );
     assert!(html.full_page_html.contains("Canonical event timeline"));
-    assert!(html.full_page_html.contains("Assembled document"));
+    assert!(
+        html.full_page_html.contains("Text-only assembly")
+            || html.full_page_html.contains("Interleaved stream"),
+        "page missing assembly sections"
+    );
     assert!(html.timeline_rows >= 2);
 }
 
