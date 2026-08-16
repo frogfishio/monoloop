@@ -272,18 +272,27 @@ lane_id
 lane_ordinal
 causal_parent_id?
 source_time?          # observational dialect time (first_ms/last_ms); not causality
+source_step?          # observational dialect stream step / sequence id; not causality
 canonical content allowed for that state
 ```
 
-`source_time` is **optional** and **observational only**. When the dialect
-supplies a source clock (Grok ACP: `params._meta.agentTimestampMs`), the
-Interpreter records the earliest and latest contributing fragment timestamps
-on the complete unit. It MUST NOT:
+`source_time` and `source_step` are **optional** and **observational only**.
+
+When the dialect supplies a source clock (Grok ACP: `params._meta.agentTimestampMs`),
+the Interpreter records the earliest and latest contributing fragment timestamps
+on the complete unit.
+
+When the dialect supplies a stream sequence id (Antigravity ACP:
+`update._meta.stepIdx`, or numeric `update.messageId` on text chunks), the
+Interpreter records the earliest contributing step on the complete unit. Human
+projection MAY order by `source_step` when wall-clock times are absent.
+
+Neither field MUST:
 
 - establish cross-lane causality;
 - replace lane ordinal or explicit causal parent;
-- invent wall-clock times when the dialect omits them; or
-- treat source time as turn success, authorization, or run completion.
+- invent wall-clock times or steps when the dialect omits them; or
+- treat source time/step as turn success, authorization, or run completion.
 
 `Created` is published as soon as a canonical unit exists. In the common case,
 a sentence or structural atom is already complete when created, so a single

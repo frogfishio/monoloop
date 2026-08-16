@@ -16,6 +16,26 @@ pub fn cursor_acp_binding() -> DialectBinding {
     DialectBinding::negotiated(DialectDescriptor::cursor_acp("1"))
 }
 
+/// Antigravity / agy ACP dialect binding (stdio NDJSON profile).
+pub fn agy_acp_binding() -> DialectBinding {
+    DialectBinding::negotiated(DialectDescriptor::agy_acp("1"))
+}
+
+/// OpenAI Codex ACP dialect binding (stdio NDJSON profile).
+pub fn codex_acp_binding() -> DialectBinding {
+    DialectBinding::negotiated(DialectDescriptor::codex_acp("1"))
+}
+
+/// Z.ai CLI headless dialect binding (OpenAI-chat NDJSON profile).
+pub fn zai_cli_binding() -> DialectBinding {
+    DialectBinding::negotiated(DialectDescriptor::zai_cli("1"))
+}
+
+/// Claude Code headless dialect binding (stream-json NDJSON profile).
+pub fn claude_code_binding() -> DialectBinding {
+    DialectBinding::negotiated(DialectDescriptor::claude_code("1"))
+}
+
 /// Interpret complete (or pre-concatenated) raw bytes under a dialect binding.
 pub async fn interpret_bytes(
     dialect: DialectBinding,

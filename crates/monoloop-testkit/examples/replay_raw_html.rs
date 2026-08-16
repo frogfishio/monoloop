@@ -9,8 +9,8 @@
 //! ```
 
 use monoloop_testkit::{
-    acp_binding, build_html_report, cursor_acp_binding, run_bytes_pipeline_with_params,
-    write_html_report, HtmlReportParams, PipelineParams,
+    acp_binding, agy_acp_binding, build_html_report, codex_acp_binding, cursor_acp_binding,
+    run_bytes_pipeline_with_params, write_html_report, HtmlReportParams, PipelineParams,
 };
 use std::path::{Path, PathBuf};
 
@@ -39,10 +39,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dialect = match dialect_kind {
         DialectKind::CursorAcp => cursor_acp_binding(),
+        DialectKind::AgyAcp => agy_acp_binding(),
+        DialectKind::CodexAcp => codex_acp_binding(),
         DialectKind::AcpGrok => acp_binding(),
     };
     let title = match dialect_kind {
         DialectKind::CursorAcp => "Cursor ACP — replayed assembly".to_string(),
+        DialectKind::AgyAcp => "Antigravity ACP — replayed assembly".to_string(),
+        DialectKind::CodexAcp => "Codex ACP — replayed assembly".to_string(),
         DialectKind::AcpGrok => "Grok/ACP — replayed assembly".to_string(),
     };
 
@@ -107,6 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 enum DialectKind {
     AcpGrok,
     CursorAcp,
+    AgyAcp,
+    CodexAcp,
 }
 
 fn detect_dialect(path: &Path, raw: &str) -> DialectKind {
@@ -115,7 +121,13 @@ fn detect_dialect(path: &Path, raw: &str) -> DialectKind {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if name.contains("cursor") || raw.contains("<< {") || raw.lines().any(|l| l.starts_with("<< "))
+    if name.contains("codex") {
+        DialectKind::CodexAcp
+    } else if name.contains("agy") || name.contains("antigravity") {
+        DialectKind::AgyAcp
+    } else if name.contains("cursor")
+        || raw.contains("<< {")
+        || raw.lines().any(|l| l.starts_with("<< "))
     {
         DialectKind::CursorAcp
     } else {
@@ -154,7 +166,7 @@ fn extract_json_frames(raw: &str, kind: DialectKind) -> Vec<String> {
         let line_start = raw[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let prefix = &raw[line_start..i];
         let inbound = match kind {
-            DialectKind::CursorAcp => {
+            DialectKind::CursorAcp | DialectKind::AgyAcp | DialectKind::CodexAcp => {
                 prefix.contains("<<") || (!prefix.contains(">>") && prefix.trim().is_empty())
             }
             DialectKind::AcpGrok => true,
@@ -208,7 +220,7 @@ fn keep_frame(s: &str, kind: DialectKind) -> bool {
     }
     match kind {
         // Interpretation cares about streamed updates + terminal stopReason.
-        DialectKind::CursorAcp => {
+        DialectKind::CursorAcp | DialectKind::AgyAcp | DialectKind::CodexAcp => {
             s.contains("session/update")
                 || s.contains("stopReason")
                 || s.contains("\"method\":\"session/update\"")

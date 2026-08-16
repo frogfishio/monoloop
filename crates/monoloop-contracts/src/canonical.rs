@@ -473,6 +473,11 @@ pub struct CanonicalUnitSnapshot {
     pub causal_parent_id: Option<UnitId>,
     /// Optional dialect source time (observational; not causality).
     pub source_time: Option<SourceTimeObservation>,
+    /// Optional dialect stream step / sequence id (observational; not causality).
+    ///
+    /// Examples: Antigravity ACP `update._meta.stepIdx`, numeric `messageId`.
+    /// Used by human projection when wall-clock source times are absent.
+    pub source_step: Option<u64>,
     /// Canonical unit content allowed for this state.
     pub unit: CanonicalUnit,
 }

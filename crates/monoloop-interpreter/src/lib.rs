@@ -9,10 +9,12 @@
 #![deny(missing_docs)]
 
 mod acp;
+mod claude_stream;
 mod engine;
 mod factory;
 mod sentence;
 mod stream;
+mod zai_chat;
 
 pub use acp::AcpDialect;
 pub use engine::{Interpretation, InterpretationInput, StartInterpretation};

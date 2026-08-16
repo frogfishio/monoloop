@@ -224,6 +224,47 @@ async fn acp_grok_tool_content_update_reaches_terminal_success() {
     );
 }
 
+/// Dialect stream steps (`stepIdx` / numeric `messageId`) attach as source_step.
+#[tokio::test]
+async fn acp_source_step_propagates_to_sentences_and_tools() {
+    let tool = br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Create","status":"completed","rawInput":{"path":"/tmp/x"},"content":[{"type":"diff","path":"/tmp/x"}],"_meta":{"stepIdx":3}}}}"#;
+    let t1 = br#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","messageId":"11","content":{"type":"text","text":"All done."}}}}"#;
+
+    let events = run_chunks(acp(), &[tool, t1]).await;
+
+    let tool_steps: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            InterpreterOutputEvent::Unit(u) => match &u.snapshot().unit {
+                CanonicalUnit::Tool(_) => u.snapshot().source_step,
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(
+        tool_steps.iter().any(|s| *s == 3),
+        "tool source_step: {tool_steps:?}"
+    );
+
+    let text_steps: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            InterpreterOutputEvent::Unit(u) => match &u.snapshot().unit {
+                CanonicalUnit::Text(t) => Some((t.content.clone(), u.snapshot().source_step)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text_steps
+            .iter()
+            .any(|(c, s)| c.contains("All done") && *s == Some(11)),
+        "text source_step: {text_steps:?}"
+    );
+}
+
 /// Dialect `agentTimestampMs` is attached as observational source_time on complete units.
 #[tokio::test]
 async fn acp_agent_timestamp_propagates_to_sentences_and_tools() {

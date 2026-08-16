@@ -12,6 +12,10 @@ monoloop-contracts = { path = "../monoloop-contracts" }
 monoloop-connector = { path = "../monoloop-connector" }
 monoloop-connector-grok = { path = "../monoloop-connector-grok" }
 monoloop-connector-cursor = { path = "../monoloop-connector-cursor" }
+monoloop-connector-agy = { path = "../monoloop-connector-agy" }
+monoloop-connector-codex = { path = "../monoloop-connector-codex" }
+monoloop-connector-zai = { path = "../monoloop-connector-zai" }
+monoloop-connector-claude = { path = "../monoloop-connector-claude" }
 monoloop-interpreter = { path = "../monoloop-interpreter" }
 monoloop-loop = { path = "../monoloop-loop" }
 pulldown-cmark = { workspace = true }

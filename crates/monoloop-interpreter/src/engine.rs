@@ -3,6 +3,10 @@
 use crate::acp::{drain_json_values, AcpDialect, AcpFragment, ToolSignal};
 use crate::sentence::SentenceSegmenter;
 use crate::stream::{CanonicalEventStream, EventPublisher};
+use crate::claude_stream::{
+    drain_ndjson_lines as drain_claude_lines, map_stream_line as map_claude_stream_line,
+};
+use crate::zai_chat::{drain_ndjson_lines, map_chat_message_line};
 use monoloop_contracts::{
     BoundaryKind, CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, ConnectionId,
     DiagnosticKind, DialectBinding, DialectFamily, ExternalSessionId, FlowId, InterpretationEnd,
@@ -181,6 +185,10 @@ fn validate_dialect(binding: &DialectBinding) -> Result<(), InterpreterError> {
         DialectFamily::Acp
         | DialectFamily::GrokBuild
         | DialectFamily::CursorAcp
+        | DialectFamily::AgyAcp
+        | DialectFamily::CodexAcp
+        | DialectFamily::ZaiCli
+        | DialectFamily::ClaudeCode
         | DialectFamily::Test => Ok(()),
         other => Err(InterpreterError::unsupported_dialect(format!(
             "unsupported dialect family: {other:?}"
@@ -206,20 +214,26 @@ struct Owner {
     unresolved_bytes_at_end: u64,
 }
 
-/// Sentence assembly for one text channel, with observational source-time spans.
+/// Sentence assembly for one text channel, with observational source spans.
 struct ChannelAssembly {
     segmenter: SentenceSegmenter,
-    /// Run-length spans covering the current segmenter buffer: `(byte_len, source_time_ms)`.
-    time_spans: Vec<(usize, Option<u64>)>,
+    /// Run-length spans: `(byte_len, source_time_ms, source_step)`.
+    spans: Vec<(usize, Option<u64>, Option<u64>)>,
 }
 
 impl Default for ChannelAssembly {
     fn default() -> Self {
         Self {
             segmenter: SentenceSegmenter::new(),
-            time_spans: Vec::new(),
+            spans: Vec::new(),
         }
     }
+}
+
+/// Observational dialect metadata attributed to a completed sentence.
+struct SentenceSourceMeta {
+    time: Option<SourceTimeObservation>,
+    step: Option<u64>,
 }
 
 impl ChannelAssembly {
@@ -227,50 +241,49 @@ impl ChannelAssembly {
         &mut self,
         text: &str,
         source_time_ms: Option<u64>,
-    ) -> Vec<(String, Option<SourceTimeObservation>)> {
+        source_step: Option<u64>,
+    ) -> Vec<(String, SentenceSourceMeta)> {
         if !text.is_empty() {
-            self.time_spans.push((text.len(), source_time_ms));
+            self.spans
+                .push((text.len(), source_time_ms, source_step));
         }
         let completed = self.segmenter.push(text);
         completed
             .into_iter()
             .map(|c| {
-                let st = self.take_spans(c.content_bytes, c.bytes_consumed);
-                (c.content, st)
+                let meta = self.take_spans(c.content_bytes, c.bytes_consumed);
+                (c.content, meta)
             })
             .collect()
     }
 
-    fn seal(&mut self) -> Vec<(String, Option<SourceTimeObservation>)> {
+    fn seal(&mut self) -> Vec<(String, SentenceSourceMeta)> {
         let completed = self.segmenter.seal_at_clean_end();
         completed
             .into_iter()
             .map(|c| {
-                let st = self.take_spans(c.content_bytes, c.bytes_consumed);
-                (c.content, st)
+                let meta = self.take_spans(c.content_bytes, c.bytes_consumed);
+                (c.content, meta)
             })
             .collect()
     }
 
     fn take_unresolved(&mut self) -> String {
-        self.time_spans.clear();
+        self.spans.clear();
         self.segmenter.take_unresolved()
     }
 
-    /// Attribute times from the content region; drop trailing whitespace spans.
-    fn take_spans(
-        &mut self,
-        content_bytes: usize,
-        bytes_consumed: usize,
-    ) -> Option<SourceTimeObservation> {
+    /// Attribute times/steps from the content region; drop trailing whitespace spans.
+    fn take_spans(&mut self, content_bytes: usize, bytes_consumed: usize) -> SentenceSourceMeta {
         let mut first = None;
         let mut last = None;
+        let mut step_min = None;
         let mut seen = 0usize;
         let mut remaining = bytes_consumed;
-        while remaining > 0 && !self.time_spans.is_empty() {
-            let (len, t) = &mut self.time_spans[0];
+        while remaining > 0 && !self.spans.is_empty() {
+            let (len, t, step) = &mut self.spans[0];
             let take = (*len).min(remaining);
-            // Only content_bytes contribute to source_time (not trailing whitespace).
+            // Only content_bytes contribute (not trailing whitespace).
             let content_take = if seen < content_bytes {
                 take.min(content_bytes - seen)
             } else {
@@ -281,15 +294,21 @@ impl ChannelAssembly {
                     first = Some(first.map_or(ms, |f: u64| f.min(ms)));
                     last = Some(last.map_or(ms, |l: u64| l.max(ms)));
                 }
+                if let Some(s) = *step {
+                    step_min = Some(step_min.map_or(s, |m: u64| m.min(s)));
+                }
             }
             seen += take;
             *len -= take;
             remaining -= take;
             if *len == 0 {
-                self.time_spans.remove(0);
+                self.spans.remove(0);
             }
         }
-        SourceTimeObservation::from_bounds(first, last)
+        SentenceSourceMeta {
+            time: SourceTimeObservation::from_bounds(first, last),
+            step: step_min,
+        }
     }
 }
 
@@ -307,6 +326,8 @@ struct ToolAssembler {
     waiting_for: Option<String>,
     first_ms: Option<u64>,
     last_ms: Option<u64>,
+    /// Earliest dialect stream step observed for this tool action.
+    first_step: Option<u64>,
 }
 
 impl ToolAssembler {
@@ -317,8 +338,18 @@ impl ToolAssembler {
         }
     }
 
+    fn note_step(&mut self, s: Option<u64>) {
+        if let Some(step) = s {
+            self.first_step = Some(self.first_step.map_or(step, |f| f.min(step)));
+        }
+    }
+
     fn source_time(&self) -> Option<SourceTimeObservation> {
         SourceTimeObservation::from_bounds(self.first_ms, self.last_ms)
+    }
+
+    fn source_step(&self) -> Option<u64> {
+        self.first_step
     }
 }
 
@@ -399,9 +430,13 @@ impl Owner {
 
         match &self.request.dialect.output.family {
             DialectFamily::Test => self.ingest_test_text().await,
-            DialectFamily::Acp | DialectFamily::GrokBuild | DialectFamily::CursorAcp => {
-                self.ingest_acp().await
-            }
+            DialectFamily::Acp
+            | DialectFamily::GrokBuild
+            | DialectFamily::CursorAcp
+            | DialectFamily::AgyAcp
+            | DialectFamily::CodexAcp => self.ingest_acp().await,
+            DialectFamily::ZaiCli => self.ingest_zai_cli().await,
+            DialectFamily::ClaudeCode => self.ingest_claude_code().await,
             _ => Err(InterpreterError::unsupported_dialect("dialect")),
         }
     }
@@ -415,7 +450,8 @@ impl Owner {
         }
         let text = String::from_utf8_lossy(valid).into_owned();
         self.frame_buf = rest.to_vec();
-        self.on_text(TextChannel::PublicResponse, &text, None).await
+        self.on_text(TextChannel::PublicResponse, &text, None, None)
+            .await
     }
 
     async fn ingest_acp(&mut self) -> Result<(), InterpreterError> {
@@ -442,18 +478,62 @@ impl Owner {
         Ok(())
     }
 
+    /// Z.ai CLI headless: one OpenAI chat message per NDJSON line.
+    async fn ingest_zai_cli(&mut self) -> Result<(), InterpreterError> {
+        if self.frame_buf.len() > self.request.limits.max_frame_bytes {
+            return Err(InterpreterError::limit("frame buffer limit exceeded"));
+        }
+        let lines = drain_ndjson_lines(&mut self.frame_buf);
+        for line in lines {
+            if !self.response_started {
+                self.response_started = true;
+                self.emit_boundary(BoundaryKind::ResponseStarted).await?;
+            }
+            for frag in map_chat_message_line(&line) {
+                self.on_fragment(frag).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Claude Code headless: stream-json events per NDJSON line.
+    async fn ingest_claude_code(&mut self) -> Result<(), InterpreterError> {
+        if self.frame_buf.len() > self.request.limits.max_frame_bytes {
+            return Err(InterpreterError::limit("frame buffer limit exceeded"));
+        }
+        let lines = drain_claude_lines(&mut self.frame_buf);
+        for line in lines {
+            if !self.response_started {
+                self.response_started = true;
+                self.emit_boundary(BoundaryKind::ResponseStarted).await?;
+            }
+            for frag in map_claude_stream_line(&line) {
+                self.on_fragment(frag).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn on_fragment(&mut self, frag: AcpFragment) -> Result<(), InterpreterError> {
         match frag {
             AcpFragment::TextDelta {
                 channel,
                 text,
                 source_time_ms,
-            } => self.on_text(channel, &text, source_time_ms).await,
+                source_step,
+            } => {
+                self.on_text(channel, &text, source_time_ms, source_step)
+                    .await
+            }
             AcpFragment::Tool {
                 action_id,
                 signal,
                 source_time_ms,
-            } => self.on_tool(action_id, signal, source_time_ms).await,
+                source_step,
+            } => {
+                self.on_tool(action_id, signal, source_time_ms, source_step)
+                    .await
+            }
             AcpFragment::ResponseFinished => {
                 self.seal_text_channels().await?;
                 self.emit_boundary(BoundaryKind::ResponseFinished).await
@@ -471,6 +551,7 @@ impl Owner {
         channel: TextChannel,
         text: &str,
         source_time_ms: Option<u64>,
+        source_step: Option<u64>,
     ) -> Result<(), InterpreterError> {
         let completed = {
             let asm = self.channels.entry(channel).or_default();
@@ -482,10 +563,11 @@ impl Owner {
                     "sentence assembly limit exceeded",
                 ));
             }
-            asm.push(text, source_time_ms)
+            asm.push(text, source_time_ms, source_step)
         };
-        for (sentence, source_time) in completed {
-            self.emit_sentence(channel, sentence, source_time).await?;
+        for (sentence, meta) in completed {
+            self.emit_sentence(channel, sentence, meta.time, meta.step)
+                .await?;
         }
         Ok(())
     }
@@ -498,8 +580,9 @@ impl Owner {
                 .get_mut(&channel)
                 .map(|asm| asm.seal())
                 .unwrap_or_default();
-            for (sentence, source_time) in sealed {
-                self.emit_sentence(channel, sentence, source_time).await?;
+            for (sentence, meta) in sealed {
+                self.emit_sentence(channel, sentence, meta.time, meta.step)
+                    .await?;
             }
         }
         Ok(())
@@ -557,6 +640,7 @@ impl Owner {
         action_id: ToolActionId,
         signal: ToolSignal,
         source_time_ms: Option<u64>,
+        source_step: Option<u64>,
     ) -> Result<(), InterpreterError> {
         if self.tools.len() >= self.request.limits.max_pending_tool_actions
             && !self.tools.contains_key(action_id.as_str())
@@ -586,6 +670,7 @@ impl Owner {
                     waiting_for: None,
                     first_ms: None,
                     last_ms: None,
+                    first_step: None,
                 },
             );
         }
@@ -593,6 +678,7 @@ impl Owner {
         let event_kind = {
             let tool = self.tools.get_mut(action_id.as_str()).unwrap();
             tool.note_time(source_time_ms);
+            tool.note_step(source_step);
             tool.generation += 1;
             match signal {
                 ToolSignal::Waiting {
@@ -697,6 +783,7 @@ impl Owner {
             state,
             LaneId::tool(),
             tool.source_time(),
+            tool.source_step(),
             unit,
         ))
     }
@@ -706,6 +793,7 @@ impl Owner {
         channel: TextChannel,
         content: String,
         source_time: Option<SourceTimeObservation>,
+        source_step: Option<u64>,
     ) -> Result<(), InterpreterError> {
         let unit_id = UnitId::new(format!("s-{}", self.next_unit));
         self.next_unit += 1;
@@ -722,7 +810,15 @@ impl Owner {
             TextChannel::PublicReasoningSummary => LaneId::reasoning(),
             _ => LaneId::response(),
         };
-        let snap = self.snapshot(unit_id, 1, UnitState::Complete, lane, source_time, unit);
+        let snap = self.snapshot(
+            unit_id,
+            1,
+            UnitState::Complete,
+            lane,
+            source_time,
+            source_step,
+            unit,
+        );
         // Created-and-complete: emit Created (complete state)
         self.pub_
             .publish(InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(
@@ -740,6 +836,7 @@ impl Owner {
             1,
             UnitState::Complete,
             LaneId::response(),
+            None,
             None,
             unit,
         );
@@ -764,6 +861,7 @@ impl Owner {
             UnitState::Complete,
             LaneId::response(),
             None,
+            None,
             unit,
         );
         self.pub_
@@ -780,6 +878,7 @@ impl Owner {
         state: UnitState,
         lane_id: LaneId,
         source_time: Option<SourceTimeObservation>,
+        source_step: Option<u64>,
         unit: CanonicalUnit,
     ) -> CanonicalUnitSnapshot {
         let lane_ordinal = self
@@ -799,6 +898,7 @@ impl Owner {
             lane_ordinal,
             causal_parent_id: None,
             source_time,
+            source_step,
             unit,
         }
     }

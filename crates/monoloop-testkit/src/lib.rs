@@ -11,8 +11,12 @@ mod distribute;
 mod driver;
 mod grok_serve;
 mod html_report;
+mod live_agy;
+mod live_claude;
+mod live_codex;
 mod live_cursor;
 mod live_grok;
+mod live_zai;
 mod pipeline;
 
 pub use chat_projector::{
@@ -35,13 +39,26 @@ pub use html_report::{
     build_html_report, join_sentences_as_markdown, markdown_to_html, write_html_report, HtmlReport,
     HtmlReportParams,
 };
+pub use live_agy::{
+    run_live_agy_prompt, LiveAgyArtifactPaths, LiveAgyRunOptions, LiveAgyRunReport,
+};
+pub use live_claude::{
+    run_live_claude_prompt, LiveClaudeArtifactPaths, LiveClaudeRunOptions, LiveClaudeRunReport,
+};
+pub use live_codex::{
+    run_live_codex_prompt, LiveCodexArtifactPaths, LiveCodexRunOptions, LiveCodexRunReport,
+};
 pub use live_cursor::{
     run_live_cursor_prompt, LiveCursorArtifactPaths, LiveCursorRunOptions, LiveCursorRunReport,
+};
+pub use live_zai::{
+    run_live_zai_prompt, LiveZaiArtifactPaths, LiveZaiRunOptions, LiveZaiRunReport,
 };
 pub use live_grok::{
     run_live_grok_prompt, LiveGrokArtifactPaths, LiveGrokRunOptions, LiveGrokRunReport,
 };
 pub use pipeline::{
-    acp_binding, collect_interpretation, cursor_acp_binding, feed_chunks, interpret_and_render,
-    interpret_bytes, render_all, test_text_binding,
+    acp_binding, agy_acp_binding, claude_code_binding, codex_acp_binding, collect_interpretation,
+    cursor_acp_binding, feed_chunks, interpret_and_render, interpret_bytes, render_all,
+    test_text_binding, zai_cli_binding,
 };

@@ -37,10 +37,14 @@ impl DefaultInterpreterFactory {
 impl InterpreterFactory for DefaultInterpreterFactory {
     fn supports(&self, dialect: &DialectBinding) -> SupportLevel {
         match &dialect.output.family {
-            DialectFamily::Test | DialectFamily::Acp | DialectFamily::GrokBuild => {
-                SupportLevel::Full
-            }
-            DialectFamily::CursorAcp => SupportLevel::Partial,
+            DialectFamily::Test
+            | DialectFamily::Acp
+            | DialectFamily::GrokBuild
+            | DialectFamily::CursorAcp
+            | DialectFamily::AgyAcp
+            | DialectFamily::CodexAcp
+            | DialectFamily::ZaiCli
+            | DialectFamily::ClaudeCode => SupportLevel::Full,
             _ => SupportLevel::None,
         }
     }

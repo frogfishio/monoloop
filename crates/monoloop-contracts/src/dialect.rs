@@ -13,6 +13,14 @@ pub enum DialectFamily {
     Acp,
     /// Cursor ACP profile.
     CursorAcp,
+    /// Google Antigravity (`agy`) ACP profile (stdio NDJSON / agy-acp bridge).
+    AgyAcp,
+    /// OpenAI Codex ACP profile (stdio NDJSON / codex-acp adapter).
+    CodexAcp,
+    /// Z.ai CLI headless profile: OpenAI-compatible chat message NDJSON on stdout.
+    ZaiCli,
+    /// Claude Code headless profile: `claude -p --output-format stream-json` NDJSON.
+    ClaudeCode,
     /// Grok Build ACP/JSONL profile family tag.
     GrokBuild,
     /// Deterministic test dialect.
@@ -61,6 +69,46 @@ impl DialectDescriptor {
             version: version.into(),
             framing: "ndjson".into(),
             profile: Some("cursor".into()),
+        }
+    }
+
+    /// Antigravity / agy ACP over stdio (native or `agy-acp` bridge).
+    pub fn agy_acp(version: impl Into<String>) -> Self {
+        Self {
+            family: DialectFamily::AgyAcp,
+            version: version.into(),
+            framing: "ndjson".into(),
+            profile: Some("antigravity".into()),
+        }
+    }
+
+    /// OpenAI Codex ACP over stdio (`@agentclientprotocol/codex-acp` adapter).
+    pub fn codex_acp(version: impl Into<String>) -> Self {
+        Self {
+            family: DialectFamily::CodexAcp,
+            version: version.into(),
+            framing: "ndjson".into(),
+            profile: Some("codex".into()),
+        }
+    }
+
+    /// Z.ai CLI headless (`zai -p`): OpenAI-compatible chat messages as NDJSON lines.
+    pub fn zai_cli(version: impl Into<String>) -> Self {
+        Self {
+            family: DialectFamily::ZaiCli,
+            version: version.into(),
+            framing: "ndjson".into(),
+            profile: Some("zai".into()),
+        }
+    }
+
+    /// Claude Code headless (`claude -p --output-format stream-json --verbose`).
+    pub fn claude_code(version: impl Into<String>) -> Self {
+        Self {
+            family: DialectFamily::ClaudeCode,
+            version: version.into(),
+            framing: "ndjson".into(),
+            profile: Some("claude_code".into()),
         }
     }
 

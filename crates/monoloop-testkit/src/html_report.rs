@@ -124,7 +124,7 @@ pub fn build_html_report(
                                 short(snap.interpretation_id.as_str()),
                                 short(snap.unit_id.as_str()),
                                 snap.unit_generation,
-                                source_time_corr(snap.source_time)
+                                source_obs_corr(snap.source_time, snap.source_step)
                             ),
                             body: t.content.clone(),
                             css_class: "ev-text".into(),
@@ -201,7 +201,7 @@ pub fn build_html_report(
                                 short(snap.interpretation_id.as_str()),
                                 t.tool_action_id.as_str(),
                                 snap.unit_generation,
-                                source_time_corr(snap.source_time)
+                                source_obs_corr(snap.source_time, snap.source_step)
                             ),
                             body,
                             css_class: "ev-tool".into(),
@@ -803,13 +803,18 @@ fn short(id: &str) -> &str {
     }
 }
 
-/// Observational dialect source-time for timeline correlation (empty when absent).
-fn source_time_corr(st: Option<SourceTimeObservation>) -> String {
+/// Observational dialect source-time / source-step for timeline correlation.
+fn source_obs_corr(st: Option<SourceTimeObservation>, step: Option<u64>) -> String {
+    let mut out = String::new();
     match st {
-        Some(s) if s.first_ms == s.last_ms => format!(" t:{}", s.first_ms),
-        Some(s) => format!(" t:{}..{}", s.first_ms, s.last_ms),
-        None => String::new(),
+        Some(s) if s.first_ms == s.last_ms => out.push_str(&format!(" t:{}", s.first_ms)),
+        Some(s) => out.push_str(&format!(" t:{}..{}", s.first_ms, s.last_ms)),
+        None => {}
     }
+    if let Some(s) = step {
+        out.push_str(&format!(" s:{s}"));
+    }
+    out
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -878,6 +883,7 @@ mod tests {
             lane_ordinal: n,
             causal_parent_id: None,
             source_time: None,
+            source_step: None,
             unit: CanonicalUnit::Text(TextSentence {
                 sentence_id: UnitId::new(format!("s{n}")),
                 channel: TextChannel::PublicResponse,
@@ -970,6 +976,7 @@ mod tests {
                 lane_ordinal: 1,
                 causal_parent_id: None,
                 source_time: None,
+                source_step: None,
                 unit: CanonicalUnit::Tool(ToolActionEvent {
                     tool_action_id: ToolActionId::new("call-1"),
                     tool_name: Some("write".into()),

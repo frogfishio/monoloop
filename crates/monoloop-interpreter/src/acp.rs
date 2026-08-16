@@ -17,6 +17,8 @@ pub enum AcpFragment {
         text: String,
         /// Dialect `agentTimestampMs` when present on the message (observational).
         source_time_ms: Option<u64>,
+        /// Dialect stream step (e.g. `_meta.stepIdx` / numeric `messageId`).
+        source_step: Option<u64>,
     },
     /// Tool action declared / updated.
     Tool {
@@ -26,6 +28,8 @@ pub enum AcpFragment {
         signal: ToolSignal,
         /// Dialect `agentTimestampMs` when present on the message (observational).
         source_time_ms: Option<u64>,
+        /// Dialect stream step (e.g. `_meta.stepIdx`).
+        source_step: Option<u64>,
     },
     /// Dialect-level response finished.
     ResponseFinished,
@@ -104,6 +108,8 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
     let mut out = Vec::new();
     let source_time_ms = extract_agent_timestamp_ms(params);
     let update = params.get("update").unwrap_or(params);
+    // Prefer update._meta.stepIdx (Antigravity), then params._meta, then numeric messageId.
+    let source_step = extract_source_step(params, update);
     let kind = update
         .get("sessionUpdate")
         .or_else(|| update.get("type"))
@@ -118,6 +124,7 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
                         channel: TextChannel::PublicResponse,
                         text,
                         source_time_ms,
+                        source_step,
                     });
                 }
             }
@@ -137,6 +144,7 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
                             channel: TextChannel::PublicReasoningSummary,
                             text,
                             source_time_ms,
+                            source_step,
                         });
                     }
                 }
@@ -148,6 +156,7 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
                 update,
                 kind == "tool_call_update",
                 source_time_ms,
+                source_step,
             ));
         }
         // Known non-content / lifecycle updates — observe silently (no diagnostic noise).
@@ -172,6 +181,7 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
                         channel: TextChannel::PublicResponse,
                         text,
                         source_time_ms,
+                        source_step,
                     });
                 }
             }
@@ -195,6 +205,35 @@ fn extract_agent_timestamp_ms(params: &Value) -> Option<u64> {
             params
                 .get("agentTimestampMs")
                 .and_then(|t| t.as_u64().or_else(|| t.as_i64().map(|i| i as u64)))
+        })
+}
+
+/// Dialect stream step for human ordering when wall-clock times are absent.
+///
+/// Preference:
+/// 1. `update._meta.stepIdx` (Antigravity)
+/// 2. `params._meta.stepIdx`
+/// 3. numeric `update.messageId` (Antigravity text chunks)
+fn extract_source_step(params: &Value, update: &Value) -> Option<u64> {
+    let step_from = |v: &Value| -> Option<u64> {
+        v.get("_meta").and_then(|m| {
+            m.get("stepIdx")
+                .or_else(|| m.get("step_idx"))
+                .and_then(|t| t.as_u64().or_else(|| t.as_i64().map(|i| i as u64)))
+        })
+    };
+    step_from(update)
+        .or_else(|| step_from(params))
+        .or_else(|| {
+            update
+                .get("messageId")
+                .and_then(|m| m.as_u64().or_else(|| m.as_i64().map(|i| i as u64)))
+                .or_else(|| {
+                    update
+                        .get("messageId")
+                        .and_then(|m| m.as_str())
+                        .and_then(|s| s.parse().ok())
+                })
         })
 }
 
@@ -232,6 +271,7 @@ fn map_tool_call(
     update: &Value,
     is_update: bool,
     source_time_ms: Option<u64>,
+    source_step: Option<u64>,
 ) -> Vec<AcpFragment> {
     let mut out = Vec::new();
     let id = update
@@ -318,6 +358,7 @@ fn map_tool_call(
                         arguments_json,
                     },
                     source_time_ms,
+                    source_step,
                 });
             }
         }
@@ -330,6 +371,7 @@ fn map_tool_call(
                 result_json,
             },
             source_time_ms,
+            source_step,
         });
         return out;
     }
@@ -349,6 +391,7 @@ fn map_tool_call(
                     arguments_json,
                 },
                 source_time_ms,
+                source_step,
             });
             return out;
         }
@@ -366,6 +409,7 @@ fn map_tool_call(
             },
         },
         source_time_ms,
+        source_step,
     });
     out
 }
@@ -543,6 +587,62 @@ mod tests {
             )),
             "{frags:?}"
         );
+    }
+
+    /// Antigravity: tools carry `update._meta.stepIdx`; text uses numeric `messageId`.
+    #[test]
+    fn extracts_agy_step_idx_and_message_id() {
+        let tool = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call_1",
+                    "title": "Create file",
+                    "status": "completed",
+                    "rawInput": { "path": "/tmp/x" },
+                    "content": [{ "type": "diff", "path": "/tmp/x" }],
+                    "_meta": { "stepIdx": 3 }
+                }
+            }
+        });
+        let frags = AcpDialect::map_message(&tool);
+        assert!(
+            frags.iter().any(|f| matches!(
+                f,
+                AcpFragment::Tool {
+                    source_step: Some(3),
+                    source_time_ms: None,
+                    ..
+                }
+            )),
+            "tool stepIdx: {frags:?}"
+        );
+
+        let text = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "messageId": "11",
+                    "content": { "type": "text", "text": "Done." }
+                }
+            }
+        });
+        let frags = AcpDialect::map_message(&text);
+        assert!(matches!(
+            &frags[0],
+            AcpFragment::TextDelta {
+                text,
+                source_step: Some(11),
+                source_time_ms: None,
+                ..
+            } if text == "Done."
+        ), "{frags:?}");
     }
 
     /// Grok Build live shape: null/absent status + rawInput on tool_call.

@@ -4,13 +4,15 @@
 //!
 //! ## Design (scalable / universal)
 //!
-//! **Human chat default — dialect source time when present**
+//! **Human chat default — dialect source order when present**
 //!
 //! Complete units often *emit* in a jumbled order relative to how a reader
 //! expects the turn (sentence assembly waits while tools complete). When the
-//! dialect supplies `source_time`, the chat report sorts by `first_ms` so
-//! humans see production order. Missing times fall back to emit order.
-//! Canonical timeline / interleaved stream stay emit-order ground truth.
+//! dialect supplies `source_time` (Grok `agentTimestampMs`) and/or
+//! `source_step` (Antigravity `_meta.stepIdx` / numeric `messageId`), the
+//! chat report sorts by those observational keys so humans see production
+//! order. Missing keys fall back to emit order. Canonical timeline /
+//! interleaved stream stay emit-order ground truth.
 //!
 //! **Fallback core — emit-order chronological chat**
 //!
@@ -62,6 +64,9 @@ pub enum ProjectionConfidence {
     /// Chronological blocks reordered by dialect `source_time.first_ms` for
     /// human readability. Not causality; content still complete units only.
     DialectSourceTime,
+    /// Chronological blocks reordered by dialect `source_step` (stream sequence
+    /// id) when wall-clock source times are absent. Observational only.
+    DialectSourceStep,
     /// Tools/steps reordered under structural gates; still no invented content.
     StructuralReorder,
 }
@@ -72,13 +77,13 @@ pub struct ProjectChatOptions {
     /// When true (default), allow [`ProjectionStrategy::StructuralOrdinalZip`]
     /// if structural gates pass. When false, always chronological.
     pub allow_structural_zip: bool,
-    /// When true (default), sort chronological blocks by dialect
-    /// `source_time.first_ms` (then emit index) when times are present so human
-    /// readers are not shown tools-before-speech that started earlier on the
-    /// wire. When times are absent, emit order is preserved. Set false to force
-    /// pure emit-order chat.
+    /// When true (default), sort chronological blocks by dialect observational
+    /// order when present: `source_time.first_ms`, then `source_step`, then emit
+    /// index. When neither time nor step is present, emit order is preserved.
+    /// Set false to force pure emit-order chat.
     pub order_by_source_time: bool,
-    /// When true (default), annotate lines with dialect source-time when known.
+    /// When true (default), annotate lines with dialect source-time / source-step
+    /// when known.
     pub annotate_source_time: bool,
 }
 
@@ -124,6 +129,8 @@ pub struct ProjectedTool {
     pub state: String,
     /// Dialect source time when present on the unit snapshot.
     pub source_time: Option<SourceTimeObservation>,
+    /// Dialect stream step when present on the unit snapshot.
+    pub source_step: Option<u64>,
 }
 
 /// One line in the projected chat.
@@ -139,6 +146,8 @@ pub struct ChatLine {
     pub reordered: bool,
     /// Dialect source time when present (observational).
     pub source_time: Option<SourceTimeObservation>,
+    /// Dialect stream step when present (observational).
+    pub source_step: Option<u64>,
 }
 
 /// Full chat projection for a run.
@@ -161,11 +170,12 @@ pub struct ChatProjection {
 }
 
 const DISCLAIMER: &str = "Chat projection is a human-readable report, not ground truth. \
-When dialect source times are present, chat lines are ordered by production time \
-so readers are not shown tools before speech that started earlier on the wire. \
-Structural ordinal zip (when shown) only reorders tools against later numbered \
-list steps when counts match — it does not invent speech. Use the event-order \
-interleaved stream and canonical timeline for exact Interpreter emit order.";
+When dialect source times or stream steps are present, chat lines are ordered by \
+those observational keys so readers see production order rather than emit-order \
+jumble. Structural ordinal zip (when shown) only reorders tools against later \
+numbered list steps when counts match — it does not invent speech. Use the \
+event-order interleaved stream and canonical timeline for exact Interpreter \
+emit order.";
 
 /// Project canonical Interpreter events into a chat-like flow (default options).
 pub fn project_chat(events: &[InterpreterOutputEvent]) -> ChatProjection {
@@ -178,26 +188,32 @@ pub fn project_chat_with(
     opts: &ProjectChatOptions,
 ) -> ChatProjection {
     let mut extracted = extract(events);
-    let source_time_applied = if opts.order_by_source_time {
-        apply_source_time_order(&mut extracted.chrono)
+    let source_order = if opts.order_by_source_time {
+        apply_source_order(&mut extracted.chrono)
     } else {
-        false
+        SourceOrderApplied::None
     };
     let (strategy, reason) = choose_strategy(&extracted, opts);
     let mut reason = reason;
-    if source_time_applied {
-        reason.push_str(
-            "; human chat ordered by dialect source_time.first_ms (emit order preserved when times absent)",
-        );
+    match source_order {
+        SourceOrderApplied::ByTime => {
+            reason.push_str(
+                "; human chat ordered by dialect source_time.first_ms (then source_step, then emit)",
+            );
+        }
+        SourceOrderApplied::ByStep => {
+            reason.push_str(
+                "; human chat ordered by dialect source_step (emit order preserved when steps absent)",
+            );
+        }
+        SourceOrderApplied::None => {}
     }
     let confidence = match strategy {
-        ProjectionStrategy::ChronologicalChat => {
-            if source_time_applied {
-                ProjectionConfidence::DialectSourceTime
-            } else {
-                ProjectionConfidence::EmitOrder
-            }
-        }
+        ProjectionStrategy::ChronologicalChat => match source_order {
+            SourceOrderApplied::ByTime => ProjectionConfidence::DialectSourceTime,
+            SourceOrderApplied::ByStep => ProjectionConfidence::DialectSourceStep,
+            SourceOrderApplied::None => ProjectionConfidence::EmitOrder,
+        },
         ProjectionStrategy::StructuralOrdinalZip => ProjectionConfidence::StructuralReorder,
     };
     let lines = match strategy {
@@ -252,12 +268,21 @@ enum ChronoBlock {
         channel: TextChannel,
         content: String,
         source_time: Option<SourceTimeObservation>,
+        source_step: Option<u64>,
         emit_index: usize,
     },
     Tool {
         tool: ProjectedTool,
         emit_index: usize,
     },
+}
+
+/// Which dialect observational key (if any) changed display order vs emit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceOrderApplied {
+    None,
+    ByTime,
+    ByStep,
 }
 
 fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
@@ -285,6 +310,7 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
                         channel: t.channel,
                         content: t.content.clone(),
                         source_time: snap.source_time,
+                        source_step: snap.source_step,
                         emit_index,
                     });
                     emit_index += 1;
@@ -295,6 +321,7 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
                         channel: t.channel,
                         content: t.content.clone(),
                         source_time: snap.source_time,
+                        source_step: snap.source_step,
                         emit_index,
                     });
                     emit_index += 1;
@@ -305,6 +332,7 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
                         channel: t.channel,
                         content: t.content.clone(),
                         source_time: snap.source_time,
+                        source_step: snap.source_step,
                         emit_index,
                     });
                     emit_index += 1;
@@ -315,7 +343,8 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
                 if saw_public {
                     tool_after_public = true;
                 }
-                let projected = projected_tool(t, snap.unit_state, snap.source_time);
+                let projected =
+                    projected_tool(t, snap.unit_state, snap.source_time, snap.source_step);
                 let id = projected.action_id.clone();
                 if let Some(&idx) = tool_index.get(&id) {
                     tools[idx] = projected.clone();
@@ -359,6 +388,7 @@ fn projected_tool(
     t: &monoloop_contracts::ToolActionEvent,
     unit_state: UnitState,
     source_time: Option<SourceTimeObservation>,
+    source_step: Option<u64>,
 ) -> ProjectedTool {
     let title = t.tool_name.clone().unwrap_or_else(|| "tool".into());
     let verb = display_verb(&title, t.request_payload.as_deref());
@@ -383,27 +413,40 @@ fn projected_tool(
         terminal: t.terminal_outcome.map(|o| format!("{o:?}")),
         state,
         source_time,
+        source_step,
     }
 }
 
-/// Sort chrono blocks by dialect `first_ms` when any times are present.
-/// Returns true when the sort actually changed display order vs emit index.
-fn apply_source_time_order(chrono: &mut [ChronoBlock]) -> bool {
+/// Sort chrono blocks by dialect observational keys when present.
+///
+/// Preference: wall-clock `source_time.first_ms` (Grok), then stream
+/// `source_step` (Antigravity stepIdx/messageId), then emit index.
+fn apply_source_order(chrono: &mut [ChronoBlock]) -> SourceOrderApplied {
     if chrono.is_empty() {
-        return false;
+        return SourceOrderApplied::None;
     }
     let any_time = chrono.iter().any(|b| block_source_time(b).is_some());
-    if !any_time {
-        return false;
+    let any_step = chrono.iter().any(|b| block_source_step(b).is_some());
+    if !any_time && !any_step {
+        return SourceOrderApplied::None;
     }
     let before: Vec<usize> = chrono.iter().map(block_emit_index).collect();
-    // Primary: first_ms when known (unknown times sort last); secondary: emit index.
     chrono.sort_by_key(|b| {
-        let t = block_source_time(b).map(|s| s.first_ms);
-        (t.unwrap_or(u64::MAX), block_emit_index(b))
+        let t = block_source_time(b)
+            .map(|s| s.first_ms)
+            .unwrap_or(u64::MAX);
+        let step = block_source_step(b).unwrap_or(u64::MAX);
+        (t, step, block_emit_index(b))
     });
     let after: Vec<usize> = chrono.iter().map(block_emit_index).collect();
-    before != after
+    if before == after {
+        return SourceOrderApplied::None;
+    }
+    if any_time {
+        SourceOrderApplied::ByTime
+    } else {
+        SourceOrderApplied::ByStep
+    }
 }
 
 fn block_source_time(b: &ChronoBlock) -> Option<SourceTimeObservation> {
@@ -413,17 +456,40 @@ fn block_source_time(b: &ChronoBlock) -> Option<SourceTimeObservation> {
     }
 }
 
+fn block_source_step(b: &ChronoBlock) -> Option<u64> {
+    match b {
+        ChronoBlock::Text { source_step, .. } => *source_step,
+        ChronoBlock::Tool { tool, .. } => tool.source_step,
+    }
+}
+
 fn block_emit_index(b: &ChronoBlock) -> usize {
     match b {
         ChronoBlock::Text { emit_index, .. } | ChronoBlock::Tool { emit_index, .. } => *emit_index,
     }
 }
 
-fn format_source_time(st: SourceTimeObservation) -> String {
-    if st.first_ms == st.last_ms {
-        format!("t={}", st.first_ms)
-    } else {
-        format!("t={}..{}", st.first_ms, st.last_ms)
+fn format_source_meta(
+    st: Option<SourceTimeObservation>,
+    step: Option<u64>,
+) -> Option<String> {
+    match (st, step) {
+        (Some(t), Some(s)) => {
+            if t.first_ms == t.last_ms {
+                Some(format!("t={} s={s}", t.first_ms))
+            } else {
+                Some(format!("t={}..{} s={s}", t.first_ms, t.last_ms))
+            }
+        }
+        (Some(t), None) => {
+            if t.first_ms == t.last_ms {
+                Some(format!("t={}", t.first_ms))
+            } else {
+                Some(format!("t={}..{}", t.first_ms, t.last_ms))
+            }
+        }
+        (None, Some(s)) => Some(format!("s={s}")),
+        (None, None) => None,
     }
 }
 
@@ -553,13 +619,13 @@ fn assemble_structural_zip(ex: &Extracted) -> Vec<ChatLine> {
     // Reasoning/status that appeared in the stream: for tools-first dumps they
     // usually sit with tools or after; surface them before the weave as context.
     for s in &ex.reasoning {
-        lines.push(line(ChatRole::Thinking, s.clone(), None, true, None));
+        lines.push(line(ChatRole::Thinking, s.clone(), None, true, None, None));
     }
     for s in &ex.status {
-        lines.push(line(ChatRole::Status, s.clone(), None, true, None));
+        lines.push(line(ChatRole::Status, s.clone(), None, true, None, None));
     }
     for s in &preamble {
-        lines.push(line(ChatRole::Agent, s.clone(), None, true, None));
+        lines.push(line(ChatRole::Agent, s.clone(), None, true, None, None));
     }
 
     // Gates guarantee steps.len() == tools.len().
@@ -570,12 +636,13 @@ fn assemble_structural_zip(ex: &Extracted) -> Vec<ChatLine> {
             Some(tool.clone()),
             true,
             tool.source_time,
+            tool.source_step,
         ));
-        lines.push(line(ChatRole::Agent, step.clone(), None, true, None));
+        lines.push(line(ChatRole::Agent, step.clone(), None, true, None, None));
     }
 
     for s in &epilogue {
-        lines.push(line(ChatRole::Agent, s.clone(), None, true, None));
+        lines.push(line(ChatRole::Agent, s.clone(), None, true, None, None));
     }
     lines
 }
@@ -585,14 +652,23 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
     let mut pending_role: Option<ChatRole> = None;
     let mut pending_text: Vec<String> = Vec::new();
     let mut pending_time: Option<SourceTimeObservation> = None;
+    let mut pending_step: Option<u64> = None;
 
     let flush = |role: &mut Option<ChatRole>,
                  buf: &mut Vec<String>,
                  time: &mut Option<SourceTimeObservation>,
+                 step: &mut Option<u64>,
                  lines: &mut Vec<ChatLine>| {
         if let Some(r) = role.take() {
             if !buf.is_empty() {
-                lines.push(line(r, join_soft(buf), None, false, time.take()));
+                lines.push(line(
+                    r,
+                    join_soft(buf),
+                    None,
+                    false,
+                    time.take(),
+                    step.take(),
+                ));
                 buf.clear();
             }
         }
@@ -604,6 +680,7 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
                 channel,
                 content,
                 source_time,
+                source_step,
                 ..
             } => {
                 let role = match channel {
@@ -617,6 +694,7 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
                         &mut pending_role,
                         &mut pending_text,
                         &mut pending_time,
+                        &mut pending_step,
                         &mut lines,
                     );
                     pending_role = Some(role);
@@ -628,12 +706,19 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
                     (None, Some(b)) => Some(b),
                     (None, None) => None,
                 };
+                pending_step = match (pending_step, *source_step) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
             }
             ChronoBlock::Tool { tool: t, .. } => {
                 flush(
                     &mut pending_role,
                     &mut pending_text,
                     &mut pending_time,
+                    &mut pending_step,
                     &mut lines,
                 );
                 lines.push(line(
@@ -642,6 +727,7 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
                     Some(t.clone()),
                     false,
                     t.source_time,
+                    t.source_step,
                 ));
             }
         }
@@ -650,6 +736,7 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
         &mut pending_role,
         &mut pending_text,
         &mut pending_time,
+        &mut pending_step,
         &mut lines,
     );
     lines
@@ -661,6 +748,7 @@ fn line(
     tool: Option<ProjectedTool>,
     reordered: bool,
     source_time: Option<SourceTimeObservation>,
+    source_step: Option<u64>,
 ) -> ChatLine {
     ChatLine {
         role,
@@ -668,6 +756,7 @@ fn line(
         tool,
         reordered,
         source_time,
+        source_step,
     }
 }
 
@@ -713,6 +802,12 @@ fn merge_consecutive_same_role(lines: &[ChatLine]) -> Vec<ChatLine> {
                         (None, Some(b)) => Some(b),
                         (None, None) => None,
                     };
+                    prev.source_step = match (prev.source_step, line.source_step) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    };
                     continue;
                 }
             }
@@ -740,8 +835,8 @@ fn render_plain(
     out.push_str(&format!("reason: {reason}\n\n"));
     for line in lines {
         let t_note = if annotate_source_time {
-            line.source_time
-                .map(|st| format!(" [{}]", format_source_time(st)))
+            format_source_meta(line.source_time, line.source_step)
+                .map(|s| format!(" [{s}]"))
                 .unwrap_or_default()
         } else {
             String::new()
@@ -785,6 +880,7 @@ fn render_html(
     let conf_class = match confidence {
         ProjectionConfidence::EmitOrder => "conf-emit",
         ProjectionConfidence::DialectSourceTime => "conf-source-time",
+        ProjectionConfidence::DialectSourceStep => "conf-source-step",
         ProjectionConfidence::StructuralReorder => "conf-structural",
     };
     let mut out = String::new();
@@ -805,13 +901,8 @@ fn render_html(
 
     for line in lines {
         let t_html = if annotate_source_time {
-            line.source_time
-                .map(|st| {
-                    format!(
-                        " <span class=\"chat-source-time\">{}</span>",
-                        escape(&format_source_time(st))
-                    )
-                })
+            format_source_meta(line.source_time, line.source_step)
+                .map(|s| format!(" <span class=\"chat-source-time\">{}</span>", escape(&s)))
                 .unwrap_or_default()
         } else {
             String::new()
@@ -943,13 +1034,26 @@ mod tests {
     };
 
     fn text_ev(content: &str, n: u64) -> InterpreterOutputEvent {
-        text_ev_at(content, n, None)
+        text_ev_meta(content, n, None, None)
     }
 
     fn text_ev_at(
         content: &str,
         n: u64,
         source_time: Option<SourceTimeObservation>,
+    ) -> InterpreterOutputEvent {
+        text_ev_meta(content, n, source_time, None)
+    }
+
+    fn text_ev_step(content: &str, n: u64, step: u64) -> InterpreterOutputEvent {
+        text_ev_meta(content, n, None, Some(step))
+    }
+
+    fn text_ev_meta(
+        content: &str,
+        n: u64,
+        source_time: Option<SourceTimeObservation>,
+        source_step: Option<u64>,
     ) -> InterpreterOutputEvent {
         InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
             unit_id: UnitId::new(format!("s{n}")),
@@ -963,6 +1067,7 @@ mod tests {
             lane_ordinal: n,
             causal_parent_id: None,
             source_time,
+            source_step,
             unit: CanonicalUnit::Text(TextSentence {
                 sentence_id: UnitId::new(format!("s{n}")),
                 channel: TextChannel::PublicResponse,
@@ -974,7 +1079,7 @@ mod tests {
     }
 
     fn tool_ev(id: &str, name: &str, n: u64) -> InterpreterOutputEvent {
-        tool_ev_at(id, name, n, None)
+        tool_ev_meta(id, name, n, None, None)
     }
 
     fn tool_ev_at(
@@ -982,6 +1087,20 @@ mod tests {
         name: &str,
         n: u64,
         source_time: Option<SourceTimeObservation>,
+    ) -> InterpreterOutputEvent {
+        tool_ev_meta(id, name, n, source_time, None)
+    }
+
+    fn tool_ev_step(id: &str, name: &str, n: u64, step: u64) -> InterpreterOutputEvent {
+        tool_ev_meta(id, name, n, None, Some(step))
+    }
+
+    fn tool_ev_meta(
+        id: &str,
+        name: &str,
+        n: u64,
+        source_time: Option<SourceTimeObservation>,
+        source_step: Option<u64>,
     ) -> InterpreterOutputEvent {
         InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
             unit_id: UnitId::new(format!("t{n}")),
@@ -995,6 +1114,7 @@ mod tests {
             lane_ordinal: n,
             causal_parent_id: None,
             source_time,
+            source_step,
             unit: CanonicalUnit::Tool(ToolActionEvent {
                 tool_action_id: ToolActionId::new(id),
                 tool_name: Some(name.into()),
@@ -1192,6 +1312,56 @@ mod tests {
         );
         assert_eq!(p.confidence, ProjectionConfidence::EmitOrder);
         assert_eq!(p.lines[0].role, ChatRole::Tool);
+    }
+
+    /// Antigravity-like: no wall-clock times, but stream `source_step` present.
+    /// Emit order can put later-step text before earlier-step tools (or reverse);
+    /// human chat follows stepIdx / messageId.
+    #[test]
+    fn source_step_orders_when_times_absent() {
+        let events = vec![
+            // Emit: tools first, then text — but text has lower step than one tool
+            // (simulate out-of-order completion relative to dialect sequence).
+            tool_ev_step("call-a", "Create file", 1, 5),
+            tool_ev_step("call-b", "Read file", 2, 8),
+            text_ev_step("I'll start the CRUD.", 3, 2),
+            text_ev_step("1. **CREATE** — done.", 4, 11),
+        ];
+        let p = project_chat_with(
+            &events,
+            &ProjectChatOptions {
+                allow_structural_zip: false,
+                order_by_source_time: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.confidence, ProjectionConfidence::DialectSourceStep);
+        assert!(
+            p.strategy_reason.contains("source_step"),
+            "{}",
+            p.strategy_reason
+        );
+        let roles: Vec<_> = p.lines.iter().map(|l| l.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                ChatRole::Agent, // step 2
+                ChatRole::Tool,  // step 5
+                ChatRole::Tool,  // step 8
+                ChatRole::Agent, // step 11
+            ],
+            "human order by source_step: {roles:?}"
+        );
+        assert!(
+            p.lines[0].text.contains("I'll start"),
+            "intro first: {:?}",
+            p.lines[0]
+        );
+        assert!(
+            p.plain_text.contains("s=2") || p.lines[0].source_step == Some(2),
+            "step annotation: {}",
+            p.plain_text
+        );
     }
 
     #[test]

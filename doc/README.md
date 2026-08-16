@@ -38,6 +38,14 @@ Initial Connector implementation profiles:
   Grok Build WebSocket server, multiple independently correlated sessions.
 - [Cursor Agent Connector](CURSOR_CONNECTOR.md) — Cursor CLI `agent acp` over
   stdio NDJSON (ACP family; Cursor profile).
+- [Antigravity (agy) Connector](AGY_CONNECTOR.md) — Google Antigravity via
+  stdio ACP (`agy-acp` bridge until native `agy --acp` ships).
+- [OpenAI Codex Connector](CODEX_CONNECTOR.md) — Codex via stdio ACP
+  (`@agentclientprotocol/codex-acp` adapter over Codex App Server).
+- [Z.ai CLI Connector](ZAI_CONNECTOR.md) — Z.ai `zai -p` headless OpenAI-chat
+  NDJSON (not ACP; tools execute inside the CLI).
+- [Claude Code Connector](CLAUDE_CONNECTOR.md) — Claude Code
+  `claude -p --output-format stream-json` (not ACP; native timestamps).
 
 Test infrastructure:
 

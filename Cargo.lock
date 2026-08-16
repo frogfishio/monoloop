@@ -369,6 +369,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "monoloop-connector-agy"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "monoloop-connector",
+ "monoloop-contracts",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "monoloop-connector-claude"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "monoloop-connector",
+ "monoloop-contracts",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "monoloop-connector-codex"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "monoloop-connector",
+ "monoloop-contracts",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "monoloop-connector-cursor"
 version = "0.1.0"
 dependencies = [
@@ -399,6 +445,22 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "monoloop-connector-zai"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "monoloop-connector",
+ "monoloop-contracts",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -444,8 +506,12 @@ dependencies = [
  "futures-util",
  "http",
  "monoloop-connector",
+ "monoloop-connector-agy",
+ "monoloop-connector-claude",
+ "monoloop-connector-codex",
  "monoloop-connector-cursor",
  "monoloop-connector-grok",
+ "monoloop-connector-zai",
  "monoloop-contracts",
  "monoloop-interpreter",
  "monoloop-loop",

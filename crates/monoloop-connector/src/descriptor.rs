@@ -11,6 +11,14 @@ pub enum ConnectorKind {
     GrokBuild,
     /// Cursor process/socket ACP.
     Cursor,
+    /// Google Antigravity (`agy`) process ACP (often via agy-acp bridge).
+    Antigravity,
+    /// OpenAI Codex process ACP (via codex-acp adapter).
+    Codex,
+    /// Z.ai CLI process (headless OpenAI-chat NDJSON).
+    Zai,
+    /// Claude Code process (headless stream-json NDJSON).
+    Claude,
     /// Extension point.
     Other(String),
 }
@@ -105,6 +113,58 @@ impl ConnectorDescriptor {
             implementation_version: env!("CARGO_PKG_VERSION").into(),
             transport_kind: "process_stdio".into(),
             supported_dialects: vec!["acp/json_rpc".into(), "cursor_acp/ndjson".into()],
+            raw_boundary: RawBoundary::ProcessPipe,
+            control_capabilities: ControlCapabilities::default(),
+        }
+    }
+
+    /// Descriptor for the Antigravity / agy ACP connector (stdio NDJSON).
+    pub fn agy_acp() -> Self {
+        Self {
+            connector_kind: ConnectorKind::Antigravity,
+            implementation_id: "monoloop.agy_acp".into(),
+            implementation_version: env!("CARGO_PKG_VERSION").into(),
+            transport_kind: "process_stdio".into(),
+            supported_dialects: vec!["acp/json_rpc".into(), "agy_acp/ndjson".into()],
+            raw_boundary: RawBoundary::ProcessPipe,
+            control_capabilities: ControlCapabilities::default(),
+        }
+    }
+
+    /// Descriptor for the OpenAI Codex ACP connector (stdio NDJSON via codex-acp).
+    pub fn codex_acp() -> Self {
+        Self {
+            connector_kind: ConnectorKind::Codex,
+            implementation_id: "monoloop.codex_acp".into(),
+            implementation_version: env!("CARGO_PKG_VERSION").into(),
+            transport_kind: "process_stdio".into(),
+            supported_dialects: vec!["acp/json_rpc".into(), "codex_acp/ndjson".into()],
+            raw_boundary: RawBoundary::ProcessPipe,
+            control_capabilities: ControlCapabilities::default(),
+        }
+    }
+
+    /// Descriptor for the Z.ai CLI connector (headless NDJSON chat messages).
+    pub fn zai_cli() -> Self {
+        Self {
+            connector_kind: ConnectorKind::Zai,
+            implementation_id: "monoloop.zai_cli".into(),
+            implementation_version: env!("CARGO_PKG_VERSION").into(),
+            transport_kind: "process_stdio".into(),
+            supported_dialects: vec!["zai_cli/ndjson".into(), "openai_chat/ndjson".into()],
+            raw_boundary: RawBoundary::ProcessPipe,
+            control_capabilities: ControlCapabilities::default(),
+        }
+    }
+
+    /// Descriptor for the Claude Code connector (headless stream-json NDJSON).
+    pub fn claude_code() -> Self {
+        Self {
+            connector_kind: ConnectorKind::Claude,
+            implementation_id: "monoloop.claude_code".into(),
+            implementation_version: env!("CARGO_PKG_VERSION").into(),
+            transport_kind: "process_stdio".into(),
+            supported_dialects: vec!["claude_code/stream_json".into(), "claude_code/ndjson".into()],
             raw_boundary: RawBoundary::ProcessPipe,
             control_capabilities: ControlCapabilities::default(),
         }
