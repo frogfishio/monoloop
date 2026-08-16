@@ -9,7 +9,9 @@ mod chat_projector;
 mod console;
 mod distribute;
 mod driver;
+mod grok_serve;
 mod html_report;
+mod live_grok;
 mod pipeline;
 
 pub use chat_projector::{
@@ -27,9 +29,13 @@ pub use driver::{
     run_bytes_pipeline, run_bytes_pipeline_with_params, DriverRunReport, PipelineParams,
     PipelineRawDump, RawInputFrame,
 };
+pub use grok_serve::{GrokServeOptions, ManagedGrokServe};
 pub use html_report::{
     build_html_report, join_sentences_as_markdown, markdown_to_html, write_html_report, HtmlReport,
     HtmlReportParams,
+};
+pub use live_grok::{
+    run_live_grok_prompt, LiveGrokArtifactPaths, LiveGrokRunOptions, LiveGrokRunReport,
 };
 pub use pipeline::{
     acp_binding, collect_interpretation, feed_chunks, interpret_and_render, interpret_bytes,

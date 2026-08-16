@@ -67,17 +67,15 @@ println!("{}", report.raw_dump.unwrap().format_text());
 ### Live Grok Build CRUD (event sequence)
 
 ```bash
-# Detached serve (do not block a parent agent on `grok serve`)
-./scripts/grok-serve-detached.sh
+# Managed live run (driver starts Grok serve, runs prompt, stops serve):
+export GROK_AGENT_SECRET=monoloop-live-test   # optional; default monoloop-live-test
+cargo run -p monoloop-testkit --example live_grok_ask -- --preset crud
+cargo run -p monoloop-testkit --example live_grok_ask -- --preset analyze
+cargo run -p monoloop-testkit --example live_grok_ask -- "Your free-form question"
+open target/live_grok_ask.html   # or live_grok_crud / live_grok_analyze
 
-export GROK_AGENT_SECRET=monoloop-live-test
-# Optional: bound prompt wait (defaults: crud 180s, analyze 120s)
-# export GROK_PROMPT_TIMEOUT_SECS=300
-cargo run -p monoloop-testkit --example live_grok_crud
-# or: cargo run -p monoloop-testkit --example live_grok_analyze
-open target/live_grok_crud.html
-
-./scripts/grok-serve-stop.sh
+# Optional safety ceiling only (default: wait until Grok finishes, ≤ 2h RPC deadline):
+# GROK_PROMPT_CEILING_SECS=3600 cargo run -p monoloop-testkit --example live_grok_ask -- --preset analyze
 
 # Re-assemble HTML from a saved raw dump (no live Grok needed):
 cargo run -p monoloop-testkit --example replay_raw_html -- target/live_grok_crud.raw.txt
