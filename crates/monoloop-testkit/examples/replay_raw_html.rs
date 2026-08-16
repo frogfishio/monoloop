@@ -1,13 +1,16 @@
-//! Replay a saved raw dump through Interpreter → HTML review (no live Grok).
+//! Replay a saved raw dump through Interpreter → HTML review (no live agent).
+//!
+//! Works for Grok WebSocket dumps and Cursor NDJSON dumps (`>>` / `<<` lines).
 //!
 //! ```bash
 //! cargo run -p monoloop-testkit --example replay_raw_html -- target/live_grok_crud.raw.txt
-//! open target/live_grok_crud.replay.html
+//! cargo run -p monoloop-testkit --example replay_raw_html -- target/live_cursor_ask.raw.txt
+//! open target/live_cursor_ask.replay.html
 //! ```
 
 use monoloop_testkit::{
-    acp_binding, build_html_report, run_bytes_pipeline_with_params, write_html_report,
-    HtmlReportParams, PipelineParams,
+    acp_binding, build_html_report, cursor_acp_binding, run_bytes_pipeline_with_params,
+    write_html_report, HtmlReportParams, PipelineParams,
 };
 use std::path::{Path, PathBuf};
 
@@ -21,28 +24,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let raw = std::fs::read_to_string(&raw_path)?;
-    let frames = extract_json_frames(&raw);
-    println!("extracted {} JSON frames from {}", frames.len(), raw_path.display());
+    let dialect_kind = detect_dialect(&raw_path, &raw);
+    let frames = extract_json_frames(&raw, dialect_kind);
+    println!(
+        "extracted {} JSON frames from {} (dialect={dialect_kind:?})",
+        frames.len(),
+        raw_path.display()
+    );
 
-    // Feed each complete JSON object as its own byte chunk (plus newline) —
-    // fragmentation-invariant Interpreter path.
     let chunks: Vec<bytes::Bytes> = frames
         .into_iter()
         .map(|j| bytes::Bytes::from(format!("{j}\n")))
         .collect();
 
+    let dialect = match dialect_kind {
+        DialectKind::CursorAcp => cursor_acp_binding(),
+        DialectKind::AcpGrok => acp_binding(),
+    };
+    let title = match dialect_kind {
+        DialectKind::CursorAcp => "Cursor ACP — replayed assembly".to_string(),
+        DialectKind::AcpGrok => "Grok/ACP — replayed assembly".to_string(),
+    };
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let report = rt.block_on(run_bytes_pipeline_with_params(
-        acp_binding(),
+        dialect,
         &chunks,
         PipelineParams {
             render_console: false,
             dump_raw: false,
             html_dump_path: None,
             html_params: HtmlReportParams {
-                title: "Live Grok CRUD — replayed assembly".into(),
+                title,
                 ..HtmlReportParams::default()
             },
             build_html: true,
@@ -53,7 +68,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = out_path_for(&raw_path);
     write_html_report(&out, &html)?;
 
-    // Also refresh sequence summary for quick inspection.
     let seq_path = out.with_extension("sequence.txt");
     let mut seq = String::new();
     seq.push_str("=== REPLAY — CANONICAL TEXT SENTENCES ===\n");
@@ -61,27 +75,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seq.push_str(&format!("{i:04} | {line}\n"));
     }
     seq.push_str(&format!(
-        "\nsentences={} timeline_rows={}\nassembled markdown:\n{}\n",
-        html.sentence_count, html.timeline_rows, html.assembled_markdown
+        "\nsentences={} timeline_rows={} strategy={:?} confidence={:?}\nassembled markdown:\n{}\n",
+        html.sentence_count,
+        html.timeline_rows,
+        html.chat_projection.strategy,
+        html.chat_projection.confidence,
+        html.assembled_markdown
     ));
+    seq.push_str("\n=== CHAT PROJECTION ===\n");
+    seq.push_str(&html.chat_projection.plain_text);
     std::fs::write(&seq_path, seq)?;
+
+    let chat_path = out.with_extension("chat.txt");
+    std::fs::write(&chat_path, &html.chat_projection.plain_text)?;
 
     println!("wrote {}", out.display());
     println!("wrote {}", seq_path.display());
+    println!("wrote {}", chat_path.display());
     println!(
-        "sentences={} timeline_rows={}",
-        html.sentence_count, html.timeline_rows
+        "sentences={} timeline_rows={} confidence={:?}",
+        html.sentence_count, html.timeline_rows, html.chat_projection.confidence
     );
-    println!("--- assembled markdown ---");
-    println!("{}", html.assembled_markdown);
+    println!("--- chat projection ---");
+    println!("{}", html.chat_projection.plain_text);
 
-    // Standalone build also keeps the API warm for tools without pipeline.
     let _ = build_html_report(&[], &HtmlReportParams::default());
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialectKind {
+    AcpGrok,
+    CursorAcp,
+}
+
+fn detect_dialect(path: &Path, raw: &str) -> DialectKind {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.contains("cursor") || raw.contains("<< {") || raw.lines().any(|l| l.starts_with("<< "))
+    {
+        DialectKind::CursorAcp
+    } else {
+        DialectKind::AcpGrok
+    }
+}
+
 fn out_path_for(raw: &Path) -> PathBuf {
-    // target/live_grok_crud.raw.txt → target/live_grok_crud.replay.html
     let name = raw
         .file_name()
         .and_then(|s| s.to_str())
@@ -93,19 +135,31 @@ fn out_path_for(raw: &Path) -> PathBuf {
     raw.with_file_name(format!("{base}.replay.html"))
 }
 
-/// Pull complete JSON objects from a raw dump text file (frame-annotated or not).
-fn extract_json_frames(raw: &str) -> Vec<String> {
+/// Pull complete JSON objects useful for interpretation.
+///
+/// For Cursor dumps with `>>` / `<<` prefixes, only **inbound** (`<<`) lines that
+/// carry `session/update` (or prompt `stopReason` results) are kept.
+fn extract_json_frames(raw: &str, kind: DialectKind) -> Vec<String> {
     let mut out = Vec::new();
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        // skip to next '{'
         while i < bytes.len() && bytes[i] != b'{' {
             i += 1;
         }
         if i >= bytes.len() {
             break;
         }
+        // Cursor dump: only take JSON that follows an inbound marker on this line.
+        let line_start = raw[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let prefix = &raw[line_start..i];
+        let inbound = match kind {
+            DialectKind::CursorAcp => {
+                prefix.contains("<<") || (!prefix.contains(">>") && prefix.trim().is_empty())
+            }
+            DialectKind::AcpGrok => true,
+        };
+
         let start = i;
         let mut depth = 0i32;
         let mut in_str = false;
@@ -129,8 +183,7 @@ fn extract_json_frames(raw: &str) -> Vec<String> {
                         if depth == 0 {
                             i += 1;
                             if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
-                                // Keep session traffic + results; skip pure dump headers.
-                                if s.contains("jsonrpc") || s.contains("sessionUpdate") {
+                                if inbound && keep_frame(s, kind) {
                                     out.push(s.to_string());
                                 }
                             }
@@ -147,4 +200,19 @@ fn extract_json_frames(raw: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn keep_frame(s: &str, kind: DialectKind) -> bool {
+    if !(s.contains("jsonrpc") || s.contains("sessionUpdate") || s.contains("session/update")) {
+        return false;
+    }
+    match kind {
+        // Interpretation cares about streamed updates + terminal stopReason.
+        DialectKind::CursorAcp => {
+            s.contains("session/update")
+                || s.contains("stopReason")
+                || s.contains("\"method\":\"session/update\"")
+        }
+        DialectKind::AcpGrok => true,
+    }
 }

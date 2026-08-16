@@ -74,6 +74,9 @@ impl CursorAgentHandle {
     }
 
     /// Create a new session (`session/new`). Returns Cursor sessionId.
+    ///
+    /// When `mode_id` / `model_id` are set, applies them via ACP
+    /// `session/set_mode` and `session/set_config_option` (no ambient default).
     pub async fn session_new(
         &self,
         config: CursorSessionConfig,
@@ -93,10 +96,17 @@ impl CursorAgentHandle {
             .and_then(|s| s.as_str())
             .ok_or_else(|| CursorConnectorError::session("session/new missing sessionId"))?
             .to_string();
-        Ok(CursorSession {
+        let session = CursorSession {
             session_id,
             inner: Arc::clone(&self.inner),
-        })
+        };
+        if let Some(mode) = &config.mode_id {
+            session.set_mode(mode).await?;
+        }
+        if let Some(model) = &config.model_id {
+            session.set_model(model).await?;
+        }
+        Ok(session)
     }
 
     /// Explicit session load (no most-recent heuristic).
@@ -160,6 +170,55 @@ impl CursorSession {
     /// Opaque external session id for Monoloop envelopes.
     pub fn external_session_id(&self) -> ExternalSessionId {
         ExternalSessionId::new(self.session_id.clone())
+    }
+
+    /// Set session mode (`agent` | `plan` | `ask`) via `session/set_mode`.
+    pub async fn set_mode(&self, mode_id: impl AsRef<str>) -> Result<(), CursorConnectorError> {
+        let mode_id = mode_id.as_ref();
+        self.inner
+            .request(
+                "session/set_mode",
+                serde_json::json!({
+                    "sessionId": self.session_id,
+                    "modeId": mode_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Set the model config option via `session/set_config_option` (`configId=model`).
+    pub async fn set_model(&self, model_id: impl AsRef<str>) -> Result<(), CursorConnectorError> {
+        let model_id = model_id.as_ref();
+        self.inner
+            .request(
+                "session/set_config_option",
+                serde_json::json!({
+                    "sessionId": self.session_id,
+                    "configId": "model",
+                    "value": model_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Set an arbitrary advertised config option by id.
+    pub async fn set_config_option(
+        &self,
+        config_id: impl AsRef<str>,
+        value: impl Into<serde_json::Value>,
+    ) -> Result<serde_json::Value, CursorConnectorError> {
+        self.inner
+            .request(
+                "session/set_config_option",
+                serde_json::json!({
+                    "sessionId": self.session_id,
+                    "configId": config_id.as_ref(),
+                    "value": value.into(),
+                }),
+            )
+            .await
     }
 
     /// Send `session/prompt` and wait for the terminal RPC result (`stopReason`).

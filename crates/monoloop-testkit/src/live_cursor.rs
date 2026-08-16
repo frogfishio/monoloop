@@ -23,6 +23,8 @@ pub struct LiveCursorRunOptions {
     pub cwd: PathBuf,
     /// Agent process config.
     pub agent: CursorAgentConfig,
+    /// Session create options (mode / model).
+    pub session: CursorSessionConfig,
     /// HTML title.
     pub title: String,
     /// Artifact stem (`{stem}.html`, `.raw.txt`, `.sequence.txt`, `.chat.txt`).
@@ -44,13 +46,26 @@ impl LiveCursorRunOptions {
         agent.auto_allow_permissions = true;
         Self {
             prompt: prompt.into(),
-            cwd: project,
+            cwd: project.clone(),
             agent,
+            session: CursorSessionConfig::new(project).with_agent_mode(),
             title: "Live Cursor ACP — interpretation review".into(),
             artifact_stem: stem,
             render_console: true,
             drain_after_prompt: Duration::from_millis(200),
         }
+    }
+
+    /// Ask mode (no tools/edits) convenience.
+    pub fn with_ask_mode(mut self) -> Self {
+        self.session = self.session.with_ask_mode();
+        self
+    }
+
+    /// Agent mode (tools) convenience.
+    pub fn with_agent_mode(mut self) -> Self {
+        self.session = self.session.with_agent_mode();
+        self
     }
 }
 
@@ -98,8 +113,10 @@ pub async fn run_live_cursor_prompt(
         .await
         .map_err(|e| e.to_string())?;
     let mut updates = agent.take_updates();
+    let mut session_cfg = opts.session.clone();
+    session_cfg.cwd = opts.cwd.clone();
     let session = agent
-        .session_new(CursorSessionConfig::new(&opts.cwd))
+        .session_new(session_cfg)
         .await
         .map_err(|e| e.to_string())?;
     let session_id = session.session_id.clone();
@@ -134,9 +151,9 @@ pub async fn run_live_cursor_prompt(
 
     // Brief drain for trailing updates after stopReason.
     tokio::time::sleep(opts.drain_after_prompt).await;
-    // Dropping agent/session after cancel of pump: finish interpretation.
-    // Abort update pump by shutting down agent (closes stdout).
-    // First finish clean so segmenter seals.
+    // Snapshot raw dump before process teardown.
+    let dump_text = agent.raw_dump_text();
+    // Finish interpretation cleanly, then shut down agent (closes update stream).
     let _ = interp.input.finish_clean().await;
     agent.shutdown().await;
     let _ = pump.await;
@@ -171,8 +188,9 @@ pub async fn run_live_cursor_prompt(
     write_html_report(&html_path, &html).map_err(|e| e.to_string())?;
 
     let raw_path = PathBuf::from(format!("{}.raw.txt", opts.artifact_stem.display()));
-    // dump already written live if configured; refresh from handle if empty
-    if !raw_path.is_file() {
+    if !dump_text.is_empty() {
+        let _ = std::fs::write(&raw_path, &dump_text);
+    } else if !raw_path.is_file() {
         let _ = std::fs::write(&raw_path, "");
     }
 

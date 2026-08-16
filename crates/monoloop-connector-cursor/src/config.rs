@@ -72,13 +72,17 @@ impl CursorAgentConfig {
     }
 }
 
-/// Session create parameters (`session/new`).
+/// Session create parameters (`session/new` + optional mode/model).
 #[derive(Clone, Debug)]
 pub struct CursorSessionConfig {
     /// Session working directory.
     pub cwd: PathBuf,
     /// MCP servers (opaque JSON; usually empty for monoloop).
     pub mcp_servers: serde_json::Value,
+    /// ACP mode after create: `agent` | `plan` | `ask` (via `session/set_mode`).
+    pub mode_id: Option<String>,
+    /// Model config option value (via `session/set_config_option` id=`model`).
+    pub model_id: Option<String>,
 }
 
 impl CursorSessionConfig {
@@ -87,6 +91,32 @@ impl CursorSessionConfig {
         Self {
             cwd: cwd.into(),
             mcp_servers: serde_json::json!([]),
+            mode_id: None,
+            model_id: None,
         }
+    }
+
+    /// Request ask mode (Q&A / no edits).
+    pub fn with_ask_mode(mut self) -> Self {
+        self.mode_id = Some("ask".into());
+        self
+    }
+
+    /// Request plan mode (read-only planning).
+    pub fn with_plan_mode(mut self) -> Self {
+        self.mode_id = Some("plan".into());
+        self
+    }
+
+    /// Request agent mode (full tools).
+    pub fn with_agent_mode(mut self) -> Self {
+        self.mode_id = Some("agent".into());
+        self
+    }
+
+    /// Select a model config value advertised by `session/new` (e.g. `composer-2.5[fast=true]`).
+    pub fn with_model(mut self, model_id: impl Into<String>) -> Self {
+        self.model_id = Some(model_id.into());
+        self
     }
 }
