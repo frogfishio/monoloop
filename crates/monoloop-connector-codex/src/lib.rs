@@ -133,9 +133,13 @@ async fn open_raw(
     };
 
     let dialect = DialectBinding::negotiated(DialectDescriptor::codex_acp("1"));
-    let max_chunk = request.limits.buffers.max_chunk_bytes.max(64 * 1024);
-    let (in_tx, mut in_rx) = mpsc::channel::<RawInputMessage>(32);
-    let (out_tx, out_rx) = mpsc::channel(config.max_output_queue);
+    let max_chunk = request.limits.buffers.max_chunk_bytes.max(1);
+    let in_capacity = (request.limits.buffers.max_queued_input_bytes.max(1) / max_chunk).max(1);
+    let out_capacity = (request.limits.buffers.max_queued_output_bytes.max(1) / max_chunk)
+        .max(1)
+        .min(config.max_output_queue.max(1));
+    let (in_tx, mut in_rx) = mpsc::channel::<RawInputMessage>(in_capacity);
+    let (out_tx, out_rx) = mpsc::channel(out_capacity);
     let (end_tx, end_rx) = oneshot::channel::<ConnectionEnd>();
 
     let input = RawInputHandle::new(
@@ -164,29 +168,58 @@ async fn open_raw(
         }
     });
 
+    let control_wait = control.clone();
     tokio::spawn(async move {
         let mut bytes_accepted = 0u64;
-        while let Some(msg) = in_rx.recv().await {
-            match msg {
-                RawInputMessage::Bytes(b) => {
-                    bytes_accepted += b.len() as u64;
-                    let text = String::from_utf8_lossy(&b).into_owned();
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    let _ = session.prompt_text(text).await;
+        let (end_kind, initiated, safe_err) = loop {
+            tokio::select! {
+                biased;
+                _ = control_wait.interrupted() => {
+                    let kind = if control_state.terminate_requested() {
+                        ConnectionEndKind::Terminated
+                    } else {
+                        ConnectionEndKind::Cancelled
+                    };
+                    let _ = session.cancel().await;
+                    break (kind, EndInitiator::LocalControl, None);
                 }
-                RawInputMessage::Finish => break,
+                msg = in_rx.recv() => {
+                    match msg {
+                        Some(RawInputMessage::Bytes(b)) => {
+                            bytes_accepted += b.len() as u64;
+                            let text = String::from_utf8_lossy(&b).into_owned();
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            if let Err(e) = session.prompt_text(text).await {
+                                break (
+                                    ConnectionEndKind::TransportFailure,
+                                    EndInitiator::LocalTransport,
+                                    Some(safe_prompt_error(&e)),
+                                );
+                            }
+                        }
+                        Some(RawInputMessage::Finish) | None => {
+                            break (
+                                ConnectionEndKind::LocalShutdown,
+                                EndInitiator::LocalControl,
+                                None,
+                            );
+                        }
+                    }
+                }
             }
-        }
+        };
+
         agent.shutdown().await;
+        control_state.mark_terminal();
         let _ = end_tx.send(ConnectionEnd {
             connection_id: connection_id.clone(),
-            kind: ConnectionEndKind::LocalShutdown,
-            initiated_by: EndInitiator::LocalControl,
+            kind: end_kind,
+            initiated_by: initiated,
             bytes_accepted,
             bytes_received: 0,
-            safe_transport_error: None,
+            safe_transport_error: safe_err,
         });
     });
 
@@ -199,4 +232,17 @@ async fn open_raw(
         control,
         completion,
     })
+}
+
+fn safe_prompt_error(e: &CodexConnectorError) -> String {
+    match e.kind {
+        monoloop_contracts::ConnectorErrorKind::DeadlineExceeded => {
+            "prompt_rpc_deadline_exceeded".into()
+        }
+        monoloop_contracts::ConnectorErrorKind::Cancelled => "prompt_cancelled".into(),
+        monoloop_contracts::ConnectorErrorKind::ConnectionFailed => "prompt_connection_failed".into(),
+        monoloop_contracts::ConnectorErrorKind::ProtocolFailed => "prompt_protocol_failed".into(),
+        monoloop_contracts::ConnectorErrorKind::SessionFailed => "prompt_session_failed".into(),
+        _ => "prompt_failed".into(),
+    }
 }

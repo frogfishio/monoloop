@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Codex ACP smoke (via `codex-acp` bridge) → HTML review.
 //!
 //! ```bash

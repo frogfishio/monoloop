@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Claude Code smoke (`stream-json`) → HTML review.
 //!
 //! ```bash

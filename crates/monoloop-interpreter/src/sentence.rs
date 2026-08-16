@@ -58,31 +58,25 @@ impl SentenceSegmenter {
 
     fn drain_complete(&mut self, seal_remainder: bool) -> Vec<CompletedSentence> {
         let mut out = Vec::new();
-        loop {
-            if let Some(end) = find_sentence_end(&self.buf) {
-                let raw = self.buf[..end].to_string();
-                let content = raw.trim_end().to_string();
-                // Content region ends at last non-whitespace of `raw` (usually `end`
-                // when the terminator is non-whitespace).
-                let content_bytes = content.len();
-                // advance past end and following whitespace (but keep newlines as
-                // paragraph hints only by dropping them from the next sentence start)
-                let mut consume = end;
-                while consume < self.buf.len()
-                    && self.buf.as_bytes()[consume].is_ascii_whitespace()
-                {
-                    consume += 1;
-                }
-                self.buf = self.buf[consume..].to_string();
-                if !content.is_empty() {
-                    out.push(CompletedSentence {
-                        content,
-                        content_bytes,
-                        bytes_consumed: consume,
-                    });
-                }
-            } else {
-                break;
+        while let Some(end) = find_sentence_end(&self.buf) {
+            let raw = self.buf[..end].to_string();
+            let content = raw.trim_end().to_string();
+            // Content region ends at last non-whitespace of `raw` (usually `end`
+            // when the terminator is non-whitespace).
+            let content_bytes = content.len();
+            // advance past end and following whitespace (but keep newlines as
+            // paragraph hints only by dropping them from the next sentence start)
+            let mut consume = end;
+            while consume < self.buf.len() && self.buf.as_bytes()[consume].is_ascii_whitespace() {
+                consume += 1;
+            }
+            self.buf = self.buf[consume..].to_string();
+            if !content.is_empty() {
+                out.push(CompletedSentence {
+                    content,
+                    content_bytes,
+                    bytes_consumed: consume,
+                });
             }
         }
         if seal_remainder && !self.buf.trim().is_empty() {

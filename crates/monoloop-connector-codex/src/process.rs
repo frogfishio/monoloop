@@ -72,27 +72,23 @@ impl ProcessInner {
 
         {
             let this = Arc::clone(&inner);
+            let max_line = this.config.max_line_bytes;
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
+                    match read_line_bounded(&mut reader, max_line).await {
+                        Ok(None) => break,
+                        Ok(Some(line)) => {
                             let trimmed = line.trim_end_matches(['\r', '\n']);
                             if trimmed.is_empty() {
-                                continue;
-                            }
-                            if trimmed.len() > this.config.max_line_bytes {
-                                warn!("codex acp line exceeds max_line_bytes; dropping");
                                 continue;
                             }
                             this.dump.push_line(format!("<< {trimmed}"));
                             this.handle_inbound_line(trimmed).await;
                         }
                         Err(e) => {
-                            debug!("codex stdout read error: {e}");
+                            warn!("codex acp stdout bound/protocol failure: {e}");
+                            this.fail_all_pending(e).await;
                             break;
                         }
                     }
@@ -106,14 +102,13 @@ impl ProcessInner {
         }
 
         if let Some(err) = stderr {
+            let max_line = inner.config.max_line_bytes.min(64 * 1024);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(err);
-                let mut line = String::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
+                    match read_line_bounded(&mut reader, max_line).await {
+                        Ok(None) => break,
+                        Ok(Some(line)) => {
                             let t = line.trim();
                             if !t.is_empty() {
                                 debug!(target: "codex_agent", "stderr: {t}");
@@ -281,5 +276,48 @@ impl ProcessInner {
         }
         self.fail_all_pending(CodexConnectorError::cancelled())
             .await;
+    }
+}
+
+/// Read one line with a hard byte cap. Returns `Ok(None)` on EOF with empty buffer.
+async fn read_line_bounded<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<String>, CodexConnectorError> {
+    let max_bytes = max_bytes.max(1);
+    let mut buf = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|e| CodexConnectorError::connection(format!("stdout read: {e}")))?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if buf.len() + take > max_bytes {
+                reader.consume(take);
+                return Err(CodexConnectorError::protocol(
+                    "ndjson line exceeds max_line_bytes",
+                ));
+            }
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if buf.len() + available.len() > max_bytes {
+            let n = available.len();
+            reader.consume(n);
+            return Err(CodexConnectorError::protocol(
+                "ndjson line exceeds max_line_bytes",
+            ));
+        }
+        let n = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(n);
     }
 }

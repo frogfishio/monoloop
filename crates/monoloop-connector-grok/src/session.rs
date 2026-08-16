@@ -167,6 +167,7 @@ pub struct SessionEnd {
 
 pub(crate) struct SessionInner {
     pub(crate) session_id: GrokSessionId,
+    #[allow(dead_code)]
     pub(crate) connection_id: ConnectionId,
     pub(crate) server: Arc<ServerInner>,
     pub(crate) out_tx: mpsc::Sender<Bytes>,

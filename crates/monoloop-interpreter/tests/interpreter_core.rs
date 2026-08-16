@@ -1,3 +1,4 @@
+#![allow(clippy::while_let_loop)]
 //! Interpreter fragmentation, sentence, and ACP mapping tests.
 
 use monoloop_contracts::{
@@ -56,8 +57,11 @@ fn text_contents(events: &[InterpreterOutputEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match e {
-            InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(s)) => match &s.unit {
-                CanonicalUnit::Text(t) => Some(t.content.clone()),
+            InterpreterOutputEvent::Unit(u) => match u.as_ref() {
+                CanonicalUnitEvent::Created(s) => match &s.unit {
+                    CanonicalUnit::Text(t) => Some(t.content.clone()),
+                    _ => None,
+                },
                 _ => None,
             },
             _ => None,
@@ -76,7 +80,7 @@ async fn fragmentation_invariant_plain_text() {
     .await;
     let c = run_chunks(
         test_d(),
-        &full.iter().map(|x| std::slice::from_ref(x)).collect::<Vec<_>>(),
+        &full.iter().map(std::slice::from_ref).collect::<Vec<_>>(),
     )
     .await;
 
@@ -110,9 +114,11 @@ async fn no_partial_sentence_on_abrupt_end() {
     let mut end_kind = None;
     loop {
         match interp.events.recv().await {
-            Some(InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(s))) => {
-                if let CanonicalUnit::Text(t) = &s.unit {
-                    texts.push(t.content.clone());
+            Some(InterpreterOutputEvent::Unit(u)) => {
+                if let CanonicalUnitEvent::Created(s) = u.as_ref() {
+                    if let CanonicalUnit::Text(t) = &s.unit {
+                        texts.push(t.content.clone());
+                    }
                 }
             }
             Some(InterpreterOutputEvent::Ended(e)) => {
@@ -120,7 +126,6 @@ async fn no_partial_sentence_on_abrupt_end() {
                 assert!(e.unresolved_text_bytes > 0);
                 break;
             }
-            Some(_) => {}
             None => break,
         }
     }
@@ -243,7 +248,7 @@ async fn acp_source_step_propagates_to_sentences_and_tools() {
         })
         .collect();
     assert!(
-        tool_steps.iter().any(|s| *s == 3),
+        tool_steps.contains(&3),
         "tool source_step: {tool_steps:?}"
     );
 
@@ -352,9 +357,12 @@ async fn sentence_complete_before_response_end() {
         .expect("timeout")
         .expect("event");
     match ev {
-        InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(s)) => {
+        InterpreterOutputEvent::Unit(u) => {
+            let CanonicalUnitEvent::Created(s) = u.as_ref() else {
+                panic!("expected created unit");
+            };
             assert_eq!(s.unit_state, UnitState::Complete);
-            match s.unit {
+            match &s.unit {
                 CanonicalUnit::Text(t) => {
                     assert_eq!(t.content, "First sentence.");
                     assert_eq!(t.channel, TextChannel::PublicResponse);
@@ -365,4 +373,45 @@ async fn sentence_complete_before_response_end() {
         other => panic!("unexpected {other:?}"),
     }
     interp.input.finish_clean().await.unwrap();
+}
+
+/// Reasoning and response lanes get independent ordinal sequences (D-006).
+#[tokio::test]
+async fn reasoning_and_response_lane_ordinals_independent() {
+    // Public reasoning summary requires public:true in ACP mapping; feed via test dialect
+    // by using ACP public thought + response chunks.
+    let thought = br#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","public":true,"content":{"type":"text","text":"Thinking carefully. "}}}}"#;
+    let resp = br#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Answer here."}}}}"#;
+    let events = run_chunks(acp(), &[thought, resp]).await;
+
+    let mut response_ords = Vec::new();
+    let mut reasoning_ords = Vec::new();
+    for e in &events {
+        let InterpreterOutputEvent::Unit(u) = e else { continue };
+        let CanonicalUnitEvent::Created(s) = u.as_ref() else { continue };
+        let CanonicalUnit::Text(t) = &s.unit else { continue };
+        match t.channel {
+            TextChannel::PublicResponse => {
+                response_ords.push((s.lane_id.as_str().to_string(), s.lane_ordinal, t.sentence_ordinal));
+            }
+            TextChannel::PublicReasoningSummary => {
+                reasoning_ords.push((s.lane_id.as_str().to_string(), s.lane_ordinal, t.sentence_ordinal));
+            }
+            _ => {}
+        }
+    }
+    // At least one response unit with matching ordinals on response lane.
+    assert!(
+        response_ords.iter().any(|(lane, lo, so)| lane == "response" && *lo == *so && *lo >= 1),
+        "response lane ordinals: {response_ords:?}"
+    );
+    if !reasoning_ords.is_empty() {
+        assert!(
+            reasoning_ords.iter().all(|(lane, lo, so)| lane == "reasoning" && *lo == *so && *lo >= 1),
+            "reasoning lane ordinals: {reasoning_ords:?}"
+        );
+        // Independent sequences: both can start at 1.
+        assert_eq!(reasoning_ords[0].1, 1);
+        assert_eq!(response_ords[0].1, 1);
+    }
 }

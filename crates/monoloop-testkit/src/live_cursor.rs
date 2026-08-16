@@ -43,7 +43,7 @@ impl LiveCursorRunOptions {
         let mut agent = CursorAgentConfig::for_project(project.clone());
         agent.raw_dump_path = Some(PathBuf::from(format!("{}.raw.txt", stem.display())));
         agent.rpc_deadline = Duration::from_secs(10 * 60);
-        agent.auto_allow_permissions = true;
+        agent = agent.with_auto_allow_permissions();
         Self {
             prompt: prompt.into(),
             cwd: project.clone(),

@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Cursor ACP smoke: short **ask-mode** prompt → HTML review.
 //!
 //! ```bash

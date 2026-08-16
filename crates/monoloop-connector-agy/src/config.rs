@@ -54,7 +54,8 @@ impl Default for AgyAgentConfig {
             rpc_deadline: Duration::from_secs(60),
             max_line_bytes: 8 * 1024 * 1024,
             max_output_queue: 256,
-            auto_allow_permissions: true,
+            // Fail closed: hosts must opt in to auto-approve tool permissions.
+            auto_allow_permissions: false,
             advertise_fs: false,
             raw_dump_path: None,
         }
@@ -86,9 +87,18 @@ impl AgyAgentConfig {
         self
     }
 
+    /// Opt in to auto-answering `session/request_permission` with allow-once.
+    ///
+    /// Only for trusted test sandboxes / unattended qualification.
+    pub fn with_auto_allow_permissions(mut self) -> Self {
+        self.auto_allow_permissions = true;
+        self
+    }
+
     /// Pass `--dangerously-skip-permissions` to the ACP bridge (unattended tools).
     ///
-    /// Only for trusted test sandboxes; maps to the agy-acp opt-in flag.
+    /// Only for trusted test sandboxes; maps to the agy-acp opt-in flag and also
+    /// enables client-side allow-once replies.
     pub fn with_skip_permissions(mut self) -> Self {
         if !self
             .args
@@ -99,6 +109,23 @@ impl AgyAgentConfig {
         }
         self.auto_allow_permissions = true;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_denies_auto_permissions() {
+        assert!(!AgyAgentConfig::default().auto_allow_permissions);
+    }
+
+    #[test]
+    fn skip_permissions_opts_in() {
+        assert!(AgyAgentConfig::default()
+            .with_skip_permissions()
+            .auto_allow_permissions);
     }
 }
 

@@ -4,6 +4,14 @@
 //! Product crates must not depend on this package.
 
 #![deny(missing_docs)]
+// Test-kit helpers prioritize clarity over every Clippy style preference.
+#![allow(
+    clippy::while_let_loop,
+    clippy::too_many_arguments,
+    clippy::field_reassign_with_default,
+    clippy::single_char_add_str,
+    dead_code
+)]
 
 mod chat_projector;
 mod console;

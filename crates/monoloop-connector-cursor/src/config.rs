@@ -49,7 +49,8 @@ impl Default for CursorAgentConfig {
             rpc_deadline: Duration::from_secs(60),
             max_line_bytes: 8 * 1024 * 1024,
             max_output_queue: 256,
-            auto_allow_permissions: true,
+            // Fail closed: hosts must opt in to auto-approve tool permissions.
+            auto_allow_permissions: false,
             advertise_fs: false,
             raw_dump_path: None,
         }
@@ -69,6 +70,32 @@ impl CursorAgentConfig {
     pub fn with_raw_dump(mut self, path: impl Into<PathBuf>) -> Self {
         self.raw_dump_path = Some(path.into());
         self
+    }
+
+    /// Opt in to auto-answering `session/request_permission` with allow-once.
+    ///
+    /// Only for trusted test sandboxes / unattended qualification. Product hosts
+    /// should inject an explicit permission policy instead.
+    pub fn with_auto_allow_permissions(mut self) -> Self {
+        self.auto_allow_permissions = true;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_denies_auto_permissions() {
+        assert!(!CursorAgentConfig::default().auto_allow_permissions);
+    }
+
+    #[test]
+    fn opt_in_enables_auto_permissions() {
+        assert!(CursorAgentConfig::default()
+            .with_auto_allow_permissions()
+            .auto_allow_permissions);
     }
 }
 

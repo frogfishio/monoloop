@@ -99,7 +99,7 @@ fn build_html_report_standalone() {
         InterpretationId, InterpreterOutputEvent, LaneId, TextChannel, TextSentence, UnitId,
         UnitState,
     };
-    let events = vec![InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(
+    let events = vec![InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
         CanonicalUnitSnapshot {
             unit_id: UnitId::new("s1"),
             unit_generation: 1,
@@ -121,7 +121,7 @@ fn build_html_report_standalone() {
                 content: "Only complete units appear.".into(),
             }),
         },
-    ))];
+    )))];
     let r = build_html_report(&events, &HtmlReportParams::default());
     assert_eq!(r.sentence_count, 1);
     assert!(r.assembled_markdown.contains("Only complete units appear."));

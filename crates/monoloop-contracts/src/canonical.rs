@@ -559,10 +559,19 @@ pub enum InterpretationEndKind {
 }
 
 /// Stream events delivered to subscribers (Interpreter output + end).
+///
+/// `Unit` is boxed so the enum stays small (strict Clippy large-variant rule).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InterpreterOutputEvent {
     /// Canonical unit lifecycle.
-    Unit(CanonicalUnitEvent),
+    Unit(Box<CanonicalUnitEvent>),
     /// Interpretation ended.
     Ended(InterpretationEnd),
+}
+
+impl InterpreterOutputEvent {
+    /// Wrap a unit lifecycle event.
+    pub fn unit(event: CanonicalUnitEvent) -> Self {
+        Self::Unit(Box::new(event))
+    }
 }

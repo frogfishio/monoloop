@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Claude Code **tool** exercise → HTML review.
 //!
 //! Uses `--dangerously-skip-permissions` so unattended file tools complete.

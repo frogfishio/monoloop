@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Write `target/interpretation.html` from a synthetic ACP stream.
 //!
 //! ```bash

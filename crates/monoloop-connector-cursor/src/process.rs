@@ -71,31 +71,26 @@ impl ProcessInner {
             child: Mutex::new(Some(child)),
         });
 
-        // stdout reader
+        // stdout reader (bounded per line — fail closed on oversize)
         {
             let this = Arc::clone(&inner);
+            let max_line = this.config.max_line_bytes;
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
+                    match read_line_bounded(&mut reader, max_line).await {
+                        Ok(None) => break,
+                        Ok(Some(line)) => {
                             let trimmed = line.trim_end_matches(['\r', '\n']);
                             if trimmed.is_empty() {
                                 continue;
                             }
-                            if trimmed.len() > this.config.max_line_bytes {
-                                warn!("cursor acp line exceeds max_line_bytes; dropping");
-                                continue;
-                            }
-                            this.dump
-                                .push_line(format!("<< {trimmed}"));
+                            this.dump.push_line(format!("<< {trimmed}"));
                             this.handle_inbound_line(trimmed).await;
                         }
                         Err(e) => {
-                            debug!("cursor stdout read error: {e}");
+                            warn!("cursor acp stdout bound/protocol failure: {e}");
+                            this.fail_all_pending(e).await;
                             break;
                         }
                     }
@@ -110,14 +105,13 @@ impl ProcessInner {
 
         // stderr drain (bounded diagnostics only)
         if let Some(err) = stderr {
+            let max_line = inner.config.max_line_bytes.min(64 * 1024);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(err);
-                let mut line = String::new();
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
+                    match read_line_bounded(&mut reader, max_line).await {
+                        Ok(None) => break,
+                        Ok(Some(line)) => {
                             let t = line.trim();
                             if !t.is_empty() {
                                 debug!(target: "cursor_agent", "stderr: {t}");
@@ -203,7 +197,6 @@ impl ProcessInner {
             }
             // Other notifications (cursor/*) are ignored at connector layer;
             // hosts may later subscribe via a separate control path.
-            return;
         }
     }
 
@@ -295,5 +288,82 @@ impl ProcessInner {
         }
         self.fail_all_pending(CursorConnectorError::cancelled())
             .await;
+    }
+}
+
+/// Read one line with a hard byte cap. Returns `Ok(None)` on EOF with empty buffer.
+///
+/// Unlike `BufRead::read_line`, this never grows beyond `max_bytes` for a single line.
+pub(crate) async fn read_line_bounded<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<String>, CursorConnectorError> {
+    let max_bytes = max_bytes.max(1);
+    let mut buf = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|e| CursorConnectorError::connection(format!("stdout read: {e}")))?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if buf.len() + take > max_bytes {
+                reader.consume(take);
+                return Err(CursorConnectorError::protocol(
+                    "ndjson line exceeds max_line_bytes",
+                ));
+            }
+            buf.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        // No newline in available slice — append or fail if over budget.
+        if buf.len() + available.len() > max_bytes {
+            let n = available.len();
+            reader.consume(n);
+            return Err(CursorConnectorError::protocol(
+                "ndjson line exceeds max_line_bytes",
+            ));
+        }
+        let n = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(n);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use tokio::io::BufReader;
+
+    #[tokio::test]
+    async fn exact_limit_line_ok() {
+        let data = b"abcd\n";
+        let mut r = BufReader::new(Cursor::new(&data[..]));
+        let line = read_line_bounded(&mut r, 5).await.unwrap().unwrap();
+        assert_eq!(line, "abcd\n");
+    }
+
+    #[tokio::test]
+    async fn one_byte_over_fails() {
+        let data = b"abcde\n"; // 6 bytes with newline
+        let mut r = BufReader::new(Cursor::new(&data[..]));
+        let err = read_line_bounded(&mut r, 5).await.unwrap_err();
+        assert_eq!(err.kind, monoloop_contracts::ConnectorErrorKind::ProtocolFailed);
+    }
+
+    #[tokio::test]
+    async fn no_newline_over_budget_fails() {
+        let data = b"abcdefghij"; // no newline
+        let mut r = BufReader::new(Cursor::new(&data[..]));
+        let err = read_line_bounded(&mut r, 5).await.unwrap_err();
+        assert_eq!(err.kind, monoloop_contracts::ConnectorErrorKind::ProtocolFailed);
     }
 }

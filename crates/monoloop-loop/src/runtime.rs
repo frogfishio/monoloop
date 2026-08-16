@@ -198,7 +198,9 @@ enum ActionState {
 }
 
 struct ActionRecord {
+    #[allow(dead_code)]
     tool_action_id: ToolActionId,
+    #[allow(dead_code)]
     unit_id: UnitId,
     last_generation: u64,
     state: ActionState,
@@ -290,7 +292,7 @@ impl LoopOwner {
             .fetch_add(1, Ordering::Relaxed);
 
         match delivered.event {
-            InterpreterOutputEvent::Unit(ev) => self.on_unit(ev).await,
+            InterpreterOutputEvent::Unit(ev) => self.on_unit(*ev).await,
             InterpreterOutputEvent::Ended(end) => {
                 self.on_interpretation_end(end).await?;
                 // Source drained for this interpretation — loop may still end when subscription closes.
@@ -306,58 +308,61 @@ impl LoopOwner {
             return Ok(());
         }
 
-        match &snap.unit {
-            CanonicalUnit::Tool(tool) => {
-                let key = format!(
-                    "{}:{}",
-                    snap.interpretation_id.as_str(),
-                    tool.tool_action_id.as_str()
-                );
-                let dig_key = format!("{}:{}", key, snap.unit_generation);
-                if let Some(prev) = self.dedup.get(&dig_key) {
-                    if *prev == snap.unit_generation {
-                        self.duplicates += 1;
-                        return Ok(());
-                    }
-                }
-                if self.dedup.len() >= self.limits.max_dedup_entries {
-                    return Err(LoopEndKind::InvariantFailed);
-                }
-                self.dedup.insert(dig_key, snap.unit_generation);
+        // Text, structure, etc. — observe only. Tools drive dispatch.
+        let CanonicalUnit::Tool(tool) = &snap.unit else {
+            return Ok(());
+        };
+        let key = format!(
+            "{}:{}",
+            snap.interpretation_id.as_str(),
+            tool.tool_action_id.as_str()
+        );
+        let dig_key = format!("{}:{}", key, snap.unit_generation);
+        if let Some(prev) = self.dedup.get(&dig_key) {
+            if *prev == snap.unit_generation {
+                self.duplicates += 1;
+                return Ok(());
+            }
+        }
+        if self.dedup.len() >= self.limits.max_dedup_entries {
+            return Err(LoopEndKind::InvariantFailed);
+        }
+        self.dedup.insert(dig_key, snap.unit_generation);
 
-                match tool.request_state {
-                    ToolRequestState::Assembling => {
-                        self.track_waiting(&key, tool.tool_action_id.clone(), snap.unit_id.clone(), snap.unit_generation);
-                    }
-                    ToolRequestState::Ready => {
-                        self.on_request_ready(
-                            &key,
-                            tool.tool_action_id.clone(),
-                            snap.unit_id.clone(),
-                            snap.unit_generation,
-                            tool.tool_name.clone(),
-                            tool.request_payload.clone(),
-                            snap,
-                        )
-                        .await?;
-                    }
-                    ToolRequestState::Incomplete | ToolRequestState::Malformed => {
-                        let rec = self.actions.entry(key).or_insert_with(|| ActionRecord {
-                            tool_action_id: tool.tool_action_id.clone(),
-                            unit_id: snap.unit_id.clone(),
-                            last_generation: 0,
-                            state: ActionState::Incomplete,
-                            dispatched: false,
-                        });
-                        if snap.unit_generation >= rec.last_generation {
-                            rec.last_generation = snap.unit_generation;
-                            rec.state = ActionState::Incomplete;
-                        }
-                    }
+        match tool.request_state {
+            ToolRequestState::Assembling => {
+                self.track_waiting(
+                    &key,
+                    tool.tool_action_id.clone(),
+                    snap.unit_id.clone(),
+                    snap.unit_generation,
+                );
+            }
+            ToolRequestState::Ready => {
+                self.on_request_ready(
+                    &key,
+                    tool.tool_action_id.clone(),
+                    snap.unit_id.clone(),
+                    snap.unit_generation,
+                    tool.tool_name.clone(),
+                    tool.request_payload.clone(),
+                    snap,
+                )
+                .await?;
+            }
+            ToolRequestState::Incomplete | ToolRequestState::Malformed => {
+                let rec = self.actions.entry(key).or_insert_with(|| ActionRecord {
+                    tool_action_id: tool.tool_action_id.clone(),
+                    unit_id: snap.unit_id.clone(),
+                    last_generation: 0,
+                    state: ActionState::Incomplete,
+                    dispatched: false,
+                });
+                if snap.unit_generation >= rec.last_generation {
+                    rec.last_generation = snap.unit_generation;
+                    rec.state = ActionState::Incomplete;
                 }
             }
-            // Text, structure, etc. — observe only.
-            _ => {}
         }
         Ok(())
     }
@@ -385,6 +390,7 @@ impl LoopOwner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn on_request_ready(
         &mut self,
         key: &str,

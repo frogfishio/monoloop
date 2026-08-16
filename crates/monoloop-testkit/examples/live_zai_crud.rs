@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Z.ai CLI **tool** exercise → HTML review.
 //!
 //! Headless `zai -p` auto-approves tools inside the CLI. Monoloop observes the

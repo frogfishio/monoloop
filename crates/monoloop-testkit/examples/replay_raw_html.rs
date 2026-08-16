@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Replay a saved raw dump through Interpreter → HTML review (no live agent).
 //!
 //! Works for Grok WebSocket dumps and Cursor NDJSON dumps (`>>` / `<<` lines).

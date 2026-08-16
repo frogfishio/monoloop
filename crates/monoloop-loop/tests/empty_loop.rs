@@ -10,7 +10,7 @@ use monoloop_contracts::{
 use monoloop_loop::{DefaultLoopRuntime, SubscriptionPublisher};
 
 fn text_event(interp: &str, content: &str) -> InterpreterOutputEvent {
-    InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
+    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
         unit_id: UnitId::new("s1"),
         unit_generation: 1,
         unit_state: UnitState::Complete,
@@ -30,7 +30,7 @@ fn text_event(interp: &str, content: &str) -> InterpreterOutputEvent {
             sentence_ordinal: 1,
             content: content.into(),
         }),
-    }))
+    })))
 }
 
 fn tool_ready(
@@ -40,7 +40,7 @@ fn tool_ready(
     payload: &str,
     gen: u64,
 ) -> InterpreterOutputEvent {
-    InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
+    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
         unit_id: UnitId::new(format!("tool-{action}")),
         unit_generation: gen,
         unit_state: UnitState::Waiting,
@@ -64,11 +64,11 @@ fn tool_ready(
             terminal_outcome: None,
             waiting_for: Some("external execution".into()),
         }),
-    }))
+    })))
 }
 
 fn tool_waiting(interp: &str, action: &str, gen: u64) -> InterpreterOutputEvent {
-    InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
+    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
         unit_id: UnitId::new(format!("tool-{action}")),
         unit_generation: gen,
         unit_state: UnitState::Waiting,
@@ -92,7 +92,7 @@ fn tool_waiting(interp: &str, action: &str, gen: u64) -> InterpreterOutputEvent 
             terminal_outcome: None,
             waiting_for: Some("args".into()),
         }),
-    }))
+    })))
 }
 
 fn open_scope(run: MonoloopRunId, loop_id: LoopId) -> LoopScope {

@@ -59,7 +59,8 @@ impl ZaiConnector {
         config: ZaiAgentConfig,
         prompt: impl AsRef<str>,
     ) -> Result<(mpsc::Receiver<bytes::Bytes>, ZaiRunOutcome), ZaiConnectorError> {
-        let (tx, rx) = mpsc::channel(config.max_stdout_bytes.min(256).max(16));
+        let capacity = config.max_stdout_bytes.clamp(16, 256);
+        let (tx, rx) = mpsc::channel(capacity);
         let outcome = run_headless_prompt(&config, prompt.as_ref(), tx).await?;
         Ok((rx, outcome))
     }

@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Grok Build: open-ended project analysis (rich tool + prose mix).
 //!
 //! Produces a messier stream than CRUD — good stress for sentence assembly and

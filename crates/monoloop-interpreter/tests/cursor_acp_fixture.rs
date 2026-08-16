@@ -1,3 +1,4 @@
+#![allow(clippy::while_let_loop)]
 //! Fixture: Cursor-shaped ACP NDJSON → Interpreter canonical units (no live agent).
 
 use monoloop_contracts::{

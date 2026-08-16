@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Codex ACP **tool** exercise → HTML review (Cursor/Agy parity).
 //!
 //! Uses `@agentclientprotocol/codex-acp` with `session/set_mode` =

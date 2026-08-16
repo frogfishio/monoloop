@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Antigravity ACP smoke (via `agy-acp` bridge) → HTML review.
 //!
 //! ```bash

@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Cursor ACP **agent-mode** tool exercise → HTML review.
 //!
 //! Asks Cursor to create/read/update a single temp file under `target/`, then

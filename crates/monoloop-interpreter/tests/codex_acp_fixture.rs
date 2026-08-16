@@ -1,3 +1,4 @@
+#![allow(clippy::while_let_loop)]
 //! Fixture: Codex/codex ACP-shaped NDJSON → Interpreter canonical units.
 
 use monoloop_contracts::{

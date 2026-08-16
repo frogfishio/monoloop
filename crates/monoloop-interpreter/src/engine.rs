@@ -389,9 +389,32 @@ impl Owner {
                     }
                 }
                 InputCmd::FinishClean => {
-                    let _ = self.seal_clean().await;
-                    self.finish(InterpretationEndKind::Complete, end_tx, status_terminal)
-                        .await;
+                    match self.seal_clean().await {
+                        Ok(()) => {
+                            self.finish(
+                                InterpretationEndKind::Complete,
+                                end_tx,
+                                status_terminal,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            let kind = match e.kind {
+                                InterpreterErrorKind::Cancelled => {
+                                    InterpretationEndKind::Cancelled
+                                }
+                                InterpreterErrorKind::FrameLimitExceeded
+                                | InterpreterErrorKind::SentenceLimitExceeded
+                                | InterpreterErrorKind::StructureLimitExceeded
+                                | InterpreterErrorKind::ToolLimitExceeded => {
+                                    InterpretationEndKind::LimitExceeded
+                                }
+                                _ => InterpretationEndKind::TransportFailed,
+                            };
+                            let _ = self.quarantine_partials().await;
+                            self.finish(kind, end_tx, status_terminal).await;
+                        }
+                    }
                     return;
                 }
                 InputCmd::Cancel => {
@@ -458,14 +481,8 @@ impl Owner {
         if self.frame_buf.len() > self.request.limits.max_frame_bytes {
             return Err(InterpreterError::limit("frame buffer limit exceeded"));
         }
-        let values = drain_json_values(&mut self.frame_buf).map_err(|e| {
-            // Incomplete JSON is not an error — only true parse failures after complete brace match
-            if e.starts_with("json parse") {
-                InterpreterError::malformed_frame(e)
-            } else {
-                InterpreterError::malformed_frame(e)
-            }
-        })?;
+        let values = drain_json_values(&mut self.frame_buf)
+            .map_err(InterpreterError::malformed_frame)?;
         for value in values {
             if !self.response_started {
                 self.response_started = true;
@@ -624,9 +641,9 @@ impl Owner {
                     let snap = self.tool_snapshot_from(&id);
                     if let Some(s) = snap {
                         self.pub_
-                            .publish(InterpreterOutputEvent::Unit(CanonicalUnitEvent::Incomplete(
+                            .publish(InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Incomplete(
                                 s,
-                            )))
+                            ))))
                             .await?;
                     }
                 }
@@ -744,7 +761,7 @@ impl Owner {
             _ => CanonicalUnitEvent::Advanced(snap),
         };
         self.pub_
-            .publish(InterpreterOutputEvent::Unit(unit_event))
+            .publish(InterpreterOutputEvent::unit(unit_event))
             .await
     }
 
@@ -798,7 +815,14 @@ impl Owner {
         let unit_id = UnitId::new(format!("s-{}", self.next_unit));
         self.next_unit += 1;
         self.sentence_count += 1;
-        let ordinal = self.next_lane_ordinal(LaneId::response().as_str());
+        // Select lane before ordinal so each channel keeps independent ordering.
+        let lane = match channel {
+            TextChannel::PublicReasoningSummary => LaneId::reasoning(),
+            TextChannel::StatusNarration => LaneId::new("status"),
+            TextChannel::QuotedExternalContent => LaneId::new("quoted"),
+            TextChannel::PublicResponse => LaneId::response(),
+        };
+        let ordinal = self.next_lane_ordinal(lane.as_str());
         let unit = CanonicalUnit::Text(TextSentence {
             sentence_id: unit_id.clone(),
             channel,
@@ -806,10 +830,6 @@ impl Owner {
             sentence_ordinal: ordinal,
             content,
         });
-        let lane = match channel {
-            TextChannel::PublicReasoningSummary => LaneId::reasoning(),
-            _ => LaneId::response(),
-        };
         let snap = self.snapshot(
             unit_id,
             1,
@@ -821,9 +841,9 @@ impl Owner {
         );
         // Created-and-complete: emit Created (complete state)
         self.pub_
-            .publish(InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(
+            .publish(InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
                 snap,
-            )))
+            ))))
             .await
     }
 
@@ -841,9 +861,9 @@ impl Owner {
             unit,
         );
         self.pub_
-            .publish(InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(
+            .publish(InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
                 snap,
-            )))
+            ))))
             .await
     }
 
@@ -865,12 +885,13 @@ impl Owner {
             unit,
         );
         self.pub_
-            .publish(InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(
+            .publish(InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
                 snap,
-            )))
+            ))))
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn snapshot(
         &self,
         unit_id: UnitId,

@@ -1055,7 +1055,7 @@ mod tests {
         source_time: Option<SourceTimeObservation>,
         source_step: Option<u64>,
     ) -> InterpreterOutputEvent {
-        InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
+        InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
             unit_id: UnitId::new(format!("s{n}")),
             unit_generation: 1,
             unit_state: UnitState::Complete,
@@ -1075,7 +1075,7 @@ mod tests {
                 sentence_ordinal: n,
                 content: content.into(),
             }),
-        }))
+        })))
     }
 
     fn tool_ev(id: &str, name: &str, n: u64) -> InterpreterOutputEvent {
@@ -1102,7 +1102,7 @@ mod tests {
         source_time: Option<SourceTimeObservation>,
         source_step: Option<u64>,
     ) -> InterpreterOutputEvent {
-        InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
+        InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
             unit_id: UnitId::new(format!("t{n}")),
             unit_generation: 1,
             unit_state: UnitState::Complete,
@@ -1126,7 +1126,7 @@ mod tests {
                 terminal_outcome: Some(ToolTerminalOutcome::Success),
                 waiting_for: None,
             }),
-        }))
+        })))
     }
 
     fn st(ms: u64) -> SourceTimeObservation {

@@ -59,7 +59,8 @@ impl ClaudeConnector {
         config: ClaudeAgentConfig,
         prompt: impl AsRef<str>,
     ) -> Result<(mpsc::Receiver<bytes::Bytes>, ClaudeRunOutcome), ClaudeConnectorError> {
-        let (tx, rx) = mpsc::channel(config.max_stdout_bytes.min(256).max(16));
+        let capacity = config.max_stdout_bytes.clamp(16, 256);
+        let (tx, rx) = mpsc::channel(capacity);
         let outcome = run_claude_print(&config, prompt.as_ref(), tx).await?;
         Ok((rx, outcome))
     }

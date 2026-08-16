@@ -58,7 +58,8 @@ impl Default for CodexAgentConfig {
             rpc_deadline: Duration::from_secs(90),
             max_line_bytes: 8 * 1024 * 1024,
             max_output_queue: 256,
-            auto_allow_permissions: true,
+            // Fail closed: hosts must opt in to auto-approve tool permissions.
+            auto_allow_permissions: false,
             advertise_fs: false,
             raw_dump_path: None,
         }
@@ -96,9 +97,28 @@ impl CodexAgentConfig {
     }
 
     /// Force unattended permission auto-allow on the ACP client side.
+    ///
+    /// Only for trusted test sandboxes / unattended qualification.
     pub fn with_auto_allow_permissions(mut self) -> Self {
         self.auto_allow_permissions = true;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_denies_auto_permissions() {
+        assert!(!CodexAgentConfig::default().auto_allow_permissions);
+    }
+
+    #[test]
+    fn opt_in_enables_auto_permissions() {
+        assert!(CodexAgentConfig::default()
+            .with_auto_allow_permissions()
+            .auto_allow_permissions);
     }
 }
 

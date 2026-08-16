@@ -277,6 +277,7 @@ impl RawDumpCollector {
 }
 
 /// Optional dump handle stored on a live server connection.
+#[allow(dead_code)]
 pub type SharedRawDump = Option<Arc<RawDumpCollector>>;
 
 #[cfg(test)]

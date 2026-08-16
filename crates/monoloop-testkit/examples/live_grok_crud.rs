@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Grok Build session: ask the agent to CRUD a test file, capture events.
 //!
 //! Prerequisites — **serve detached** (do not block a parent agent on `grok serve`):

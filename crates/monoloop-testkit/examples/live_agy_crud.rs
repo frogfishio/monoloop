@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default, clippy::while_let_loop, dead_code)]
 //! Live Antigravity ACP **tool** exercise → HTML review (Cursor parity).
 //!
 //! Uses the `agy-acp` bridge with `--dangerously-skip-permissions` so unattended
