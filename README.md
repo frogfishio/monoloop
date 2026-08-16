@@ -80,6 +80,10 @@ open target/live_grok_ask.html   # or live_grok_crud / live_grok_analyze
 # Re-assemble HTML from a saved raw dump (no live Grok needed):
 cargo run -p monoloop-testkit --example replay_raw_html -- target/live_grok_crud.raw.txt
 open target/live_grok_crud.replay.html
+
+# Deterministic qualification (Interpreter + projection matrix; optional live dump replay):
+./scripts/qualify-interpreter-projection.sh
+./scripts/qualify-interpreter-projection.sh --with-replay-html
 ```
 
 Connects to `ws://127.0.0.1:2419/ws`, creates a session with `cwd` = this project,
