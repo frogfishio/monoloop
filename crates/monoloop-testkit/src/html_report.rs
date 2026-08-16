@@ -12,8 +12,8 @@
 
 use crate::chat_projector::{project_chat, ChatProjection};
 use monoloop_contracts::{
-    BoundaryKind, CanonicalUnit, InterpretationEnd, InterpreterOutputEvent, StructureKind,
-    TextChannel, ToolRequestState, UnitState,
+    BoundaryKind, CanonicalUnit, InterpretationEnd, InterpreterOutputEvent, SourceTimeObservation,
+    StructureKind, TextChannel, ToolRequestState, UnitState,
 };
 use pulldown_cmark::{html, Options, Parser};
 use std::path::Path;
@@ -119,11 +119,12 @@ pub fn build_html_report(
                             state: format!("{:?}", snap.unit_state),
                             label: t.channel.label().to_string(),
                             correlation: format!(
-                                "c:{} i:{} u:{} g:{}",
+                                "c:{} i:{} u:{} g:{}{}",
                                 short(snap.connection_id.as_str()),
                                 short(snap.interpretation_id.as_str()),
                                 short(snap.unit_id.as_str()),
-                                snap.unit_generation
+                                snap.unit_generation,
+                                source_time_corr(snap.source_time)
                             ),
                             body: t.content.clone(),
                             css_class: "ev-text".into(),
@@ -195,11 +196,12 @@ pub fn build_html_report(
                             state,
                             label: name,
                             correlation: format!(
-                                "c:{} i:{} action:{} g:{}",
+                                "c:{} i:{} action:{} g:{}{}",
                                 short(snap.connection_id.as_str()),
                                 short(snap.interpretation_id.as_str()),
                                 t.tool_action_id.as_str(),
-                                snap.unit_generation
+                                snap.unit_generation,
+                                source_time_corr(snap.source_time)
                             ),
                             body,
                             css_class: "ev-tool".into(),
@@ -729,7 +731,9 @@ details { margin-top: 0.75rem; color: var(--muted); }
 .chat-strategy { color: var(--muted); font-size: 0.85rem; }
 .chat-reason { color: var(--muted); font-size: 0.82rem; }
 .chat-projection.conf-emit .chat-strategy code:first-of-type { color: #7dcea0; }
+.chat-projection.conf-source-time .chat-strategy code:first-of-type { color: #85c1e9; }
 .chat-projection.conf-structural .chat-strategy code:first-of-type { color: #f0c27a; }
+.chat-source-time { color: var(--muted); font-size: 0.8rem; font-weight: 500; font-family: ui-monospace, monospace; }
 .chat-flow { display: flex; flex-direction: column; gap: 0.55rem; }
 .chat-line {
   border-radius: 10px;
@@ -799,6 +803,15 @@ fn short(id: &str) -> &str {
     }
 }
 
+/// Observational dialect source-time for timeline correlation (empty when absent).
+fn source_time_corr(st: Option<SourceTimeObservation>) -> String {
+    match st {
+        Some(s) if s.first_ms == s.last_ms => format!(" t:{}", s.first_ms),
+        Some(s) => format!(" t:{}..{}", s.first_ms, s.last_ms),
+        None => String::new(),
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -864,6 +877,7 @@ mod tests {
             lane_id: LaneId::response(),
             lane_ordinal: n,
             causal_parent_id: None,
+            source_time: None,
             unit: CanonicalUnit::Text(TextSentence {
                 sentence_id: UnitId::new(format!("s{n}")),
                 channel: TextChannel::PublicResponse,
@@ -955,6 +969,7 @@ mod tests {
                 lane_id: LaneId::response(),
                 lane_ordinal: 1,
                 causal_parent_id: None,
+                source_time: None,
                 unit: CanonicalUnit::Tool(ToolActionEvent {
                     tool_action_id: ToolActionId::new("call-1"),
                     tool_name: Some("write".into()),

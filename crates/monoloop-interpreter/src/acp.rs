@@ -15,6 +15,8 @@ pub enum AcpFragment {
         channel: TextChannel,
         /// Fragment text (not a canonical unit).
         text: String,
+        /// Dialect `agentTimestampMs` when present on the message (observational).
+        source_time_ms: Option<u64>,
     },
     /// Tool action declared / updated.
     Tool {
@@ -22,6 +24,8 @@ pub enum AcpFragment {
         action_id: ToolActionId,
         /// Kind of tool signal.
         signal: ToolSignal,
+        /// Dialect `agentTimestampMs` when present on the message (observational).
+        source_time_ms: Option<u64>,
     },
     /// Dialect-level response finished.
     ResponseFinished,
@@ -72,6 +76,12 @@ impl AcpDialect {
                     out.extend(map_session_update(params));
                 }
             }
+            // Cursor extension notifications — observational only (no effects).
+            "cursor/update_todos" | "cursor/task" | "cursor/generate_image" => {
+                out.push(AcpFragment::Diagnostic {
+                    message: format!("cursor extension notification: {method}"),
+                });
+            }
             // Terminal prompt response often has result.stopReason
             _ => {
                 if value.get("result").is_some() && value.get("id").is_some() {
@@ -92,6 +102,7 @@ impl AcpDialect {
 
 fn map_session_update(params: &Value) -> Vec<AcpFragment> {
     let mut out = Vec::new();
+    let source_time_ms = extract_agent_timestamp_ms(params);
     let update = params.get("update").unwrap_or(params);
     let kind = update
         .get("sessionUpdate")
@@ -106,6 +117,7 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
                     out.push(AcpFragment::TextDelta {
                         channel: TextChannel::PublicResponse,
                         text,
+                        source_time_ms,
                     });
                 }
             }
@@ -124,6 +136,7 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
                         out.push(AcpFragment::TextDelta {
                             channel: TextChannel::PublicReasoningSummary,
                             text,
+                            source_time_ms,
                         });
                     }
                 }
@@ -131,9 +144,14 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
             // else: suppress private thought
         }
         "tool_call" | "tool_call_update" => {
-            out.extend(map_tool_call(update, kind == "tool_call_update"));
+            out.extend(map_tool_call(
+                update,
+                kind == "tool_call_update",
+                source_time_ms,
+            ));
         }
         // Known non-content / lifecycle updates — observe silently (no diagnostic noise).
+        // Cursor ACP shares the same core sessionUpdate vocabulary as standard ACP.
         "available_commands_update"
         | "current_mode_update"
         | "plan"
@@ -153,12 +171,31 @@ fn map_session_update(params: &Value) -> Vec<AcpFragment> {
                     out.push(AcpFragment::TextDelta {
                         channel: TextChannel::PublicResponse,
                         text,
+                        source_time_ms,
                     });
                 }
             }
         }
     }
     out
+}
+
+/// Grok ACP places observational time on `params._meta.agentTimestampMs`.
+/// Also accept the same key on the update object when present.
+fn extract_agent_timestamp_ms(params: &Value) -> Option<u64> {
+    let from_meta = |v: &Value| -> Option<u64> {
+        v.get("_meta")
+            .and_then(|m| m.get("agentTimestampMs"))
+            .and_then(|t| t.as_u64().or_else(|| t.as_i64().map(|i| i as u64)))
+    };
+    from_meta(params)
+        .or_else(|| params.get("update").and_then(from_meta))
+        .or_else(|| {
+            // Bare update object passed as params in some fixtures.
+            params
+                .get("agentTimestampMs")
+                .and_then(|t| t.as_u64().or_else(|| t.as_i64().map(|i| i as u64)))
+        })
 }
 
 fn extract_text_content(update: &Value) -> Option<String> {
@@ -191,7 +228,11 @@ fn extract_text_content(update: &Value) -> Option<String> {
     None
 }
 
-fn map_tool_call(update: &Value, is_update: bool) -> Vec<AcpFragment> {
+fn map_tool_call(
+    update: &Value,
+    is_update: bool,
+    source_time_ms: Option<u64>,
+) -> Vec<AcpFragment> {
     let mut out = Vec::new();
     let id = update
         .get("toolCallId")
@@ -213,12 +254,14 @@ fn map_tool_call(update: &Value, is_update: bool) -> Vec<AcpFragment> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Grok Build often omits `status` (null). Prefer explicit status when present;
+    // otherwise infer terminality from result payload on tool_call_update.
     let status = update
         .get("status")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    // Complete args?
     let args = update
         .get("rawInput")
         .or_else(|| update.get("arguments"))
@@ -228,19 +271,65 @@ fn map_tool_call(update: &Value, is_update: bool) -> Vec<AcpFragment> {
             .map(|a| a.is_object() || a.is_array() || a.is_string())
             .unwrap_or(false);
 
-    if matches!(status, "completed" | "failed" | "cancelled") {
-        let success = status == "completed";
-        let result_json = update
-            .get("rawOutput")
-            .or_else(|| update.get("content"))
-            .or_else(|| update.get("result"))
-            .map(|v| v.to_string());
+    let result_value = update
+        .get("rawOutput")
+        .or_else(|| update.get("result"))
+        // Grok Build: tool_call_update carries tool outcome as `content`
+        // (e.g. diff array for write, text blocks for read) without status.
+        .or_else(|| {
+            if is_update {
+                update.get("content")
+            } else {
+                None
+            }
+        });
+    let has_result = result_value.is_some_and(is_tool_result_payload);
+
+    let explicit_terminal = matches!(
+        status.as_str(),
+        "completed" | "complete" | "success" | "failed" | "failure" | "error" | "cancelled" | "canceled"
+    );
+    let explicit_failure = matches!(
+        status.as_str(),
+        "failed" | "failure" | "error" | "cancelled" | "canceled"
+    );
+
+    // Terminal: explicit status, or Grok-style update with result content and no
+    // in-progress marker.
+    let in_progress = matches!(
+        status.as_str(),
+        "pending" | "in_progress" | "in-progress" | "running" | "started"
+    );
+    if explicit_terminal || (has_result && !in_progress) {
+        // Emit Ready first when this same message carries complete args, so
+        // hosts still see a complete request before the terminal outcome.
+        if args_complete {
+            if let Some(a) = args {
+                let tool_name = name.clone().unwrap_or_else(|| "unknown".into());
+                let arguments_json = if a.is_string() {
+                    a.as_str().unwrap_or("{}").to_string()
+                } else {
+                    a.to_string()
+                };
+                out.push(AcpFragment::Tool {
+                    action_id: action_id.clone(),
+                    signal: ToolSignal::RequestReady {
+                        tool_name,
+                        arguments_json,
+                    },
+                    source_time_ms,
+                });
+            }
+        }
+        let success = !explicit_failure;
+        let result_json = result_value.map(|v| v.to_string());
         out.push(AcpFragment::Tool {
             action_id,
             signal: ToolSignal::Resolved {
                 success,
                 result_json,
             },
+            source_time_ms,
         });
         return out;
     }
@@ -259,6 +348,7 @@ fn map_tool_call(update: &Value, is_update: bool) -> Vec<AcpFragment> {
                     tool_name,
                     arguments_json,
                 },
+                source_time_ms,
             });
             return out;
         }
@@ -275,8 +365,20 @@ fn map_tool_call(update: &Value, is_update: bool) -> Vec<AcpFragment> {
                 "complete tool request".into()
             },
         },
+        source_time_ms,
     });
     out
+}
+
+/// True when `content`/`rawOutput` looks like tool outcome material (not empty).
+fn is_tool_result_payload(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(_) | Value::Number(_) => true,
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(m) => !m.is_empty(),
+    }
 }
 
 /// Extract complete JSON values from a growing byte buffer (fragment-safe).
@@ -380,8 +482,192 @@ mod tests {
             &frags[0],
             AcpFragment::TextDelta {
                 text,
+                source_time_ms: None,
                 ..
             } if text == "Hi. "
+        ));
+    }
+
+    #[test]
+    fn extracts_agent_timestamp_ms_from_params_meta() {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "_meta": {
+                    "agentTimestampMs": 1786859347289_u64,
+                    "chunkId": 1
+                },
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "I'll" }
+                }
+            }
+        });
+        let frags = AcpDialect::map_message(&msg);
+        assert!(matches!(
+            &frags[0],
+            AcpFragment::TextDelta {
+                text,
+                source_time_ms: Some(1786859347289),
+                ..
+            } if text == "I'll"
+        ));
+    }
+
+    #[test]
+    fn tool_call_carries_source_time() {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "_meta": { "agentTimestampMs": 1001_u64 },
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-1",
+                    "title": "write",
+                    "rawInput": { "path": "/tmp/x" }
+                }
+            }
+        });
+        let frags = AcpDialect::map_message(&msg);
+        assert!(
+            frags.iter().any(|f| matches!(
+                f,
+                AcpFragment::Tool {
+                    source_time_ms: Some(1001),
+                    signal: ToolSignal::RequestReady { .. },
+                    ..
+                }
+            )),
+            "{frags:?}"
+        );
+    }
+
+    /// Grok Build live shape: null/absent status + rawInput on tool_call.
+    #[test]
+    fn grok_tool_call_without_status_is_ready_when_raw_input_present() {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-1",
+                    "title": "write",
+                    "status": null,
+                    "rawInput": {
+                        "file_path": "/tmp/x.txt",
+                        "content": "hello\n"
+                    }
+                }
+            }
+        });
+        let frags = AcpDialect::map_message(&msg);
+        assert!(
+            frags.iter().any(|f| matches!(
+                f,
+                AcpFragment::Tool {
+                    signal: ToolSignal::RequestReady { tool_name, .. },
+                    ..
+                } if tool_name == "write"
+            )),
+            "{frags:?}"
+        );
+        assert!(
+            !frags.iter().any(|f| matches!(
+                f,
+                AcpFragment::Tool {
+                    signal: ToolSignal::Resolved { .. },
+                    ..
+                }
+            )),
+            "initial call must not resolve: {frags:?}"
+        );
+    }
+
+    /// Grok Build live shape: tool_call_update with content (diff) and no status
+    /// means tool outcome observed → Resolved (and Ready if args present).
+    #[test]
+    fn grok_tool_update_content_without_status_resolves() {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "title": "Write `/tmp/x.txt`",
+                    "status": null,
+                    "kind": "edit",
+                    "rawInput": {
+                        "file_path": "/tmp/x.txt",
+                        "content": "hello\n"
+                    },
+                    "content": [{
+                        "type": "diff",
+                        "path": "/tmp/x.txt",
+                        "oldText": "",
+                        "newText": "hello\n"
+                    }],
+                    "locations": []
+                }
+            }
+        });
+        let frags = AcpDialect::map_message(&msg);
+        assert!(
+            frags.iter().any(|f| matches!(
+                f,
+                AcpFragment::Tool {
+                    signal: ToolSignal::RequestReady { .. },
+                    ..
+                }
+            )),
+            "ready first: {frags:?}"
+        );
+        assert!(
+            frags.iter().any(|f| matches!(
+                f,
+                AcpFragment::Tool {
+                    signal: ToolSignal::Resolved {
+                        success: true,
+                        result_json: Some(j),
+                    },
+                    ..
+                } if j.contains("diff")
+            )),
+            "resolved with result: {frags:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_failed_status_still_fails() {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-2",
+                    "title": "bash",
+                    "status": "failed",
+                    "rawOutput": { "error": "boom" }
+                }
+            }
+        });
+        let frags = AcpDialect::map_message(&msg);
+        assert!(matches!(
+            &frags[0],
+            AcpFragment::Tool {
+                signal: ToolSignal::Resolved {
+                    success: false,
+                    ..
+                },
+                ..
+            }
         ));
     }
 }

@@ -396,6 +396,58 @@ pub enum BoundaryKind {
     UsageFinalized,
 }
 
+/// Dialect-observed source time for a complete (or lifecycle) unit.
+///
+/// Observational only: does **not** establish causality, turn success, or
+/// authority. Lane ordinal / explicit causal parent remain primary. Values are
+/// provider clock milliseconds when the dialect supplies them (e.g. Grok ACP
+/// `params._meta.agentTimestampMs`); absent when the dialect does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceTimeObservation {
+    /// Earliest dialect-reported source timestamp (ms) among contributing fragments.
+    pub first_ms: u64,
+    /// Latest dialect-reported source timestamp (ms) among contributing fragments.
+    pub last_ms: u64,
+}
+
+impl SourceTimeObservation {
+    /// Build from a single observed timestamp.
+    pub fn point(ms: u64) -> Self {
+        Self {
+            first_ms: ms,
+            last_ms: ms,
+        }
+    }
+
+    /// Merge two observations (min first, max last).
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            first_ms: self.first_ms.min(other.first_ms),
+            last_ms: self.last_ms.max(other.last_ms),
+        }
+    }
+
+    /// Extend with an optional single timestamp.
+    pub fn include(self, ms: Option<u64>) -> Self {
+        match ms {
+            Some(t) => self.merge(Self::point(t)),
+            None => self,
+        }
+    }
+
+    /// From optional first/last (None if neither known).
+    pub fn from_bounds(first: Option<u64>, last: Option<u64>) -> Option<Self> {
+        match (first, last) {
+            (Some(f), Some(l)) => Some(Self {
+                first_ms: f.min(l),
+                last_ms: f.max(l),
+            }),
+            (Some(t), None) | (None, Some(t)) => Some(Self::point(t)),
+            (None, None) => None,
+        }
+    }
+}
+
 /// Correlation + lifecycle envelope for one unit generation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalUnitSnapshot {
@@ -419,6 +471,8 @@ pub struct CanonicalUnitSnapshot {
     pub lane_ordinal: u64,
     /// Optional causal parent unit.
     pub causal_parent_id: Option<UnitId>,
+    /// Optional dialect source time (observational; not causality).
+    pub source_time: Option<SourceTimeObservation>,
     /// Canonical unit content allowed for this state.
     pub unit: CanonicalUnit,
 }

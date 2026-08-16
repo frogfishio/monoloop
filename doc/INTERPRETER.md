@@ -271,8 +271,19 @@ flow_id
 lane_id
 lane_ordinal
 causal_parent_id?
+source_time?          # observational dialect time (first_ms/last_ms); not causality
 canonical content allowed for that state
 ```
+
+`source_time` is **optional** and **observational only**. When the dialect
+supplies a source clock (Grok ACP: `params._meta.agentTimestampMs`), the
+Interpreter records the earliest and latest contributing fragment timestamps
+on the complete unit. It MUST NOT:
+
+- establish cross-lane causality;
+- replace lane ordinal or explicit causal parent;
+- invent wall-clock times when the dialect omits them; or
+- treat source time as turn success, authorization, or run completion.
 
 `Created` is published as soon as a canonical unit exists. In the common case,
 a sentence or structural atom is already complete when created, so a single
@@ -540,7 +551,9 @@ Ordering guarantees:
 - source position is monotonic within a decoded dialect stream;
 - cross-lane relationships require an explicit dialect correlation or causal
   link;
-- arrival time alone does not establish causality; and
+- arrival time alone does not establish causality;
+- dialect source timestamps (when present) are observational metadata and do
+  not establish causality; and
 - a later renderer may choose a visual linearization without changing canonical
   order.
 

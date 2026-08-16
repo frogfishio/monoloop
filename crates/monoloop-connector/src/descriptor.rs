@@ -96,4 +96,17 @@ impl ConnectorDescriptor {
             control_capabilities: ControlCapabilities::default(),
         }
     }
+
+    /// Descriptor for the Cursor Agent ACP connector (stdio NDJSON).
+    pub fn cursor_acp() -> Self {
+        Self {
+            connector_kind: ConnectorKind::Cursor,
+            implementation_id: "monoloop.cursor_acp".into(),
+            implementation_version: env!("CARGO_PKG_VERSION").into(),
+            transport_kind: "process_stdio".into(),
+            supported_dialects: vec!["acp/json_rpc".into(), "cursor_acp/ndjson".into()],
+            raw_boundary: RawBoundary::ProcessPipe,
+            control_capabilities: ControlCapabilities::default(),
+        }
+    }
 }

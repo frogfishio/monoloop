@@ -54,6 +54,16 @@ impl DialectDescriptor {
         }
     }
 
+    /// Cursor Agent ACP over stdio (newline-delimited JSON-RPC).
+    pub fn cursor_acp(version: impl Into<String>) -> Self {
+        Self {
+            family: DialectFamily::CursorAcp,
+            version: version.into(),
+            framing: "ndjson".into(),
+            profile: Some("cursor".into()),
+        }
+    }
+
     /// Deterministic in-memory test dialect.
     pub fn test_raw() -> Self {
         Self {

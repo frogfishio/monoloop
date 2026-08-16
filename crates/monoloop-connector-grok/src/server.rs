@@ -989,7 +989,13 @@ async fn handle_inbound(
     }
 
     if msg.is_notification_or_request() {
-        // Demux by sessionId when present; expose complete JSON-RPC bytes to session.
+        // Server → client request (has method + id): must answer or the agent hangs.
+        // Grok Build uses this for fs/* when we advertise clientCapabilities.fs.
+        if msg.id.is_some() && msg.method.is_some() {
+            return answer_client_request(inner, &msg).await;
+        }
+
+        // Notification (method, no id): demux by sessionId into the session stream.
         if let Some(sid) = session_id_from_params(&msg.params) {
             let map = inner.sessions.read().await;
             if let Some(session) = map.get(&sid) {
@@ -1000,13 +1006,151 @@ async fn handle_inbound(
                 "notification for unknown sessionId",
             ));
         }
-        // Server request without session (e.g. some permission shapes) — fail closed for now.
-        return Err(GrokConnectorError::protocol(
-            "unscoped server message without sessionId",
-        ));
+        // Unscoped notification — ignore (e.g. global capability noise).
+        return Ok(());
     }
 
     Err(GrokConnectorError::protocol("unrecognized json-rpc message"))
+}
+
+/// Max bytes returned for a single `fs/read_text_file` (fail closed beyond).
+const MAX_CLIENT_FS_READ_BYTES: usize = 1024 * 1024;
+
+/// Answer ACP client methods Grok invokes over the reverse channel.
+async fn answer_client_request(
+    inner: &Arc<ServerInner>,
+    msg: &JsonRpcMessage,
+) -> Result<(), GrokConnectorError> {
+    let id = msg
+        .id
+        .clone()
+        .ok_or_else(|| GrokConnectorError::protocol("client request missing id"))?;
+    let method = msg.method.as_deref().unwrap_or("");
+    let params = msg.params.clone().unwrap_or(serde_json::Value::Null);
+
+    let response_bytes = match method {
+        "fs/read_text_file" => match client_fs_read(&params).await {
+            Ok(content) => json_rpc_result(id, serde_json::json!({ "content": content }))?,
+            Err((code, message)) => json_rpc_error(id, code, message)?,
+        },
+        "fs/write_text_file" => match client_fs_write(&params).await {
+            Ok(()) => json_rpc_result(id, serde_json::json!({}))?,
+            Err((code, message)) => json_rpc_error(id, code, message)?,
+        },
+        other => json_rpc_error(
+            id,
+            -32601,
+            format!("method not implemented by monoloop-connector-grok: {other}"),
+        )?,
+    };
+
+    if response_bytes.len() > inner.limits.max_message_bytes {
+        return Err(GrokConnectorError::resource(
+            "client response exceeds max_message_bytes",
+        ));
+    }
+    inner
+        .write_tx
+        .send(WriteCmd::Text(response_bytes))
+        .await
+        .map_err(|_| GrokConnectorError::connection("write path closed"))?;
+    Ok(())
+}
+
+async fn client_fs_read(params: &serde_json::Value) -> Result<String, (i64, String)> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or((-32602, "fs/read_text_file missing path".into()))?;
+    validate_client_fs_path(path)?;
+
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|e| (-32000, format!("read failed: {e}")))?;
+    if data.len() > MAX_CLIENT_FS_READ_BYTES {
+        return Err((
+            -32000,
+            format!("file exceeds max read size ({MAX_CLIENT_FS_READ_BYTES} bytes)"),
+        ));
+    }
+    let mut text = String::from_utf8_lossy(&data).into_owned();
+
+    // Optional line window (1-based), as used by some ACP clients.
+    let line = params.get("line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64());
+    if line > 1 || limit.is_some() {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = line.saturating_sub(1).min(lines.len());
+        let end = match limit {
+            Some(n) => (start + n as usize).min(lines.len()),
+            None => lines.len(),
+        };
+        text = lines[start..end].join("\n");
+        if end > start && text.as_bytes().last() != Some(&b'\n') && data.ends_with(b"\n") {
+            // keep simple; trailing newline optional
+        }
+    }
+    Ok(text)
+}
+
+async fn client_fs_write(params: &serde_json::Value) -> Result<(), (i64, String)> {
+    let path = params
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or((-32602, "fs/write_text_file missing path".into()))?;
+    validate_client_fs_path(path)?;
+    let content = params
+        .get("content")
+        .or_else(|| params.get("text"))
+        .and_then(|v| v.as_str())
+        .ok_or((-32602, "fs/write_text_file missing content".into()))?;
+    if content.len() > MAX_CLIENT_FS_READ_BYTES {
+        return Err((-32000, "content exceeds max write size".into()));
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| (-32000, format!("create parent dirs: {e}")))?;
+        }
+    }
+    tokio::fs::write(path, content.as_bytes())
+        .await
+        .map_err(|e| (-32000, format!("write failed: {e}")))?;
+    Ok(())
+}
+
+fn validate_client_fs_path(path: &str) -> Result<(), (i64, String)> {
+    if path.is_empty() || path.contains('\0') {
+        return Err((-32602, "invalid path".into()));
+    }
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err((-32602, "path must be absolute".into()));
+    }
+    Ok(())
+}
+
+fn json_rpc_result(id: RpcId, result: serde_json::Value) -> Result<bytes::Bytes, GrokConnectorError> {
+    let v = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    });
+    let raw = serde_json::to_vec(&v)
+        .map_err(|e| GrokConnectorError::protocol(format!("serialize result: {e}")))?;
+    Ok(bytes::Bytes::from(raw))
+}
+
+fn json_rpc_error(id: RpcId, code: i64, message: impl Into<String>) -> Result<bytes::Bytes, GrokConnectorError> {
+    let v = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message.into() },
+    });
+    let raw = serde_json::to_vec(&v)
+        .map_err(|e| GrokConnectorError::protocol(format!("serialize error: {e}")))?;
+    Ok(bytes::Bytes::from(raw))
 }
 
 async fn fail_all_pending(inner: &ServerInner, err: GrokConnectorError) {

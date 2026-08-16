@@ -11,6 +11,7 @@ bytes = { workspace = true }
 monoloop-contracts = { path = "../monoloop-contracts" }
 monoloop-connector = { path = "../monoloop-connector" }
 monoloop-connector-grok = { path = "../monoloop-connector-grok" }
+monoloop-connector-cursor = { path = "../monoloop-connector-cursor" }
 monoloop-interpreter = { path = "../monoloop-interpreter" }
 monoloop-loop = { path = "../monoloop-loop" }
 pulldown-cmark = { workspace = true }

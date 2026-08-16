@@ -11,6 +11,11 @@ use std::sync::Arc;
 
 use crate::console::{ConsoleRenderer, ConsoleRendererConfig, ConsoleSink, SyncMemorySink};
 
+/// Cursor ACP dialect binding (stdio NDJSON profile).
+pub fn cursor_acp_binding() -> DialectBinding {
+    DialectBinding::negotiated(DialectDescriptor::cursor_acp("1"))
+}
+
 /// Interpret complete (or pre-concatenated) raw bytes under a dialect binding.
 pub async fn interpret_bytes(
     dialect: DialectBinding,

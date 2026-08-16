@@ -111,6 +111,7 @@ fn build_html_report_standalone() {
             lane_id: LaneId::response(),
             lane_ordinal: 1,
             causal_parent_id: None,
+            source_time: None,
             unit: CanonicalUnit::Text(TextSentence {
                 sentence_id: UnitId::new("s1"),
                 channel: TextChannel::PublicResponse,

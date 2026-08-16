@@ -21,6 +21,7 @@ fn text_event(interp: &str, content: &str) -> InterpreterOutputEvent {
         lane_id: LaneId::response(),
         lane_ordinal: 1,
         causal_parent_id: None,
+        source_time: None,
         unit: CanonicalUnit::Text(TextSentence {
             sentence_id: UnitId::new("s1"),
             channel: TextChannel::PublicResponse,
@@ -49,6 +50,7 @@ fn tool_ready(
         lane_id: LaneId::tool(),
         lane_ordinal: 1,
         causal_parent_id: None,
+        source_time: None,
         unit: CanonicalUnit::Tool(ToolActionEvent {
             tool_action_id: ToolActionId::new(action),
             tool_name: Some(name.into()),
@@ -75,6 +77,7 @@ fn tool_waiting(interp: &str, action: &str, gen: u64) -> InterpreterOutputEvent 
         lane_id: LaneId::tool(),
         lane_ordinal: 1,
         causal_parent_id: None,
+        source_time: None,
         unit: CanonicalUnit::Tool(ToolActionEvent {
             tool_action_id: ToolActionId::new(action),
             tool_name: Some("bash".into()),

@@ -11,6 +11,7 @@ mod distribute;
 mod driver;
 mod grok_serve;
 mod html_report;
+mod live_cursor;
 mod live_grok;
 mod pipeline;
 
@@ -34,10 +35,13 @@ pub use html_report::{
     build_html_report, join_sentences_as_markdown, markdown_to_html, write_html_report, HtmlReport,
     HtmlReportParams,
 };
+pub use live_cursor::{
+    run_live_cursor_prompt, LiveCursorArtifactPaths, LiveCursorRunOptions, LiveCursorRunReport,
+};
 pub use live_grok::{
     run_live_grok_prompt, LiveGrokArtifactPaths, LiveGrokRunOptions, LiveGrokRunReport,
 };
 pub use pipeline::{
-    acp_binding, collect_interpretation, feed_chunks, interpret_and_render, interpret_bytes,
-    render_all, test_text_binding,
+    acp_binding, collect_interpretation, cursor_acp_binding, feed_chunks, interpret_and_render,
+    interpret_bytes, render_all, test_text_binding,
 };

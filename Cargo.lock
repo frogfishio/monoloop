@@ -369,6 +369,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "monoloop-connector-cursor"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "monoloop-connector",
+ "monoloop-contracts",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "monoloop-connector-grok"
 version = "0.1.0"
 dependencies = [
@@ -429,6 +444,7 @@ dependencies = [
  "futures-util",
  "http",
  "monoloop-connector",
+ "monoloop-connector-cursor",
  "monoloop-connector-grok",
  "monoloop-contracts",
  "monoloop-interpreter",

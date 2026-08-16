@@ -1,0 +1,92 @@
+//! Cursor Agent ACP connector configuration.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// How to launch the Cursor ACP server process.
+#[derive(Clone, Debug)]
+pub struct CursorAgentConfig {
+    /// Path to the `agent` binary (default: `agent` on PATH, or `~/.local/bin/agent`).
+    pub agent_bin: PathBuf,
+    /// Working directory for the agent process and default session `cwd`.
+    pub cwd: PathBuf,
+    /// Extra args before `acp` (e.g. `--api-key`, `--mode ask`).
+    pub extra_args: Vec<String>,
+    /// Auth method id advertised by Cursor (`cursor_login`).
+    pub auth_method_id: String,
+    /// Client name reported in `initialize`.
+    pub client_name: String,
+    /// Client version reported in `initialize`.
+    pub client_version: String,
+    /// Handshake / RPC deadline.
+    pub rpc_deadline: Duration,
+    /// Max bytes per NDJSON line (fail-closed).
+    pub max_line_bytes: usize,
+    /// Bounded output queue for dialect bytes (session/update lines).
+    pub max_output_queue: usize,
+    /// Auto-answer `session/request_permission` with allow-once (tests / unattended).
+    pub auto_allow_permissions: bool,
+    /// When true, advertise client fs read/write capabilities (requires host handlers).
+    pub advertise_fs: bool,
+    /// Optional path to append raw NDJSON lines (test diagnostics only).
+    pub raw_dump_path: Option<PathBuf>,
+}
+
+impl Default for CursorAgentConfig {
+    fn default() -> Self {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let agent_bin = std::env::var_os("CURSOR_AGENT_BIN")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|h| h.join(".local/bin/agent")))
+            .unwrap_or_else(|| PathBuf::from("agent"));
+        Self {
+            agent_bin,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            extra_args: Vec::new(),
+            auth_method_id: "cursor_login".into(),
+            client_name: "monoloop-cursor".into(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            rpc_deadline: Duration::from_secs(60),
+            max_line_bytes: 8 * 1024 * 1024,
+            max_output_queue: 256,
+            auto_allow_permissions: true,
+            advertise_fs: false,
+            raw_dump_path: None,
+        }
+    }
+}
+
+impl CursorAgentConfig {
+    /// Config for a project directory with optional artifact dump path.
+    pub fn for_project(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Attach a raw NDJSON dump path.
+    pub fn with_raw_dump(mut self, path: impl Into<PathBuf>) -> Self {
+        self.raw_dump_path = Some(path.into());
+        self
+    }
+}
+
+/// Session create parameters (`session/new`).
+#[derive(Clone, Debug)]
+pub struct CursorSessionConfig {
+    /// Session working directory.
+    pub cwd: PathBuf,
+    /// MCP servers (opaque JSON; usually empty for monoloop).
+    pub mcp_servers: serde_json::Value,
+}
+
+impl CursorSessionConfig {
+    /// Session in the given cwd with no MCP servers.
+    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            cwd: cwd.into(),
+            mcp_servers: serde_json::json!([]),
+        }
+    }
+}

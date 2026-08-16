@@ -36,6 +36,7 @@ fn tool_pending(id: &str, title: &str) -> String {
 }
 
 fn tool_ready(id: &str, title: &str, args_json: &str) -> String {
+    // Explicit pending + rawInput only (no result content) → Ready, not terminal.
     format!(
         r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"tool_call_update","toolCallId":"{id}","title":{title},"status":"pending","rawInput":{args_json}}}}}}}"#,
         title = serde_json::to_string(title).unwrap()
@@ -43,9 +44,9 @@ fn tool_ready(id: &str, title: &str, args_json: &str) -> String {
 }
 
 fn tool_done(id: &str, title: &str, args_json: &str) -> String {
-    // root.params.update.rawOutput — four nested after rawOutput object.
+    // Grok Build live shape: null status + content result (not only status=completed).
     format!(
-        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"tool_call_update","toolCallId":"{id}","title":{title},"status":"completed","rawInput":{args_json},"rawOutput":{{"ok":true}}}}}}}}"#,
+        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"tool_call_update","toolCallId":"{id}","title":{title},"rawInput":{args_json},"content":[{{"type":"text","text":"ok"}}]}}}}}}"#,
         title = serde_json::to_string(title).unwrap()
     )
 }
@@ -409,9 +410,18 @@ async fn q_replay_saved_live_dumps_if_present() {
             "replay produced nothing for {}",
             path.display()
         );
-        // Never invent speech that isn't in public texts for chronological mode.
+        // Chronological chat may use emit order or dialect source-time reorder;
+        // never invent speech either way.
         if chat.strategy == ProjectionStrategy::ChronologicalChat {
-            assert_eq!(chat.confidence, ProjectionConfidence::EmitOrder);
+            assert!(
+                matches!(
+                    chat.confidence,
+                    ProjectionConfidence::EmitOrder
+                        | ProjectionConfidence::DialectSourceTime
+                ),
+                "unexpected confidence {:?}",
+                chat.confidence
+            );
         }
         eprintln!(
             "replayed {} → events={} sentences={} strategy={:?} tools={}",

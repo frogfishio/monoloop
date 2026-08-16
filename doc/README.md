@@ -32,10 +32,12 @@ must not become production dependencies.
 | 02 | [Interpreter](INTERPRETER.md) | Async incremental dialect interpretation and immediate in-memory canonical-unit events |
 | 03 | [The Loop](THE_LOOP.md) | Minimal lossless event loop with an empty-capable extension/tool boundary |
 
-Initial Connector implementation profile:
+Initial Connector implementation profiles:
 
 - [Grok Build Network Connector](GROK_BUILD_CONNECTOR.md) — one authenticated
   Grok Build WebSocket server, multiple independently correlated sessions.
+- [Cursor Agent Connector](CURSOR_CONNECTOR.md) — Cursor CLI `agent acp` over
+  stdio NDJSON (ACP family; Cursor profile).
 
 Test infrastructure:
 

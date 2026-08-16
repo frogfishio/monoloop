@@ -16,10 +16,10 @@ mod loop_types;
 pub use canonical::{
     BoundaryKind, CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, DiagnosticKind,
     FlowId, InterpretationEnd, InterpretationEndKind, InterpretationId, InterpreterOutputEvent,
-    LaneId, ModelDiagnostic, ParagraphBoundary, ParagraphKind, SemanticBoundary, StructuralAtom,
-    StructureKind, TextChannel, TextSentence, TokenCount, ToolActionEvent, ToolActionId,
-    ToolExecutionState, ToolRequestState, ToolResultState, ToolTerminalOutcome, UnitId, UnitState,
-    UsageObservation,
+    LaneId, ModelDiagnostic, ParagraphBoundary, ParagraphKind, SemanticBoundary, SourceTimeObservation,
+    StructuralAtom, StructureKind, TextChannel, TextSentence, TokenCount, ToolActionEvent,
+    ToolActionId, ToolExecutionState, ToolRequestState, ToolResultState, ToolTerminalOutcome,
+    UnitId, UnitState, UsageObservation,
 };
 pub use dialect::{DialectBinding, DialectDescriptor, DialectFamily, DialectNegotiation};
 pub use error::{

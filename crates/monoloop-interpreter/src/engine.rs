@@ -8,8 +8,9 @@ use monoloop_contracts::{
     DiagnosticKind, DialectBinding, DialectFamily, ExternalSessionId, FlowId, InterpretationEnd,
     InterpretationEndKind, InterpretationId, InterpretationLimits, InterpreterError,
     InterpreterErrorKind, InterpreterOutputEvent, LaneId, ModelDiagnostic, SemanticBoundary,
-    TextChannel, TextSentence, ToolActionEvent, ToolActionId, ToolExecutionState, ToolRequestState,
-    ToolResultState, ToolTerminalOutcome, UnitId, UnitState, UsageObservation,
+    SourceTimeObservation, TextChannel, TextSentence, ToolActionEvent, ToolActionId,
+    ToolExecutionState, ToolRequestState, ToolResultState, ToolTerminalOutcome, UnitId, UnitState,
+    UsageObservation,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -149,7 +150,7 @@ pub(crate) fn spawn_interpretation(
         let mut owner = Owner {
             request,
             pub_,
-            segmenters: HashMap::new(),
+            channels: HashMap::new(),
             tools: HashMap::new(),
             lane_ordinals: HashMap::new(),
             next_unit: 1,
@@ -177,7 +178,10 @@ pub(crate) fn spawn_interpretation(
 
 fn validate_dialect(binding: &DialectBinding) -> Result<(), InterpreterError> {
     match &binding.output.family {
-        DialectFamily::Acp | DialectFamily::GrokBuild | DialectFamily::Test => Ok(()),
+        DialectFamily::Acp
+        | DialectFamily::GrokBuild
+        | DialectFamily::CursorAcp
+        | DialectFamily::Test => Ok(()),
         other => Err(InterpreterError::unsupported_dialect(format!(
             "unsupported dialect family: {other:?}"
         ))),
@@ -187,7 +191,8 @@ fn validate_dialect(binding: &DialectBinding) -> Result<(), InterpreterError> {
 struct Owner {
     request: StartInterpretation,
     pub_: EventPublisher,
-    segmenters: HashMap<(TextChannel,), SentenceSegmenter>,
+    /// Per-channel text assembly + dialect source-time windows.
+    channels: HashMap<TextChannel, ChannelAssembly>,
     tools: HashMap<String, ToolAssembler>,
     lane_ordinals: HashMap<String, u64>,
     next_unit: u64,
@@ -199,6 +204,93 @@ struct Owner {
     diagnostics: Vec<String>,
     response_started: bool,
     unresolved_bytes_at_end: u64,
+}
+
+/// Sentence assembly for one text channel, with observational source-time spans.
+struct ChannelAssembly {
+    segmenter: SentenceSegmenter,
+    /// Run-length spans covering the current segmenter buffer: `(byte_len, source_time_ms)`.
+    time_spans: Vec<(usize, Option<u64>)>,
+}
+
+impl Default for ChannelAssembly {
+    fn default() -> Self {
+        Self {
+            segmenter: SentenceSegmenter::new(),
+            time_spans: Vec::new(),
+        }
+    }
+}
+
+impl ChannelAssembly {
+    fn push(
+        &mut self,
+        text: &str,
+        source_time_ms: Option<u64>,
+    ) -> Vec<(String, Option<SourceTimeObservation>)> {
+        if !text.is_empty() {
+            self.time_spans.push((text.len(), source_time_ms));
+        }
+        let completed = self.segmenter.push(text);
+        completed
+            .into_iter()
+            .map(|c| {
+                let st = self.take_spans(c.content_bytes, c.bytes_consumed);
+                (c.content, st)
+            })
+            .collect()
+    }
+
+    fn seal(&mut self) -> Vec<(String, Option<SourceTimeObservation>)> {
+        let completed = self.segmenter.seal_at_clean_end();
+        completed
+            .into_iter()
+            .map(|c| {
+                let st = self.take_spans(c.content_bytes, c.bytes_consumed);
+                (c.content, st)
+            })
+            .collect()
+    }
+
+    fn take_unresolved(&mut self) -> String {
+        self.time_spans.clear();
+        self.segmenter.take_unresolved()
+    }
+
+    /// Attribute times from the content region; drop trailing whitespace spans.
+    fn take_spans(
+        &mut self,
+        content_bytes: usize,
+        bytes_consumed: usize,
+    ) -> Option<SourceTimeObservation> {
+        let mut first = None;
+        let mut last = None;
+        let mut seen = 0usize;
+        let mut remaining = bytes_consumed;
+        while remaining > 0 && !self.time_spans.is_empty() {
+            let (len, t) = &mut self.time_spans[0];
+            let take = (*len).min(remaining);
+            // Only content_bytes contribute to source_time (not trailing whitespace).
+            let content_take = if seen < content_bytes {
+                take.min(content_bytes - seen)
+            } else {
+                0
+            };
+            if content_take > 0 {
+                if let Some(ms) = *t {
+                    first = Some(first.map_or(ms, |f: u64| f.min(ms)));
+                    last = Some(last.map_or(ms, |l: u64| l.max(ms)));
+                }
+            }
+            seen += take;
+            *len -= take;
+            remaining -= take;
+            if *len == 0 {
+                self.time_spans.remove(0);
+            }
+        }
+        SourceTimeObservation::from_bounds(first, last)
+    }
 }
 
 struct ToolAssembler {
@@ -213,6 +305,21 @@ struct ToolAssembler {
     result_payload: Option<String>,
     terminal: Option<ToolTerminalOutcome>,
     waiting_for: Option<String>,
+    first_ms: Option<u64>,
+    last_ms: Option<u64>,
+}
+
+impl ToolAssembler {
+    fn note_time(&mut self, t: Option<u64>) {
+        if let Some(ms) = t {
+            self.first_ms = Some(self.first_ms.map_or(ms, |f| f.min(ms)));
+            self.last_ms = Some(self.last_ms.map_or(ms, |l| l.max(ms)));
+        }
+    }
+
+    fn source_time(&self) -> Option<SourceTimeObservation> {
+        SourceTimeObservation::from_bounds(self.first_ms, self.last_ms)
+    }
 }
 
 impl Owner {
@@ -292,7 +399,9 @@ impl Owner {
 
         match &self.request.dialect.output.family {
             DialectFamily::Test => self.ingest_test_text().await,
-            DialectFamily::Acp | DialectFamily::GrokBuild => self.ingest_acp().await,
+            DialectFamily::Acp | DialectFamily::GrokBuild | DialectFamily::CursorAcp => {
+                self.ingest_acp().await
+            }
             _ => Err(InterpreterError::unsupported_dialect("dialect")),
         }
     }
@@ -306,7 +415,7 @@ impl Owner {
         }
         let text = String::from_utf8_lossy(valid).into_owned();
         self.frame_buf = rest.to_vec();
-        self.on_text(TextChannel::PublicResponse, &text).await
+        self.on_text(TextChannel::PublicResponse, &text, None).await
     }
 
     async fn ingest_acp(&mut self) -> Result<(), InterpreterError> {
@@ -335,8 +444,16 @@ impl Owner {
 
     async fn on_fragment(&mut self, frag: AcpFragment) -> Result<(), InterpreterError> {
         match frag {
-            AcpFragment::TextDelta { channel, text } => self.on_text(channel, &text).await,
-            AcpFragment::Tool { action_id, signal } => self.on_tool(action_id, signal).await,
+            AcpFragment::TextDelta {
+                channel,
+                text,
+                source_time_ms,
+            } => self.on_text(channel, &text, source_time_ms).await,
+            AcpFragment::Tool {
+                action_id,
+                signal,
+                source_time_ms,
+            } => self.on_tool(action_id, signal, source_time_ms).await,
             AcpFragment::ResponseFinished => {
                 self.seal_text_channels().await?;
                 self.emit_boundary(BoundaryKind::ResponseFinished).await
@@ -349,32 +466,40 @@ impl Owner {
         }
     }
 
-    async fn on_text(&mut self, channel: TextChannel, text: &str) -> Result<(), InterpreterError> {
-        let key = (channel,);
-        let seg = self.segmenters.entry(key).or_default();
-        if seg.buffered_bytes() + text.len() > self.request.limits.max_sentence_assembly_bytes {
-            return Err(InterpreterError::new(
-                InterpreterErrorKind::SentenceLimitExceeded,
-                "sentence assembly limit exceeded",
-            ));
-        }
-        let completed = seg.push(text);
-        for sentence in completed {
-            self.emit_sentence(channel, sentence).await?;
+    async fn on_text(
+        &mut self,
+        channel: TextChannel,
+        text: &str,
+        source_time_ms: Option<u64>,
+    ) -> Result<(), InterpreterError> {
+        let completed = {
+            let asm = self.channels.entry(channel).or_default();
+            if asm.segmenter.buffered_bytes() + text.len()
+                > self.request.limits.max_sentence_assembly_bytes
+            {
+                return Err(InterpreterError::new(
+                    InterpreterErrorKind::SentenceLimitExceeded,
+                    "sentence assembly limit exceeded",
+                ));
+            }
+            asm.push(text, source_time_ms)
+        };
+        for (sentence, source_time) in completed {
+            self.emit_sentence(channel, sentence, source_time).await?;
         }
         Ok(())
     }
 
     async fn seal_text_channels(&mut self) -> Result<(), InterpreterError> {
-        let channels: Vec<TextChannel> = self.segmenters.keys().map(|(c,)| *c).collect();
+        let channels: Vec<TextChannel> = self.channels.keys().copied().collect();
         for channel in channels {
             let sealed = self
-                .segmenters
-                .get_mut(&(channel,))
-                .map(|s| s.seal_at_clean_end())
+                .channels
+                .get_mut(&channel)
+                .map(|asm| asm.seal())
                 .unwrap_or_default();
-            for sentence in sealed {
-                self.emit_sentence(channel, sentence).await?;
+            for (sentence, source_time) in sealed {
+                self.emit_sentence(channel, sentence, source_time).await?;
             }
         }
         Ok(())
@@ -386,8 +511,8 @@ impl Owner {
 
     async fn quarantine_partials(&mut self) -> Result<(), InterpreterError> {
         // Do not promote incomplete sentences.
-        for ((channel,), seg) in self.segmenters.iter_mut() {
-            let unresolved = seg.take_unresolved();
+        for (channel, asm) in self.channels.iter_mut() {
+            let unresolved = asm.take_unresolved();
             if !unresolved.is_empty() {
                 self.unresolved_bytes_at_end += unresolved.len() as u64;
                 self.diagnostics.push(format!(
@@ -431,6 +556,7 @@ impl Owner {
         &mut self,
         action_id: ToolActionId,
         signal: ToolSignal,
+        source_time_ms: Option<u64>,
     ) -> Result<(), InterpreterError> {
         if self.tools.len() >= self.request.limits.max_pending_tool_actions
             && !self.tools.contains_key(action_id.as_str())
@@ -458,12 +584,15 @@ impl Owner {
                     result_payload: None,
                     terminal: None,
                     waiting_for: None,
+                    first_ms: None,
+                    last_ms: None,
                 },
             );
         }
 
         let event_kind = {
             let tool = self.tools.get_mut(action_id.as_str()).unwrap();
+            tool.note_time(source_time_ms);
             tool.generation += 1;
             match signal {
                 ToolSignal::Waiting {
@@ -567,6 +696,7 @@ impl Owner {
             tool.generation,
             state,
             LaneId::tool(),
+            tool.source_time(),
             unit,
         ))
     }
@@ -575,6 +705,7 @@ impl Owner {
         &mut self,
         channel: TextChannel,
         content: String,
+        source_time: Option<SourceTimeObservation>,
     ) -> Result<(), InterpreterError> {
         let unit_id = UnitId::new(format!("s-{}", self.next_unit));
         self.next_unit += 1;
@@ -591,7 +722,7 @@ impl Owner {
             TextChannel::PublicReasoningSummary => LaneId::reasoning(),
             _ => LaneId::response(),
         };
-        let snap = self.snapshot(unit_id, 1, UnitState::Complete, lane, unit);
+        let snap = self.snapshot(unit_id, 1, UnitState::Complete, lane, source_time, unit);
         // Created-and-complete: emit Created (complete state)
         self.pub_
             .publish(InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(
@@ -609,6 +740,7 @@ impl Owner {
             1,
             UnitState::Complete,
             LaneId::response(),
+            None,
             unit,
         );
         self.pub_
@@ -631,6 +763,7 @@ impl Owner {
             1,
             UnitState::Complete,
             LaneId::response(),
+            None,
             unit,
         );
         self.pub_
@@ -646,6 +779,7 @@ impl Owner {
         generation: u64,
         state: UnitState,
         lane_id: LaneId,
+        source_time: Option<SourceTimeObservation>,
         unit: CanonicalUnit,
     ) -> CanonicalUnitSnapshot {
         let lane_ordinal = self
@@ -664,6 +798,7 @@ impl Owner {
             lane_id,
             lane_ordinal,
             causal_parent_id: None,
+            source_time,
             unit,
         }
     }
@@ -691,8 +826,8 @@ impl Owner {
         }
         self.ended = true;
         let mut unresolved = self.unresolved_bytes_at_end;
-        for seg in self.segmenters.values() {
-            unresolved += seg.buffered_bytes() as u64;
+        for asm in self.channels.values() {
+            unresolved += asm.segmenter.buffered_bytes() as u64;
         }
         unresolved += self.frame_buf.len() as u64;
 

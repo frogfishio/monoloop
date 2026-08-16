@@ -17,13 +17,13 @@ mod stream;
 pub use acp::AcpDialect;
 pub use engine::{Interpretation, InterpretationInput, StartInterpretation};
 pub use factory::{DefaultInterpreterFactory, InterpreterFactory, SupportLevel};
-pub use sentence::{SentenceSegmenter, SENTENCE_SEGMENTER_VERSION};
+pub use sentence::{CompletedSentence, SentenceSegmenter, SENTENCE_SEGMENTER_VERSION};
 pub use stream::CanonicalEventStream;
 
 pub use monoloop_contracts::{
     BoundaryKind, Bytes, CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, ConnectionId,
     DialectBinding, DialectDescriptor, DialectFamily, ExternalSessionId, FlowId, InterpretationEnd,
     InterpretationEndKind, InterpretationId, InterpretationLimits, InterpreterError,
-    InterpreterErrorKind, InterpreterOutputEvent, LaneId, TextChannel, TextSentence, ToolActionId,
-    UnitId, UnitState,
+    InterpreterErrorKind, InterpreterOutputEvent, LaneId, SourceTimeObservation, TextChannel,
+    TextSentence, ToolActionId, UnitId, UnitState,
 };

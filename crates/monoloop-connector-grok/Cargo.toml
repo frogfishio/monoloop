@@ -14,7 +14,7 @@ monoloop-connector = { path = "../monoloop-connector" }
 monoloop-contracts = { path = "../monoloop-contracts" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

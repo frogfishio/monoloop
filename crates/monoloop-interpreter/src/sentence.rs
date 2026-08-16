@@ -6,6 +6,19 @@
 /// Version label for the segmenter (recorded in interpretation diagnostics).
 pub const SENTENCE_SEGMENTER_VERSION: &str = "v2";
 
+/// One completed sentence from the segmenter, with buffer consumption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedSentence {
+    /// Sentence text (trimmed trailing whitespace).
+    pub content: String,
+    /// Bytes of the content region (through terminator, excluding following
+    /// whitespace). Used for dialect source-time attribution.
+    pub content_bytes: usize,
+    /// Bytes removed from the assembly buffer for this sentence
+    /// (content region + trailing whitespace after the terminator).
+    pub bytes_consumed: usize,
+}
+
 /// Deterministic sentence boundary finder.
 ///
 /// Prefers waiting over premature emission. Does not emit incomplete fragments.
@@ -28,13 +41,13 @@ impl SentenceSegmenter {
     /// Push text and return newly completed sentences (in order).
     ///
     /// Incomplete remainder stays buffered.
-    pub fn push(&mut self, text: &str) -> Vec<String> {
+    pub fn push(&mut self, text: &str) -> Vec<CompletedSentence> {
         self.buf.push_str(text);
         self.drain_complete(false)
     }
 
     /// Seal remaining buffer at clean semantic completion (may lack terminal punctuation).
-    pub fn seal_at_clean_end(&mut self) -> Vec<String> {
+    pub fn seal_at_clean_end(&mut self) -> Vec<CompletedSentence> {
         self.drain_complete(true)
     }
 
@@ -43,12 +56,15 @@ impl SentenceSegmenter {
         std::mem::take(&mut self.buf)
     }
 
-    fn drain_complete(&mut self, seal_remainder: bool) -> Vec<String> {
+    fn drain_complete(&mut self, seal_remainder: bool) -> Vec<CompletedSentence> {
         let mut out = Vec::new();
         loop {
             if let Some(end) = find_sentence_end(&self.buf) {
                 let raw = self.buf[..end].to_string();
                 let content = raw.trim_end().to_string();
+                // Content region ends at last non-whitespace of `raw` (usually `end`
+                // when the terminator is non-whitespace).
+                let content_bytes = content.len();
                 // advance past end and following whitespace (but keep newlines as
                 // paragraph hints only by dropping them from the next sentence start)
                 let mut consume = end;
@@ -59,17 +75,27 @@ impl SentenceSegmenter {
                 }
                 self.buf = self.buf[consume..].to_string();
                 if !content.is_empty() {
-                    out.push(content);
+                    out.push(CompletedSentence {
+                        content,
+                        content_bytes,
+                        bytes_consumed: consume,
+                    });
                 }
             } else {
                 break;
             }
         }
         if seal_remainder && !self.buf.trim().is_empty() {
+            let bytes_consumed = self.buf.len();
             let content = self.buf.trim().to_string();
+            let content_bytes = content.len();
             self.buf.clear();
             if !content.is_empty() {
-                out.push(content);
+                out.push(CompletedSentence {
+                    content,
+                    content_bytes,
+                    bytes_consumed,
+                });
             }
         }
         out
@@ -252,13 +278,17 @@ fn looks_like_abbreviation_or_decimal(s: &str, dot_idx: usize) -> bool {
 mod tests {
     use super::*;
 
+    fn contents(done: &[CompletedSentence]) -> Vec<String> {
+        done.iter().map(|c| c.content.clone()).collect()
+    }
+
     #[test]
     fn splits_on_period_space() {
         let mut s = SentenceSegmenter::new();
         let a = s.push("Hello world. ");
-        assert_eq!(a, vec!["Hello world.".to_string()]);
+        assert_eq!(contents(&a), vec!["Hello world.".to_string()]);
         let b = s.push("Next one! ");
-        assert_eq!(b, vec!["Next one!".to_string()]);
+        assert_eq!(contents(&b), vec!["Next one!".to_string()]);
     }
 
     #[test]
@@ -267,7 +297,7 @@ mod tests {
         assert!(s.push("The build uses std::").is_empty());
         let done = s.push("sync::Arc to share the handle. ");
         assert_eq!(
-            done,
+            contents(&done),
             vec!["The build uses std::sync::Arc to share the handle.".to_string()]
         );
     }
@@ -286,11 +316,11 @@ mod tests {
         let done = s.push("**CREATE** — Wrote the file with `hello monoloop crud`.\n\n");
         assert_eq!(done.len(), 1, "{done:?}");
         assert!(
-            done[0].starts_with("1."),
+            done[0].content.starts_with("1."),
             "list marker must stay attached: {}",
-            done[0]
+            done[0].content
         );
-        assert!(done[0].contains("**CREATE**"));
+        assert!(done[0].content.contains("**CREATE**"));
     }
 
     #[test]
@@ -299,10 +329,12 @@ mod tests {
         let text = "1. **CREATE** — Wrote the file.\n\n2. **READ** — File contained x.\n\n3. **UPDATE** — Done.\n\n";
         let done = s.push(text);
         assert_eq!(done.len(), 3, "{done:?}");
-        assert!(done.iter().all(|x| !x.trim().chars().all(|c| c.is_ascii_digit() || c == '.')));
-        assert!(done[0].contains("CREATE"));
-        assert!(done[1].contains("READ"));
-        assert!(done[2].contains("UPDATE"));
+        assert!(done
+            .iter()
+            .all(|x| !x.content.trim().chars().all(|c| c.is_ascii_digit() || c == '.')));
+        assert!(done[0].content.contains("CREATE"));
+        assert!(done[1].content.contains("READ"));
+        assert!(done[2].content.contains("UPDATE"));
     }
 
     #[test]
@@ -312,8 +344,8 @@ mod tests {
         assert!(s.push("starting with create.").is_empty());
         let done = s.push("CRUD exercise on the file only:\n\n");
         assert_eq!(done.len(), 2, "{done:?}");
-        assert_eq!(done[0], "starting with create.");
-        assert!(done[1].starts_with("CRUD exercise"));
+        assert_eq!(done[0].content, "starting with create.");
+        assert!(done[1].content.starts_with("CRUD exercise"));
     }
 
     /// Exact token stream observed from live Grok CRUD (`target/live_grok_crud.raw.txt`).
@@ -455,36 +487,39 @@ mod tests {
             done.extend(s.push(c));
         }
         done.extend(s.seal_at_clean_end());
+        let texts = contents(&done);
 
         // No glued create.CRUD; no bare list markers.
         assert!(
-            done.iter().all(|x| !x.contains("create.CRUD")),
-            "must split missing-space: {done:?}"
+            texts.iter().all(|x| !x.contains("create.CRUD")),
+            "must split missing-space: {texts:?}"
         );
         assert!(
-            done.iter()
+            texts
+                .iter()
                 .all(|x| !is_only_list_marker(x) && x.trim() != "1." && x.trim() != "2."),
-            "bare list markers leaked: {done:?}"
+            "bare list markers leaked: {texts:?}"
         );
         assert!(
-            done.iter().any(|x| x.ends_with("create.")),
-            "expected sentence ending create.: {done:?}"
+            texts.iter().any(|x| x.ends_with("create.")),
+            "expected sentence ending create.: {texts:?}"
         );
         assert!(
-            done.iter().any(|x| x.starts_with("CRUD exercise")),
-            "expected CRUD exercise sentence: {done:?}"
+            texts.iter().any(|x| x.starts_with("CRUD exercise")),
+            "expected CRUD exercise sentence: {texts:?}"
         );
         assert_eq!(
-            done.iter()
+            texts
+                .iter()
                 .filter(|x| x.contains("**CREATE**")
                     || x.contains("**READ**")
                     || x.contains("**UPDATE**")
                     || x.contains("**DELETE**"))
                 .count(),
             5,
-            "five step sentences: {done:?}"
+            "five step sentences: {texts:?}"
         );
-        for step in done.iter().filter(|x| {
+        for step in texts.iter().filter(|x| {
             x.contains("**CREATE**")
                 || x.contains("**READ**")
                 || x.contains("**UPDATE**")
@@ -496,8 +531,8 @@ mod tests {
             );
         }
         assert!(
-            done.iter().any(|x| x.contains("No other files were touched")),
-            "{done:?}"
+            texts.iter().any(|x| x.contains("No other files were touched")),
+            "{texts:?}"
         );
     }
 
@@ -506,7 +541,7 @@ mod tests {
         let mut s = SentenceSegmenter::new();
         s.push("Done");
         let sealed = s.seal_at_clean_end();
-        assert_eq!(sealed, vec!["Done".to_string()]);
+        assert_eq!(contents(&sealed), vec!["Done".to_string()]);
     }
 
     #[test]

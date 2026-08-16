@@ -4,11 +4,18 @@
 //!
 //! ## Design (scalable / universal)
 //!
-//! **Always correct core — chronological chat**
+//! **Human chat default — dialect source time when present**
 //!
-//! Walk complete units in Interpreter emit order, map channels to chat roles,
-//! collapse consecutive same-role text. No invented speech, no tool↔sentence
-//! claims. Works for every mix of agent / thinking / tool / status.
+//! Complete units often *emit* in a jumbled order relative to how a reader
+//! expects the turn (sentence assembly waits while tools complete). When the
+//! dialect supplies `source_time`, the chat report sorts by `first_ms` so
+//! humans see production order. Missing times fall back to emit order.
+//! Canonical timeline / interleaved stream stay emit-order ground truth.
+//!
+//! **Fallback core — emit-order chronological chat**
+//!
+//! Map channels to chat roles, collapse consecutive same-role text. No invented
+//! speech, no tool↔sentence claims.
 //!
 //! **Optional structural zip (gated)**
 //!
@@ -20,7 +27,8 @@
 //! Then: preamble → thinking/status → ordinal `(tool[i], step[i])` → epilogue.
 //! Pairing is **index-only** — no CREATE/READ/keyword matching.
 //!
-//! If any gate fails → chronological. Prefer honesty over a pretty but wrong weave.
+//! If any gate fails → chronological (source-time or emit). Prefer honesty over
+//! a pretty but wrong weave.
 //!
 //! ```text
 //! AGENT:    I'll take care of that.
@@ -32,14 +40,15 @@
 //! ```
 
 use monoloop_contracts::{
-    CanonicalUnit, InterpreterOutputEvent, TextChannel, ToolRequestState, UnitState,
+    CanonicalUnit, InterpreterOutputEvent, SourceTimeObservation, TextChannel, ToolRequestState,
+    UnitState,
 };
 use std::collections::HashMap;
 
 /// Strategy used to lay out the projected chat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionStrategy {
-    /// Emit-order layout with chat chrome. Universal default.
+    /// Chronological layout with chat chrome (source-time or emit order).
     ChronologicalChat,
     /// Tools-first dump + equal numbered steps → ordinal tool/step zip only.
     StructuralOrdinalZip,
@@ -50,6 +59,9 @@ pub enum ProjectionStrategy {
 pub enum ProjectionConfidence {
     /// Layout follows emit order (no reordering of tools vs text).
     EmitOrder,
+    /// Chronological blocks reordered by dialect `source_time.first_ms` for
+    /// human readability. Not causality; content still complete units only.
+    DialectSourceTime,
     /// Tools/steps reordered under structural gates; still no invented content.
     StructuralReorder,
 }
@@ -60,12 +72,24 @@ pub struct ProjectChatOptions {
     /// When true (default), allow [`ProjectionStrategy::StructuralOrdinalZip`]
     /// if structural gates pass. When false, always chronological.
     pub allow_structural_zip: bool,
+    /// When true (default), sort chronological blocks by dialect
+    /// `source_time.first_ms` (then emit index) when times are present so human
+    /// readers are not shown tools-before-speech that started earlier on the
+    /// wire. When times are absent, emit order is preserved. Set false to force
+    /// pure emit-order chat.
+    pub order_by_source_time: bool,
+    /// When true (default), annotate lines with dialect source-time when known.
+    pub annotate_source_time: bool,
 }
 
 impl Default for ProjectChatOptions {
     fn default() -> Self {
         Self {
             allow_structural_zip: true,
+            // Human product surface: avoid jumbled tools-before-speech when the
+            // dialect clock is available. Kernel emit order remains elsewhere.
+            order_by_source_time: true,
+            annotate_source_time: true,
         }
     }
 }
@@ -98,6 +122,8 @@ pub struct ProjectedTool {
     pub terminal: Option<String>,
     /// Request/unit state label.
     pub state: String,
+    /// Dialect source time when present on the unit snapshot.
+    pub source_time: Option<SourceTimeObservation>,
 }
 
 /// One line in the projected chat.
@@ -111,6 +137,8 @@ pub struct ChatLine {
     pub tool: Option<ProjectedTool>,
     /// True when this line was placed by structural zip (not pure emit order).
     pub reordered: bool,
+    /// Dialect source time when present (observational).
+    pub source_time: Option<SourceTimeObservation>,
 }
 
 /// Full chat projection for a run.
@@ -133,10 +161,11 @@ pub struct ChatProjection {
 }
 
 const DISCLAIMER: &str = "Chat projection is a human-readable report, not ground truth. \
-Default layout follows Interpreter emit order. Structural ordinal zip (when shown) \
-only reorders tools against later numbered list steps when counts match — it does \
-not invent speech. Use the event-order interleaved stream and canonical timeline \
-for exact emit order.";
+When dialect source times are present, chat lines are ordered by production time \
+so readers are not shown tools before speech that started earlier on the wire. \
+Structural ordinal zip (when shown) only reorders tools against later numbered \
+list steps when counts match — it does not invent speech. Use the event-order \
+interleaved stream and canonical timeline for exact Interpreter emit order.";
 
 /// Project canonical Interpreter events into a chat-like flow (default options).
 pub fn project_chat(events: &[InterpreterOutputEvent]) -> ChatProjection {
@@ -148,10 +177,27 @@ pub fn project_chat_with(
     events: &[InterpreterOutputEvent],
     opts: &ProjectChatOptions,
 ) -> ChatProjection {
-    let extracted = extract(events);
+    let mut extracted = extract(events);
+    let source_time_applied = if opts.order_by_source_time {
+        apply_source_time_order(&mut extracted.chrono)
+    } else {
+        false
+    };
     let (strategy, reason) = choose_strategy(&extracted, opts);
+    let mut reason = reason;
+    if source_time_applied {
+        reason.push_str(
+            "; human chat ordered by dialect source_time.first_ms (emit order preserved when times absent)",
+        );
+    }
     let confidence = match strategy {
-        ProjectionStrategy::ChronologicalChat => ProjectionConfidence::EmitOrder,
+        ProjectionStrategy::ChronologicalChat => {
+            if source_time_applied {
+                ProjectionConfidence::DialectSourceTime
+            } else {
+                ProjectionConfidence::EmitOrder
+            }
+        }
         ProjectionStrategy::StructuralOrdinalZip => ProjectionConfidence::StructuralReorder,
     };
     let lines = match strategy {
@@ -159,8 +205,20 @@ pub fn project_chat_with(
         ProjectionStrategy::ChronologicalChat => assemble_chronological(&extracted),
     };
     let lines = merge_consecutive_same_role(&lines);
-    let plain_text = render_plain(&lines, strategy, confidence, &reason);
-    let html = render_html(&lines, strategy, confidence, &reason);
+    let plain_text = render_plain(
+        &lines,
+        strategy,
+        confidence,
+        &reason,
+        opts.annotate_source_time,
+    );
+    let html = render_html(
+        &lines,
+        strategy,
+        confidence,
+        &reason,
+        opts.annotate_source_time,
+    );
     ChatProjection {
         strategy,
         confidence,
@@ -193,8 +251,13 @@ enum ChronoBlock {
     Text {
         channel: TextChannel,
         content: String,
+        source_time: Option<SourceTimeObservation>,
+        emit_index: usize,
     },
-    Tool(ProjectedTool),
+    Tool {
+        tool: ProjectedTool,
+        emit_index: usize,
+    },
 }
 
 fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
@@ -206,6 +269,7 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
     let mut status: Vec<String> = Vec::new();
     let mut saw_public = false;
     let mut tool_after_public = false;
+    let mut emit_index = 0usize;
 
     for ev in events {
         let InterpreterOutputEvent::Unit(unit_ev) = ev else {
@@ -220,21 +284,30 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
                     chrono.push(ChronoBlock::Text {
                         channel: t.channel,
                         content: t.content.clone(),
+                        source_time: snap.source_time,
+                        emit_index,
                     });
+                    emit_index += 1;
                 }
                 TextChannel::PublicReasoningSummary => {
                     reasoning.push(t.content.clone());
                     chrono.push(ChronoBlock::Text {
                         channel: t.channel,
                         content: t.content.clone(),
+                        source_time: snap.source_time,
+                        emit_index,
                     });
+                    emit_index += 1;
                 }
                 TextChannel::StatusNarration => {
                     status.push(t.content.clone());
                     chrono.push(ChronoBlock::Text {
                         channel: t.channel,
                         content: t.content.clone(),
+                        source_time: snap.source_time,
+                        emit_index,
                     });
+                    emit_index += 1;
                 }
                 TextChannel::QuotedExternalContent => {}
             },
@@ -242,20 +315,26 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
                 if saw_public {
                     tool_after_public = true;
                 }
-                let projected = projected_tool(t, snap.unit_state);
+                let projected = projected_tool(t, snap.unit_state, snap.source_time);
                 let id = projected.action_id.clone();
                 if let Some(&idx) = tool_index.get(&id) {
                     tools[idx] = projected.clone();
-                    if let Some(ChronoBlock::Tool(slot)) = chrono.iter_mut().find(|b| match b {
-                        ChronoBlock::Tool(p) => p.action_id == id,
-                        _ => false,
-                    }) {
+                    if let Some(ChronoBlock::Tool { tool: slot, .. }) =
+                        chrono.iter_mut().find(|b| match b {
+                            ChronoBlock::Tool { tool: p, .. } => p.action_id == id,
+                            _ => false,
+                        })
+                    {
                         *slot = projected;
                     }
                 } else {
                     tool_index.insert(id, tools.len());
                     tools.push(projected.clone());
-                    chrono.push(ChronoBlock::Tool(projected));
+                    chrono.push(ChronoBlock::Tool {
+                        tool: projected,
+                        emit_index,
+                    });
+                    emit_index += 1;
                 }
             }
             _ => {}
@@ -279,6 +358,7 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
 fn projected_tool(
     t: &monoloop_contracts::ToolActionEvent,
     unit_state: UnitState,
+    source_time: Option<SourceTimeObservation>,
 ) -> ProjectedTool {
     let title = t.tool_name.clone().unwrap_or_else(|| "tool".into());
     let verb = display_verb(&title, t.request_payload.as_deref());
@@ -302,6 +382,48 @@ fn projected_tool(
         args: t.request_payload.clone(),
         terminal: t.terminal_outcome.map(|o| format!("{o:?}")),
         state,
+        source_time,
+    }
+}
+
+/// Sort chrono blocks by dialect `first_ms` when any times are present.
+/// Returns true when the sort actually changed display order vs emit index.
+fn apply_source_time_order(chrono: &mut [ChronoBlock]) -> bool {
+    if chrono.is_empty() {
+        return false;
+    }
+    let any_time = chrono.iter().any(|b| block_source_time(b).is_some());
+    if !any_time {
+        return false;
+    }
+    let before: Vec<usize> = chrono.iter().map(block_emit_index).collect();
+    // Primary: first_ms when known (unknown times sort last); secondary: emit index.
+    chrono.sort_by_key(|b| {
+        let t = block_source_time(b).map(|s| s.first_ms);
+        (t.unwrap_or(u64::MAX), block_emit_index(b))
+    });
+    let after: Vec<usize> = chrono.iter().map(block_emit_index).collect();
+    before != after
+}
+
+fn block_source_time(b: &ChronoBlock) -> Option<SourceTimeObservation> {
+    match b {
+        ChronoBlock::Text { source_time, .. } => *source_time,
+        ChronoBlock::Tool { tool, .. } => tool.source_time,
+    }
+}
+
+fn block_emit_index(b: &ChronoBlock) -> usize {
+    match b {
+        ChronoBlock::Text { emit_index, .. } | ChronoBlock::Tool { emit_index, .. } => *emit_index,
+    }
+}
+
+fn format_source_time(st: SourceTimeObservation) -> String {
+    if st.first_ms == st.last_ms {
+        format!("t={}", st.first_ms)
+    } else {
+        format!("t={}..{}", st.first_ms, st.last_ms)
     }
 }
 
@@ -431,13 +553,13 @@ fn assemble_structural_zip(ex: &Extracted) -> Vec<ChatLine> {
     // Reasoning/status that appeared in the stream: for tools-first dumps they
     // usually sit with tools or after; surface them before the weave as context.
     for s in &ex.reasoning {
-        lines.push(line(ChatRole::Thinking, s.clone(), None, true));
+        lines.push(line(ChatRole::Thinking, s.clone(), None, true, None));
     }
     for s in &ex.status {
-        lines.push(line(ChatRole::Status, s.clone(), None, true));
+        lines.push(line(ChatRole::Status, s.clone(), None, true, None));
     }
     for s in &preamble {
-        lines.push(line(ChatRole::Agent, s.clone(), None, true));
+        lines.push(line(ChatRole::Agent, s.clone(), None, true, None));
     }
 
     // Gates guarantee steps.len() == tools.len().
@@ -447,12 +569,13 @@ fn assemble_structural_zip(ex: &Extracted) -> Vec<ChatLine> {
             String::new(),
             Some(tool.clone()),
             true,
+            tool.source_time,
         ));
-        lines.push(line(ChatRole::Agent, step.clone(), None, true));
+        lines.push(line(ChatRole::Agent, step.clone(), None, true, None));
     }
 
     for s in &epilogue {
-        lines.push(line(ChatRole::Agent, s.clone(), None, true));
+        lines.push(line(ChatRole::Agent, s.clone(), None, true, None));
     }
     lines
 }
@@ -461,13 +584,15 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
     let mut lines = Vec::new();
     let mut pending_role: Option<ChatRole> = None;
     let mut pending_text: Vec<String> = Vec::new();
+    let mut pending_time: Option<SourceTimeObservation> = None;
 
     let flush = |role: &mut Option<ChatRole>,
                  buf: &mut Vec<String>,
+                 time: &mut Option<SourceTimeObservation>,
                  lines: &mut Vec<ChatLine>| {
         if let Some(r) = role.take() {
             if !buf.is_empty() {
-                lines.push(line(r, join_soft(buf), None, false));
+                lines.push(line(r, join_soft(buf), None, false, time.take()));
                 buf.clear();
             }
         }
@@ -475,7 +600,12 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
 
     for b in &ex.chrono {
         match b {
-            ChronoBlock::Text { channel, content } => {
+            ChronoBlock::Text {
+                channel,
+                content,
+                source_time,
+                ..
+            } => {
                 let role = match channel {
                     TextChannel::PublicResponse => ChatRole::Agent,
                     TextChannel::PublicReasoningSummary => ChatRole::Thinking,
@@ -483,23 +613,45 @@ fn assemble_chronological(ex: &Extracted) -> Vec<ChatLine> {
                     TextChannel::QuotedExternalContent => continue,
                 };
                 if pending_role != Some(role) {
-                    flush(&mut pending_role, &mut pending_text, &mut lines);
+                    flush(
+                        &mut pending_role,
+                        &mut pending_text,
+                        &mut pending_time,
+                        &mut lines,
+                    );
                     pending_role = Some(role);
                 }
                 pending_text.push(content.clone());
+                pending_time = match (pending_time, *source_time) {
+                    (Some(a), Some(b)) => Some(a.merge(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
             }
-            ChronoBlock::Tool(t) => {
-                flush(&mut pending_role, &mut pending_text, &mut lines);
+            ChronoBlock::Tool { tool: t, .. } => {
+                flush(
+                    &mut pending_role,
+                    &mut pending_text,
+                    &mut pending_time,
+                    &mut lines,
+                );
                 lines.push(line(
                     ChatRole::Tool,
                     String::new(),
                     Some(t.clone()),
                     false,
+                    t.source_time,
                 ));
             }
         }
     }
-    flush(&mut pending_role, &mut pending_text, &mut lines);
+    flush(
+        &mut pending_role,
+        &mut pending_text,
+        &mut pending_time,
+        &mut lines,
+    );
     lines
 }
 
@@ -508,12 +660,14 @@ fn line(
     text: String,
     tool: Option<ProjectedTool>,
     reordered: bool,
+    source_time: Option<SourceTimeObservation>,
 ) -> ChatLine {
     ChatLine {
         role,
         text,
         tool,
         reordered,
+        source_time,
     }
 }
 
@@ -553,6 +707,12 @@ fn merge_consecutive_same_role(lines: &[ChatLine]) -> Vec<ChatLine> {
                     }
                     prev.text.push_str(&line.text);
                     prev.reordered = prev.reordered || line.reordered;
+                    prev.source_time = match (prev.source_time, line.source_time) {
+                        (Some(a), Some(b)) => Some(a.merge(b)),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    };
                     continue;
                 }
             }
@@ -569,6 +729,7 @@ fn render_plain(
     strategy: ProjectionStrategy,
     confidence: ProjectionConfidence,
     reason: &str,
+    annotate_source_time: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -578,24 +739,31 @@ fn render_plain(
     out.push_str("\n");
     out.push_str(&format!("reason: {reason}\n\n"));
     for line in lines {
+        let t_note = if annotate_source_time {
+            line.source_time
+                .map(|st| format!(" [{}]", format_source_time(st)))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         match (&line.role, &line.tool) {
             (ChatRole::Agent, _) => {
-                out.push_str("AGENT:\n");
+                out.push_str(&format!("AGENT{t_note}:\n"));
                 out.push_str(&line.text);
                 out.push_str("\n\n");
             }
             (ChatRole::Thinking, _) => {
-                out.push_str("THINKING:\n… ");
+                out.push_str(&format!("THINKING{t_note}:\n… "));
                 out.push_str(&line.text);
                 out.push_str("\n\n");
             }
             (ChatRole::Status, _) => {
-                out.push_str("STATUS:\n");
+                out.push_str(&format!("STATUS{t_note}:\n"));
                 out.push_str(&line.text);
                 out.push_str("\n\n");
             }
             (ChatRole::Tool, Some(t)) => {
-                out.push_str(&format!("TOOL: {} — {}\n", t.verb, t.title));
+                out.push_str(&format!("TOOL{t_note}: {} — {}\n", t.verb, t.title));
                 if let Some(term) = &t.terminal {
                     out.push_str(&format!("      → {term}\n"));
                 }
@@ -612,9 +780,11 @@ fn render_html(
     strategy: ProjectionStrategy,
     confidence: ProjectionConfidence,
     reason: &str,
+    annotate_source_time: bool,
 ) -> String {
     let conf_class = match confidence {
         ProjectionConfidence::EmitOrder => "conf-emit",
+        ProjectionConfidence::DialectSourceTime => "conf-source-time",
         ProjectionConfidence::StructuralReorder => "conf-structural",
     };
     let mut out = String::new();
@@ -634,16 +804,30 @@ fn render_html(
     out.push_str("<div class=\"chat-flow\">\n");
 
     for line in lines {
+        let t_html = if annotate_source_time {
+            line.source_time
+                .map(|st| {
+                    format!(
+                        " <span class=\"chat-source-time\">{}</span>",
+                        escape(&format_source_time(st))
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         match (&line.role, &line.tool) {
             (ChatRole::Agent, _) => {
-                out.push_str(&agent_bubble(&line.text, line.reordered));
+                out.push_str(&agent_bubble(&line.text, line.reordered, &t_html));
             }
             (ChatRole::Thinking, _) => {
                 out.push_str("<div class=\"chat-line thinking");
                 if line.reordered {
                     out.push_str(" reordered");
                 }
-                out.push_str("\"><div class=\"chat-role\">Thinking</div>");
+                out.push_str("\"><div class=\"chat-role\">Thinking");
+                out.push_str(&t_html);
+                out.push_str("</div>");
                 out.push_str("<div class=\"chat-body thinking-body\">… ");
                 out.push_str(&md_html(&line.text));
                 out.push_str("</div></div>\n");
@@ -653,7 +837,9 @@ fn render_html(
                 if line.reordered {
                     out.push_str(" reordered");
                 }
-                out.push_str("\"><div class=\"chat-role\">Status</div>");
+                out.push_str("\"><div class=\"chat-role\">Status");
+                out.push_str(&t_html);
+                out.push_str("</div>");
                 out.push_str("<div class=\"chat-body\">");
                 out.push_str(&md_html(&line.text));
                 out.push_str("</div></div>\n");
@@ -664,7 +850,9 @@ fn render_html(
                     out.push_str(" reordered");
                 }
                 out.push_str("\">");
-                out.push_str("<div class=\"chat-role\">Tool</div>");
+                out.push_str("<div class=\"chat-role\">Tool");
+                out.push_str(&t_html);
+                out.push_str("</div>");
                 out.push_str("<div class=\"chat-tool-card\">");
                 out.push_str(&format!(
                     "<span class=\"chat-tool-verb\">{}</span> \
@@ -703,13 +891,15 @@ fn render_html(
     out
 }
 
-fn agent_bubble(text: &str, reordered: bool) -> String {
+fn agent_bubble(text: &str, reordered: bool, time_html: &str) -> String {
     let mut out = String::new();
     out.push_str("<div class=\"chat-line agent");
     if reordered {
         out.push_str(" reordered");
     }
-    out.push_str("\"><div class=\"chat-role\">Agent</div>");
+    out.push_str("\"><div class=\"chat-role\">Agent");
+    out.push_str(time_html);
+    out.push_str("</div>");
     out.push_str("<div class=\"chat-body\">");
     out.push_str(&md_html(text));
     out.push_str("</div></div>\n");
@@ -753,6 +943,14 @@ mod tests {
     };
 
     fn text_ev(content: &str, n: u64) -> InterpreterOutputEvent {
+        text_ev_at(content, n, None)
+    }
+
+    fn text_ev_at(
+        content: &str,
+        n: u64,
+        source_time: Option<SourceTimeObservation>,
+    ) -> InterpreterOutputEvent {
         InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
             unit_id: UnitId::new(format!("s{n}")),
             unit_generation: 1,
@@ -764,6 +962,7 @@ mod tests {
             lane_id: LaneId::response(),
             lane_ordinal: n,
             causal_parent_id: None,
+            source_time,
             unit: CanonicalUnit::Text(TextSentence {
                 sentence_id: UnitId::new(format!("s{n}")),
                 channel: TextChannel::PublicResponse,
@@ -775,6 +974,15 @@ mod tests {
     }
 
     fn tool_ev(id: &str, name: &str, n: u64) -> InterpreterOutputEvent {
+        tool_ev_at(id, name, n, None)
+    }
+
+    fn tool_ev_at(
+        id: &str,
+        name: &str,
+        n: u64,
+        source_time: Option<SourceTimeObservation>,
+    ) -> InterpreterOutputEvent {
         InterpreterOutputEvent::Unit(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
             unit_id: UnitId::new(format!("t{n}")),
             unit_generation: 1,
@@ -786,6 +994,7 @@ mod tests {
             lane_id: LaneId::response(),
             lane_ordinal: n,
             causal_parent_id: None,
+            source_time,
             unit: CanonicalUnit::Tool(ToolActionEvent {
                 tool_action_id: ToolActionId::new(id),
                 tool_name: Some(name.into()),
@@ -798,6 +1007,10 @@ mod tests {
                 waiting_for: None,
             }),
         }))
+    }
+
+    fn st(ms: u64) -> SourceTimeObservation {
+        SourceTimeObservation::point(ms)
     }
 
     #[test]
@@ -899,10 +1112,86 @@ mod tests {
             &events,
             &ProjectChatOptions {
                 allow_structural_zip: false,
+                ..Default::default()
             },
         );
         assert_eq!(p.strategy, ProjectionStrategy::ChronologicalChat);
         assert!(p.strategy_reason.contains("disabled"));
+    }
+
+    /// Live Grok shape: tools emit before the complete sentence, but dialect
+    /// source times show speech started earlier — human chat must not look jumbled.
+    #[test]
+    fn source_time_puts_earlier_speech_before_later_tools() {
+        let events = vec![
+            // Emit order: tools first (sentence still assembling when tools finished).
+            tool_ev_at("call-1", "Write `f`", 1, Some(st(2000))),
+            tool_ev_at("call-2", "Read `f`", 2, Some(st(3000))),
+            text_ev_at(
+                "I'll run the CRUD steps, starting by creating it.",
+                3,
+                Some(SourceTimeObservation {
+                    first_ms: 1000,
+                    last_ms: 1500,
+                }),
+            ),
+            text_ev_at("1. **CREATE** — Wrote the file.", 4, Some(st(4000))),
+        ];
+        let p = project_chat(&events);
+        assert_eq!(p.strategy, ProjectionStrategy::ChronologicalChat);
+        assert_eq!(p.confidence, ProjectionConfidence::DialectSourceTime);
+        assert!(
+            p.strategy_reason.contains("source_time"),
+            "{}",
+            p.strategy_reason
+        );
+        let roles: Vec<_> = p.lines.iter().map(|l| l.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                ChatRole::Agent, // intro — earlier first_ms
+                ChatRole::Tool,
+                ChatRole::Tool,
+                ChatRole::Agent, // list step — later first_ms
+            ],
+            "human order: speech intro then tools: {roles:?}"
+        );
+        assert!(
+            p.lines[0]
+                .text
+                .contains("I'll run the CRUD steps"),
+            "intro first: {:?}",
+            p.lines[0]
+        );
+        // Pure emit order would still show tools first when source-time is forced off.
+        let emit = project_chat_with(
+            &events,
+            &ProjectChatOptions {
+                order_by_source_time: false,
+                allow_structural_zip: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(emit.confidence, ProjectionConfidence::EmitOrder);
+        assert_eq!(emit.lines[0].role, ChatRole::Tool);
+    }
+
+    #[test]
+    fn without_source_times_emit_order_unchanged() {
+        let events = vec![
+            tool_ev("a1", "Write `f`", 1),
+            text_ev("I'll start.", 2),
+        ];
+        let p = project_chat_with(
+            &events,
+            &ProjectChatOptions {
+                allow_structural_zip: false,
+                order_by_source_time: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.confidence, ProjectionConfidence::EmitOrder);
+        assert_eq!(p.lines[0].role, ChatRole::Tool);
     }
 
     #[test]
