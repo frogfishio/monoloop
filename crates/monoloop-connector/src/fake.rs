@@ -6,7 +6,9 @@ use crate::handles::{
     ConnectionCompletionHandle, ConnectionEndKind, ConnectionOwner, EndInitiator, RawInputHandle,
     RawInputMessage, RawOutputHandle,
 };
+use crate::instance::ConnectorInstanceId;
 use crate::open::{OpenConnection, OpenedRawConnection, PendingRawConnection};
+use crate::session::validate_open_attachment_owner;
 use crate::traits::Connector;
 use bytes::Bytes;
 use monoloop_contracts::{
@@ -75,21 +77,42 @@ pub struct FakeConnector {
     descriptor: ConnectorDescriptor,
     config: FakeConnectorConfig,
     pairs: Arc<Mutex<PairState>>,
+    /// Instance identity for session-attachment ownership checks.
+    instance_id: ConnectorInstanceId,
 }
 
 impl FakeConnector {
-    /// Create a fake connector with the given config.
+    /// Create a fake connector with the given config (fresh instance id).
     pub fn new(config: FakeConnectorConfig) -> Self {
+        Self::with_instance_id_and_config(ConnectorInstanceId::generate(), config)
+    }
+
+    /// Create with an explicit instance id (matched SessionAdapter ownership).
+    pub fn with_instance_id(instance_id: ConnectorInstanceId) -> Self {
+        Self::with_instance_id_and_config(instance_id, FakeConnectorConfig::default())
+    }
+
+    /// Create with instance id and config.
+    pub fn with_instance_id_and_config(
+        instance_id: ConnectorInstanceId,
+        config: FakeConnectorConfig,
+    ) -> Self {
         Self {
             descriptor: ConnectorDescriptor::fake(),
             config,
             pairs: Arc::new(Mutex::new(PairState::default())),
+            instance_id,
         }
     }
 
     /// Echo-only defaults.
     pub fn echo() -> Self {
         Self::new(FakeConnectorConfig::default())
+    }
+
+    /// Borrow instance id.
+    pub fn instance_id(&self) -> &ConnectorInstanceId {
+        &self.instance_id
     }
 
     fn resolve_endpoint(&self, endpoint_ref: &str) -> FakeEndpoint {
@@ -118,6 +141,7 @@ impl Connector for FakeConnector {
         let pairs = Arc::clone(&self.pairs);
         let control_for_open = control.clone();
         let control_state_for_open = Arc::clone(&control_state);
+        let instance_id = self.instance_id.clone();
 
         let opened = Box::pin(async move {
             open_fake(
@@ -127,6 +151,7 @@ impl Connector for FakeConnector {
                 pairs,
                 control_for_open,
                 control_state_for_open,
+                instance_id,
             )
             .await
         });
@@ -146,7 +171,10 @@ async fn open_fake(
     pairs: Arc<Mutex<PairState>>,
     control: ConnectionControlHandle,
     control_state: Arc<ControlState>,
+    instance_id: ConnectorInstanceId,
 ) -> Result<OpenedRawConnection, ConnectorError> {
+    validate_open_attachment_owner(&instance_id, request.session_attachment.as_deref())?;
+
     if config.fail_open {
         return Err(ConnectorError::connection_failed("fake configured to fail open")
             .with_connection_id(request.connection_id.as_str()));
@@ -178,7 +206,11 @@ async fn open_fake(
 
     let connection_id = request.connection_id.clone();
     let max_chunk = request.limits.buffers.max_chunk_bytes;
-    let external_session_id = request.external_session_id.clone();
+    let external_session_id = request
+        .session_attachment
+        .as_ref()
+        .map(|a| a.external_session_id.clone())
+        .or(request.external_session_id.clone());
 
     let input = RawInputHandle::new(
         connection_id.clone(),

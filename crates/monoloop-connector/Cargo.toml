@@ -9,9 +9,12 @@ description = "Abstract Connector contract, shared transport handles, FakeConnec
 [dependencies]
 bytes = { workspace = true }
 monoloop-contracts = { path = "../monoloop-contracts" }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time"] }

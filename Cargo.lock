@@ -1118,9 +1118,12 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "monoloop-contracts",
+ "secrecy",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

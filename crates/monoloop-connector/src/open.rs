@@ -2,6 +2,7 @@
 
 use crate::control::ConnectionControlHandle;
 use crate::handles::{ConnectionCompletionHandle, RawInputHandle, RawOutputHandle};
+use crate::session::SessionAttachment;
 use monoloop_contracts::{
     ConnectionId, ConnectorLimits, DialectBinding, ExternalSessionId,
 };
@@ -18,6 +19,8 @@ pub struct OpenConnection {
     pub endpoint_ref: String,
     /// Optional externally owned session identity to attach.
     pub external_session_id: Option<ExternalSessionId>,
+    /// Optional session attachment from the matched SessionAdapter (ownership-checked).
+    pub session_attachment: Option<Arc<SessionAttachment>>,
     /// Opaque credential reference (resolved inside the connector boundary).
     pub credential_ref: Option<String>,
     /// Required dialect family/version range (descriptive; connector validates).
@@ -33,12 +36,23 @@ impl OpenConnection {
             connection_id,
             endpoint_ref: endpoint_ref.into(),
             external_session_id: None,
+            session_attachment: None,
             credential_ref: None,
             required_dialect: None,
             limits: ConnectorLimits::default(),
         }
     }
+
+    /// Attach a session attachment (runtime path after SessionAdapter success).
+    pub fn with_session_attachment(mut self, attachment: Arc<SessionAttachment>) -> Self {
+        self.external_session_id = Some(attachment.external_session_id.clone());
+        self.session_attachment = Some(attachment);
+        self
+    }
 }
+
+// SessionAttachment is not Debug by default on route — provide limited Debug for OpenConnection.
+// OpenConnection derives Debug; SessionAttachment needs Debug.
 
 /// Open in progress: control is available immediately.
 pub struct PendingRawConnection {
