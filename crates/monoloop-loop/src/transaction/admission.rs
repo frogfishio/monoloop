@@ -111,7 +111,12 @@ pub fn admit(
 
     let channel_for_release = request.channel_id.clone();
     let capacity = Arc::clone(&ctx.capacity);
+    // Once-only: actor finalize and shutdown supervisor may both observe the entry.
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let release_capacity: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if released.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         capacity.release(&channel_for_release);
     });
 
@@ -177,6 +182,7 @@ pub fn admit(
         guard,
         control_tx,
         actor_join: reaper,
+        release_capacity: Arc::clone(&release_capacity),
     };
 
     {

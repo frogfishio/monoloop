@@ -30,6 +30,8 @@ pub struct ActiveTransaction {
     pub control_tx: mpsc::Sender<ControlMessage>,
     /// Join handle for actor (+ delivery reaper).
     pub actor_join: tokio::task::JoinHandle<()>,
+    /// Once-only capacity release (actor finalize and/or shutdown supervisor).
+    pub release_capacity: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Registry of admitted transactions.

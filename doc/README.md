@@ -17,6 +17,10 @@
 **WP-00 evidence:** [WP00_BASELINE_EVIDENCE.md](WP00_BASELINE_EVIDENCE.md) ·
 [WP00_PROFILE_CAPABILITY_WORKSHEET.md](WP00_PROFILE_CAPABILITY_WORKSHEET.md)
 
+**WP-12 release qualification:** [WP12_REQUIREMENTS_ACCEPTANCE.md](WP12_REQUIREMENTS_ACCEPTANCE.md) ·
+[WP12_CURRENT_LIMITATIONS.md](WP12_CURRENT_LIMITATIONS.md) ·
+[WP12_PROFILE_CAPABILITY_REPORT.md](WP12_PROFILE_CAPABILITY_REPORT.md)
+
 This directory defines Monoloop from first principles. It does not describe a
 refactor of a previous implementation loop. Existing code may later supply
 adapters or reusable implementations only after it satisfies these contracts.

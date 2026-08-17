@@ -225,8 +225,9 @@ impl DefaultTransactionRuntime {
 
         for entry in active {
             let _ = entry.control_tx.try_send(ControlMessage::ForceTerminate);
-            match tokio::time::timeout(slice / 4 + Duration::from_millis(50), entry.actor_join).await
-            {
+            let join_budget = (slice / 4).max(Duration::from_millis(100));
+            let abort = entry.actor_join.abort_handle();
+            match tokio::time::timeout(join_budget, entry.actor_join).await {
                 Ok(Ok(())) => {
                     if entry.guard.callback_was_scheduled() {
                         normally_finalized += 1;
@@ -272,6 +273,9 @@ impl DefaultTransactionRuntime {
                     }
                 }
                 Err(_) => {
+                    // Actor did not finish within budget (e.g. blocked on sink).
+                    // Abort owned work; JoinHandle drop alone would only detach.
+                    abort.abort();
                     if let Some(payload) = entry.guard.try_claim() {
                         entry.guard.mark_callback_scheduled();
                         let end = build_transaction_end(
@@ -298,6 +302,8 @@ impl DefaultTransactionRuntime {
                     }
                 }
             }
+            // Always release capacity once (idempotent with actor finalize).
+            (entry.release_capacity)();
         }
 
         if let Some(mcp) = self.inner.mcp.lock().await.take() {

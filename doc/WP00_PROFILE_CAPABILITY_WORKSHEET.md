@@ -147,7 +147,7 @@ Honest gaps — **not** complete:
 | HTTP connector / credentials | Grok WS only | WP-09 |
 | Direct LLM path | Absent | WP-10 |
 | Profile production migration | Live testkit examples only | WP-11 |
-| Hardening / conformance | Partial empty-loop + fixtures | WP-12 |
+| Hardening / conformance | WP-12 suites + architecture gates + limitations docs | WP-12 (see `WP12_*`) |
 
 Empty-tool path is **already** qualified (required). Do not relabel it as
 TransactionRuntime complete.
