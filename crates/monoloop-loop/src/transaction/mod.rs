@@ -4,6 +4,7 @@
 //! WP-04: admission, events, finalization, callbacks, no-I/O actor.
 //! WP-06: linked tools, dispatcher, Loop adapters.
 
+mod acp_encoder;
 mod active_registry;
 mod actor;
 mod admission;
@@ -27,12 +28,16 @@ mod tool_capacity;
 mod tool_handler;
 mod validation;
 
+pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
 pub use bootstrap::{RuntimeBootstrap, RuntimeConfig};
 pub use capacity::CapacityManagers;
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
 pub use dispatcher::{DispatchOutcome, DispatchRequest, TransactionToolDispatcher};
 pub use error::StartupError;
-pub use exchange::{run_exchange, ExchangeFailure, ExchangeOutcome, ExchangeParams};
+pub use exchange::{
+    run_encoded_exchange, run_exchange, EncodedExchangeParams, ExchangeFailure, ExchangeOutcome,
+    ExchangeParams,
+};
 pub use fake_support::{EmptyBytesEncoder, RejectEncoder, TestTextEncoder};
 pub use finalization::{EventSequencer, FinalizationGuard};
 pub use host_tools::{HostToolRegistry, RegisteredTool};

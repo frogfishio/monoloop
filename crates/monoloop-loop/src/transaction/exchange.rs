@@ -76,12 +76,31 @@ pub struct ExchangeParams<'a> {
     pub deadline: Duration,
 }
 
+/// Parameters for a continuation exchange (fresh identities, pre-encoded body).
+pub struct EncodedExchangeParams<'a> {
+    /// Transaction id.
+    pub transaction_id: TransactionId,
+    /// Connector instance.
+    pub connector: &'a dyn Connector,
+    /// Interpreter factory.
+    pub interpreter: &'a dyn InterpreterFactory,
+    /// Endpoint ref.
+    pub endpoint_ref: &'a str,
+    /// Credential ref.
+    pub credential_ref: Option<&'a str>,
+    /// Optional session attachment.
+    pub session_attachment: Option<Arc<monoloop_connector::SessionAttachment>>,
+    /// Already-encoded provider body.
+    pub encoded: EncodedExchange,
+    /// Interpretation limits.
+    pub interpretation_limits: InterpretationLimits,
+    /// Overall deadline for the exchange.
+    pub deadline: Duration,
+}
+
 /// Run one SendAndFinish exchange end-to-end (no raw bytes enter actor queues).
 pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome, ExchangeFailure> {
     let exchange_id = ExchangeId::generate();
-    let connection_id = ConnectionId::generate();
-    let interpretation_id = InterpretationId::generate();
-
     let encoded = params
         .encoder
         .encode_initial(monoloop_contracts::InitialEncodeRequest {
@@ -93,14 +112,62 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
         })
         .map_err(|_| ExchangeFailure::EncodingFailed)?;
 
-    let mut open = OpenConnection::new(connection_id.clone(), params.endpoint_ref);
-    open.credential_ref = params.credential_ref.map(|s| s.to_string());
-    if let Some(att) = params.session_attachment {
+    open_and_run(
+        exchange_id,
+        params.connector,
+        params.endpoint_ref,
+        params.credential_ref,
+        params.session_attachment,
+        encoded,
+        params.interpreter,
+        params.interpretation_limits,
+        params.deadline,
+    )
+    .await
+}
+
+/// Run one exchange with a pre-encoded body (tool continuation).
+pub async fn run_encoded_exchange(
+    params: EncodedExchangeParams<'_>,
+) -> Result<ExchangeOutcome, ExchangeFailure> {
+    let exchange_id = ExchangeId::generate();
+    open_and_run(
+        exchange_id,
+        params.connector,
+        params.endpoint_ref,
+        params.credential_ref,
+        params.session_attachment,
+        params.encoded,
+        params.interpreter,
+        params.interpretation_limits,
+        params.deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_and_run(
+    exchange_id: ExchangeId,
+    connector: &dyn Connector,
+    endpoint_ref: &str,
+    credential_ref: Option<&str>,
+    session_attachment: Option<Arc<monoloop_connector::SessionAttachment>>,
+    encoded: EncodedExchange,
+    interpreter: &dyn InterpreterFactory,
+    interpretation_limits: InterpretationLimits,
+    deadline: Duration,
+) -> Result<ExchangeOutcome, ExchangeFailure> {
+    let connection_id = ConnectionId::generate();
+    let interpretation_id = InterpretationId::generate();
+
+    let mut open = OpenConnection::new(connection_id.clone(), endpoint_ref);
+    open.credential_ref = credential_ref.map(|s| s.to_string());
+    if let Some(att) = session_attachment {
         open = open.with_session_attachment(att);
     }
 
-    let pending = params.connector.begin_open(open);
-    let opened = match tokio::time::timeout(params.deadline, pending.opened).await {
+    let pending = connector.begin_open(open);
+    let opened = match tokio::time::timeout(deadline, pending.opened).await {
         Ok(Ok(o)) => o,
         Ok(Err(_)) => return Err(ExchangeFailure::ChannelOpenFailed),
         Err(_) => return Err(ExchangeFailure::ChannelOpenFailed),
@@ -111,9 +178,9 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
         interpretation_id,
         opened,
         encoded,
-        params.interpreter,
-        params.interpretation_limits,
-        params.deadline,
+        interpreter,
+        interpretation_limits,
+        deadline,
     )
     .await
 }

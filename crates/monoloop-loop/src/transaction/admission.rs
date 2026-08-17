@@ -161,6 +161,8 @@ pub fn admit(
             .invocation_config
             .deadline
             .unwrap_or(ctx.limits.transaction_deadline),
+        max_continuations: ctx.limits.max_continuations,
+        max_provider_exchanges: ctx.limits.max_provider_exchanges,
     });
 
     let reaper = tokio::spawn(async move {

@@ -11,12 +11,14 @@
 
 #![deny(missing_docs)]
 
+mod channel_binding;
 mod config;
 mod error;
 mod process;
 mod raw_dump;
 mod session;
 
+pub use channel_binding::{cursor_channel_binding, CursorConnectorFactory};
 pub use config::{CursorAgentConfig, CursorSessionConfig};
 pub use error::CursorConnectorError;
 pub use raw_dump::CursorRawDump;

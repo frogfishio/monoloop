@@ -12,6 +12,8 @@ futures-util = { workspace = true }
 http = { workspace = true }
 monoloop-connector = { path = "../monoloop-connector" }
 monoloop-contracts = { path = "../monoloop-contracts" }
+monoloop-interpreter = { path = "../monoloop-interpreter" }
+monoloop-loop = { path = "../monoloop-loop" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }

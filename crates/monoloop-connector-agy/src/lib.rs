@@ -10,12 +10,14 @@
 
 #![deny(missing_docs)]
 
+mod channel_binding;
 mod config;
 mod error;
 mod process;
 mod raw_dump;
 mod session;
 
+pub use channel_binding::{agy_channel_binding, AgyConnectorFactory};
 pub use config::{AgyAgentConfig, AgySessionConfig};
 pub use error::AgyConnectorError;
 pub use raw_dump::AgyRawDump;

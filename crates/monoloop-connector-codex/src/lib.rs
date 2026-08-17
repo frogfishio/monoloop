@@ -14,12 +14,14 @@
 
 #![deny(missing_docs)]
 
+mod channel_binding;
 mod config;
 mod error;
 mod process;
 mod raw_dump;
 mod session;
 
+pub use channel_binding::{codex_channel_binding, CodexConnectorFactory};
 pub use config::{CodexAgentConfig, CodexSessionConfig};
 pub use error::CodexConnectorError;
 pub use raw_dump::CodexRawDump;

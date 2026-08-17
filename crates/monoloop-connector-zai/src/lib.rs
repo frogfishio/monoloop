@@ -11,11 +11,13 @@
 
 #![deny(missing_docs)]
 
+mod channel_binding;
 mod config;
 mod error;
 mod raw_dump;
 mod run;
 
+pub use channel_binding::{zai_channel_binding, ZaiConnectorFactory};
 pub use config::ZaiAgentConfig;
 pub use error::ZaiConnectorError;
 pub use raw_dump::ZaiRawDump;

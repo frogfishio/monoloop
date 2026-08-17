@@ -25,3 +25,11 @@ uuid = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
 reqwest = { workspace = true }
+
+# WP-11 profile binding qualification
+monoloop-connector-grok = { path = "../monoloop-connector-grok" }
+monoloop-connector-cursor = { path = "../monoloop-connector-cursor" }
+monoloop-connector-codex = { path = "../monoloop-connector-codex" }
+monoloop-connector-agy = { path = "../monoloop-connector-agy" }
+monoloop-connector-zai = { path = "../monoloop-connector-zai" }
+monoloop-connector-claude = { path = "../monoloop-connector-claude" }

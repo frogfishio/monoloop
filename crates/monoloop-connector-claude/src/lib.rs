@@ -11,11 +11,13 @@
 
 #![deny(missing_docs)]
 
+mod channel_binding;
 mod config;
 mod error;
 mod raw_dump;
 mod run;
 
+pub use channel_binding::{claude_channel_binding, ClaudeConnectorFactory};
 pub use config::ClaudeAgentConfig;
 pub use error::ClaudeConnectorError;
 pub use raw_dump::ClaudeRawDump;

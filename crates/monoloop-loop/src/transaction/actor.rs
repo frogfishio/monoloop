@@ -3,7 +3,9 @@
 use super::active_registry::{ActiveTransactionRegistry, ClaimSessionError, ControlMessage};
 use super::dispatcher::{DispatchOutcome, TransactionToolDispatcher};
 use super::events::QueuedEvent;
-use super::exchange::{run_exchange, ExchangeFailure, ExchangeParams};
+use super::exchange::{
+    run_encoded_exchange, run_exchange, EncodedExchangeParams, ExchangeFailure, ExchangeParams,
+};
 use super::finalization::{build_transaction_end, FinalizationGuard};
 use super::loop_adapters::dispatch_ready_tool;
 use super::mcp::{CapabilityToken, McpGatewayHandle};
@@ -11,11 +13,12 @@ use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::SharedToolCapacity;
 use monoloop_connector::{Connector, SessionAdapter};
 use monoloop_contracts::{
-    CanonicalUnit, CanonicalUnitEvent, ChannelId, ChannelKind, EffectiveConfig,
-    EventDeliveryOutcome, ExternalSessionId, InterpretationLimits, McpConfigurationCapability,
-    McpReachability, OutboundDialectEncoder, SessionId, SessionKey, ToolExecutionMode,
-    ToolLifecycleEvent, ToolRequestState, TransactionEndKind, TransactionEvent,
-    TransactionEventPayload, TransactionId,
+    CanonicalAssistantToolCall, CanonicalMessage, CanonicalToolResult, CanonicalUnit,
+    CanonicalUnitEvent, ChannelId, ChannelKind, ContinuationContext, ContinuationPolicy,
+    EffectiveConfig, EventDeliveryOutcome, ExternalSessionId, InterpretationLimits,
+    McpConfigurationCapability, McpReachability, OutboundDialectEncoder, SessionId, SessionKey,
+    TextChannel, TextPart, ToolExecutionMode, ToolLifecycleEvent, ToolName, ToolRequestState,
+    TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionId,
 };
 use monoloop_interpreter::InterpreterFactory;
 use std::sync::{Arc, Mutex};
@@ -77,6 +80,10 @@ pub struct ActorSpawn {
     pub release_capacity: Arc<dyn Fn() + Send + Sync>,
     /// Transaction deadline.
     pub deadline: Duration,
+    /// Maximum inline tool continuations (provider exchanges after the first).
+    pub max_continuations: usize,
+    /// Maximum total provider exchanges including the first.
+    pub max_provider_exchanges: usize,
 }
 
 /// Spawn the actor task.
@@ -121,6 +128,8 @@ async fn run_actor(spawn: ActorSpawn) {
         registry,
         release_capacity,
         deadline,
+        max_continuations,
+        max_provider_exchanges,
     } = spawn;
 
     let mut terminal_kind = TransactionEndKind::Completed;
@@ -283,9 +292,14 @@ async fn run_actor(spawn: ActorSpawn) {
                 .map_err(|_| TransactionEndKind::InvariantFailed)?;
         }
 
-        // --- One provider exchange ---
+        // --- Provider exchanges (initial + optional inline tool continuations) ---
         let tool_specs: Vec<_> = tools.specs().into_iter().cloned().collect();
-        let outcome = tokio::select! {
+        let max_exchanges = max_provider_exchanges.max(1);
+        let max_inline = max_continuations;
+        let mut exchanges_done = 0usize;
+        let mut continuations_done = 0usize;
+
+        let mut outcome = tokio::select! {
             biased;
             ctrl = control_rx.recv() => {
                 return Err(match ctrl {
@@ -307,60 +321,122 @@ async fn run_actor(spawn: ActorSpawn) {
                 interpretation_limits: InterpretationLimits::default(),
                 deadline,
             }) => r,
-        };
-
-        let outcome = outcome.map_err(map_exchange_failure)?;
-
-        // Publish canonical units (no raw bytes ever enter actor queues).
-        for unit in &outcome.units {
-            if !emit_canonical_unit(
-                &event_tx,
-                &guard,
-                transaction_id,
-                &channel_id,
-                &session_key,
-                unit.clone(),
-            )
-            .await
-            {
-                return Err(TransactionEndKind::EventDeliveryFailed);
-            }
         }
+        .map_err(map_exchange_failure)?;
+        exchanges_done += 1;
 
-        if let Some(fail) = outcome.failure {
-            return Err(map_exchange_failure(fail));
-        }
-
-        // --- Linked tools (ModelToolCalls) ---
-        if tool_mode == ToolExecutionMode::ModelToolCalls {
-            let sk = session_key.clone().ok_or(TransactionEndKind::InvariantFailed)?;
-            if !tools.is_empty() {
-                let dispatcher = TransactionToolDispatcher::new(
+        loop {
+            // Publish canonical units (no raw bytes ever enter actor queues).
+            for unit in &outcome.units {
+                if !emit_canonical_unit(
+                    &event_tx,
+                    &guard,
                     transaction_id,
-                    sk,
-                    tools.clone(),
-                    SharedToolCapacity::unlimited(),
-                    16,
-                    64,
-                );
-                let mut ordinal: u32 = 0;
-                for unit in &outcome.units {
-                    let snap = unit.snapshot();
-                    let CanonicalUnit::Tool(tool) = &snap.unit else {
-                        continue;
-                    };
-                    if tool.request_state != ToolRequestState::Ready {
-                        continue;
+                    &channel_id,
+                    &session_key,
+                    unit.clone(),
+                )
+                .await
+                {
+                    return Err(TransactionEndKind::EventDeliveryFailed);
+                }
+            }
+
+            if let Some(fail) = outcome.failure {
+                return Err(map_exchange_failure(fail));
+            }
+
+            // --- Linked tools (ModelToolCalls) ---
+            if tool_mode != ToolExecutionMode::ModelToolCalls {
+                break;
+            }
+
+            let ready = collect_ready_tools(&outcome.units);
+            if ready.is_empty() || tools.is_empty() {
+                // No tool requests, or empty admitted set (zero external effects).
+                break;
+            }
+
+            let sk = session_key
+                .clone()
+                .ok_or(TransactionEndKind::InvariantFailed)?;
+
+            let dispatcher = TransactionToolDispatcher::new(
+                transaction_id,
+                sk,
+                tools.clone(),
+                SharedToolCapacity::unlimited(),
+                16,
+                64,
+            );
+
+            let mut results: Vec<CanonicalToolResult> = Vec::with_capacity(ready.len());
+            for (ord, (action_id, name, payload, provider_id)) in ready.into_iter().enumerate() {
+                let dispatch_outcome = tokio::select! {
+                    biased;
+                    ctrl = control_rx.recv() => {
+                        return Err(match ctrl {
+                            Some(ControlMessage::ForceTerminate) => {
+                                TransactionEndKind::Terminated
+                            }
+                            _ => TransactionEndKind::Cancelled,
+                        });
                     }
-                    let Some(name) = tool.tool_name.as_deref() else {
-                        continue;
-                    };
-                    let Some(payload) = tool.request_payload.as_deref() else {
-                        continue;
-                    };
-                    let ord = ordinal;
-                    ordinal = ordinal.saturating_add(1);
-                    let dispatch_outcome = tokio::select! {
+                    r = dispatch_ready_tool(
+                        &dispatcher,
+                        outcome.exchange_id,
+                        action_id,
+                        &name,
+                        &provider_id,
+                        ord as u32,
+                        &payload,
+                    ) => r,
+                };
+                if let DispatchOutcome::Canonical { result, .. } = &dispatch_outcome {
+                    results.push(result.clone());
+                }
+                emit_dispatch_outcome(
+                    &event_tx,
+                    &guard,
+                    transaction_id,
+                    &channel_id,
+                    &session_key,
+                    dispatch_outcome,
+                )
+                .await?;
+            }
+
+            if results.is_empty() {
+                // All rejected/runtime-failed handled by emit_dispatch_outcome.
+                break;
+            }
+
+            match effective.continuation_policy {
+                ContinuationPolicy::CallerControlled => {
+                    return Err(TransactionEndKind::ContinuationRequired);
+                }
+                ContinuationPolicy::InlineToolContinuation => {
+                    if continuations_done >= max_inline || exchanges_done >= max_exchanges {
+                        return Err(TransactionEndKind::LimitExceeded);
+                    }
+                    let context = build_continuation_context(&input, &outcome.units)
+                        .map_err(|_| TransactionEndKind::EncodingFailed)?;
+                    let exchange_id = monoloop_contracts::ExchangeId::generate();
+                    let encoded = encoder
+                        .encode_tool_continuation(
+                            monoloop_contracts::ToolContinuationEncodeRequest {
+                                transaction_id: &transaction_id,
+                                exchange_id: &exchange_id,
+                                context: &context,
+                                results: &results,
+                                config: &effective,
+                                tools: &tool_specs,
+                            },
+                        )
+                        .map_err(|_| TransactionEndKind::EncodingFailed)?;
+                    // Drop unused pre-allocated id; run_encoded_exchange allocates its own.
+                    let _ = exchange_id;
+                    outcome = tokio::select! {
                         biased;
                         ctrl = control_rx.recv() => {
                             return Err(match ctrl {
@@ -370,28 +446,24 @@ async fn run_actor(spawn: ActorSpawn) {
                                 _ => TransactionEndKind::Cancelled,
                             });
                         }
-                        r = dispatch_ready_tool(
-                            &dispatcher,
-                            outcome.exchange_id,
-                            tool.tool_action_id.clone(),
-                            name,
-                            tool.tool_action_id.as_str(),
-                            ord,
-                            payload,
-                        ) => r,
-                    };
-                    emit_dispatch_outcome(
-                        &event_tx,
-                        &guard,
-                        transaction_id,
-                        &channel_id,
-                        &session_key,
-                        dispatch_outcome,
-                    )
-                    .await?;
+                        r = run_encoded_exchange(EncodedExchangeParams {
+                            transaction_id,
+                            connector: connector.as_ref(),
+                            interpreter: interpreter.as_ref(),
+                            endpoint_ref: &endpoint_ref,
+                            credential_ref: credential_ref.as_deref(),
+                            session_attachment: attachment.clone(),
+                            encoded,
+                            interpretation_limits: InterpretationLimits::default(),
+                            deadline,
+                        }) => r,
+                    }
+                    .map_err(map_exchange_failure)?;
+                    exchanges_done += 1;
+                    continuations_done += 1;
+                    // Loop to publish next units and possibly more tools.
                 }
             }
-            // Empty resolved set: zero effects — no dispatcher start (empty-tool path).
         }
 
         Ok::<(), TransactionEndKind>(())
@@ -467,6 +539,80 @@ fn map_exchange_failure(f: ExchangeFailure) -> TransactionEndKind {
         ExchangeFailure::Cancelled => TransactionEndKind::Cancelled,
         ExchangeFailure::Terminated => TransactionEndKind::Terminated,
     }
+}
+
+/// Ready tool requests: (action_id, name, payload_json, provider_call_id).
+fn collect_ready_tools(
+    units: &[CanonicalUnitEvent],
+) -> Vec<(
+    monoloop_contracts::ToolActionId,
+    String,
+    String,
+    String,
+)> {
+    let mut out = Vec::new();
+    for unit in units {
+        let snap = unit.snapshot();
+        let CanonicalUnit::Tool(tool) = &snap.unit else {
+            continue;
+        };
+        if tool.request_state != ToolRequestState::Ready {
+            continue;
+        }
+        let Some(name) = tool.tool_name.clone() else {
+            continue;
+        };
+        let Some(payload) = tool.request_payload.clone() else {
+            continue;
+        };
+        let provider_id = tool.tool_action_id.as_str().to_string();
+        out.push((tool.tool_action_id.clone(), name, payload, provider_id));
+    }
+    out
+}
+
+/// Build continuation context: original input + assistant message with tool calls.
+fn build_continuation_context(
+    input: &monoloop_contracts::CanonicalInput,
+    units: &[CanonicalUnitEvent],
+) -> Result<ContinuationContext, ()> {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    for unit in units {
+        let snap = unit.snapshot();
+        match &snap.unit {
+            CanonicalUnit::Text(t) if t.channel == TextChannel::PublicResponse => {
+                text.push_str(&t.content);
+                text.push(' ');
+            }
+            CanonicalUnit::Tool(tool) if tool.request_state == ToolRequestState::Ready => {
+                let name = tool.tool_name.as_deref().ok_or(())?;
+                let payload = tool.request_payload.as_deref().unwrap_or("{}");
+                let args: serde_json::Value =
+                    serde_json::from_str(payload).unwrap_or_else(|_| serde_json::json!({}));
+                tool_calls.push(CanonicalAssistantToolCall {
+                    tool_call_id: tool.tool_action_id.as_str().to_string(),
+                    tool_name: ToolName::try_new(name).map_err(|_| ())?,
+                    arguments: args,
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut messages = input.messages().to_vec();
+    let content = if text.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![TextPart::try_new(text.trim(), 256 * 1024).map_err(|_| ())?]
+    };
+    if content.is_empty() && tool_calls.is_empty() {
+        return Err(());
+    }
+    messages.push(CanonicalMessage::Assistant {
+        content,
+        tool_calls,
+    });
+    ContinuationContext::try_new(messages).map_err(|_| ())
 }
 
 async fn emit_unit_or_session(

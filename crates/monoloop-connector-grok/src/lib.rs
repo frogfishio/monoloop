@@ -8,6 +8,7 @@
 
 #![deny(missing_docs)]
 
+mod channel_binding;
 mod config;
 mod error;
 mod jsonrpc;
@@ -16,6 +17,7 @@ mod secret;
 mod server;
 mod session;
 
+pub use channel_binding::{grok_channel_binding, validate_grok_endpoint, GrokConnectorFactory};
 pub use config::{
     GrokConnectorLimits, GrokServerConfig, GrokSessionConfig, GrokSessionLoadConfig,
 };

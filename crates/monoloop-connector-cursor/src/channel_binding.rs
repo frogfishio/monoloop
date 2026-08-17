@@ -1,0 +1,205 @@
+//! WP-11: Cursor ACP ChannelBinding + ConnectorFactory.
+
+use crate::CursorConnector;
+use monoloop_connector::{
+    Connector, ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId,
+    ControlDisposition, McpServerDescriptor, PendingOperationControl, PendingSessionAttachment,
+    PendingSessionConfiguration, SessionAdapter, SessionAttachError, SessionAttachRequest,
+    SessionAttachment, SessionAttachmentCompletion,     SessionConfigurationError, SessionRoute,
+};
+use monoloop_contracts::{
+    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy,
+    DialectDescriptor, ExchangeMode, ExternalSessionId, McpConfigurationCapability, McpReachability,
+    SessionId, SessionMode, ToolExecutionMode,
+};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
+
+/// Cursor process connector factory with session ownership.
+#[derive(Default)]
+/// ConnectorFactory for this profile.
+pub struct CursorConnectorFactory;
+
+impl CursorConnectorFactory {
+    /// Default factory.
+    /// Build a ChannelBinding for TransactionRuntime composition.
+pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ConnectorFactory for CursorConnectorFactory {
+    fn create(&self) -> Result<ConnectorInstance, ConnectorBuildError> {
+        let instance_id = ConnectorInstanceId::generate();
+        let connector = Arc::new(CursorConnector::new());
+        let sessions = Arc::new(ProfileSessionAdapter::new(instance_id.clone()));
+        Ok(ConnectorInstance::new(
+            instance_id,
+            connector as Arc<dyn Connector>,
+            Some(sessions as Arc<dyn SessionAdapter>),
+        ))
+    }
+}
+
+struct ProfileRoute {
+    owner: ConnectorInstanceId,
+}
+impl SessionRoute for ProfileRoute {
+    fn owner(&self) -> &ConnectorInstanceId {
+        &self.owner
+    }
+}
+
+struct PendingCtrl {
+    cancel: std::sync::atomic::AtomicBool,
+    terminate: std::sync::atomic::AtomicBool,
+}
+impl PendingOperationControl for PendingCtrl {
+    fn cancel(&self) -> ControlDisposition {
+        if self.cancel.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            ControlDisposition::AlreadyRequested
+        } else {
+            ControlDisposition::Accepted
+        }
+    }
+    fn force_terminate(&self) -> ControlDisposition {
+        if self
+            .terminate
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            ControlDisposition::AlreadyRequested
+        } else {
+            ControlDisposition::Accepted
+        }
+    }
+}
+
+/// Explicit create/load session reservation (no most-recent heuristic).
+struct ProfileSessionAdapter {
+    owner: ConnectorInstanceId,
+    known: Mutex<HashMap<String, monoloop_contracts::SessionConfig>>,
+}
+
+impl ProfileSessionAdapter {
+    fn new(owner: ConnectorInstanceId) -> Self {
+        Self {
+            owner,
+            known: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl SessionAdapter for ProfileSessionAdapter {
+    fn begin_attach(
+        &self,
+        request: SessionAttachRequest,
+    ) -> Result<PendingSessionAttachment, SessionAttachError> {
+        let control = Arc::new(PendingCtrl {
+            cancel: std::sync::atomic::AtomicBool::new(false),
+            terminate: std::sync::atomic::AtomicBool::new(false),
+        });
+        let control_api: Arc<dyn PendingOperationControl> = control.clone();
+        let owner = self.owner.clone();
+        let known_snapshot = self
+            .known
+            .lock()
+            .map_err(|_| SessionAttachError::SessionFailed)?
+            .clone();
+
+        let completion: SessionAttachmentCompletion = Box::pin(async move {
+            if control.terminate.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SessionAttachError::Terminated);
+            }
+            if control.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SessionAttachError::Cancelled);
+            }
+            let (ext, cfg) = if let Some(ref sid) = request.requested_session_id {
+                let cfg = known_snapshot
+                    .get(sid.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| request.session_config.clone());
+                let ext = ExternalSessionId::try_new(sid.as_str())
+                    .map_err(|_| SessionAttachError::SessionFailed)?;
+                (ext, cfg)
+            } else {
+                let sid = SessionId::generate();
+                let ext = ExternalSessionId::try_new(sid.as_str())
+                    .map_err(|_| SessionAttachError::SessionFailed)?;
+                (ext, request.session_config)
+            };
+            Ok(Arc::new(SessionAttachment::new(
+                owner.clone(),
+                ext,
+                cfg,
+                Arc::new(ProfileRoute { owner }),
+            )))
+        });
+        Ok(PendingSessionAttachment {
+            control: control_api,
+            completion,
+        })
+    }
+
+    fn begin_refresh_mcp(
+        &self,
+        attachment: Arc<SessionAttachment>,
+        _: Option<McpServerDescriptor>,
+    ) -> Result<PendingSessionConfiguration, SessionConfigurationError> {
+        if attachment.owner != self.owner {
+            return Err(SessionConfigurationError::OwnerMismatch);
+        }
+        Err(SessionConfigurationError::Unsupported)
+    }
+}
+
+/// Cursor Channel binding (ExternalAgent, MCP CreationOnly, Bidirectional).
+/// Build a ChannelBinding for TransactionRuntime composition.
+pub fn cursor_channel_binding(
+    id: impl AsRef<str>,
+    endpoint_ref: impl Into<String>,
+    encoder: Arc<dyn monoloop_contracts::OutboundDialectEncoder>,
+    interpreter: Arc<dyn monoloop_interpreter::InterpreterFactory>,
+) -> monoloop_loop::ChannelBinding {
+    let d = DialectDescriptor::cursor_acp("1");
+    monoloop_loop::ChannelBinding {
+        id: ChannelId::try_new(id.as_ref()).expect("channel id"),
+        kind: ChannelKind::ExternalAgent,
+        tool_mode: ToolExecutionMode::McpGateway,
+        connector_factory: Arc::new(CursorConnectorFactory::new()),
+        encoder,
+        interpreter,
+        endpoint_ref: endpoint_ref.into(),
+        credential_ref: None,
+        defaults: ChannelDefaults::default(),
+        capabilities: ChannelCapabilities {
+            session_mode: SessionMode::External,
+            mcp_configuration: McpConfigurationCapability::CreationOnly,
+            mcp_reachability: McpReachability::SameLoopbackNamespace,
+            exchange_mode: ExchangeMode::Bidirectional,
+            continuation_policies: BTreeSet::from([ContinuationPolicy::CallerControlled]),
+            supports_distinct_session_concurrency: true,
+            input_dialect: d.clone(),
+            output_dialect: d,
+        },
+        limits: ChannelLimits::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_binding_validates() {
+        use monoloop_interpreter::DefaultInterpreterFactory;
+        use monoloop_loop::AcpPromptEncoder;
+        let b = cursor_channel_binding(
+            "cursor-1",
+            "cursor:stdio",
+            Arc::new(AcpPromptEncoder::cursor()),
+            Arc::new(DefaultInterpreterFactory::new()),
+        );
+        assert!(b.descriptor().validate().is_ok());
+        assert!(b.connector_factory.create().unwrap().sessions.is_some());
+    }
+}
