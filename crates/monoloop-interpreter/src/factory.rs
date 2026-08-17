@@ -44,7 +44,8 @@ impl InterpreterFactory for DefaultInterpreterFactory {
             | DialectFamily::AgyAcp
             | DialectFamily::CodexAcp
             | DialectFamily::ZaiCli
-            | DialectFamily::ClaudeCode => SupportLevel::Full,
+            | DialectFamily::ClaudeCode
+            | DialectFamily::OpenAiChatCompletions => SupportLevel::Full,
             _ => SupportLevel::None,
         }
     }

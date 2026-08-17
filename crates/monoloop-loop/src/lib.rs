@@ -33,12 +33,12 @@ pub use transaction::{
     ExchangeParams, FinalizationGuard, HostToolRegistry, HostToolRuntime, ImmediateToolHandler,
     InputValidationFailure, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
     McpBindingState, McpGateway, McpGatewayHandle, McpInstallError, McpListenerShell, McpRouteTable,
-    OutputValidationFailure, PanicOnStartHandler, PendingMcpBinding, RegisteredTool, RejectEncoder,
-    ResolvedTool, ResolvedToolRegistry, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig,
-    RuntimeState, SharedToolCapacity, StartFailHandler, Startup, StartupError, TestTextEncoder,
-    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, TransactionMcpHandler,
-    TransactionToolCapacity, TransactionToolDispatcher, validate_tool_completion,
-    validate_tool_input, run_exchange,
+    OpenAiChatCompletionsEncoder, OpenAiEncoderOptions, OutputValidationFailure, PanicOnStartHandler,
+    PendingMcpBinding, RegisteredTool, RejectEncoder, ResolvedTool, ResolvedToolRegistry,
+    ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeState, SharedToolCapacity,
+    StartFailHandler, Startup, StartupError, TestTextEncoder, ToolExecutionCompletion,
+    ToolExecutionControl, ToolHandler, TransactionMcpHandler, TransactionToolCapacity,
+    TransactionToolDispatcher, validate_tool_completion, validate_tool_input, run_exchange,
 };
 
 pub use monoloop_contracts::{

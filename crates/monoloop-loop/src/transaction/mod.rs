@@ -19,6 +19,7 @@ mod finalization;
 mod host_tools;
 mod loop_adapters;
 mod mcp;
+mod openai_encoder;
 mod resolved_tools;
 mod runtime;
 mod state;
@@ -44,6 +45,7 @@ pub use mcp::{
 };
 /// Back-compat alias: the MCP gateway owns the loopback listener.
 pub use mcp::McpGateway as McpListenerShell;
+pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};
 pub use resolved_tools::{ResolvedTool, ResolvedToolSet};
 pub use runtime::{DefaultTransactionRuntime, Startup};
 pub use state::RuntimeState;

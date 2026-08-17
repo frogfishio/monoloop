@@ -1,11 +1,12 @@
 //! Interpretation instance: feed raw bytes, assemble, publish canonical events.
 
 use crate::acp::{drain_json_values, AcpDialect, AcpFragment, ToolSignal};
-use crate::sentence::SentenceSegmenter;
-use crate::stream::{CanonicalEventStream, EventPublisher};
 use crate::claude_stream::{
     drain_ndjson_lines as drain_claude_lines, map_stream_line as map_claude_stream_line,
 };
+use crate::openai_chat::OpenAiSseState;
+use crate::sentence::SentenceSegmenter;
+use crate::stream::{CanonicalEventStream, EventPublisher};
 use crate::zai_chat::{drain_ndjson_lines, map_chat_message_line};
 use monoloop_contracts::{
     BoundaryKind, CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, ConnectionId,
@@ -151,6 +152,11 @@ pub(crate) fn spawn_interpretation(
     let status_bytes = Arc::clone(&status.bytes_consumed);
 
     tokio::spawn(async move {
+        let openai = OpenAiSseState::new(
+            request.limits.max_frame_bytes.min(64 * 1024),
+            request.limits.max_frame_bytes,
+            request.limits.max_bytes_per_tool_action,
+        );
         let mut owner = Owner {
             request,
             pub_,
@@ -166,6 +172,7 @@ pub(crate) fn spawn_interpretation(
             diagnostics: Vec::new(),
             response_started: false,
             unresolved_bytes_at_end: 0,
+            openai,
         };
         owner.run(cmd_rx, end_tx, status_terminal, status_bytes).await;
     });
@@ -189,7 +196,11 @@ fn validate_dialect(binding: &DialectBinding) -> Result<(), InterpreterError> {
         | DialectFamily::CodexAcp
         | DialectFamily::ZaiCli
         | DialectFamily::ClaudeCode
+        | DialectFamily::OpenAiChatCompletions
         | DialectFamily::Test => Ok(()),
+        DialectFamily::OpenAiResponses => Err(InterpreterError::unsupported_dialect(
+            "OpenAI Responses is not supported; use Chat Completions SSE",
+        )),
         other => Err(InterpreterError::unsupported_dialect(format!(
             "unsupported dialect family: {other:?}"
         ))),
@@ -212,6 +223,8 @@ struct Owner {
     diagnostics: Vec<String>,
     response_started: bool,
     unresolved_bytes_at_end: u64,
+    /// OpenAI Chat Completions SSE assembler (idle for other dialects).
+    openai: OpenAiSseState,
 }
 
 /// Sentence assembly for one text channel, with observational source spans.
@@ -460,8 +473,29 @@ impl Owner {
             | DialectFamily::CodexAcp => self.ingest_acp().await,
             DialectFamily::ZaiCli => self.ingest_zai_cli().await,
             DialectFamily::ClaudeCode => self.ingest_claude_code().await,
+            DialectFamily::OpenAiChatCompletions => self.ingest_openai_chat().await,
             _ => Err(InterpreterError::unsupported_dialect("dialect")),
         }
+    }
+
+    /// OpenAI Chat Completions streaming SSE.
+    async fn ingest_openai_chat(&mut self) -> Result<(), InterpreterError> {
+        // Consume the latest chunk from frame_buf (append already done by caller).
+        // OpenAiSseState owns its own line carry; feed only the new portion.
+        // frame_buf accumulates full stream for limit check; we process delta.
+        let chunk = std::mem::take(&mut self.frame_buf);
+        if chunk.len() > self.request.limits.max_undecoded_bytes {
+            return Err(InterpreterError::limit("undecoded buffer limit exceeded"));
+        }
+        let frags = self.openai.push_bytes(&chunk)?;
+        for frag in frags {
+            if !self.response_started {
+                self.response_started = true;
+                self.emit_boundary(BoundaryKind::ResponseStarted).await?;
+            }
+            self.on_fragment(frag).await?;
+        }
+        Ok(())
     }
 
     /// Test dialect: raw UTF-8 text assembly (no JSON framing).
@@ -606,6 +640,16 @@ impl Owner {
     }
 
     async fn seal_clean(&mut self) -> Result<(), InterpreterError> {
+        if matches!(
+            self.request.dialect.output.family,
+            DialectFamily::OpenAiChatCompletions
+        ) {
+            // Flush any trailing line / require [DONE].
+            let frags = self.openai.seal_clean()?;
+            for frag in frags {
+                self.on_fragment(frag).await?;
+            }
+        }
         self.seal_text_channels().await
     }
 

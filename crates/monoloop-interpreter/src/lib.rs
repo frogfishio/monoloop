@@ -12,6 +12,7 @@ mod acp;
 mod claude_stream;
 mod engine;
 mod factory;
+mod openai_chat;
 mod sentence;
 mod stream;
 mod zai_chat;
@@ -19,6 +20,7 @@ mod zai_chat;
 pub use acp::AcpDialect;
 pub use engine::{Interpretation, InterpretationInput, StartInterpretation};
 pub use factory::{DefaultInterpreterFactory, InterpreterFactory, SupportLevel};
+pub use openai_chat::{OpenAiSseState, DEFAULT_CHOICE_INDEX};
 pub use sentence::{CompletedSentence, SentenceSegmenter, SENTENCE_SEGMENTER_VERSION};
 pub use stream::CanonicalEventStream;
 
