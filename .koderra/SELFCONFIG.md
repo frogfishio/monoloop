@@ -33,6 +33,7 @@ It is **prohibited** as a product dependency.
 | Requirements | `doc/REQUIREMENTS.md` |
 | Transaction architecture | `doc/TRANSACTION_RUNTIME_DESIGN.md` |
 | Development contract | `doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md` |
+| Delivery sequence | `doc/TRANSACTION_RUNTIME_DELIVERY_PLAN.md` |
 | Component 01 | `doc/CONNECTOR.md` |
 | Component 02 | `doc/INTERPRETER.md` |
 | Component 03 | `doc/THE_LOOP.md` |

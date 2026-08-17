@@ -203,10 +203,17 @@ transactions.
 
 ### Identity model
 
-Every transaction belongs to one effective `session_id`. That ID is the
-correlation key on input, streamed output, termination, and final completion.
-External callers own its relationship to a UI conversation, task, user, or
-durable record.
+Every transaction has a `transaction_id` from admission and belongs to one
+effective `session_id` once session establishment succeeds. The transaction ID
+is the control identity before a new external session exists; the resulting
+`SessionKey` is the session correlation/control identity afterward. External
+callers own its relationship to a UI conversation, task, user, or durable
+record.
+
+Session strings are scoped by the selected Channel. Routing, duplicate
+exclusion, and session-directed termination use the pair
+`SessionKey { channel_id, session_id }`; external IDs are not assumed globally
+unique across providers.
 
 For an external agent/tool, the external system creates and manages the
 meaningful session ID. The Connector must propagate and reuse that authoritative
@@ -229,6 +236,7 @@ TransactionInput
     session_id?
     selected_channel
     prompt / canonical_input
+    session_config?
     invocation_config
     deadline?
 
@@ -242,9 +250,11 @@ TransactionEnd
     terminal_kind
 ```
 
-Every event and the final result carry the effective `session_id`, whether
-supplied or created during admission. Conceptually, successful completion is
-`session_id.done`.
+Every ordinary event and final result carry the effective `session_id` once
+established. A transaction terminated or failed before a new external system
+creates its session has `session_id: None` in completion and remains identified
+by `transaction_id`. Conceptually, successful completion is
+`SessionKey.done`.
 
 ### Session reuse and external agents
 
@@ -272,16 +282,18 @@ supplied or created during admission. Conceptually, successful completion is
 5. No in-flow transaction or session-routing state is persisted by Monoloop.
 6. Resource limits must bound total transactions, per-Channel transactions,
    queued input/output, and transaction lifetime.
-7. Only one transaction may be in flow for a given session ID at a time. A
-   second request for an active session ID is rejected; it is not queued.
+7. Only one transaction may be in flow for a given `SessionKey` at a time. A
+   second request for the same Channel/session pair is rejected; it is not
+   queued. An identical opaque session string on a different Channel is a
+   different key.
 8. Backpressure or failure in one transaction must not corrupt, reorder, or
    terminate unrelated transactions.
 
 ### User termination
 
 A caller must be able to request cancellation or forced termination by
-`session_id` while the transaction is opening, queued, sending, streaming,
-or waiting on provider-owned inner turns.
+`transaction_id` at every phase, including before a new external session has an
+ID, and by `SessionKey` after session establishment.
 
 Termination must:
 
@@ -322,7 +334,8 @@ transaction admission, correlation, lifecycle races, and terminal publication.
 - [ ] Every admitted transaction produces exactly one terminal result.
 - [ ] No transaction event is emitted after its terminal result.
 - [ ] Multiple external sessions progress concurrently without cross-routing.
-- [ ] A second request for an in-flow session ID is rejected immediately.
+- [ ] A second request for an in-flow SessionKey is rejected immediately.
+- [ ] Identical session strings on different Channels remain isolated.
 - [ ] Multiple stateless LLM transactions progress concurrently.
 - [ ] Reusing an explicit external-tool session ID does not create a new
   session.
@@ -357,8 +370,8 @@ Individual requests do not load executable code. Instead, each request selects
 which linked tools are available for that transaction.
 
 Two simultaneous transactions may expose completely different tool sets.
-Availability is isolated by `session_id` and must not leak between
-transactions.
+Availability is isolated by `TransactionId` and `SessionKey` and must not leak
+between transactions.
 
 ### Canonical tool specification
 
@@ -412,6 +425,12 @@ MCP exposure and direct-LLM exposure must remain at parity:
 5. They produce equivalent canonical tool lifecycle and result events.
 6. A tool unavailable to one transaction cannot be discovered or invoked
    through another transaction's MCP or local model-tool path.
+7. A delayed MCP request from an earlier transaction cannot be routed into a
+   later transaction on the same external session.
+8. A profile that can install MCP only during session creation is explicitly
+   `CreationOnly`: tool-enabled use requires a new session and that attachment
+   cannot later be reused by Monoloop. Reusable-session tool parity requires a
+   profile that can refresh the MCP descriptor per transaction.
 
 Provider-specific encoding differences belong to the Channel's outbound
 encoder or MCP adapter. They must not create separate tool definitions with
@@ -440,13 +459,14 @@ await the final result.
 
 1. Every admitted transaction registers exactly one completion callback.
 2. The callback is invoked exactly once with the transaction's final result.
-3. The callback carries the transaction's effective `session_id`.
+3. The callback carries the transaction ID and its effective `session_id` when
+   session establishment succeeded.
 4. Normal completion, user termination, timeout, transport failure, and limit
    failure all complete through the same callback contract.
-5. Callback invocation occurs only after the transaction has selected its
-   terminal result.
-6. The Loop emits no transaction events after scheduling the completion
-   callback.
+5. Callback invocation occurs only after terminal selection and after final
+   `Ended` delivery is attempted under `terminal_event_delivery_deadline`.
+6. No transaction event is emitted after that final attempt or after scheduling
+   the completion callback.
 7. Callback execution must not block transaction processing, Connector I/O, or
    unrelated callbacks.
 8. A slow or failing callback must not delay or alter other transactions.
@@ -470,6 +490,11 @@ without polling.
 - Transaction termination prevents new tool calls from starting for that
   transaction and completes or cancels already-started calls according to the
   linked tool's declared cancellation policy.
+- Every linked tool has a bounded termination mechanism: cooperative within a
+  deadline, directly abortable, or isolated behind a killable boundary.
+- Successful outputs and declared domain failures are bounded and validated
+  against the canonical output contract. Runtime/contract failures remain
+  distinct from ordinary tool-domain failures.
 
 ### Acceptance criteria
 
@@ -484,6 +509,13 @@ without polling.
 - [ ] Both paths invoke the same linked implementation and emit equivalent
   canonical results.
 - [ ] One transaction cannot discover or invoke another transaction's tools.
+- [ ] MCP capabilities rotate per transaction and stale capabilities fail
+  closed.
+- [ ] Creation-only and refreshable MCP profiles are distinguished honestly;
+  unsupported session reuse is rejected.
+- [ ] Tool outputs are validated and domain failures remain distinguishable
+  from runtime failures.
+- [ ] Unstoppable in-process tool handlers are rejected.
 - [ ] Request submission returns after bounded admission without waiting for
   completion.
 - [ ] Every admitted transaction invokes its completion callback exactly once.
@@ -499,10 +531,11 @@ without polling.
 
 ### Canonical input boundary
 
-The first canonical input schema is an ordered list of messages. Each message
-has a role and one or more ordered text content parts. It may also carry the
-bounded name/tool-call correlation required to represent caller-supplied prior
-tool context.
+The first canonical input schema is an ordered list of typed messages: system
+and user text messages; assistant messages containing text and/or canonical
+tool-call declarations; and tool-result messages referencing a preceding
+assistant tool call. This must represent caller-supplied prior tool context
+without inventing or dropping the assistant call.
 
 Monoloop has no responsibility for crafting, augmenting, rewriting, ranking,
 summarizing, or otherwise deciding prompt content. The caller supplies the
@@ -540,8 +573,8 @@ Requirements:
 
 1. Event subscription is established as part of bounded transaction admission
    so that initial events cannot be missed.
-2. Every event carries the effective `session_id` and a monotonic
-   transaction-local sequence.
+2. Every event carries `transaction_id`, `channel_id`, the effective
+   `session_id`, and a monotonic transaction-local sequence.
 3. Events are published incrementally as soon as canonical units become
    available.
 4. Events from simultaneous sessions must never be mixed or cross-routed.
@@ -555,6 +588,8 @@ Requirements:
 10. The terminal result is delivered through the completion callback defined in
     R-003 after the final transaction event is accepted, or after a bounded
     failed final-delivery attempt that is reported truthfully in completion.
+11. Terminal event delivery has an independent cleanup deadline and does not
+    reuse an expired transaction deadline.
 
 ### Entirely ephemeral runtime
 
@@ -582,6 +617,8 @@ The complete Monoloop system is ephemeral.
   transactions.
 - [ ] The completion callback follows final-event acceptance exactly once, and
   a failed final delivery is reported rather than claimed delivered.
+- [ ] Graceful runtime shutdown invokes every admitted transaction's callback
+  exactly once, including transactions whose actor requires forced abort.
 - [ ] Downstream code can reconstruct presentation independently from the event
   stream.
 - [ ] Monoloop contains no persistence implementation or durable recovery path.

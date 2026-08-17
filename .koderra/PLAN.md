@@ -1,5 +1,12 @@
 # Monoloop Development Plan
 
+**Current transaction-runtime execution plan:**
+`doc/TRANSACTION_RUNTIME_DELIVERY_PLAN.md`
+
+The roadmap below records the foundational implementation sequence. Its
+remaining items are superseded by the work packages and PR ordering in the
+current delivery plan.
+
 **Vision**: A three-component async Rust kernel (Connector → Interpreter → Loop)
 that hosts compose for multi-channel LLM I/O. Specs in `doc/` are the living
 product definition. The test kit proves the kernel without becoming product.
@@ -36,11 +43,10 @@ product definition. The test kit proves the kernel without becoming product.
 4. ~~**monoloop-interpreter (initial)**~~ — reassemble → complete canonical events.
 5. ~~**Console renderer (testkit)**~~ — append-only human projection.
 6. ~~**monoloop-loop + distributor + Driver**~~ — empty-tool path end-to-end.
-7. **Harden all components** — race/load suites, Markdown structures, permission
-   requests, architecture import gates.
-8. **Outbound encoder seam** — dialect encoding in testkit first.
-9. **monoloop-conformance** — full acceptance matrices.
-10. **Later** — real tools, authz, durable receipts, more Channel profiles.
+7. **Transaction runtime delivery** — execute WP-00 through WP-12 in
+   `doc/TRANSACTION_RUNTIME_DELIVERY_PLAN.md`.
+8. **Release qualification** — complete the R-000 through R-004 evidence and
+   profile capability matrix defined by that plan.
 
 ## Non-goals (near term)
 

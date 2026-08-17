@@ -16,7 +16,8 @@ Long-term facts that should persist across sessions.
 - Authoritative specs: `doc/` (RFC-style MUST/MUST NOT).
 - Test kit (Driver, Console, fixtures, outbound test encoder) is **not** product.
 - Production events and completion are push-based; one active transaction is
-  permitted per `SessionId`, with duplicates rejected rather than queued.
+  permitted per `SessionKey { ChannelId, SessionId }`, with duplicates rejected
+  rather than queued.
 - Initial Connector: **Grok Build** — ACP/JSON-RPC 2.0 over authenticated WebSocket;
   one server, many sessions; correlation ID = Grok `sessionId`.
 

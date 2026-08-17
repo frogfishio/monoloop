@@ -150,6 +150,7 @@ TransactionRequest
     selected ChannelId
     SessionId?
     CanonicalInput
+    SessionConfig?
     InvocationConfig
     requested ToolId[]
     event sink
@@ -161,6 +162,10 @@ direct-LLM admission generates an ephemeral one when absent, while a new
 external-agent session supplies its authoritative ID asynchronously. Exact
 types and the first text-message input schema are fixed in
 `TRANSACTION_RUNTIME_IMPLEMENTATION.md`.
+
+Session exclusion and session-directed control use
+`SessionKey { ChannelId, SessionId }`, because authoritative provider session
+strings are not globally unique across Channels.
 
 The test-kit retains this lower-level conformance request:
 
@@ -179,8 +184,9 @@ MonoloopRequest
 ```
 
 `canonical_input` is a complete provider-neutral request product. The first
-production form is ordered role-bearing messages with text content parts. It is
-never a provider-native JSON object or raw wire body.
+production form is typed system/user/assistant/tool messages and can represent
+historical assistant tool calls plus their correlated tool results. It is never
+a provider-native JSON object or raw wire body.
 
 The caller explicitly selects `selected_channel`. Monoloop does not rank,
 recommend, or choose channels.
@@ -214,7 +220,7 @@ A Channel is a configured composition, not a new intelligence layer:
 ```text
 ChannelBinding
     channel_id
-    connector factory/configuration
+    ConnectorFactory producing a matched Connector/SessionAdapter instance
     required dialect range
     canonical outbound encoder
     Interpreter factory/profile
@@ -261,8 +267,9 @@ contract. Monoloop has no ambient "current Grok session", "current Cursor
 session", or most-recent-session fallback.
 
 Different Grok sessions progress concurrently. Only one transaction may be in
-flow for a given session ID. A second request for that active session is
-rejected immediately and is never queued, regardless of provider capability.
+flow for a given Channel/session pair. A second request for that active
+`SessionKey` is rejected immediately and is never queued, regardless of
+provider capability.
 
 An external session may outlive a Monoloop run or local network connection. A
 Connector detaching its local route does not claim to close or delete the Grok
@@ -279,23 +286,23 @@ A mechanical outbound encoder is required:
 
 ```rust
 pub trait OutboundDialectEncoder: Send + Sync {
-    fn encode_request(
+    fn encode_initial(
         &self,
-        dialect: &DialectDescriptor,
-        request: &CanonicalRequest,
-    ) -> Result<EncodedOutboundMessage, EncodingError>;
+        request: InitialEncodeRequest<'_>,
+    ) -> Result<EncodedExchange, EncodingError>;
 
-    fn encode_tool_result(
+    fn encode_tool_continuation(
         &self,
-        dialect: &DialectDescriptor,
-        result: &OutboundToolResult,
-    ) -> Result<EncodedOutboundMessage, EncodingError>;
+        request: ToolContinuationEncodeRequest<'_>,
+    ) -> Result<EncodedExchange, EncodingError>;
 }
 ```
 
 This is a required supporting seam. Its production contract is fixed by
 `TRANSACTION_RUNTIME_IMPLEMENTATION.md`; tests may also use a deterministic
-test dialect encoder.
+test dialect encoder. Any older test Driver `encode_request` /
+`encode_tool_result` helpers are adapters to this contract, not an alternative
+production API.
 
 The encoder:
 
@@ -318,10 +325,11 @@ caller
   -> external channel
   -> Connector raw output + dialect
   -> Interpreter
-  -> canonical event distributor
-       +-> caller event subscription
-       +-> Console Renderer subscription (test only)
-       +-> inner LoopRuntime lossless subscription
+  -> exchange canonical distributor
+       +-> TransactionActor subscription
+       |      -> FinalizationGuard/EventSequencer
+       |      -> bounded TransactionEventSink delivery
+       +-> inner LoopRuntime lossless subscription (ModelToolCalls only)
               -> abstract ToolRegistry/ToolRuntime
               -> OutboundToolResult
               -> continuation policy
@@ -416,15 +424,16 @@ The coordinator performs:
 ```text
 1. validate complete canonical request
 2. validate explicit ChannelBinding
-3. begin Connector open and retain immediate control
-4. obtain negotiated DialectBinding
-5. choose exact encoder and Interpreter implementation
-6. start Interpreter and event distribution
-7. start The Loop with a distinct lossless subscription
-8. encode the canonical request
-9. send complete encoded bytes to Connector input
-10. finish/retain input according to Channel exchange contract
-11. consume canonical events until terminal coordination
+3. for external agents, prepare MCP when applicable and establish attachment
+4. begin Connector exchange open and retain immediate control
+5. obtain negotiated DialectBinding
+6. choose exact encoder and Interpreter implementation
+7. start Interpreter and exchange event distribution
+8. start the inner Loop with a distinct subscription only for ModelToolCalls
+9. encode the canonical request
+10. send complete encoded bytes to Connector input
+11. finish/retain input according to Channel exchange contract
+12. consume canonical events until terminal coordination
 ```
 
 No provider request bytes are created before the actual negotiated dialect is
@@ -450,17 +459,22 @@ Connector byte chunks, provider tokens, partial text, or partial tool payloads.
 
 ## 14. In-memory event distribution
 
-Each run owns a bounded event distributor. It provides independent
-subscriptions for:
+Each production exchange owns a bounded canonical distributor. It provides
+independent subscriptions for:
 
-- The Loop: lossless and gap-detecting;
-- the caller: declared lossless or best-effort policy;
-- Console Renderer: test-only policy; and
-- future run-scoped observers.
+- the inner Loop: lossless and gap-detecting for `ModelToolCalls`;
+- the transaction actor: lossless and gap-detecting.
+
+The production caller is not a direct subscriber to that distributor. The actor
+validates transaction/exchange identity and publishes through the
+`FinalizationGuard` event sequencer and bounded `TransactionEventSink`.
+
+The test-kit Driver may additionally create direct test/Console subscriptions;
+that topology is test composition and does not bypass the production actor.
 
 Requirements:
 
-- one accepted event may be delivered to every admitted subscriber;
+- one accepted event may be delivered to every admitted internal subscriber;
 - subscribers never race for one queue entry;
 - one subscriber's cursor/state is not another's;
 - delivery sequence and event identity are explicit;

@@ -12,6 +12,8 @@
 
 **Development specification:** [TRANSACTION_RUNTIME_IMPLEMENTATION.md](TRANSACTION_RUNTIME_IMPLEMENTATION.md)
 
+**Engineering delivery plan:** [TRANSACTION_RUNTIME_DELIVERY_PLAN.md](TRANSACTION_RUNTIME_DELIVERY_PLAN.md)
+
 This directory defines Monoloop from first principles. It does not describe a
 refactor of a previous implementation loop. Existing code may later supply
 adapters or reusable implementations only after it satisfies these contracts.

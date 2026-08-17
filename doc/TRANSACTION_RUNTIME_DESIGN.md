@@ -53,10 +53,11 @@ pub struct TransactionRequest {
     pub channel_id: ChannelId,
     pub session_id: Option<SessionId>,
     pub input: CanonicalInput,
-    pub config: InvocationConfig,
+    pub session_config: Option<SessionConfig>,
+    pub invocation_config: InvocationConfig,
     pub tools: Vec<ToolId>,
-    pub events: TransactionEventSink,
-    pub completion: CompletionCallback,
+    pub events: Arc<dyn TransactionEventSink>,
+    pub completion: Box<dyn CompletionCallback>,
 }
 
 pub struct AdmissionReceipt {
@@ -66,7 +67,12 @@ pub struct AdmissionReceipt {
 
 pub enum TransactionSelector {
     Transaction(TransactionId),
-    Session(SessionId),
+    Session(SessionKey),
+}
+
+pub enum TerminationMode {
+    Cancel { reason: CancellationReason },
+    ForceTerminate { reason: TerminationReason },
 }
 
 pub trait TransactionRuntime: Send + Sync {
@@ -80,6 +86,8 @@ pub trait TransactionRuntime: Send + Sync {
         selector: TransactionSelector,
         mode: TerminationMode,
     ) -> TerminationDisposition;
+
+    fn shutdown(&self, deadline: Duration) -> Shutdown;
 }
 ```
 
@@ -94,6 +102,11 @@ The completion callback is a single-use asynchronous callback as specified in
 `TRANSACTION_RUNTIME_IMPLEMENTATION.md`. It is not a future that the caller
 must poll to drive transaction progress.
 
+Concrete runtime construction is asynchronous through
+`DefaultTransactionRuntime::start(RuntimeBootstrap)`. It validates registries,
+constructs matched Connector/SessionAdapter instances, binds MCP, and exposes
+the runtime only after startup succeeds.
+
 ## 3. Core contracts
 
 The provider-neutral contracts belong in `monoloop-contracts`.
@@ -104,11 +117,17 @@ The provider-neutral contracts belong in `monoloop-contracts`.
 SessionId
     caller-supplied or ephemeral direct-LLM correlation identity
 
+SessionKey
+    ChannelId + SessionId; registry and control identity
+
 ExternalSessionId
     authoritative session identity returned by an external agent
 
 TransactionId
     public control identity for one admitted transaction
+
+ExchangeId
+    identity for one provider request/response cycle inside a transaction
 
 MonoloopRunId
     internal component identity derived one-to-one from TransactionId
@@ -116,7 +135,9 @@ MonoloopRunId
 
 For an external-agent transaction, the effective public `SessionId` is the
 external system's authoritative session ID. For a direct LLM it is only an
-ephemeral correlation key.
+ephemeral correlation key. Provider session strings are not assumed globally
+unique: exclusion, lookup, and session-directed termination use
+`SessionKey { channel_id, session_id }`.
 
 `TransactionId` is returned by admission and permits termination before a new
 external session has produced its ID. `MonoloopRunId` remains internal. Both
@@ -132,29 +153,36 @@ CanonicalInput
     ordered messages[]
 
 CanonicalMessage
-    role
-    content_parts[]
+    System(text parts)
+    User(text parts)
+    Assistant(text parts?, canonical tool calls[])
+    Tool(tool_call_id, text parts)
 
-ContentPart
-    text
+CanonicalAssistantToolCall
+    tool_call_id
+    tool_name
+    arguments
 ```
 
-The enum can gain new versioned content parts later without changing prompt
-ownership. Monoloop validates bounds and order but never creates, rewrites, or
-improves messages.
+This can faithfully carry historical assistant tool calls and their tool-result
+messages, including assistant tool-call messages without text. The enum can gain
+new versioned content later without changing prompt ownership. Monoloop
+validates bounds, references, and order but never creates, rewrites, or improves
+messages.
 
 ### 3.3 Transaction events
 
 ```rust
 pub struct TransactionEvent {
     pub transaction_id: TransactionId,
+    pub channel_id: ChannelId,
     pub session_id: SessionId,
     pub sequence: u64,
     pub payload: TransactionEventPayload,
 }
 
 pub enum TransactionEventPayload {
-    SessionEstablished,
+    SessionEstablished { external_session_id: ExternalSessionId },
     CanonicalUnit(CanonicalUnitEvent),
     ToolLifecycle(ToolLifecycleEvent),
     Diagnostic(TransactionDiagnostic),
@@ -162,10 +190,11 @@ pub enum TransactionEventPayload {
 }
 ```
 
-The transaction actor allocates `sequence`. Neither Connector tasks,
-Interpreter tasks, MCP handlers, nor tool tasks may publish directly to caller
-sinks. They send internal commands to the actor, which validates run identity,
-assigns sequence, and publishes in order.
+The runtime-owned event sequencer in the transaction's `FinalizationGuard`
+allocates `sequence`. The live actor is its only ordinary caller; after an actor
+is aborted and joined, the shutdown supervisor may use it once for `Ended`.
+Connector tasks, Interpreter tasks, MCP handlers, and tool tasks never publish
+directly to caller sinks.
 
 ### 3.4 Completion
 
@@ -180,6 +209,7 @@ Completed
 ContinuationRequired
 Cancelled
 Terminated
+RuntimeShutdown
 DeadlineExceeded
 ChannelOpenFailed
 EncodingFailed
@@ -212,9 +242,18 @@ DefaultTransactionRuntime
     global limits
 ```
 
+An asynchronous `DefaultTransactionRuntime::start(RuntimeBootstrap)` validates
+registries and Channel combinations, constructs each Channel's matched
+Connector/SessionAdapter instance, binds the MCP listener, and returns only
+after the runtime is accepting submissions. Partial startup is cleaned up and
+returned as a typed `StartupError`.
+
 ### 4.1 Active transaction registry
 
-The registry is keyed by effective `SessionId`.
+The registry always has a `TransactionId` index. Once a session is known it also
+has a `SessionKey { ChannelId, SessionId }` index. The same opaque provider
+session string may therefore be active on different Channels without collision,
+while a duplicate on the same Channel is rejected.
 
 Admission:
 
@@ -222,7 +261,7 @@ Admission:
 2. resolve the selected Channel;
 3. determine or provision the session identity;
 4. resolve all tool IDs against the host registry;
-5. reserve the session ID;
+5. reserve the TransactionId and, when already known, the SessionKey;
 6. attach the event sink and completion callback;
 7. spawn one transaction actor; and
 8. return the admission receipt.
@@ -230,13 +269,14 @@ Admission:
 The reservation and duplicate check occur in one short synchronous critical
 section with no I/O and no `.await`.
 
-A second transaction for an active session ID is rejected immediately. It is
+A second transaction for an active session key is rejected immediately. It is
 never queued.
 
 For an external session created asynchronously, admission first reserves the
 internal run ID. When the Connector returns the authoritative session ID, the
-actor atomically claims that ID before publishing `SessionEstablished`. A
-collision fails that transaction before its prompt is sent.
+actor atomically claims the selected Channel/session pair before publishing
+`SessionEstablished`. A collision fails that transaction before its prompt is
+sent.
 
 ### 4.2 One actor per transaction
 
@@ -249,17 +289,15 @@ TransactionActor
     run identity
     selected ChannelBinding
     ResolvedToolSet
-    Connector handles
-    Interpreter handles
+    per-ExchangeId Connector/Interpreter handles
     Loop tool state
-    event sequence
-    terminal selector
+    shared exactly-once FinalizationGuard / EventSequencer handle
     child-task set
     cancellation token
 ```
 
-All asynchronous producers report through one bounded command channel. The
-actor is the only code allowed to:
+All asynchronous producers report through one bounded command channel. During
+normal operation the actor is the only code allowed to:
 
 - advance transaction state;
 - publish caller events;
@@ -267,6 +305,11 @@ actor is the only code allowed to:
 - send a continuation;
 - select terminal state; or
 - release the active-session reservation.
+
+The sole exception is forced runtime shutdown after the actor has been aborted
+and joined: the shutdown supervisor may claim the transaction's
+`FinalizationGuard` to publish/attempt `Ended`, release routing, and invoke the
+callback.
 
 This actor model removes lock ordering from transaction logic and makes terminal
 races deterministic.
@@ -278,9 +321,9 @@ aborted during bounded teardown.
 
 ```text
 admitted
-  -> opening_channel
   -> establishing_session
   -> activating_tools
+  -> opening_channel
   -> sending
   -> receiving
        -> executing_tools
@@ -291,14 +334,17 @@ admitted
 
 any nonterminal state
   -> cancelling
+  -> finalizing
   -> terminal
 
 any nonterminal state
   -> terminating
+  -> finalizing
   -> terminal
 
 any nonterminal state
   -> failed
+  -> finalizing
   -> terminal
 ```
 
@@ -306,9 +352,18 @@ For external agents, provider-owned inner turns stay inside `receiving`.
 MCP calls may enter `executing_tools`, but their results return through MCP and
 the external agent controls its next inner turn.
 
+`DirectLlm` skips `establishing_session`. External agents always establish an
+owned attachment before transaction-level Connector open. `activating_tools` is
+a validated no-op except for `McpGateway`, where descriptor
+installation/refresh, SessionKey claim, and route activation must complete
+before opening/sending.
+
 For direct LLMs, a canonical tool request enters `executing_tools`. The Loop
 encodes the tool result as a continuation, sends it to the same Channel, and
 returns to `receiving`. All model/tool/model cycles remain one transaction.
+Each initial request and continuation is nevertheless a distinct exchange with
+a fresh `ExchangeId`, `ConnectionId`, and `InterpretationId`. A completed
+Interpreter is never reused for another HTTP response.
 
 ## 6. Channel architecture
 
@@ -318,10 +373,9 @@ A `ChannelBinding` is configuration plus implementations:
 ChannelBinding
     channel_id
     channel_kind
-    Connector factory/config
+    ConnectorFactory producing one matched Connector/SessionAdapter instance
     outbound dialect encoder
     Interpreter factory/profile
-    session adapter
     tool execution mode
     capabilities
     static defaults
@@ -343,10 +397,28 @@ ModelToolCalls
 None
 ```
 
+External-agent capabilities separately declare MCP configuration as
+`None`, `CreationOnly`, or `Refreshable`. `CreationOnly` supports tools only
+while creating a new external session and makes that attachment ineligible for
+later Monoloop transactions. `Refreshable` is required for request-scoped tool
+changes on a reused session.
+
 This mode is important. An external agent may emit observational tool events
 while also invoking the actual tool through MCP. Those observed events must not
 trigger a second local execution. Only the configured authoritative path may
 execute tools.
+
+Session attachment and transport opening cannot be assembled from unrelated
+instances. A `ConnectorFactory` produces one `ConnectorInstance` containing the
+Connector and, for external-agent Channels, its matching `SessionAdapter`.
+Attachments carry an opaque route and owner identity that the Connector
+validates on open.
+
+That instance supports bounded concurrent work for distinct SessionKeys; a
+profile may use bounded internal semaphores but cannot hold one async mutex
+across unrelated provider operations. Transaction-level order is fixed:
+external attach/create/load before exchange open, while direct LLMs skip
+attachment and open directly.
 
 ### 6.1 Provider configuration
 
@@ -398,6 +470,7 @@ pub struct ToolSpec {
     pub input_schema: JsonSchema,
     pub output_contract: ToolOutputContract,
     pub limits: ToolLimits,
+    pub cancellation: ToolCancellationPolicy,
 }
 
 pub trait ToolHandler: Send + Sync {
@@ -444,12 +517,14 @@ direct-LLM canonical tool request -+      -> validate active run
                                            -> validate payload schema
                                            -> enforce limits
                                            -> start linked ToolHandler
+                                           -> validate declared output
                                            -> emit lifecycle
                                            -> return canonical result
 ```
 
-The dispatcher requires `SessionId`, `MonoloopRunId`, `ToolActionId`, and
-`ToolId`. A late request with the correct session but an old run ID is rejected.
+The dispatcher requires `SessionKey`, `TransactionId`, `ExchangeId` where
+applicable, `ToolActionId`, and `ToolId`. A late request with the correct
+session but an old transaction/exchange identity is rejected.
 
 Tool execution is asynchronous. `ToolExecutionHandle` must expose:
 
@@ -458,68 +533,89 @@ Tool execution is asynchronous. `ToolExecutionHandle` must expose:
 - one completion future consumed by the transaction actor; and
 - a declared cancellation behavior.
 
+Supported cancellation behavior is cooperative within a bounded grace period,
+directly abortable, or isolated behind a killable execution boundary.
+Unstoppable in-process execution is rejected at registry construction because
+it cannot satisfy bounded transaction teardown.
+
+Tool completion distinguishes:
+
+- canonical success;
+- declared bounded domain failure, which is returned to MCP/the model as a tool
+  result; and
+- runtime failure, panic, lost completion, or output-contract violation, which
+  fails the transaction as `ToolExchangeFailed`.
+
+Successful output and domain errors are validated against `ToolOutputContract`
+and byte limits before publication.
+
 The current `Available -> DispatchRejected` branch is replaced only when this
 handle and its conformance tests exist. It must not be relabelled complete while
 real execution remains deferred.
 
 ## 8. MCP hosting
 
-### 8.1 One gateway, scoped bindings
+### 8.1 One gateway, transaction-scoped bindings
 
 Monoloop hosts one bounded MCP gateway per runtime, not one server process per
-transaction.
+transaction. Routing capabilities are nevertheless unique per transaction.
 
 The initial transport is MCP Streamable HTTP on a loopback listener. Each
-external session attachment receives an unguessable capability URL/token:
+`McpGateway` external-agent transaction, including one with an empty tool set,
+receives a new unguessable capability URL/token:
 
 ```text
-http://127.0.0.1:<port>/mcp/<capability>
+http://127.0.0.1:<port>/mcp/<transaction-capability>
 ```
 
 The token is a secret routing capability. It is never logged, emitted as a
 diagnostic, or accepted from transaction request configuration.
 
-The gateway owns bounded `McpSessionBinding` entries:
+The gateway first creates bounded disabled pending entries:
 
 ```text
-McpSessionBinding
+PendingMcpTransactionBinding
     capability token
-    external session attachment
-    active run ID?
-    active ResolvedToolSet?
-    transaction command sender?
+    TransactionId
+    ResolvedToolSet
+    transaction command sender
     limits
 ```
 
-The MCP descriptor is supplied through the existing `mcpServers` session
-configuration when an external session is created or attached.
+For a new external session, the descriptor is included in session creation;
+after the authoritative ID is returned and `SessionKey` is claimed, the route
+activates as an immutable `McpTransactionBinding`. For a reused session, its
+owning `SessionAdapter` refreshes the `mcpServers` descriptor and the route
+activates only after confirmation. A pending route rejects calls as not ready.
+Only an active route may receive a prompt-associated tool call.
 
 ### 8.2 Request-scoped availability on a persistent session
 
 External sessions persist across transactions, but requested tools change.
-Therefore the MCP endpoint remains attached to the external session while its
-active tool set changes atomically:
+Therefore the MCP descriptor and capability rotate for every transaction:
 
 ```text
 before prompt send
-    bind active run + ResolvedToolSet
+    create pending capability + ResolvedToolSet binding
+    install during new-session creation or refresh existing session
+    claim SessionKey and activate route
 
 during transaction
     tools/list -> active set only
     tools/call -> active set only
 
-before terminal callback
-    clear active run + tool set
+before terminal event
+    revoke and remove capability
+    bounded attempt to remove descriptor from external session
 ```
 
-Because Monoloop permits only one in-flow transaction per session, MCP requests
-cannot be ambiguous.
+Capability values are never reused. A delayed call from an older transaction
+therefore addresses a removed route and cannot enter a newer transaction.
+Unknown, revoked, stale, cross-session, or out-of-allowlist calls fail closed
+and never reach a handler.
 
-When no transaction is active, `tools/list` returns an empty set and
-`tools/call` returns a typed inactive-session error.
-
-A request using a stale binding, stale run, unknown tool, or tool outside the
-active allowlist fails closed and never reaches a handler.
+Local revocation happens before attempting external descriptor removal, so an
+unresponsive external session cannot keep the capability valid.
 
 ### 8.3 MCP-to-Loop flow
 
@@ -538,9 +634,15 @@ external agent
 The MCP response is the tool result transport for an external agent. The Loop
 does not also encode that result into the agent's model stream.
 
-If a Connector profile cannot install or refresh the Monoloop MCP descriptor
-for an attached session, a tool-enabled transaction is rejected. Monoloop must
-not claim tool parity on a profile that cannot provide it.
+If a Connector profile can install but not refresh the Monoloop MCP descriptor,
+it may qualify as `CreationOnly`; it must reject supplied/reused sessions and
+must not advertise reusable-session tool parity. A `None` profile accepts only
+empty tool sets. Monoloop does not claim parity beyond the capability a profile
+actually proves.
+
+The initial gateway is loopback-only. A Channel qualifies it only when the
+external agent shares the Monoloop host's loopback network namespace. Remote or
+container-isolated agents require a separately secured transport profile.
 
 ## 9. Direct-LLM flow
 
@@ -571,6 +673,17 @@ The generic HTTP Connector owns HTTP/TLS/authentication/body streaming and
 cancellation. It does not inspect prompts, tools, model options, or SSE event
 semantics.
 
+One tracked `ExchangeDriver` owns each HTTP exchange. It pumps
+`RawOutputHandle` bytes directly into one new Interpretation, reconciles both
+terminal handles, and fan-outs accepted canonical events to the transaction
+actor and—only for `ModelToolCalls`—the inner Loop. Raw byte chunks do not pass
+through the actor command queue.
+
+Provider tool-call IDs are scoped by `ExchangeId`; the same provider ID in a
+later exchange creates a distinct action. Continuation context, total provider
+input/output bytes, exchange count, and continuation count are bounded without
+silent truncation.
+
 ## 10. Event delivery
 
 Every transaction has one required caller event sink attached at admission.
@@ -580,6 +693,9 @@ The transaction actor publishes events in order. If the required sink closes,
 the transaction fails as `EventDeliveryFailed`. If it stops consuming,
 backpressure affects only that transaction; global and per-transaction
 deadlines still apply.
+
+The final `Ended` event uses a separate bounded terminal-delivery budget from
+cleanup. It does not reuse an already expired transaction deadline.
 
 Optional presentation/demo subscribers are separate best-effort consumers and
 cannot weaken the required caller stream or the Loop's internal tool stream.
@@ -598,7 +714,8 @@ The finalization order is:
 3. clear the active MCP tool binding;
 4. cancel Connector, Interpreter, Loop, and running tools as required;
 5. join or abort all transaction child tasks within cleanup limits;
-6. deliver the final `Ended` transaction event and await bounded acceptance;
+6. deliver the final `Ended` transaction event using the terminal-delivery
+   deadline and await bounded acceptance;
 7. report `EventDeliveryFailed` through completion if final delivery fails;
 8. close the event stream;
 9. remove the active-session reservation;
@@ -611,9 +728,16 @@ the next transaction for the same session.
 No producer can publish after terminal selection because producers do not own
 the caller sink and their commands are rejected by run ID.
 
+The actor and shutdown supervisor share an exactly-once `FinalizationGuard`.
+Normal completion is actor-owned. If forced shutdown must abort an actor, the
+supervisor claims the still-unclaimed guard, emits/attempts `RuntimeShutdown`,
+removes routing, and invokes the callback. No admitted transaction is discarded
+without one callback invocation attempt.
+
 ## 12. Cancellation and termination
 
-`terminate(session_id, mode)` sends a high-priority command to the actor.
+`terminate(TransactionId | SessionKey, mode)` sends a high-priority command to
+the actor.
 
 Cancellation and termination are raced against every blocking phase:
 
@@ -641,19 +765,21 @@ The runtime enforces configuration for:
 
 - global active transactions;
 - active transactions per Channel;
-- one active transaction per session;
-- actor command queue;
-- event queue;
+- one active transaction per SessionKey;
+- actor command queue items and bytes;
+- event queue items and bytes;
 - callback queue and callback concurrency;
 - MCP session bindings and requests;
 - tools per transaction;
-- tool schema and payload bytes;
+- tool schema, input payload, and output bytes;
 - queued and concurrent tool calls;
 - per-tool concurrency;
 - Connector, Interpreter, and Loop queues;
 - diagnostics;
+- continuation-context, provider exchange, and total provider input/output
+  bytes;
 - transaction deadline; and
-- cleanup deadline.
+- cleanup, terminal-event delivery, callback, and shutdown deadlines.
 
 Zero and contradictory limits fail configuration validation. Capacity is
 enforced in the unit named by the contract: byte limits are not approximated by
@@ -666,12 +792,17 @@ Monoloop persists nothing.
 Runtime shutdown:
 
 1. rejects new admissions;
-2. sends termination to every actor;
-3. waits only for the configured global shutdown deadline;
-4. aborts remaining local tasks and processes;
-5. closes the MCP listener;
-6. releases registries, callbacks, and routing entries; and
-7. exits without writing recovery state.
+2. sends `RuntimeShutdown` terminalization to every actor;
+3. waits within the configured global shutdown deadline;
+4. aborts and joins actors that exceed their actor grace;
+5. uses each aborted actor's `FinalizationGuard` to attempt the final event,
+   clear routing, and invoke its callback exactly once;
+6. revokes all MCP capabilities and closes the listener;
+7. bounds remaining callback futures by the lesser of their own deadline and
+   remaining shutdown time;
+8. verifies all admitted finalization guards were claimed;
+9. releases registries and bounded services; and
+10. exits without writing recovery state.
 
 Outstanding external sessions remain owned by their external systems.
 
@@ -734,7 +865,8 @@ Each slice is complete and honestly labelled within its scope.
 ### Slice 5: connector migration and qualification
 
 - adapt all six external profiles to `ChannelBinding`;
-- verify session creation/reuse and MCP support honestly per profile;
+- verify session creation/reuse and
+  `None`/`CreationOnly`/`Refreshable` MCP support honestly per profile;
 - concurrent multi-session qualification;
 - remove connector-local prompt shortcuts that bypass canonical encoding.
 
@@ -747,7 +879,7 @@ Deterministic tests are the primary gate.
 
 Required scenarios include:
 
-- duplicate active session admission;
+- duplicate active SessionKey admission;
 - generated direct-LLM session identity;
 - external session creation and reuse;
 - many concurrent sessions with no cross-routing;

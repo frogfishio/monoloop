@@ -57,10 +57,11 @@ caller
   → external channel
   → Connector raw output + DialectBinding
   → Interpreter
-  → canonical event distributor
-       → caller subscription
-       → Console Renderer (test only)
-       → inner LoopRuntime (lossless)
+  → exchange canonical distributor
+       → TransactionActor
+           → FinalizationGuard/EventSequencer
+           → bounded caller TransactionEventSink
+       → inner LoopRuntime (lossless; ModelToolCalls only)
            → request-scoped ToolRegistry/ToolRuntime
            → OutboundToolResult
   → continuation policy (inline | caller_controlled)
@@ -107,7 +108,8 @@ dependency direction is one-way into the kernel, never reverse.
   empty registry → deterministic `tool_unavailable`, zero effects.
 - Exactly one terminal outcome per connection / interpretation / loop / run.
 - Cancellation is explicit, bounded, idempotent, and run-scoped.
-- One in-flow transaction per SessionId; a duplicate is rejected, never queued.
+- One in-flow transaction per `SessionKey { ChannelId, SessionId }`; a duplicate
+  is rejected, never queued.
 - Production transaction completion and live events are push-based.
 
 ## Authoritative docs
@@ -117,6 +119,7 @@ dependency direction is one-way into the kernel, never reverse.
 - Integration: `doc/MONOLOOP.md`
 - Transaction architecture: `doc/TRANSACTION_RUNTIME_DESIGN.md`
 - Development contract: `doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md`
+- Delivery sequence: `doc/TRANSACTION_RUNTIME_DELIVERY_PLAN.md`
 - Components: `doc/CONNECTOR.md`, `doc/INTERPRETER.md`, `doc/THE_LOOP.md`
 - Grok profile: `doc/GROK_BUILD_CONNECTOR.md`
 - Test kit: `doc/TEST_KIT.md`, `doc/CONSOLE_INPUT.md`, `doc/CONSOLE_RENDERER.md`

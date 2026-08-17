@@ -18,8 +18,9 @@ are a separate test kit. They are not additional product components.
 
 See the [documentation index](doc/README.md), [requirements
 register](doc/REQUIREMENTS.md), [transaction design](doc/TRANSACTION_RUNTIME_DESIGN.md),
-[development specification](doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md), [Grok
-Build Connector profile](doc/GROK_BUILD_CONNECTOR.md), and [Test Kit and
+[development specification](doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md),
+[delivery plan](doc/TRANSACTION_RUNTIME_DELIVERY_PLAN.md), [Grok Build
+Connector profile](doc/GROK_BUILD_CONNECTOR.md), and [Test Kit and
 Driver](doc/TEST_KIT.md).
 
 ## Workspace (implementation in progress)

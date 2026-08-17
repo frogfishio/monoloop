@@ -78,11 +78,15 @@ entries. Specs under `doc/` remain normative; this file captures *why*.
 
 ## 2026-08 — Outbound encoder is a seam, not a product component
 
-- **Decision**: Canonical→dialect encoding is a required supporting seam; initial
-  implementation lives in the test kit Driver path.
+- **Decision**: Canonical→dialect encoding is a required supporting seam.
+  Deterministic test encoders live in the Driver path; production encoders live
+  in Component 3's transaction adapter layer.
 - **Rationale**: Encoding must not live inside Connector, Interpreter, Loop, or
   Console Input.
-- **Implication**: Loop emits provider-neutral `OutboundToolResult` only.
+- **Implication**: The inner Loop emits provider-neutral `OutboundToolResult`
+  only. The 2026-08-17 transaction-runtime decision supersedes the
+  test-kit-only location: production encoders are Component 3 adapters invoked
+  by `TransactionRuntime`, never by the inner Loop.
 
 ## 2026-08 — Async, multi-thread Tokio, no ambient task-local identity
 
@@ -145,11 +149,11 @@ entries. Specs under `doc/` remain normative; this file captures *why*.
   refines the earlier “minimal Loop” decision without creating a fourth
   component.
 
-## 2026-08-17 — Push completion and one active transaction per session
+## 2026-08-17 — Push completion and one active transaction per SessionKey
 
 - **Decision**: Production submission performs bounded synchronous admission,
   streams canonical events to an attached sink, and invokes one asynchronous
-  completion callback. A second request for an active `SessionId` is rejected
+  completion callback. A second request for an active `SessionKey` is rejected
   immediately and is not queued.
 - **Rationale**: Calling systems must not poll or block, and mutable session
   routing must remain unambiguous.
@@ -187,6 +191,33 @@ entries. Specs under `doc/` remain normative; this file captures *why*.
 - **Implication**: Monoloop validates and mechanically encodes this product but
   never authors or rewrites it. New content-part kinds require versioned
   contracts and dialect tests.
+
+## 2026-08-17 — Transaction isolation closes over Channel, exchange, and capability
+
+- **Decision**: Session exclusion uses `SessionKey { ChannelId, SessionId }`;
+  every provider cycle has a fresh `ExchangeId`/connection/interpretation; and
+  every external-agent transaction receives a newly rotated MCP capability.
+- **Rationale**: Provider session strings are not globally unique, completed
+  Interpretations cannot decode later HTTP responses, and a stable MCP URL
+  cannot distinguish a delayed old call from a current call.
+- **Implication**: Session-directed termination includes Channel identity.
+  Connector factories produce matched Connector/SessionAdapter instances.
+  MCP descriptors are refreshed before every prompt and revoked before terminal
+  publication. Profiles unable to refresh or reach the configured MCP transport
+  reject tool-enabled requests.
+
+## 2026-08-17 — Finalization and tool execution remain forcibly bounded
+
+- **Decision**: Actor and shutdown supervisor share an exactly-once
+  `FinalizationGuard`; final event delivery has its own cleanup deadline; and
+  transaction tools must be cooperative, abortable, or isolated-killable.
+- **Rationale**: Aborting an actor during shutdown must not lose its callback,
+  an expired transaction deadline must not suppress its terminal event, and
+  unstoppable in-process work contradicts leak-free bounded teardown.
+- **Implication**: Graceful shutdown invokes every admitted callback exactly
+  once. Unbounded/non-cancellable handlers are rejected. Tool outputs are
+  contract-validated, while domain failures remain distinct from runtime
+  failures.
 
 ## Template for new entries
 

@@ -3,6 +3,7 @@
 **Status:** Accepted for development  
 **Implements:** `REQUIREMENTS.md` R-000 through R-004  
 **Architecture:** `TRANSACTION_RUNTIME_DESIGN.md`
+**Delivery:** `TRANSACTION_RUNTIME_DELIVERY_PLAN.md`
 
 This document fixes the contracts and implementation choices that a developer
 would otherwise have to invent. It is normative for the transaction-runtime
@@ -23,15 +24,16 @@ specification, not used to silently weaken it.
    execution, and completion are asynchronous.
 6. Production completion is push-based through an asynchronous one-shot
    callback. The test-kit may retain awaitable handles internally.
-7. A second transaction for the same active `SessionId` is rejected immediately
+7. A second transaction for the same active `SessionKey` is rejected immediately
    and is never queued.
 8. `TransactionId` identifies one admitted transaction. `SessionId` is the
    caller-visible session/correlation identity. `ExternalSessionId` is the
    authoritative identity created by an external agent.
 9. Direct-LLM sessions are ephemeral routing identities only. They imply no
    provider-side state or Monoloop history.
-10. The first canonical input supports ordered messages containing text parts.
-    Monoloop validates and encodes them but never authors or rewrites them.
+10. The first canonical input supports ordered typed messages containing text,
+    assistant tool calls, and correlated tool results. Monoloop validates and
+    encodes them but never authors or rewrites them.
 11. The request selects tools by stable `ToolId`. Definitions and linked
     handlers come only from the immutable host registry.
 12. Direct-LLM tools execute through `LoopRuntime`. MCP calls and Loop tool calls
@@ -41,6 +43,15 @@ specification, not used to silently weaken it.
     hand-roll a partial JSON-RPC protocol.
 14. The runtime is entirely in-memory. It has no recovery, retry queue, session
     database, event journal, or callback persistence.
+15. Session exclusion and session-directed control use
+    `SessionKey { channel_id, session_id }`; provider session strings are not
+    assumed globally unique.
+16. Every provider request/response cycle has a distinct `ExchangeId`,
+    `ConnectionId`, and `InterpretationId`.
+17. MCP capability URLs are transaction-specific and revoked at terminal state.
+    A persistent session never reuses one capability across transactions.
+18. Transaction-owned tools must support bounded termination, either directly
+    or through a killable isolation boundary.
 
 ## 2. Dependency direction
 
@@ -76,7 +87,12 @@ oversized, or control-character values.
 
 ```rust
 pub struct TransactionId(Uuid);
+pub struct ExchangeId(Uuid);
 pub struct SessionId(String);
+pub struct SessionKey {
+    pub channel_id: ChannelId,
+    pub session_id: SessionId,
+}
 pub struct ExternalSessionId(String);
 pub struct ChannelId(String);
 pub struct ToolId(String);
@@ -96,6 +112,19 @@ Rules:
   one-to-one from `TransactionId` for this runtime.
 - Every child completion carries `TransactionId`. Session identity alone is
   insufficient to accept a late child result.
+- Provider session IDs are scoped to a Channel. Registry lookup, duplicate
+  exclusion, MCP routing, and session-directed termination use `SessionKey`.
+  Events expose both `channel_id` and the unmodified authoritative `session_id`.
+- `ExchangeId` identifies one provider exchange inside a transaction. Every
+  exchange allocates a fresh `ConnectionId` and `InterpretationId`; late
+  exchange results are rejected by all four identities.
+
+For an external-agent Channel, `SessionId` and `ExternalSessionId` wrap the same
+validated opaque byte string; conversion changes only the Rust type. When a
+caller supplies a `SessionId`, the completed attachment must return an
+`ExternalSessionId` with identical bytes before the `SessionKey` is installed
+or any prompt is sent. A mismatch selects `InvariantFailed` and releases the
+attachment.
 
 ### 3.2 Canonical input
 
@@ -104,38 +133,55 @@ pub struct CanonicalInput {
     pub messages: Vec<CanonicalMessage>,
 }
 
-pub struct CanonicalMessage {
-    pub role: MessageRole,
-    pub content: Vec<ContentPart>,
-    pub name: Option<String>,
-    pub tool_call_id: Option<String>,
+pub enum CanonicalMessage {
+    System {
+        content: Vec<TextPart>,
+        name: Option<String>,
+    },
+    User {
+        content: Vec<TextPart>,
+        name: Option<String>,
+    },
+    Assistant {
+        content: Vec<TextPart>,
+        tool_calls: Vec<CanonicalAssistantToolCall>,
+    },
+    Tool {
+        tool_call_id: String,
+        content: Vec<TextPart>,
+    },
 }
 
-pub enum MessageRole {
-    System,
-    User,
-    Assistant,
-    Tool,
+pub struct TextPart {
+    pub text: String,
 }
 
-pub enum ContentPart {
-    Text { text: String },
+pub struct CanonicalAssistantToolCall {
+    pub tool_call_id: String,
+    pub tool_name: ToolName,
+    pub arguments: serde_json::Value,
 }
 ```
 
 Validation:
 
 - at least one message;
-- at least one content part per message;
+- at least one text part for `System`, `User`, and `Tool`;
+- at least one text part or assistant tool call for `Assistant`;
 - all strings and aggregate encoded bytes bounded by `InputLimits`;
-- `tool_call_id` is required only for `Tool` and forbidden for `System`/`User`;
-- `name` is bounded and optional;
+- tool-call IDs are unique within the canonical input;
+- every `Tool.tool_call_id` refers to a preceding assistant tool call;
+- assistant tool names and argument JSON satisfy the same name, depth, and byte
+  bounds used by live tool calls;
+- `name` is bounded and available only where declared above;
 - no empty text part;
 - role order is preserved exactly;
 - no trimming, interpolation, system-message insertion, or prompt rewriting.
 
-Adding image, audio, file, or structured parts requires a versioned contract
-change and dialect qualification. Unknown parts fail; they are not converted to
+This representation can losslessly encode caller-supplied historical
+assistant-tool-call/tool-result sequences, including assistant messages with no
+text. Adding image, audio, file, or other content requires a versioned contract
+change and dialect qualification. Unknown content fails; it is not converted to
 text.
 
 ### 3.3 Invocation configuration
@@ -153,6 +199,13 @@ pub struct InvocationConfig {
     pub extensions: BTreeMap<ExtensionKey, VersionedExtension>,
 }
 
+pub struct SessionConfig {
+    pub specialist_profile: Option<String>,
+    pub mode: Option<String>,
+    pub permission_profile: Option<String>,
+    pub extensions: BTreeMap<ExtensionKey, VersionedExtension>,
+}
+
 pub enum ContinuationPolicy {
     InlineToolContinuation,
     CallerControlled,
@@ -167,6 +220,13 @@ pub struct VersionedExtension {
 `ExtensionKey` is a bounded namespace such as `openai.seed`, not an arbitrary
 unqualified key. Extension depth, key count, string bytes, and total serialized
 bytes are validated before admission.
+
+`SessionConfig` is optional and applies only to external-agent session
+creation/attachment. It contains no prompt, MCP descriptor, endpoint,
+credential, or secret. Common labels and extension keys/values are bounded.
+Direct-LLM Channels reject non-`None` session configuration. For an existing
+external session, immutable settings must match the attached session's known
+configuration or admission fails; no setting is silently reapplied.
 
 Effective configuration is built once:
 
@@ -206,7 +266,23 @@ Each transaction owns:
 
 - one bounded event-delivery queue and one sequential delivery task;
 - one callback reservation acquired during admission; and
-- one callback task scheduled only during terminal cleanup.
+- one `FinalizationGuard` containing the callback, terminal-event route, last
+  event sequence, and an atomic exactly-once claim.
+
+The guard is retained in the active registry as well as by the actor. Normally
+the actor claims it. During forced runtime shutdown, the shutdown supervisor may
+claim it only after the actor has been aborted and joined. Whichever path claims
+it must attempt the final event, remove registry entries, and invoke the
+callback exactly once. Dropping an unclaimed guard is an invariant failure.
+
+The event-delivery task and callback reservation are runtime-owned resources of
+the guard, not members of the actor's abortable `JoinSet`. They remain usable
+after actor abort and are closed only by successful guard finalization or final
+runtime teardown.
+
+Guard claim uses one atomic compare-and-swap. The winning path takes the
+single-use callback and terminal route from a short `std::sync::Mutex` section
+with no I/O and no `.await`; losing paths cannot observe or invoke them.
 
 Event delivery preserves order. A delivery error or panic reports
 `EventDeliveryFailed`. A delivery future that exceeds the transaction deadline
@@ -220,7 +296,8 @@ pub struct TransactionRequest {
     pub channel_id: ChannelId,
     pub session_id: Option<SessionId>,
     pub input: CanonicalInput,
-    pub config: InvocationConfig,
+    pub session_config: Option<SessionConfig>,
+    pub invocation_config: InvocationConfig,
     pub tools: Vec<ToolId>,
     pub events: Arc<dyn TransactionEventSink>,
     pub completion: Box<dyn CompletionCallback>,
@@ -233,7 +310,33 @@ pub struct AdmissionReceipt {
 
 pub enum TransactionSelector {
     Transaction(TransactionId),
-    Session(SessionId),
+    Session(SessionKey),
+}
+
+pub enum TerminationMode {
+    Cancel { reason: CancellationReason },
+    ForceTerminate { reason: TerminationReason },
+}
+
+pub struct CancellationReason {
+    pub code: CancellationReasonCode,
+    pub detail: Option<SafeDiagnostic>,
+}
+
+pub enum CancellationReasonCode {
+    CallerRequested,
+    RuntimeShutdown,
+}
+
+pub struct TerminationReason {
+    pub code: TerminationReasonCode,
+    pub detail: Option<SafeDiagnostic>,
+}
+
+pub enum TerminationReasonCode {
+    CallerRequested,
+    CancellationGraceExpired,
+    RuntimeShutdown,
 }
 
 pub type Shutdown =
@@ -255,19 +358,58 @@ pub trait TransactionRuntime: Send + Sync {
 }
 ```
 
+The types above belong to `monoloop-contracts`. Concrete startup belongs to
+`monoloop-loop`, preventing contracts from depending on an implementation
+crate:
+
+```rust
+pub type Startup =
+    Pin<Box<dyn Future<Output = Result<Arc<DefaultTransactionRuntime>, StartupError>>
+        + Send
+        + 'static>>;
+
+pub struct RuntimeBootstrap {
+    pub config: RuntimeConfig,
+    pub channels: ChannelRegistry,
+    pub tools: HostToolRegistry,
+    pub executor: tokio::runtime::Handle,
+}
+
+impl DefaultTransactionRuntime {
+    pub fn start(bootstrap: RuntimeBootstrap) -> Startup;
+}
+```
+
 `AdmissionReceipt.session_id` is immediately present for direct LLMs and
 existing external sessions. `transaction_id` permits termination while a new
 external session is still being created.
 
+`Cancel` requests cooperative child cancellation and produces `Cancelled` when
+it wins terminal selection. `ForceTerminate` immediately requests each
+available force/abort control and produces `Terminated` when it wins. Both are
+idempotent; repeating either mode returns `AlreadyRequested`, and neither may
+rewrite a terminal result already selected.
+
+`TerminationMode`, both reason types, their closed code enums, and
+`SafeDiagnostic` belong to `monoloop-contracts`. Details are optional,
+bounded, pre-redacted text and grant no routing or authorization authority.
+
 `submit` performs no network, process, filesystem, tool, or callback operation.
 It validates, resolves immutable entries, reserves bounded capacity, installs
 the registry entry, spawns the actor, and returns.
+
+`start` is the only startup path. It validates registries and limits, binds and
+qualifies the loopback MCP listener, creates bounded runtime services, and
+returns only after the runtime is `Accepting`. Startup failure closes every
+partially created service and returns a typed `StartupError`; a partially
+started runtime is never exposed.
 
 ### 3.6 Events and terminal result
 
 ```rust
 pub struct TransactionEvent {
     pub transaction_id: TransactionId,
+    pub channel_id: ChannelId,
     pub session_id: SessionId,
     pub sequence: u64,
     pub payload: TransactionEventPayload,
@@ -298,6 +440,7 @@ pub enum TransactionEndKind {
     ContinuationRequired,
     Cancelled,
     Terminated,
+    RuntimeShutdown,
     DeadlineExceeded,
     ChannelOpenFailed,
     EncodingFailed,
@@ -334,10 +477,11 @@ provider bodies, or unbounded error chains.
 4. validate Channel/config/tool-mode capabilities;
 5. resolve and deduplicate every `ToolId` into one immutable `ResolvedToolSet`;
 6. compute effective configuration without I/O;
-7. allocate `TransactionId` and direct-LLM `SessionId` if needed;
+7. allocate `TransactionId`, direct-LLM `SessionId` if needed, and the resulting
+   `SessionKey` when the session is already known;
 8. reserve global, per-Channel, event-delivery, and callback capacity;
 9. in one non-async registry critical section, reject a duplicate active
-   `SessionId` and install `ActiveTransaction`;
+   `SessionKey` and install `ActiveTransaction` with its `FinalizationGuard`;
 10. create bounded control/data/event channels;
 11. spawn the actor and delivery task through the injected Tokio handle; and
 12. return `AdmissionReceipt`.
@@ -346,9 +490,10 @@ Any failure before step 9 releases all acquired permits. Any spawn failure rolls
 back the registry entry and permits before returning `AdmissionError`.
 
 For a new external session, the registry first indexes the transaction by
-`TransactionId`. When session creation returns, the actor atomically claims the
-authoritative `SessionId`. Collision selects `InvariantFailed` before sending
-the prompt and releases the external attachment.
+`TransactionId`. When session creation returns, the actor atomically claims
+`SessionKey { selected channel, authoritative session ID }`. Collision selects
+`InvariantFailed` before sending the prompt, revokes any MCP capability, and
+releases the external attachment.
 
 Admission errors are closed and typed:
 
@@ -383,14 +528,47 @@ pub enum ToolExecutionMode {
     None,
 }
 
+pub enum McpConfigurationCapability {
+    None,
+    CreationOnly,
+    Refreshable,
+}
+
+pub struct ChannelCapabilities {
+    pub session_mode: SessionMode,
+    pub mcp_configuration: McpConfigurationCapability,
+    pub mcp_reachability: McpReachability,
+    pub exchange_mode: ExchangeMode,
+    pub continuation_policies: BTreeSet<ContinuationPolicy>,
+    pub supports_distinct_session_concurrency: bool,
+    pub input_dialect: DialectDescriptor,
+    pub output_dialect: DialectDescriptor,
+    pub option_policy: OptionPolicy,
+}
+
+pub enum SessionMode {
+    Stateless,
+    External,
+}
+
+pub enum McpReachability {
+    None,
+    SameLoopbackNamespace,
+    QualifiedRemoteTransport,
+}
+
+pub enum ExchangeMode {
+    RequestResponse,
+    Bidirectional,
+}
+
 pub struct ChannelBinding {
     pub id: ChannelId,
     pub kind: ChannelKind,
     pub tool_mode: ToolExecutionMode,
-    pub connector: Arc<dyn ConnectorFactory>,
+    pub connector_factory: Arc<dyn ConnectorFactory>,
     pub encoder: Arc<dyn OutboundDialectEncoder>,
     pub interpreter: Arc<dyn InterpreterFactory>,
-    pub sessions: Arc<dyn SessionAdapter>,
     pub defaults: ChannelDefaults,
     pub capabilities: ChannelCapabilities,
     pub limits: ChannelLimits,
@@ -401,7 +579,42 @@ The Channel registry is immutable after runtime construction. Duplicate IDs,
 invalid capability combinations, unsupported dialect pairs, missing session
 adapters, or zero/contradictory limits fail runtime construction.
 
+Startup validates this matrix:
+
+- `DirectLlm` requires `Stateless`, no `SessionAdapter`, and initially
+  `RequestResponse`;
+- `ExternalAgent` requires `External` and a `SessionAdapter`;
+- `McpGateway` requires non-`None` MCP configuration and declared reachable
+  transport;
+- non-MCP tool modes require `mcp_configuration == None`;
+- `SendAndRetain` is legal only for `Bidirectional`;
+- `InlineToolContinuation` requires `ModelToolCalls`;
+- every production Channel must support concurrent distinct sessions, although
+  its configured semaphore may bound the count; and
+- encoder, Connector, and Interpreter dialect declarations must match exactly.
+
 ```rust
+pub struct ConnectorInstance {
+    pub instance_id: ConnectorInstanceId,
+    pub connector: Arc<dyn Connector>,
+    pub sessions: Option<Arc<dyn SessionAdapter>>,
+}
+
+pub trait ConnectorFactory: Send + Sync {
+    fn create(&self) -> Result<ConnectorInstance, ConnectorBuildError>;
+}
+
+pub struct SessionAttachment {
+    pub owner: ConnectorInstanceId,
+    pub external_session_id: ExternalSessionId,
+    pub effective_session_config: SessionConfig,
+    pub route: Arc<dyn SessionRoute>,
+}
+
+pub trait SessionRoute: Send + Sync {
+    fn owner(&self) -> &ConnectorInstanceId;
+}
+
 pub trait OutboundDialectEncoder: Send + Sync {
     fn encode_initial(
         &self,
@@ -414,17 +627,181 @@ pub trait OutboundDialectEncoder: Send + Sync {
     ) -> Result<EncodedExchange, EncodingError>;
 }
 
+pub trait InterpreterFactory: Send + Sync {
+    fn supports(&self, dialect: &DialectBinding) -> SupportLevel;
+    fn start(
+        &self,
+        request: StartInterpretation,
+    ) -> Result<Interpretation, InterpreterError>;
+}
+
+pub struct InitialEncodeRequest<'a> {
+    pub transaction_id: &'a TransactionId,
+    pub exchange_id: &'a ExchangeId,
+    pub input: &'a CanonicalInput,
+    pub config: &'a EffectiveConfig,
+    pub tools: &'a [ToolSpec],
+}
+
+pub struct ToolContinuationEncodeRequest<'a> {
+    pub transaction_id: &'a TransactionId,
+    pub exchange_id: &'a ExchangeId,
+    pub context: &'a ContinuationContext,
+    pub results: &'a [CanonicalToolResult],
+    pub config: &'a EffectiveConfig,
+    pub tools: &'a [ToolSpec],
+}
+
+pub struct EncodedExchange {
+    pub bytes: bytes::Bytes,
+    pub required_input_dialect: DialectDescriptor,
+    pub input_policy: ExchangeInputPolicy,
+}
+
+pub enum ExchangeInputPolicy {
+    SendAndFinish,
+    SendAndRetain,
+}
+
 pub trait SessionAdapter: Send + Sync {
     fn begin_attach(
         &self,
         request: SessionAttachRequest,
     ) -> Result<PendingSessionAttachment, SessionAttachError>;
+
+    fn begin_refresh_mcp(
+        &self,
+        attachment: Arc<SessionAttachment>,
+        descriptor: Option<McpServerDescriptor>,
+    ) -> Result<PendingSessionConfiguration, SessionConfigurationError>;
+}
+
+pub struct McpServerDescriptor {
+    pub server_name: String,
+    pub protocol_version: String,
+    capability_url: secrecy::SecretString,
+}
+
+pub struct SessionAttachRequest {
+    pub transaction_id: TransactionId,
+    pub channel_id: ChannelId,
+    pub requested_session_id: Option<SessionId>,
+    pub session_config: SessionConfig,
+    pub initial_mcp: Option<McpServerDescriptor>,
+    pub deadline: Instant,
+}
+
+pub trait PendingOperationControl: Send + Sync {
+    fn cancel(&self) -> ControlDisposition;
+    fn force_terminate(&self) -> ControlDisposition;
+}
+
+pub struct PendingSessionAttachment {
+    pub control: Arc<dyn PendingOperationControl>,
+    pub completion: SessionAttachmentCompletion,
+}
+
+pub struct PendingSessionConfiguration {
+    pub control: Arc<dyn PendingOperationControl>,
+    pub completion: SessionConfigurationCompletion,
 }
 ```
 
+The encoder trait and request value types belong to `monoloop-contracts`.
+`InitialEncodeRequest` contains canonical input, effective configuration, and
+`&[ToolSpec]`; it does not reference the live `ResolvedToolSet` or handler
+objects from `monoloop-loop`. `ResolvedToolSet::specs()` supplies that exact
+ordered slice, preserving one canonical definition without reversing crate
+dependencies.
+
+`ContinuationContext` is an immutable bounded canonical message sequence
+containing the original caller input plus prior assistant tool calls and tool
+results required by the selected dialect. The actor constructs it mechanically
+from accepted canonical events/results; the encoder cannot fetch hidden
+history. `SendAndFinish` is required for HTTP request/response exchanges;
+`SendAndRetain` is allowed only for a Channel that declares a qualified
+bidirectional exchange.
+
+`ConnectorFactory`, `ConnectorInstance`, `SessionAdapter`, `SessionAttachment`,
+and `SessionRoute` belong to `monoloop-connector`, not
+`monoloop-contracts`. Runtime startup creates exactly one
+`ConnectorInstance` for each Channel binding. External-session attachment and
+all opens for that Channel use the `SessionAdapter` and `Connector` from that
+same instance.
+
 `PendingSessionAttachment` contains immediate cancellation control and exactly
-one completion future. `EncodedExchange` is bounded bytes plus an explicit
+one completion future. `PendingSessionConfiguration` likewise has immediate
+control and one completion future; `Some(descriptor)` installs the current
+transaction capability and `None` removes Monoloop MCP configuration when the
+profile supports removal. `OpenConnection` gains an optional
+`Arc<SessionAttachment>` and the Connector rejects an attachment whose
+`owner` differs from its own instance ID. The opaque route is the only local
+routing authority; copying an external session string into another Connector
+instance does not authorize attachment.
+
+The SessionAdapter normalizes and validates requested session configuration and
+returns the effective immutable value on `SessionAttachment`. If an existing
+provider session cannot report or verify a requested setting, that setting is
+unsupported for attach and fails explicitly.
+
+Direct-LLM Channels require `ConnectorInstance.sessions == None`.
+External-agent Channels require `Some(SessionAdapter)`. These combinations are
+validated at startup. `EncodedExchange` is bounded bytes plus an explicit
 exchange policy; it contains no transport credentials.
+
+`SessionAttachRequest` carries an optional initial MCP descriptor. A new
+external session therefore receives its transaction capability as part of
+session creation when the protocol requires `mcpServers` at creation time.
+Existing sessions use `begin_refresh_mcp`.
+
+`McpServerDescriptor` belongs to `monoloop-connector`. Its capability URL is
+secret-bearing: the type implements only redacted `Debug`/display behavior and
+exposes the URL solely to the selected SessionAdapter's serialization method.
+Server name, protocol version, and total serialized descriptor bytes are
+bounded. `SessionAttachRequest` contains no prompt or invocation-level model
+configuration.
+
+The `InterpreterFactory` definition above is the existing
+`monoloop-interpreter` port. Every ExchangeDriver supplies a fresh
+`StartInterpretation` containing its new interpretation/connection IDs, frozen
+dialect binding, external session identity, and limits.
+
+Channel capabilities declare `None`, `CreationOnly`, or `Refreshable` MCP
+configuration. `CreationOnly` permits a tool-enabled transaction only while
+creating a new external session; because the descriptor cannot later be rotated
+or removed, that resulting attachment is not eligible for another Monoloop
+transaction. Existing-session admission fails `CapabilityMismatch`.
+`Refreshable` is required for request-scoped tools across session reuse.
+
+Both pending completion futures resolve exactly once to success or a typed
+failure. Dropped senders become invariant failures, not implicit cancellation.
+Their controls are available before any I/O can block and are invoked by both
+transaction termination modes.
+
+Transaction-level ordering is fixed, not profile-selected:
+
+```text
+DirectLlm:
+    open exchange -> send
+
+ExternalAgent:
+    prepare pending MCP capability when applicable
+    -> attach/create/load session
+    -> claim SessionKey
+    -> activate/refresh MCP when applicable
+    -> open exchange with the returned SessionAttachment
+    -> send
+```
+
+An adapter may internally start a process or transport while attaching, but it
+still returns one attachment before transaction-level `begin_open`.
+
+The one `ConnectorInstance` per Channel is explicitly concurrent. Its
+`Connector` and `SessionAdapter` must accept operations for distinct
+`SessionKey`s concurrently up to Channel limits. A profile may use bounded
+internal semaphores/queues, but it may not serialize unrelated sessions behind
+an async mutex held across provider I/O. Same-SessionKey concurrency is rejected
+by admission before the instance is called.
 
 ## 6. Transaction actor
 
@@ -434,14 +811,15 @@ transaction state. It is not stored behind an async mutex.
 ```text
 TransactionActor
     TransactionId
-    SessionId?
+    SessionKey?
     phase
     ChannelBinding
     EffectiveConfig
     ResolvedToolSet
-    connection/interpretation/loop handles
+    active ExchangeState map
+    inner LoopRuntime handle when tool mode is ModelToolCalls
     continuation context
-    event sequence
+    FinalizationGuard/EventSequencer handle
     terminal selection?
     JoinSet of owned child tasks
     acquired capacity permits
@@ -456,10 +834,11 @@ The run loop uses `tokio::select! { biased; ... }` with control first. A full
 control channel means a request is already pending; it never falls back to the
 ordinary command queue.
 
-Every child command includes `TransactionId`. Commands with a stale ID, commands
-invalid for the current phase, and commands after terminal selection are
-rejected and counted. An impossible in-scope command selects `InvariantFailed`;
-it is not ignored.
+Every child command includes `TransactionId`; exchange commands also include
+`ExchangeId`, `ConnectionId`, and `InterpretationId` as applicable. Commands
+with stale identity, commands invalid for the current phase, and commands after
+terminal selection are rejected and counted. An impossible in-scope command
+selects `InvariantFailed`; it is not ignored.
 
 The actor never directly awaits unbounded Connector, Interpreter, tool, MCP, or
 callback work. Such work runs in the actor's `JoinSet` or in a runtime-owned
@@ -471,13 +850,26 @@ bounded service and reports through a command.
 enum ActorCommand {
     SessionAttached(SessionAttachment),
     SessionAttachFailed(SessionAttachError),
-    ConnectorOpened(OpenConnection),
-    ConnectorOpenFailed(ConnectorError),
-    InputSent,
-    ConnectorChunk(Bytes),
-    ConnectorEnded(ConnectionEnd),
-    InterpreterEvent(InterpreterOutputEvent),
-    InterpreterEnded(InterpretationEnd),
+    ExchangeOpened {
+        exchange_id: ExchangeId,
+        connection_id: ConnectionId,
+        interpretation_id: InterpretationId,
+    },
+    ExchangeOpenFailed {
+        exchange_id: ExchangeId,
+        error: ConnectorError,
+    },
+    InputSent { exchange_id: ExchangeId },
+    InterpreterEvent {
+        exchange_id: ExchangeId,
+        interpretation_id: InterpretationId,
+        event: InterpreterOutputEvent,
+    },
+    ExchangeEnded {
+        exchange_id: ExchangeId,
+        connection: ConnectionEnd,
+        interpretation: InterpretationEnd,
+    },
     LoopEvent(LoopOutputEvent),
     LoopEnded(LoopEnd),
     McpToolStarted(ToolActionId),
@@ -486,18 +878,28 @@ enum ActorCommand {
     DeadlineElapsed,
     ChildPanicked(ChildKind),
 }
+
+pub enum ChildKind {
+    SessionAttachment,
+    SessionConfiguration,
+    ExchangeDriver(ExchangeId),
+    InnerLoop,
+    ToolExecution(ToolExecutionId),
+}
 ```
 
-Large payload commands use owned `Bytes`/boxed events and count against queue
-and byte limits.
+Raw Connector bytes are deliberately absent from `ActorCommand`; they travel
+through the bounded exchange bridge described below. Canonical event payloads
+are boxed where necessary and count against event queue and canonical-unit byte
+limits.
 
 ### 6.2 State transitions
 
 ```text
 Admitted
-  -> OpeningChannel
   -> EstablishingSession
   -> ActivatingTools
+  -> OpeningChannel
   -> Sending
   -> Receiving
        -> ExecutingTools
@@ -511,9 +913,15 @@ any nonterminal -> Terminating -> Finalizing -> Terminal
 any nonterminal -> Failing -> Finalizing -> Terminal
 ```
 
-Channel bindings declare whether channel open precedes session attachment or
-vice versa. The actor follows that fixed declaration; it does not infer ordering
-from whichever future completes first.
+`DirectLlm` skips `EstablishingSession`; non-`McpGateway` Channels treat
+`ActivatingTools` as a validated no-op. An `McpGateway` Channel creates its
+pending capability before session creation/attachment and may leave
+`ActivatingTools` only after SessionKey claim, descriptor
+installation/refresh, and route activation succeed. No request is sent before
+that point.
+
+The fixed attach-before-open ordering for external agents is defined in §5. The
+actor does not infer ordering from whichever future completes first.
 
 External-agent MCP calls may move transaction bookkeeping through
 `ExecutingTools`, but the MCP response—not an encoded model continuation—returns
@@ -523,11 +931,61 @@ second execution.
 For direct LLMs, `ToolRequestReady` reaches `LoopRuntime`, which dispatches and
 returns `OutboundToolResult`. Under `InlineToolContinuation`, the coordinator
 encodes the complete result and opens the next HTTP exchange within the same
-transaction. Under `CallerControlled`, it finishes as
+transaction. That exchange receives a new `ExchangeId`, `ConnectionId`, and
+`InterpretationId`. Under `CallerControlled`, the transaction finishes as
 `ContinuationRequired`.
 
 Each allowed `(phase, command)` pair is implemented as an explicit match and has
 a unit test. There is no wildcard that silently ignores an in-scope command.
+
+The first ordinary `EventDeliveryFailed` command selects
+`TransactionEndKind::EventDeliveryFailed` and transitions
+`Failing -> Finalizing -> Terminal`. Later delivery failures are diagnostics
+only because terminal-cause selection is already fixed.
+
+### 6.3 Exchange driver and canonical fan-out
+
+Every provider request/response cycle is owned by one tracked `ExchangeDriver`.
+It owns:
+
+```text
+ExchangeId
+OpenedRawConnection
+Interpretation
+Connector -> Interpreter pump task
+canonical distributor
+connection and interpretation completion tasks
+```
+
+The pump performs:
+
+```text
+RawOutputHandle.receive()
+    -> InterpretationInput.push_bytes()
+    -> on authoritative clean Connector end: finish_clean()
+    -> on transport failure: transport_failed()
+    -> on cancellation: cancel()
+```
+
+It never copies raw chunks through the transaction actor. Connector queued-byte
+limits and Interpreter undecoded/frame limits bound both sides of the pump.
+Backpressure is direct and no extra overflow queue exists.
+
+Each accepted Interpreter event enters an exchange-scoped lossless distributor:
+
+- the transaction actor receives one subscription for public sequencing; and
+- only `ModelToolCalls` Channels give the inner `LoopRuntime` a second lossless
+  subscription.
+
+`McpGateway` and `None` Channels do not feed provider-observed tool events into
+the inner Loop, preventing duplicate execution. Loop output returns to the
+actor. Distributor delivery order and gaps use the existing
+`CanonicalEventSubscription` contract.
+
+An exchange is complete only after both Connector and Interpretation terminal
+results are reconciled. The actor retains no completed exchange handles after
+reconciliation. Direct-LLM continuation history stores bounded canonical
+assistant tool-call/result material, not live exchange objects.
 
 ## 7. Terminal arbitration and cleanup
 
@@ -544,7 +1002,8 @@ Finalization order:
 4. request Connector, Interpreter, Loop, and tool cancellation concurrently;
 5. await owned children until `cleanup_deadline`;
 6. abort remaining abortable tasks and record bounded diagnostics;
-7. deliver `Ended` as the final event and await its acknowledgement;
+7. deliver `Ended` as the final event and await its acknowledgement using the
+   independent `terminal_event_delivery_deadline`;
 8. if final delivery fails, produce the callback result as
    `EventDeliveryFailed`, preserve the selected cause in
    `prior_terminal_cause`, and record failed delivery; no claim is made that the
@@ -575,12 +1034,18 @@ either identity after session establishment.
 
 ## 8. Event sequencing and backpressure
 
-The actor is the sole allocator of transaction event sequence numbers. Sequence
-starts at one, is contiguous, and includes `Ended`.
+The runtime-owned `EventSequencer` inside `FinalizationGuard` is the sole
+allocator of transaction event sequence numbers. The live actor is its only
+ordinary caller; after actor abort and join, the shutdown supervisor may use it
+once for `Ended`. Sequence starts at one, is contiguous, and includes `Ended`.
 
 The actor writes to a runtime-owned bounded queue, not directly to caller code.
 When the queue is full, it enters a backpressured send that still selects the
 control channel first. It does not spin, drop, or allocate an overflow buffer.
+
+Ordinary event delivery is bounded by the remaining transaction deadline.
+Terminal `Ended` delivery uses `terminal_event_delivery_deadline` from the
+cleanup budget; it never reuses an already expired transaction deadline.
 
 Canonical Interpreter events and Loop lifecycle events are composed into the
 transaction stream without conversion to presentation text. Internal Connector
@@ -608,6 +1073,52 @@ pub struct RegisteredTool {
     pub handler: Arc<dyn ToolHandler>,
 }
 
+pub struct ToolCallContext {
+    pub transaction_id: TransactionId,
+    pub session_key: SessionKey,
+    pub exchange_id: Option<ExchangeId>,
+    pub tool_action_id: ToolActionId,
+    pub tool_id: ToolId,
+    pub deadline: Instant,
+}
+
+pub struct ToolOutputContract {
+    pub success: ToolSuccessContract,
+    pub error_data_schema: Option<JsonSchema>,
+}
+
+pub enum ToolSuccessContract {
+    Json { schema: JsonSchema },
+    Text { media_type: String },
+}
+
+pub enum CanonicalToolOutput {
+    Json(serde_json::Value),
+    Text(String),
+}
+
+pub struct CanonicalToolError {
+    pub code: String,
+    pub message: String,
+    pub data: Option<serde_json::Value>,
+}
+
+pub struct CanonicalToolResult {
+    pub transaction_id: TransactionId,
+    pub session_key: SessionKey,
+    pub exchange_id: ExchangeId,
+    pub tool_action_id: ToolActionId,
+    pub tool_id: ToolId,
+    pub provider_tool_call_id: String,
+    pub request_ordinal: u32,
+    pub outcome: CanonicalToolResultOutcome,
+}
+
+pub enum CanonicalToolResultOutcome {
+    Succeeded(CanonicalToolOutput),
+    DomainFailed(CanonicalToolError),
+}
+
 pub trait ToolHandler: Send + Sync {
     fn start(
         &self,
@@ -621,16 +1132,50 @@ pub struct ToolExecutionHandle {
     pub control: ToolExecutionControl,
     pub completion: ToolExecutionCompletion,
 }
+
+pub enum ToolCompletion {
+    Succeeded(CanonicalToolOutput),
+    DomainFailed(CanonicalToolError),
+    RuntimeFailed(ToolRuntimeError),
+}
+
+pub enum ToolCancellationPolicy {
+    Cooperative { grace: Duration },
+    Abortable,
+    IsolatedKillable { grace: Duration },
+}
 ```
 
 `ToolExecutionCompletion` is consumed exactly once. It resolves to a bounded
-canonical success or typed failure. Cancellation behavior is explicitly
-`Cooperative`, `Abortable`, or `NotCancellable`; admission may reject a Channel
-whose required policy cannot be met.
+`ToolCompletion`. `Succeeded` and `DomainFailed` are ordinary canonical tool
+outcomes: after validation they return through MCP or become direct-LLM tool
+result messages. `RuntimeFailed` means the linked implementation could not
+produce a trustworthy declared result and selects `ToolExchangeFailed`.
+
+Every tool must be `Cooperative`, `Abortable`, or `IsolatedKillable`.
+`HostToolRegistry::build` rejects a handler without a bounded terminal
+mechanism. Cooperative handlers that exceed grace are treated as runtime
+failures; if they cannot then be aborted, they must instead run in an
+`IsolatedKillable` execution service. Unstoppable in-process work is not a
+supported tool declaration.
 
 `HostToolRegistry::build` validates all entries at startup and rejects duplicate
 IDs/names, invalid schemas, incompatible output declarations, and limit
 violations.
+
+Text media types, error codes/messages/data, JSON depth, and serialized output
+bytes are bounded. `CanonicalToolError` is part of the public output contract;
+it contains no unbounded internal error chain or secret diagnostic.
+
+`ToolCallContext` carries correlation and deadline authority only. It never
+contains the prompt, model credentials, MCP capability, raw provider body,
+unrestricted runtime handle, or another transaction's tools.
+
+`CanonicalToolResult` is the sole continuation/MCP success-domain-result
+product. `provider_tool_call_id` is preserved exactly for dialect encoding,
+while internal routing uses `ToolActionId` and `ExchangeId`.
+`request_ordinal` preserves model-declared order independently of execution
+completion order. Runtime failures never masquerade as this type.
 
 Admission creates `ResolvedToolSet` containing:
 
@@ -644,13 +1189,22 @@ Admission creates `ResolvedToolSet` containing:
 
 `TransactionToolDispatcher` is the only code that:
 
-1. validates transaction/run identity;
+1. validates SessionKey, transaction, and exchange identity where applicable;
 2. checks the resolved allowlist;
 3. validates JSON input schema and payload bytes;
 4. acquires global, transaction, and per-tool capacity;
 5. invokes the linked handler;
-6. tracks cancellation and completion; and
-7. creates canonical lifecycle/result events.
+6. tracks cancellation and completion;
+7. validates successful output against `ToolOutputContract`, including encoded
+   bytes, schema, and content-type constraints;
+8. validates domain errors against their bounded public error contract; and
+9. creates canonical lifecycle/result events.
+
+Invalid model/MCP arguments and declared domain failures produce canonical
+rejected/failed tool results and do not by themselves fail the transaction.
+Unknown/disallowed/stale calls fail closed at the calling protocol boundary.
+Handler start failure, panic, lost completion, output-contract violation, or
+failure of the bounded termination mechanism selects `ToolExchangeFailed`.
 
 The existing `ToolRegistry` and `ToolRuntime` ports remain the inner
 `LoopRuntime` boundary. `ResolvedToolRegistry` and `HostToolRuntime` implement
@@ -660,17 +1214,20 @@ empty-tool conformance tests, not as the advertised production tool path.
 
 ## 10. MCP gateway
 
-One `McpGateway` is created per `DefaultTransactionRuntime`.
+One `McpGateway` is created per `DefaultTransactionRuntime`; every admitted
+`McpGateway` external-agent transaction receives a new gateway binding, even
+when its resolved tool set is empty.
 
 - Transport: MCP Streamable HTTP.
 - Bind address: loopback only in the first implementation.
 - Protocol: maintained `rmcp` server implementation.
-- Routing: unguessable 256-bit capability token in the URL.
+- Routing: a transaction-specific unguessable 256-bit capability token in the
+  URL.
 - Token generation: OS CSPRNG.
 - Logging: token and full URL are always redacted.
 
 ```text
-http://127.0.0.1:<port>/mcp/<capability>
+http://127.0.0.1:<port>/mcp/<transaction-capability>
 ```
 
 The runtime validates the selected `rmcp`/HTTP dependency against the workspace
@@ -678,16 +1235,42 @@ MSRV before implementation. If the maintained SDK cannot support the current
 MSRV, update the workspace MSRV through an explicit project decision; do not
 replace it with an unqualified partial protocol.
 
-Each binding stores the external attachment and an atomically replaceable
-active view:
+Each capability starts as a disabled pending binding:
 
 ```text
-Inactive
-Active(TransactionId, SessionId, ResolvedToolSet, dispatcher route)
+PendingMcpTransactionBinding
+    capability token
+    TransactionId
+    ResolvedToolSet
+    dispatcher route
+    cancellation/deadline
 ```
 
-Before sending the external-agent prompt, the actor activates the exact
-transaction view. Before terminal event publication, it clears that view.
+The pending route rejects calls as not ready. For a new external session, its
+descriptor is passed in `SessionAttachRequest`; after the external system
+returns its authoritative ID and the actor claims `SessionKey`, the route is
+atomically activated as an immutable `McpTransactionBinding`. For an existing
+session, activation occurs only after `begin_refresh_mcp` confirms descriptor
+installation.
+
+Before sending every external-agent prompt, including on a reused session, the
+actor therefore:
+
+1. creates a fresh pending binding and capability;
+2. installs it during session creation or refreshes the existing session;
+3. claims/validates `SessionKey`;
+4. activates the route; and
+5. only then sends the prompt.
+
+Before terminal event publication it revokes and removes the binding. Capability
+tokens are never reused. A delayed request from an older transaction therefore
+addresses a revoked token and cannot be interpreted as a call in a newer
+transaction, even when tool names and `SessionId` are identical.
+
+After local revocation, cleanup makes a bounded
+`begin_refresh_mcp(attachment, None)` attempt to remove the stale descriptor
+from a reusable external session. Failure is a safe diagnostic and cannot
+restore or prolong the already revoked local capability.
 
 Required MCP methods:
 
@@ -700,10 +1283,21 @@ Required MCP methods:
 Pagination is implemented if the selected MCP protocol version requires or
 permits it; an unbounded list is prohibited.
 
-Inactive, stale, unknown, cross-session, disallowed, schema-invalid, overloaded,
-and terminating calls return typed MCP errors and never reach a handler.
-`tools/list` while inactive returns an empty list. The gateway has global,
-per-binding, body-byte, request-duration, and concurrent-call limits.
+Revoked, stale, unknown, cross-session, disallowed, schema-invalid, overloaded,
+and terminating calls return typed MCP/HTTP errors and never reach a handler.
+There is no inactive persistent endpoint: after revocation the capability route
+does not exist. The gateway has global, per-binding, body-byte,
+request-duration, and concurrent-call limits.
+
+The initial loopback transport supports only agent processes that can reach the
+Monoloop host's loopback namespace. A Channel must declare and validate that
+reachability. Remote, container-isolated, or VM-isolated agents require a
+separately secured and qualified transport profile; they are rejected by the
+loopback profile rather than receiving an unusable URL.
+
+`CreationOnly` profiles are qualified separately: one newly created session,
+one transaction capability, and no later reuse of that attachment. They are not
+advertised as supporting request-scoped tool changes on reusable sessions.
 
 ## 11. OpenAI Chat Completions v1
 
@@ -754,6 +1348,22 @@ It:
 - maps declared finish reasons without treating EOF alone as success; and
 - requires `[DONE]` or another explicitly qualified terminal condition.
 
+Every provider tool call is assigned:
+
+```text
+CanonicalToolActionKey
+    ExchangeId
+    provider tool_call_id
+
+ToolActionId
+    Monoloop-generated internal identity
+```
+
+Provider call IDs need be unique only within one exchange. Deduplication and
+completion correlation use `CanonicalToolActionKey`; continuation encoding uses
+the preserved provider call ID. A repeated provider ID in a later exchange
+cannot collide with an earlier action.
+
 Tool calls are grouped by one provider exchange. The runtime may execute calls
 from that group concurrently within configured limits, but it does not send a
 continuation until the exchange has reached its qualified `tool_calls` finish
@@ -764,7 +1374,14 @@ completion order.
 For a tool continuation, the encoder appends the assistant tool-call message and
 one `role: "tool"` message per completed call, preserving call IDs. A new HTTP
 exchange is opened for each continuation; all exchanges retain the same
-`TransactionId` and `SessionId`.
+`TransactionId` and `SessionKey` but receive new exchange, connection, and
+interpretation identities.
+
+Continuation context retains only the canonical input plus assistant tool-call
+and tool-result messages required to encode the next request. Its encoded size,
+total transaction request bytes, total transaction response bytes, exchange
+count, and continuation count are independently bounded. Exceeding any bound
+selects `LimitExceeded`; history is never silently truncated.
 
 Non-streaming responses, OpenAI Responses events, provider-specific NDJSON, and
 silent field renaming are not included in this dialect. A Channel requiring
@@ -782,21 +1399,28 @@ pub struct TransactionLimits {
     pub max_active_transactions: usize,
     pub max_active_per_channel: usize,
     pub max_actor_commands: usize,
+    pub max_actor_command_bytes: usize,
     pub max_event_queue: usize,
+    pub max_event_queue_bytes: usize,
     pub max_input_bytes: usize,
     pub max_messages: usize,
     pub max_content_parts: usize,
     pub max_tools_per_transaction: usize,
     pub max_tool_schema_bytes: usize,
     pub max_tool_payload_bytes: usize,
+    pub max_tool_output_bytes: usize,
     pub max_concurrent_tools_per_transaction: usize,
     pub max_queued_tools_per_transaction: usize,
     pub max_continuations: usize,
     pub max_provider_exchanges: usize,
+    pub max_continuation_context_bytes: usize,
+    pub max_total_provider_input_bytes: usize,
+    pub max_total_provider_output_bytes: usize,
     pub max_diagnostic_count: usize,
     pub max_diagnostic_bytes: usize,
     pub transaction_deadline: Duration,
     pub cleanup_deadline: Duration,
+    pub terminal_event_delivery_deadline: Duration,
     pub callback_deadline: Duration,
 }
 ```
@@ -806,6 +1430,10 @@ tool, per-tool, callback, and shutdown limits. Zero capacity, overflow-prone
 relationships, callback capacity below active-transaction capacity, and
 deadlines beyond configured maxima are configuration errors.
 
+Queues carrying variable-sized values acquire both an item permit and a byte
+permit before enqueue and release both on dequeue/drop. Tokio channel item
+capacity alone does not satisfy the byte bounds.
+
 ## 13. Shutdown
 
 `shutdown` atomically changes runtime state from `Accepting` to `Draining`.
@@ -814,18 +1442,31 @@ Subsequent admission returns `RuntimeShuttingDown`.
 The runtime:
 
 1. snapshots active control handles without awaiting under the registry lock;
-2. requests termination for all actors;
-3. waits until the supplied deadline;
-4. aborts remaining local async tasks;
-5. closes the MCP listener;
-6. closes callback admission and bounded services;
-7. clears all registries and capability routes; and
-8. enters `Stopped`.
+2. requests `RuntimeShutdown` terminalization for all actors;
+3. waits for actors to claim their `FinalizationGuard` and schedule callbacks;
+4. at the actor shutdown deadline, aborts and joins remaining actors;
+5. claims each aborted actor's still-unclaimed `FinalizationGuard`, attempts its
+   final event as `RuntimeShutdown`, removes its registry entries, and invokes
+   its callback;
+6. verifies that every admitted transaction has one claimed finalization guard;
+7. closes the MCP listener and revokes all remaining capabilities;
+8. prevents new callback reservations, then waits for already invoked callback
+   futures only until their individual callback deadlines;
+9. clears bounded services and registries; and
+10. enters `Stopped`.
 
-It writes no recovery state. A blocked external callback future is aborted at
-its callback deadline. Blocking work is prohibited inside callback invocation,
-tool handlers, and async adapters unless isolated behind a separately bounded,
-owned blocking service.
+The supplied shutdown deadline bounds the whole shutdown operation. Runtime
+configuration reserves a nonzero finalization portion of that deadline. Every
+callback's `call` method is invoked exactly once before shutdown completes; its
+returned future receives the smaller of its callback deadline and the remaining
+global shutdown time, then is aborted if still pending. Shutdown returns a
+`ShutdownDisposition` containing counts for normally finalized, supervisor
+finalized, callback-failed, callback-aborted, and invariant-failed
+transactions.
+
+It writes no recovery state. Blocking work is prohibited inside callback
+invocation, tool handlers, and async adapters unless isolated behind a
+separately bounded, owned blocking service.
 
 ## 14. Error mapping
 
@@ -840,11 +1481,14 @@ Loop/dispatcher/tool failure       -> ToolExchangeFailed
 required event sink failure        -> EventDeliveryFailed
 deadline                           -> DeadlineExceeded
 configured bound                   -> LimitExceeded
+graceful runtime shutdown           -> RuntimeShutdown
 impossible state/stale in-scope ID -> InvariantFailed
 ```
 
 Cancellation caused by caller intent is `Cancelled` or `Terminated`, not the
 component error produced while cancellation tears a child down.
+Declared tool-domain failure and invalid tool arguments are canonical tool
+outcomes, not `ToolExchangeFailed`.
 
 ## 15. Source-file plan
 
@@ -865,14 +1509,13 @@ schema validator is replaced with ad hoc parsing merely to avoid a dependency.
 ### `monoloop-contracts`
 
 ```text
-src/id.rs              add TransactionId, SessionId, ChannelId, ToolId, ToolName
+src/id.rs              add TransactionId, ExchangeId, SessionId/Key, ChannelId, ToolId/Name
 src/input.rs           CanonicalInput and validation
 src/config.rs          invocation/effective config and extensions
 src/transaction.rs     request, receipt, events, terminal, sinks, runtime trait
 src/channel.rs         Channel data contracts and capabilities
 src/tool.rs            canonical tool specification/call/result/lifecycle
 src/encoder.rs         outbound encoder contracts
-src/session.rs         session attachment contracts
 src/limits.rs          transaction/tool/MCP/callback limits
 src/dialect.rs         OpenAiChatCompletions family and descriptor
 src/lib.rs             public exports
@@ -883,6 +1526,9 @@ src/lib.rs             public exports
 ```text
 src/http.rs            generic streaming HTTP Connector
 src/credential.rs      host-injected CredentialResolver
+src/factory.rs         ConnectorFactory, ConnectorInstance, instance identity
+src/session.rs         SessionAdapter, attachment, and opaque owned route
+src/open.rs            accept and validate optional SessionAttachment
 tests/http.rs          status, streaming, cancellation, limits, auth redaction
 ```
 
@@ -906,8 +1552,11 @@ src/transaction/command.rs       internal command vocabulary
 src/transaction/state.rs         explicit transition function
 src/transaction/events.rs        sequencer and bounded delivery task
 src/transaction/terminal.rs      terminal selection and cleanup
+src/transaction/finalization.rs  shared exactly-once shutdown/actor guard
 src/transaction/callback.rs      bounded callback reservations/executor
 src/transaction/registry.rs      active transaction/session registry
+src/transaction/exchange.rs      per-exchange driver and I/O pump
+src/transaction/distributor.rs   actor/inner-Loop canonical fan-out
 src/channel/binding.rs           live ChannelBinding
 src/channel/registry.rs          immutable Channel registry
 src/encoder/openai_chat.rs       initial and continuation encoding
@@ -917,7 +1566,7 @@ src/tools/dispatcher.rs          one validated execution path
 src/tools/execution.rs           handles, cancellation, completion
 src/tools/loop_ports.rs          ToolRegistry/ToolRuntime adapters
 src/mcp/gateway.rs               rmcp server and bounded routing
-src/mcp/binding.rs               capability/session active view
+src/mcp/binding.rs               immutable transaction capability binding
 src/mcp/error.rs                 typed fail-closed mapping
 ```
 
@@ -927,7 +1576,8 @@ the move is mechanical and covered by existing tests.
 
 ### External profile crates
 
-Each existing profile crate adds `channel_binding.rs` and a `SessionAdapter`.
+Each existing profile crate adds `channel_binding.rs` and a
+`ConnectorFactory` producing a matched Connector/SessionAdapter instance.
 Prompt-in-open shortcuts are removed after the binding is qualified. Every
 profile declares:
 
@@ -967,11 +1617,14 @@ Gate:
 
 - bounded submit returns before fake I/O is released;
 - generated/supplied session identity;
-- duplicate active session rejected;
+- duplicate active SessionKey rejected;
+- identical provider session strings on different Channels remain isolated;
 - terminate by transaction ID before external session creation;
 - terminate by session after establishment;
 - cancellation in every phase;
 - exactly one terminal event and callback attempt;
+- graceful shutdown invokes every admitted callback, including for an actor
+  requiring supervisor finalization;
 - no event after terminal;
 - no registry/task/permit leak.
 
@@ -987,6 +1640,9 @@ Gate:
 - empty set discovers and executes nothing;
 - different simultaneous transactions expose different sets;
 - schema, payload, queue, transaction, global, and per-tool limits;
+- output-contract and tool-output byte validation;
+- domain failure continuation versus runtime failure termination;
+- rejection of unbounded/non-cancellable handlers;
 - completion/cancel races;
 - direct fake-model tool/result/continuation cycle;
 - no `Available -> DispatchRejected` production placeholder.
@@ -1000,6 +1656,7 @@ Gate:
 
 - protocol initialization, list, call, error, cancellation, and shutdown;
 - inactive/stale/unknown/cross-session requests fail closed;
+- a delayed request using transaction A's capability cannot enter transaction B;
 - capability tokens never appear in logs/diagnostics;
 - MCP and local projections have equivalent names/descriptions/schemas;
 - both routes reach the identical registered handler;
@@ -1016,6 +1673,9 @@ Gate:
 - malformed, truncated, oversized, delayed, disconnected, and non-success HTTP
   responses;
 - multi-fragment and multiple tool calls;
+- repeated provider tool-call IDs in different exchanges remain distinct;
+- a fresh connection and interpretation are used for every continuation;
+- continuation-context and total provider byte limits;
 - configured continuation ceiling;
 - cancellation during DNS/connect/body/tool/continuation;
 - two provider profiles use the same implementation without provider branches;
@@ -1029,9 +1689,9 @@ Codex, Z.ai, and Claude Code.
 Gate:
 
 - create and reuse behavior per profile;
-- honest MCP/tool support matrix;
+- honest `None`/`CreationOnly`/`Refreshable` MCP support matrix;
 - many concurrent different sessions;
-- same-session rejection;
+- same-SessionKey rejection;
 - no prompt shortcut bypassing canonical encoding;
 - all profile and workspace conformance tests.
 
@@ -1051,9 +1711,16 @@ cancellation, termination, and concurrency paths. Required cross-cutting tests:
 9. callback failure/panic/deadline;
 10. shutdown with active transactions and callbacks;
 11. maximum configured concurrency plus one;
-12. sequence continuity under concurrent producers; and
+12. sequence continuity under concurrent producers;
 13. zero live actors, child tasks, routes, registry entries, and held permits
-    after every terminal kind.
+    after every terminal kind;
+14. identical raw session IDs on different Channels;
+15. delayed old MCP call after capability rotation;
+16. forced-shutdown supervisor finalization and one callback invocation;
+17. terminal-event delivery after the transaction deadline;
+18. output-contract violation versus declared tool-domain failure;
+19. repeated provider tool-call IDs across exchanges; and
+20. continuation-context and aggregate provider-byte exhaustion.
 
 Use paused Tokio time, barriers, scripted transports, and deterministic fake
 handlers. Do not use sleeps for ordering. Live providers are qualification
