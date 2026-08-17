@@ -8,8 +8,9 @@ description = "Minimal extensible Loop: lossless canonical subscription, empty-c
 
 [dependencies]
 monoloop-contracts = { path = "../monoloop-contracts" }
+monoloop-connector = { path = "../monoloop-connector" }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 

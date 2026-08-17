@@ -1253,6 +1253,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "jsonschema",
+ "monoloop-connector",
  "monoloop-contracts",
  "rand 0.9.5",
  "reqwest",
