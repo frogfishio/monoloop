@@ -10,21 +10,18 @@ description = "Minimal extensible Loop: lossless canonical subscription, empty-c
 monoloop-contracts = { path = "../monoloop-contracts" }
 monoloop-connector = { path = "../monoloop-connector" }
 monoloop-interpreter = { path = "../monoloop-interpreter" }
+axum = { workspace = true }
 jsonschema = { workspace = true }
+rand = { workspace = true }
+rmcp = { workspace = true }
+secrecy = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
-tokio-util = { workspace = true }
-# WP-00 dependency qualification only (no production MCP gateway yet — WP-07).
-axum = { workspace = true }
-jsonschema = { workspace = true }
-rand = { workspace = true }
 reqwest = { workspace = true }
-rmcp = { workspace = true }
-secrecy = { workspace = true }
-serde_json = { workspace = true }

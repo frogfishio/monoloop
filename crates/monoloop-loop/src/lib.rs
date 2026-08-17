@@ -27,15 +27,17 @@ pub use tools::{
     ToolRuntimeTerminal,
 };
 pub use transaction::{
-    dispatch_ready_tool, AsyncToolHandler, CapacityManagers, ChannelBinding, ChannelRegistry,
-    DefaultTransactionRuntime, DispatchOutcome, DispatchRequest, EmptyBytesEncoder, EventSequencer,
-    ExchangeFailure, ExchangeOutcome, ExchangeParams, FinalizationGuard, HostToolRegistry,
-    HostToolRuntime, ImmediateToolHandler, InputValidationFailure, LinkedToolExecutionHandle,
-    LiveChannel, LostCompletionHandler, McpListenerShell, OutputValidationFailure,
-    PanicOnStartHandler, RegisteredTool, RejectEncoder, ResolvedTool, ResolvedToolRegistry,
-    ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeState, SharedToolCapacity, StartFailHandler,
-    Startup, StartupError, TestTextEncoder, ToolExecutionCompletion, ToolExecutionControl,
-    ToolHandler, TransactionToolCapacity, TransactionToolDispatcher, validate_tool_completion,
+    dispatch_ready_tool, tool_definitions_from_resolved, AsyncToolHandler, CapabilityToken,
+    CapacityManagers, ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, DispatchOutcome,
+    DispatchRequest, EmptyBytesEncoder, EventSequencer, ExchangeFailure, ExchangeOutcome,
+    ExchangeParams, FinalizationGuard, HostToolRegistry, HostToolRuntime, ImmediateToolHandler,
+    InputValidationFailure, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
+    McpBindingState, McpGateway, McpGatewayHandle, McpInstallError, McpListenerShell, McpRouteTable,
+    OutputValidationFailure, PanicOnStartHandler, PendingMcpBinding, RegisteredTool, RejectEncoder,
+    ResolvedTool, ResolvedToolRegistry, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig,
+    RuntimeState, SharedToolCapacity, StartFailHandler, Startup, StartupError, TestTextEncoder,
+    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, TransactionMcpHandler,
+    TransactionToolCapacity, TransactionToolDispatcher, validate_tool_completion,
     validate_tool_input, run_exchange,
 };
 

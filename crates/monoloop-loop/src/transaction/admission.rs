@@ -7,6 +7,7 @@ use super::channel_registry::LiveChannel;
 use super::events::spawn_delivery_task;
 use super::finalization::{EventSequencer, FinalizationGuard};
 use super::host_tools::HostToolRegistry;
+use super::mcp::McpGatewayHandle;
 use super::resolved_tools::ResolvedToolSet;
 use monoloop_contracts::{
     merge_effective_config, AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId,
@@ -29,6 +30,8 @@ pub struct AdmissionContext {
     pub registry: Arc<Mutex<ActiveTransactionRegistry>>,
     /// Transaction limits.
     pub limits: TransactionLimits,
+    /// Optional MCP gateway handle (loopback listener).
+    pub mcp: Option<McpGatewayHandle>,
 }
 
 /// Perform synchronous admission (no network/tool I/O).
@@ -85,6 +88,7 @@ pub fn admit(
     })?;
 
     let transaction_id = TransactionId::generate();
+    let existing_session = request.session_id.is_some();
     let (session_id, session_key, provisional_external) =
         allocate_session(live.binding.kind, &request.channel_id, request.session_id.clone())?;
 
@@ -132,8 +136,12 @@ pub fn admit(
         channel_id: request.channel_id.clone(),
         channel_kind: live.binding.kind,
         tool_mode: live.binding.tool_mode,
+        mcp_configuration: live.binding.capabilities.mcp_configuration,
+        mcp_reachability: live.binding.capabilities.mcp_reachability,
+        mcp: ctx.mcp.clone(),
         session_key: session_key.clone(),
         provisional_external,
+        existing_session,
         sessions: live.instance.sessions.clone(),
         connector: Arc::clone(&live.instance.connector),
         encoder: Arc::clone(&live.binding.encoder),

@@ -8,7 +8,7 @@ use super::channel_registry::{ChannelBinding, LiveChannel};
 use super::error::StartupError;
 use super::finalization::build_transaction_end;
 use super::host_tools::HostToolRegistry;
-use super::mcp_shell::McpListenerShell;
+use super::mcp::McpGateway;
 use super::state::RuntimeState;
 use monoloop_contracts::{
     AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId, ChannelKind,
@@ -49,7 +49,9 @@ struct RuntimeInner {
     tools: HostToolRegistry,
     capacity: Arc<CapacityManagers>,
     registry: Arc<Mutex<ActiveTransactionRegistry>>,
-    mcp: AsyncMutex<Option<McpListenerShell>>,
+    mcp: AsyncMutex<Option<McpGateway>>,
+    /// Cloneable handle for admission/actors (None when MCP listener disabled).
+    mcp_handle: Option<super::mcp::McpGatewayHandle>,
 }
 
 /// Production transaction runtime.
@@ -117,16 +119,19 @@ impl DefaultTransactionRuntime {
             ));
         }
 
-        let mcp = if bootstrap.config.enable_mcp_listener {
-            match McpListenerShell::bind_loopback().await {
-                Ok(shell) => Some(shell),
+        let (mcp, mcp_handle) = if bootstrap.config.enable_mcp_listener {
+            match McpGateway::bind_loopback(256).await {
+                Ok(gw) => {
+                    let handle = gw.handle();
+                    (Some(gw), Some(handle))
+                }
                 Err(_) => {
                     cleanup_partial(realized, None).await;
                     return Err(StartupError::McpBindFailed);
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         let capacity = Arc::new(CapacityManagers::new(
@@ -148,6 +153,7 @@ impl DefaultTransactionRuntime {
                 capacity,
                 registry: Arc::new(Mutex::new(ActiveTransactionRegistry::new())),
                 mcp: AsyncMutex::new(mcp),
+                mcp_handle,
             }),
         }))
     }
@@ -327,7 +333,7 @@ fn clone_binding(binding: &ChannelBinding) -> ChannelBinding {
 
 async fn cleanup_partial(
     realized: Vec<(ChannelId, LiveChannel)>,
-    mcp: Option<McpListenerShell>,
+    mcp: Option<McpGateway>,
 ) {
     drop(realized);
     if let Some(m) = mcp {
@@ -353,6 +359,7 @@ impl TransactionRuntime for DefaultTransactionRuntime {
             capacity: Arc::clone(&self.inner.capacity),
             registry: Arc::clone(&self.inner.registry),
             limits: self.inner.config.transaction_limits.clone(),
+            mcp: self.inner.mcp_handle.clone(),
         };
         admit(&ctx, request)
     }

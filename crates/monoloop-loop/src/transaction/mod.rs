@@ -18,7 +18,7 @@ mod fake_support;
 mod finalization;
 mod host_tools;
 mod loop_adapters;
-mod mcp_shell;
+mod mcp;
 mod resolved_tools;
 mod runtime;
 mod state;
@@ -38,7 +38,12 @@ pub use host_tools::{HostToolRegistry, RegisteredTool};
 pub use loop_adapters::{
     dispatch_ready_tool, HostToolRuntime, ResolvedToolRegistry,
 };
-pub use mcp_shell::McpListenerShell;
+pub use mcp::{
+    tool_definitions_from_resolved, CapabilityToken, McpBindingState, McpGateway, McpGatewayHandle,
+    McpInstallError, McpRouteTable, PendingMcpBinding, TransactionMcpHandler,
+};
+/// Back-compat alias: the MCP gateway owns the loopback listener.
+pub use mcp::McpGateway as McpListenerShell;
 pub use resolved_tools::{ResolvedTool, ResolvedToolSet};
 pub use runtime::{DefaultTransactionRuntime, Startup};
 pub use state::RuntimeState;

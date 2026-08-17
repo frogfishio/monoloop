@@ -6,14 +6,16 @@ use super::events::QueuedEvent;
 use super::exchange::{run_exchange, ExchangeFailure, ExchangeParams};
 use super::finalization::{build_transaction_end, FinalizationGuard};
 use super::loop_adapters::dispatch_ready_tool;
+use super::mcp::{CapabilityToken, McpGatewayHandle};
 use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::SharedToolCapacity;
 use monoloop_connector::{Connector, SessionAdapter};
 use monoloop_contracts::{
     CanonicalUnit, CanonicalUnitEvent, ChannelId, ChannelKind, EffectiveConfig,
-    EventDeliveryOutcome, ExternalSessionId, InterpretationLimits, OutboundDialectEncoder,
-    SessionId, SessionKey, ToolExecutionMode, ToolLifecycleEvent, ToolRequestState,
-    TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionId,
+    EventDeliveryOutcome, ExternalSessionId, InterpretationLimits, McpConfigurationCapability,
+    McpReachability, OutboundDialectEncoder, SessionId, SessionKey, ToolExecutionMode,
+    ToolLifecycleEvent, ToolRequestState, TransactionEndKind, TransactionEvent,
+    TransactionEventPayload, TransactionId,
 };
 use monoloop_interpreter::InterpreterFactory;
 use std::sync::{Arc, Mutex};
@@ -31,10 +33,18 @@ pub struct ActorSpawn {
     pub channel_kind: ChannelKind,
     /// Tool execution mode (controls Loop fan-out; MCP/None skip).
     pub tool_mode: ToolExecutionMode,
+    /// MCP install mode for external agents.
+    pub mcp_configuration: McpConfigurationCapability,
+    /// MCP reachability declaration.
+    pub mcp_reachability: McpReachability,
+    /// MCP gateway handle (required for McpGateway tool mode when enabled).
+    pub mcp: Option<McpGatewayHandle>,
     /// Session key if known at admission.
     pub session_key: Option<SessionKey>,
     /// Provisional external create (no session yet).
     pub provisional_external: bool,
+    /// Session was supplied by caller (existing external session).
+    pub existing_session: bool,
     /// Session adapter for external Channels.
     pub sessions: Option<Arc<dyn SessionAdapter>>,
     /// Connector for open/send/receive.
@@ -89,8 +99,12 @@ async fn run_actor(spawn: ActorSpawn) {
         channel_id,
         channel_kind: _,
         tool_mode,
+        mcp_configuration,
+        mcp_reachability,
+        mcp,
         mut session_key,
         provisional_external,
+        existing_session,
         sessions,
         connector,
         encoder,
@@ -111,6 +125,8 @@ async fn run_actor(spawn: ActorSpawn) {
 
     let mut terminal_kind = TransactionEndKind::Completed;
     let mut attachment: Option<Arc<monoloop_connector::SessionAttachment>> = None;
+    let mcp_token: Arc<Mutex<Option<CapabilityToken>>> = Arc::new(Mutex::new(None));
+    let mcp_token_work = Arc::clone(&mcp_token);
 
     let work = async {
         // --- EstablishingSession (provisional external) ---
@@ -203,8 +219,69 @@ async fn run_actor(spawn: ActorSpawn) {
             }
         }
 
-        // ActivatingTools: MCP pending WP-07; ModelToolCalls/None validate as no-op.
-        let _ = &tool_mode;
+        // --- ActivatingTools (MCP gateway) ---
+        if tool_mode == ToolExecutionMode::McpGateway {
+            if mcp_reachability != McpReachability::SameLoopbackNamespace {
+                // Loopback profile only; remote agents fail closed.
+                return Err(TransactionEndKind::InvariantFailed);
+            }
+            if mcp_configuration == McpConfigurationCapability::CreationOnly && existing_session {
+                // CreationOnly rejects later reuse of an attachment.
+                return Err(TransactionEndKind::InvariantFailed);
+            }
+            let handle = mcp.as_ref().ok_or(TransactionEndKind::InvariantFailed)?;
+            let sk = session_key
+                .clone()
+                .ok_or(TransactionEndKind::InvariantFailed)?;
+            let dispatcher = TransactionToolDispatcher::new(
+                transaction_id,
+                sk,
+                tools.clone(),
+                SharedToolCapacity::unlimited(),
+                16,
+                64,
+            );
+            let pending = handle
+                .install_pending(
+                    transaction_id,
+                    tools.clone(),
+                    dispatcher,
+                    monoloop_contracts::ExchangeId::generate(),
+                )
+                .map_err(|_| TransactionEndKind::InvariantFailed)?;
+            {
+                let mut g = mcp_token_work.lock().unwrap_or_else(|e| e.into_inner());
+                *g = Some(pending.token.clone());
+            }
+            // Install/refresh descriptor on external session when available.
+            if let (Some(att), Some(adapter)) = (attachment.as_ref(), sessions.as_ref()) {
+                if mcp_configuration == McpConfigurationCapability::Refreshable
+                    || mcp_configuration == McpConfigurationCapability::CreationOnly
+                {
+                    let pending_cfg = adapter
+                        .begin_refresh_mcp(Arc::clone(att), Some(pending.descriptor.clone()))
+                        .map_err(|_| TransactionEndKind::InvariantFailed)?;
+                    tokio::select! {
+                        biased;
+                        ctrl = control_rx.recv() => {
+                            let _ = pending_cfg.control.cancel();
+                            return Err(match ctrl {
+                                Some(ControlMessage::ForceTerminate) => {
+                                    TransactionEndKind::Terminated
+                                }
+                                _ => TransactionEndKind::Cancelled,
+                            });
+                        }
+                        r = pending_cfg.completion => {
+                            r.map_err(|_| TransactionEndKind::InvariantFailed)?;
+                        }
+                    }
+                }
+            }
+            handle
+                .activate(&pending.token)
+                .map_err(|_| TransactionEndKind::InvariantFailed)?;
+        }
 
         // --- One provider exchange ---
         let tool_specs: Vec<_> = tools.specs().into_iter().cloned().collect();
@@ -344,6 +421,23 @@ async fn run_actor(spawn: ActorSpawn) {
         }
     };
     let _ = cancelled;
+
+    // Local revocation before terminal publication / external descriptor removal.
+    let revoked_token = {
+        let mut g = mcp_token.lock().unwrap_or_else(|e| e.into_inner());
+        g.take()
+    };
+    if let Some(token) = revoked_token {
+        if let Some(handle) = &mcp {
+            handle.revoke(&token);
+            if let (Some(att), Some(adapter)) = (attachment.as_ref(), sessions.as_ref()) {
+                if let Ok(pending_cfg) = adapter.begin_refresh_mcp(Arc::clone(att), None) {
+                    let _ = tokio::time::timeout(Duration::from_millis(200), pending_cfg.completion)
+                        .await;
+                }
+            }
+        }
+    }
 
     let result = ActorResult {
         kind: terminal_kind,
