@@ -2,17 +2,18 @@
 
 use monoloop_connector::{FakeConnectorFactory, FakeSessionAdapterConfig};
 use monoloop_contracts::{
-    user_text_input, AdmissionErrorKind, ChannelCapabilities, ChannelDefaults, ChannelId,
-    ChannelKind, ChannelLimits, ContinuationPolicy, DialectDescriptor, ExchangeMode,
+    user_text_input, AdmissionErrorKind, CanonicalToolOutput, ChannelCapabilities, ChannelDefaults,
+    ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy, DialectDescriptor, ExchangeMode,
     FnCompletionCallback, FnEventSink, InvocationConfig, JsonSchema, McpConfigurationCapability,
-    McpReachability, SessionMode, ToolCancellationPolicy, ToolExecutionMode, ToolId, ToolLimits,
-    ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionRequest,
-    TransactionRuntime,
+    McpReachability, SessionMode, ToolCancellationPolicy, ToolCompletion, ToolExecutionMode,
+    ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract,
+    TransactionRequest, TransactionRuntime,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
-    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, TestTextEncoder,
-    RuntimeBootstrap, RuntimeConfig, RuntimeState, StartupError,
+    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry,
+    ImmediateToolHandler, RegisteredTool, RuntimeBootstrap, RuntimeConfig, RuntimeState,
+    StartupError, TestTextEncoder,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -151,7 +152,7 @@ fn duplicate_channel_ids_rejected() {
 fn duplicate_tool_ids_rejected() {
     let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
     let mk = |id: &str, name: &str| {
-        ToolSpec::try_new(
+        let spec = ToolSpec::try_new(
             ToolId::try_new(id).unwrap(),
             ToolName::try_new(name).unwrap(),
             "d",
@@ -165,7 +166,15 @@ fn duplicate_tool_ids_rejected() {
             ToolLimits::default(),
             ToolCancellationPolicy::Abortable,
         )
-        .unwrap()
+        .unwrap();
+        RegisteredTool::new(
+            spec,
+            Arc::new(ImmediateToolHandler::new(|_, _| {
+                Ok(ToolCompletion::Succeeded(CanonicalToolOutput::Json(
+                    serde_json::json!({}),
+                )))
+            })),
+        )
     };
     let err = HostToolRegistry::build(vec![mk("t1", "a"), mk("t1", "b")]).unwrap_err();
     assert!(matches!(err, StartupError::ToolRegistry(_)));
@@ -175,7 +184,7 @@ fn duplicate_tool_ids_rejected() {
 fn duplicate_tool_names_rejected() {
     let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
     let mk = |id: &str| {
-        ToolSpec::try_new(
+        let spec = ToolSpec::try_new(
             ToolId::try_new(id).unwrap(),
             ToolName::try_new("same-name").unwrap(),
             "d",
@@ -189,7 +198,15 @@ fn duplicate_tool_names_rejected() {
             ToolLimits::default(),
             ToolCancellationPolicy::Abortable,
         )
-        .unwrap()
+        .unwrap();
+        RegisteredTool::new(
+            spec,
+            Arc::new(ImmediateToolHandler::new(|_, _| {
+                Ok(ToolCompletion::Succeeded(CanonicalToolOutput::Json(
+                    serde_json::json!({}),
+                )))
+            })),
+        )
     };
     let err = HostToolRegistry::build(vec![mk("a"), mk("b")]).unwrap_err();
     assert!(matches!(err, StartupError::ToolRegistry(_)));

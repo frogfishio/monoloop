@@ -6,7 +6,8 @@ use crate::tools::{NoToolRuntime, ToolRuntime};
 use monoloop_contracts::{
     CanonicalUnit, CanonicalUnitEvent, InterpretationEnd, InterpreterOutputEvent, LoopEnd,
     LoopEndKind, LoopError, LoopId, LoopLimits, LoopOutputEvent, LoopScope, MonoloopRunId,
-    OutboundToolOutcome, OutboundToolResult, ToolActionId, ToolRequestState, UnitId,
+    OutboundToolOutcome, OutboundToolResult, ToolActionId, ToolExecutionId, ToolRequestState,
+    UnitId,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -158,7 +159,7 @@ fn spawn_loop(request: StartLoop) -> Result<LoopHandle, LoopError> {
             loop_id: request.loop_id,
             scope: request.scope,
             registry: request.tool_registry,
-            _runtime: request.tool_runtime,
+            runtime: request.tool_runtime,
             limits: request.limits,
             out_tx,
             control: control_task,
@@ -212,7 +213,7 @@ struct LoopOwner {
     loop_id: LoopId,
     scope: LoopScope,
     registry: Arc<dyn ToolRegistry>,
-    _runtime: Arc<dyn ToolRuntime>,
+    runtime: Arc<dyn ToolRuntime>,
     limits: LoopLimits,
     out_tx: mpsc::Sender<LoopOutputEvent>,
     control: LoopControl,
@@ -504,9 +505,56 @@ impl LoopOwner {
                 // Empty registry: never call ToolRuntime.start.
             }
             ToolResolution::Available(_) => {
-                // Future path: allocate execution id and call runtime.
-                // Initial product forbids starting without later policy; treat as rejected.
-                self.diag("Available tool without runtime policy — dispatch_rejected".into());
+                let execution_id = ToolExecutionId::generate();
+                let handle = match self.runtime.start(crate::tools::StartToolExecution {
+                    execution_id: execution_id.clone(),
+                    tool_action_id: tool_action_id.as_str().to_string(),
+                    tool_name: name,
+                    request_payload: payload,
+                    request_generation: generation,
+                }) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        self.diag(format!("tool runtime start failed: {e}"));
+                        if self
+                            .out_tx
+                            .send(LoopOutputEvent::OutboundToolResult(OutboundToolResult {
+                                outbound_result_id: uuid::Uuid::new_v4().to_string(),
+                                monoloop_run_id: self.monoloop_run_id.clone(),
+                                loop_id: self.loop_id.clone(),
+                                source_interpretation_id: snap.interpretation_id.clone(),
+                                source_connection_id: snap.connection_id.clone(),
+                                external_session_id: snap.external_session_id.clone(),
+                                tool_action_id,
+                                request_generation: generation,
+                                tool_execution_id: None,
+                                outcome: OutboundToolOutcome::ExecutionFailed,
+                                payload: e.0,
+                                source_unit_id: unit_id,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            return Err(LoopEndKind::OutputFailed);
+                        }
+                        self.outbound_results += 1;
+                        return Ok(());
+                    }
+                };
+
+                let terminal = if let Some(rx) = handle.completion {
+                    rx.await.unwrap_or(crate::tools::ToolRuntimeTerminal {
+                        outcome: OutboundToolOutcome::ExecutionLost,
+                        payload: "completion lost".into(),
+                    })
+                } else {
+                    crate::tools::ToolRuntimeTerminal {
+                        outcome: OutboundToolOutcome::ExecutionFailed,
+                        payload: "runtime returned no completion".into(),
+                    }
+                };
+
+                self.outbound_results += 1;
                 if self
                     .out_tx
                     .send(LoopOutputEvent::OutboundToolResult(OutboundToolResult {
@@ -518,9 +566,9 @@ impl LoopOwner {
                         external_session_id: snap.external_session_id.clone(),
                         tool_action_id,
                         request_generation: generation,
-                        tool_execution_id: None,
-                        outcome: OutboundToolOutcome::DispatchRejected,
-                        payload: "available tool path deferred".into(),
+                        tool_execution_id: Some(execution_id),
+                        outcome: terminal.outcome,
+                        payload: terminal.payload,
                         source_unit_id: unit_id,
                     }))
                     .await

@@ -1,16 +1,19 @@
 //! Transaction actor: session establish + one provider exchange + finalization.
 
 use super::active_registry::{ActiveTransactionRegistry, ClaimSessionError, ControlMessage};
+use super::dispatcher::{DispatchOutcome, TransactionToolDispatcher};
 use super::events::QueuedEvent;
 use super::exchange::{run_exchange, ExchangeFailure, ExchangeParams};
 use super::finalization::{build_transaction_end, FinalizationGuard};
+use super::loop_adapters::dispatch_ready_tool;
 use super::resolved_tools::ResolvedToolSet;
+use super::tool_capacity::SharedToolCapacity;
 use monoloop_connector::{Connector, SessionAdapter};
 use monoloop_contracts::{
-    CanonicalUnitEvent, ChannelId, ChannelKind, EffectiveConfig, EventDeliveryOutcome,
-    ExternalSessionId, InterpretationLimits, OutboundDialectEncoder, SessionId, SessionKey,
-    ToolExecutionMode, TransactionEndKind, TransactionEvent, TransactionEventPayload,
-    TransactionId,
+    CanonicalUnit, CanonicalUnitEvent, ChannelId, ChannelKind, EffectiveConfig,
+    EventDeliveryOutcome, ExternalSessionId, InterpretationLimits, OutboundDialectEncoder,
+    SessionId, SessionKey, ToolExecutionMode, ToolLifecycleEvent, ToolRequestState,
+    TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionId,
 };
 use monoloop_interpreter::InterpreterFactory;
 use std::sync::{Arc, Mutex};
@@ -200,8 +203,8 @@ async fn run_actor(spawn: ActorSpawn) {
             }
         }
 
-        // ActivatingTools: no-op for ModelToolCalls/None; MCP pending WP-07.
-        let _ = tool_mode;
+        // ActivatingTools: MCP pending WP-07; ModelToolCalls/None validate as no-op.
+        let _ = &tool_mode;
 
         // --- One provider exchange ---
         let tool_specs: Vec<_> = tools.specs().into_iter().cloned().collect();
@@ -232,14 +235,14 @@ async fn run_actor(spawn: ActorSpawn) {
         let outcome = outcome.map_err(map_exchange_failure)?;
 
         // Publish canonical units (no raw bytes ever enter actor queues).
-        for unit in outcome.units {
+        for unit in &outcome.units {
             if !emit_canonical_unit(
                 &event_tx,
                 &guard,
                 transaction_id,
                 &channel_id,
                 &session_key,
-                unit,
+                unit.clone(),
             )
             .await
             {
@@ -249,6 +252,69 @@ async fn run_actor(spawn: ActorSpawn) {
 
         if let Some(fail) = outcome.failure {
             return Err(map_exchange_failure(fail));
+        }
+
+        // --- Linked tools (ModelToolCalls) ---
+        if tool_mode == ToolExecutionMode::ModelToolCalls {
+            let sk = session_key.clone().ok_or(TransactionEndKind::InvariantFailed)?;
+            if !tools.is_empty() {
+                let dispatcher = TransactionToolDispatcher::new(
+                    transaction_id,
+                    sk,
+                    tools.clone(),
+                    SharedToolCapacity::unlimited(),
+                    16,
+                    64,
+                );
+                let mut ordinal: u32 = 0;
+                for unit in &outcome.units {
+                    let snap = unit.snapshot();
+                    let CanonicalUnit::Tool(tool) = &snap.unit else {
+                        continue;
+                    };
+                    if tool.request_state != ToolRequestState::Ready {
+                        continue;
+                    }
+                    let Some(name) = tool.tool_name.as_deref() else {
+                        continue;
+                    };
+                    let Some(payload) = tool.request_payload.as_deref() else {
+                        continue;
+                    };
+                    let ord = ordinal;
+                    ordinal = ordinal.saturating_add(1);
+                    let dispatch_outcome = tokio::select! {
+                        biased;
+                        ctrl = control_rx.recv() => {
+                            return Err(match ctrl {
+                                Some(ControlMessage::ForceTerminate) => {
+                                    TransactionEndKind::Terminated
+                                }
+                                _ => TransactionEndKind::Cancelled,
+                            });
+                        }
+                        r = dispatch_ready_tool(
+                            &dispatcher,
+                            outcome.exchange_id,
+                            tool.tool_action_id.clone(),
+                            name,
+                            tool.tool_action_id.as_str(),
+                            ord,
+                            payload,
+                        ) => r,
+                    };
+                    emit_dispatch_outcome(
+                        &event_tx,
+                        &guard,
+                        transaction_id,
+                        &channel_id,
+                        &session_key,
+                        dispatch_outcome,
+                    )
+                    .await?;
+                }
+            }
+            // Empty resolved set: zero effects — no dispatcher start (empty-tool path).
         }
 
         Ok::<(), TransactionEndKind>(())
@@ -350,6 +416,89 @@ async fn emit_canonical_unit(
         channel_id,
         session_key,
         TransactionEventPayload::CanonicalUnit(unit),
+    )
+    .await
+}
+
+async fn emit_dispatch_outcome(
+    event_tx: &mpsc::Sender<QueuedEvent>,
+    guard: &FinalizationGuard,
+    transaction_id: TransactionId,
+    channel_id: &ChannelId,
+    session_key: &Option<SessionKey>,
+    outcome: DispatchOutcome,
+) -> Result<(), TransactionEndKind> {
+    match outcome {
+        DispatchOutcome::Canonical { lifecycle, .. } => {
+            for ev in lifecycle {
+                if !emit_tool_lifecycle(
+                    event_tx,
+                    guard,
+                    transaction_id,
+                    channel_id,
+                    session_key,
+                    ev,
+                )
+                .await
+                {
+                    return Err(TransactionEndKind::EventDeliveryFailed);
+                }
+            }
+            Ok(())
+        }
+        DispatchOutcome::Rejected { lifecycle, .. } => {
+            for ev in lifecycle {
+                if !emit_tool_lifecycle(
+                    event_tx,
+                    guard,
+                    transaction_id,
+                    channel_id,
+                    session_key,
+                    ev,
+                )
+                .await
+                {
+                    return Err(TransactionEndKind::EventDeliveryFailed);
+                }
+            }
+            // Rejected arguments are ordinary tool outcomes; transaction continues.
+            Ok(())
+        }
+        DispatchOutcome::RuntimeFailed { lifecycle, .. } => {
+            for ev in lifecycle {
+                if !emit_tool_lifecycle(
+                    event_tx,
+                    guard,
+                    transaction_id,
+                    channel_id,
+                    session_key,
+                    ev,
+                )
+                .await
+                {
+                    return Err(TransactionEndKind::EventDeliveryFailed);
+                }
+            }
+            Err(TransactionEndKind::ToolExchangeFailed)
+        }
+    }
+}
+
+async fn emit_tool_lifecycle(
+    event_tx: &mpsc::Sender<QueuedEvent>,
+    guard: &FinalizationGuard,
+    transaction_id: TransactionId,
+    channel_id: &ChannelId,
+    session_key: &Option<SessionKey>,
+    lifecycle: ToolLifecycleEvent,
+) -> bool {
+    emit_unit_or_session(
+        event_tx,
+        guard,
+        transaction_id,
+        channel_id,
+        session_key,
+        TransactionEventPayload::ToolLifecycle(lifecycle),
     )
     .await
 }

@@ -13,19 +13,30 @@ mod subscription;
 mod tools;
 mod transaction;
 
-pub use registry::{EmptyToolRegistry, ResolveToolRequest, ToolRegistry, ToolResolution};
+pub use registry::{
+    EmptyToolRegistry, ResolveToolRequest, ToolDescriptorRef, ToolRegistry, ToolRegistryError,
+    ToolResolution,
+};
 pub use runtime::{DefaultLoopRuntime, LoopCompletion, LoopControl, LoopHandle, LoopHealth, StartLoop};
 pub use subscription::{
     CanonicalEventSubscription, DeliveredEvent, SubscriberId, SubscriptionGap, SubscriptionPublisher,
     SubscriptionStatus,
 };
-pub use tools::{NoToolRuntime, ToolRuntime};
+pub use tools::{
+    NoToolRuntime, StartToolExecution, ToolExecutionHandle, ToolRuntime, ToolRuntimeError,
+    ToolRuntimeTerminal,
+};
 pub use transaction::{
-    CapacityManagers, ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, EmptyBytesEncoder,
-    EventSequencer, ExchangeFailure, ExchangeOutcome, ExchangeParams, FinalizationGuard,
-    HostToolRegistry, LiveChannel, McpListenerShell, RejectEncoder, ResolvedToolSet,
-    RuntimeBootstrap, RuntimeConfig, RuntimeState, Startup, StartupError, TestTextEncoder,
-    run_exchange,
+    dispatch_ready_tool, AsyncToolHandler, CapacityManagers, ChannelBinding, ChannelRegistry,
+    DefaultTransactionRuntime, DispatchOutcome, DispatchRequest, EmptyBytesEncoder, EventSequencer,
+    ExchangeFailure, ExchangeOutcome, ExchangeParams, FinalizationGuard, HostToolRegistry,
+    HostToolRuntime, ImmediateToolHandler, InputValidationFailure, LinkedToolExecutionHandle,
+    LiveChannel, LostCompletionHandler, McpListenerShell, OutputValidationFailure,
+    PanicOnStartHandler, RegisteredTool, RejectEncoder, ResolvedTool, ResolvedToolRegistry,
+    ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeState, SharedToolCapacity, StartFailHandler,
+    Startup, StartupError, TestTextEncoder, ToolExecutionCompletion, ToolExecutionControl,
+    ToolHandler, TransactionToolCapacity, TransactionToolDispatcher, validate_tool_completion,
+    validate_tool_input, run_exchange,
 };
 
 pub use monoloop_contracts::{

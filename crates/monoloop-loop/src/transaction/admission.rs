@@ -191,7 +191,7 @@ fn resolve_tools(
         return Ok(ResolvedToolSet::empty());
     }
     let mut seen = HashSet::new();
-    let mut specs = Vec::with_capacity(tools.len());
+    let mut registered = Vec::with_capacity(tools.len());
     for id in tools {
         if !seen.insert(id.clone()) {
             return Err(AdmissionError::new(
@@ -199,12 +199,12 @@ fn resolve_tools(
                 "duplicate tool id on request",
             ));
         }
-        let spec = host.get(id).ok_or_else(|| {
+        let tool = host.get(id).ok_or_else(|| {
             AdmissionError::new(AdmissionErrorKind::UnknownTool, "unknown tool id")
         })?;
-        specs.push(spec.clone());
+        registered.push(tool.clone());
     }
-    Ok(ResolvedToolSet::from_specs(specs))
+    Ok(ResolvedToolSet::from_registered(registered))
 }
 
 fn allocate_session(

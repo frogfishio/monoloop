@@ -10,6 +10,8 @@ description = "Minimal extensible Loop: lossless canonical subscription, empty-c
 monoloop-contracts = { path = "../monoloop-contracts" }
 monoloop-connector = { path = "../monoloop-connector" }
 monoloop-interpreter = { path = "../monoloop-interpreter" }
+jsonschema = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
 tracing = { workspace = true }

@@ -2,6 +2,7 @@
 //!
 //! WP-03: bootstrap / registries / startup.
 //! WP-04: admission, events, finalization, callbacks, no-I/O actor.
+//! WP-06: linked tools, dispatcher, Loop adapters.
 
 mod active_registry;
 mod actor;
@@ -9,26 +10,44 @@ mod admission;
 mod bootstrap;
 mod capacity;
 mod channel_registry;
+mod dispatcher;
 mod error;
 mod events;
 mod exchange;
 mod fake_support;
 mod finalization;
 mod host_tools;
+mod loop_adapters;
 mod mcp_shell;
 mod resolved_tools;
 mod runtime;
 mod state;
+mod tool_capacity;
+mod tool_handler;
+mod validation;
 
 pub use bootstrap::{RuntimeBootstrap, RuntimeConfig};
 pub use capacity::CapacityManagers;
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
+pub use dispatcher::{DispatchOutcome, DispatchRequest, TransactionToolDispatcher};
 pub use error::StartupError;
 pub use exchange::{run_exchange, ExchangeFailure, ExchangeOutcome, ExchangeParams};
 pub use fake_support::{EmptyBytesEncoder, RejectEncoder, TestTextEncoder};
 pub use finalization::{EventSequencer, FinalizationGuard};
-pub use host_tools::HostToolRegistry;
+pub use host_tools::{HostToolRegistry, RegisteredTool};
+pub use loop_adapters::{
+    dispatch_ready_tool, HostToolRuntime, ResolvedToolRegistry,
+};
 pub use mcp_shell::McpListenerShell;
-pub use resolved_tools::ResolvedToolSet;
+pub use resolved_tools::{ResolvedTool, ResolvedToolSet};
 pub use runtime::{DefaultTransactionRuntime, Startup};
 pub use state::RuntimeState;
+pub use tool_capacity::{SharedToolCapacity, TransactionToolCapacity};
+pub use tool_handler::{
+    AsyncToolHandler, ImmediateToolHandler, LinkedToolExecutionHandle, LostCompletionHandler,
+    PanicOnStartHandler, StartFailHandler, ToolExecutionCompletion, ToolExecutionControl,
+    ToolHandler,
+};
+pub use validation::{
+    validate_tool_completion, validate_tool_input, InputValidationFailure, OutputValidationFailure,
+};
