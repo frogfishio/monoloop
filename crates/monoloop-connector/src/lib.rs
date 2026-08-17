@@ -7,10 +7,12 @@
 #![deny(missing_docs)]
 
 mod control;
+mod credential;
 mod descriptor;
 mod fake;
 mod fake_session;
 mod handles;
+mod http;
 mod instance;
 mod open;
 mod proxy;
@@ -21,6 +23,9 @@ pub use control::{
     CancellationReason, ConnectionControlHandle, ControlDisposition, ControlState,
     TerminationReason,
 };
+pub use credential::{
+    AnonymousCredentialResolver, CredentialResolver, MapCredentialResolver, ResolvedCredential,
+};
 pub use descriptor::{ConnectorDescriptor, ConnectorKind, ControlCapabilities, RawBoundary};
 pub use fake::{FakeConnector, FakeConnectorConfig, FakeEndpoint};
 pub use fake_session::{
@@ -30,6 +35,10 @@ pub use fake_session::{
 pub use handles::{
     ConnectionCompletionHandle, ConnectionEnd, ConnectionEndKind, ConnectionOwner, EndInitiator,
     RawInputHandle, RawInputMessage, RawOutputHandle,
+};
+pub use http::{
+    validate_endpoint_url, HttpMethod, StreamingHttpConfig, StreamingHttpConnector,
+    StreamingHttpConnectorFactory,
 };
 pub use instance::{
     ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId,
