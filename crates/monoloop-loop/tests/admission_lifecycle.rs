@@ -10,8 +10,9 @@ use monoloop_contracts::{
     TransactionEvent, TransactionEventPayload, TransactionRequest, TransactionRuntime,
     TransactionSelector,
 };
+use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
-    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, RejectEncoder,
+    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, TestTextEncoder,
     RuntimeBootstrap, RuntimeConfig,
 };
 use std::collections::BTreeSet;
@@ -20,7 +21,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 fn caps(session: SessionMode, exchange: ExchangeMode) -> ChannelCapabilities {
-    let d = DialectDescriptor::openai_chat_completions("v1");
+    let d = DialectDescriptor::test_raw();
     ChannelCapabilities {
         session_mode: session,
         mcp_configuration: McpConfigurationCapability::None,
@@ -39,7 +40,10 @@ fn llm_binding(id: &str) -> ChannelBinding {
         kind: ChannelKind::DirectLlm,
         tool_mode: ToolExecutionMode::ModelToolCalls,
         connector_factory: Arc::new(FakeConnectorFactory::direct_llm()),
-        encoder: Arc::new(RejectEncoder),
+        encoder: Arc::new(TestTextEncoder),
+        interpreter: Arc::new(DefaultInterpreterFactory::new()),
+        endpoint_ref: "default".into(),
+        credential_ref: None,
         defaults: ChannelDefaults::default(),
         capabilities: caps(SessionMode::Stateless, ExchangeMode::RequestResponse),
         limits: ChannelLimits::default(),

@@ -5,6 +5,7 @@ use monoloop_contracts::{
     ChannelCapabilities, ChannelDefaults, ChannelDescriptor, ChannelId, ChannelKind, ChannelLimits,
     OutboundDialectEncoder, ToolExecutionMode,
 };
+use monoloop_interpreter::InterpreterFactory;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,6 +21,12 @@ pub struct ChannelBinding {
     pub connector_factory: Arc<dyn ConnectorFactory>,
     /// Outbound dialect encoder.
     pub encoder: Arc<dyn OutboundDialectEncoder>,
+    /// Interpreter factory for this Channel's output dialect.
+    pub interpreter: Arc<dyn InterpreterFactory>,
+    /// Transport endpoint reference for `OpenConnection`.
+    pub endpoint_ref: String,
+    /// Optional credential reference for open.
+    pub credential_ref: Option<String>,
     /// Channel defaults for effective config merge.
     pub defaults: ChannelDefaults,
     /// Declared capabilities.

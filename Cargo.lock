@@ -1255,6 +1255,7 @@ dependencies = [
  "jsonschema",
  "monoloop-connector",
  "monoloop-contracts",
+ "monoloop-interpreter",
  "rand 0.9.5",
  "reqwest",
  "rmcp",

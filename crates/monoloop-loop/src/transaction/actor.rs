@@ -1,33 +1,55 @@
-//! WP-04 no-I/O transaction actor: lifecycle, events, terminal, callback.
+//! Transaction actor: session establish + one provider exchange + finalization.
 
 use super::active_registry::{ActiveTransactionRegistry, ClaimSessionError, ControlMessage};
 use super::events::QueuedEvent;
+use super::exchange::{run_exchange, ExchangeFailure, ExchangeParams};
 use super::finalization::{build_transaction_end, FinalizationGuard};
-use monoloop_connector::SessionAdapter;
+use super::resolved_tools::ResolvedToolSet;
+use monoloop_connector::{Connector, SessionAdapter};
 use monoloop_contracts::{
-    ChannelId, ChannelKind, EventDeliveryOutcome, ExternalSessionId, SessionId, SessionKey,
-    TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionId,
+    CanonicalUnitEvent, ChannelId, ChannelKind, EffectiveConfig, EventDeliveryOutcome,
+    ExternalSessionId, InterpretationLimits, OutboundDialectEncoder, SessionId, SessionKey,
+    ToolExecutionMode, TransactionEndKind, TransactionEvent, TransactionEventPayload,
+    TransactionId,
 };
+use monoloop_interpreter::InterpreterFactory;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// Inputs for the no-I/O actor.
+/// Inputs for the transaction actor.
 pub struct ActorSpawn {
     /// Transaction id.
     pub transaction_id: TransactionId,
     /// Channel id.
     pub channel_id: ChannelId,
-    /// Channel kind (WP-05 exchange path).
+    /// Channel kind (session topology).
     #[allow(dead_code)]
     pub channel_kind: ChannelKind,
+    /// Tool execution mode (controls Loop fan-out; MCP/None skip).
+    pub tool_mode: ToolExecutionMode,
     /// Session key if known at admission.
     pub session_key: Option<SessionKey>,
     /// Provisional external create (no session yet).
     pub provisional_external: bool,
-    /// Session adapter (WP-05 attach path).
-    #[allow(dead_code)]
+    /// Session adapter for external Channels.
     pub sessions: Option<Arc<dyn SessionAdapter>>,
+    /// Connector for open/send/receive.
+    pub connector: Arc<dyn Connector>,
+    /// Outbound encoder.
+    pub encoder: Arc<dyn OutboundDialectEncoder>,
+    /// Interpreter factory.
+    pub interpreter: Arc<dyn InterpreterFactory>,
+    /// Endpoint ref for open.
+    pub endpoint_ref: String,
+    /// Credential ref.
+    pub credential_ref: Option<String>,
+    /// Canonical input.
+    pub input: monoloop_contracts::CanonicalInput,
+    /// Effective configuration.
+    pub effective: EffectiveConfig,
+    /// Resolved tools (specs for encoder).
+    pub tools: ResolvedToolSet,
     /// Finalization guard.
     pub guard: Arc<FinalizationGuard>,
     /// Control receiver (capacity 1).
@@ -63,9 +85,18 @@ async fn run_actor(spawn: ActorSpawn) {
         transaction_id,
         channel_id,
         channel_kind: _,
+        tool_mode,
         mut session_key,
         provisional_external,
-        sessions: _,
+        sessions,
+        connector,
+        encoder,
+        interpreter,
+        endpoint_ref,
+        credential_ref,
+        input,
+        effective,
+        tools,
         guard,
         mut control_rx,
         event_tx,
@@ -75,76 +106,179 @@ async fn run_actor(spawn: ActorSpawn) {
         deadline,
     } = spawn;
 
-    let mut emitted = 0u64;
     let mut terminal_kind = TransactionEndKind::Completed;
+    let mut attachment: Option<Arc<monoloop_connector::SessionAttachment>> = None;
 
-    let setup = async {
+    let work = async {
+        // --- EstablishingSession (provisional external) ---
         if provisional_external {
-            let sid = SessionId::generate();
-            let key = SessionKey::new(channel_id.clone(), sid.clone());
-            {
-                let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-                match reg.claim_session(transaction_id, key.clone()) {
-                    Ok(()) => {}
-                    Err(ClaimSessionError::Collision) => {
-                        return Err(TransactionEndKind::InvariantFailed);
+            // WP-05: synthetic session id when no real attach race; still claim SessionKey.
+            // If a SessionAdapter is present, prefer begin_attach for real lifecycle.
+            if let Some(ref adapter) = sessions {
+                let req = monoloop_connector::SessionAttachRequest {
+                    transaction_id,
+                    channel_id: channel_id.clone(),
+                    requested_session_id: None,
+                    session_config: effective.session.clone(),
+                    initial_mcp: None,
+                    deadline: std::time::Instant::now() + deadline,
+                };
+                let pending = adapter
+                    .begin_attach(req)
+                    .map_err(|_| TransactionEndKind::ChannelOpenFailed)?;
+                let att = tokio::select! {
+                    biased;
+                    ctrl = control_rx.recv() => {
+                        let _ = pending.control.cancel();
+                        return Err(match ctrl {
+                            Some(ControlMessage::ForceTerminate) => TransactionEndKind::Terminated,
+                            _ => TransactionEndKind::Cancelled,
+                        });
                     }
-                    Err(_) => return Err(TransactionEndKind::InvariantFailed),
+                    r = pending.completion => {
+                        r.map_err(|_| TransactionEndKind::ChannelOpenFailed)?
+                    }
+                };
+                let sid = SessionId::from_external(&att.external_session_id);
+                let key = SessionKey::new(channel_id.clone(), sid.clone());
+                {
+                    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    match reg.claim_session(transaction_id, key.clone()) {
+                        Ok(()) => {}
+                        Err(ClaimSessionError::Collision) => {
+                            return Err(TransactionEndKind::InvariantFailed);
+                        }
+                        Err(_) => return Err(TransactionEndKind::InvariantFailed),
+                    }
+                }
+                session_key = Some(key);
+                if !emit_unit_or_session(
+                    &event_tx,
+                    &guard,
+                    transaction_id,
+                    &channel_id,
+                    &session_key,
+                    TransactionEventPayload::SessionEstablished {
+                        external_session_id: att.external_session_id.clone(),
+                    },
+                )
+                .await
+                {
+                    return Err(TransactionEndKind::EventDeliveryFailed);
+                }
+                attachment = Some(att);
+            } else {
+                let sid = SessionId::generate();
+                let key = SessionKey::new(channel_id.clone(), sid.clone());
+                {
+                    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    match reg.claim_session(transaction_id, key.clone()) {
+                        Ok(()) => {}
+                        Err(ClaimSessionError::Collision) => {
+                            return Err(TransactionEndKind::InvariantFailed);
+                        }
+                        Err(_) => return Err(TransactionEndKind::InvariantFailed),
+                    }
+                }
+                session_key = Some(key);
+                let ext = ExternalSessionId::try_new(sid.as_str())
+                    .map_err(|_| TransactionEndKind::InvariantFailed)?;
+                if !emit_unit_or_session(
+                    &event_tx,
+                    &guard,
+                    transaction_id,
+                    &channel_id,
+                    &session_key,
+                    TransactionEventPayload::SessionEstablished {
+                        external_session_id: ext,
+                    },
+                )
+                .await
+                {
+                    return Err(TransactionEndKind::EventDeliveryFailed);
                 }
             }
-            session_key = Some(key);
-            let ext = ExternalSessionId::try_new(sid.as_str())
-                .map_err(|_| TransactionEndKind::InvariantFailed)?;
-            let seq = guard.sequencer().allocate();
-            emitted = seq;
-            let sid_ev = session_key
-                .as_ref()
-                .map(|k| k.session_id.clone())
-                .unwrap_or(sid);
-            let event = TransactionEvent {
+        }
+
+        // ActivatingTools: no-op for ModelToolCalls/None; MCP pending WP-07.
+        let _ = tool_mode;
+
+        // --- One provider exchange ---
+        let tool_specs: Vec<_> = tools.specs().into_iter().cloned().collect();
+        let outcome = tokio::select! {
+            biased;
+            ctrl = control_rx.recv() => {
+                return Err(match ctrl {
+                    Some(ControlMessage::ForceTerminate) => TransactionEndKind::Terminated,
+                    _ => TransactionEndKind::Cancelled,
+                });
+            }
+            r = run_exchange(ExchangeParams {
                 transaction_id,
-                channel_id: channel_id.clone(),
-                session_id: sid_ev,
-                sequence: seq,
-                payload: TransactionEventPayload::SessionEstablished {
-                    external_session_id: ext,
-                },
-            };
-            if event_tx
-                .send(QueuedEvent { event, ack: None })
-                .await
-                .is_err()
+                connector: connector.as_ref(),
+                encoder: encoder.as_ref(),
+                interpreter: interpreter.as_ref(),
+                endpoint_ref: &endpoint_ref,
+                credential_ref: credential_ref.as_deref(),
+                session_attachment: attachment.clone(),
+                input: &input,
+                config: &effective,
+                tools: &tool_specs,
+                interpretation_limits: InterpretationLimits::default(),
+                deadline,
+            }) => r,
+        };
+
+        let outcome = outcome.map_err(map_exchange_failure)?;
+
+        // Publish canonical units (no raw bytes ever enter actor queues).
+        for unit in outcome.units {
+            if !emit_canonical_unit(
+                &event_tx,
+                &guard,
+                transaction_id,
+                &channel_id,
+                &session_key,
+                unit,
+            )
+            .await
             {
                 return Err(TransactionEndKind::EventDeliveryFailed);
             }
         }
+
+        if let Some(fail) = outcome.failure {
+            return Err(map_exchange_failure(fail));
+        }
+
         Ok::<(), TransactionEndKind>(())
     };
 
-    tokio::select! {
+    // Race work against deadline / delivery failure only (control is selected inside work).
+    let cancelled = tokio::select! {
         biased;
-        ctrl = control_rx.recv() => {
-            terminal_kind = match ctrl {
-                Some(ControlMessage::ForceTerminate) => TransactionEndKind::Terminated,
-                Some(ControlMessage::Cancel) | None => TransactionEndKind::Cancelled,
-            };
-        }
-        _ = tokio::time::sleep(deadline) => {
-            terminal_kind = TransactionEndKind::DeadlineExceeded;
-        }
         fail = delivery_fail_rx.recv() => {
             if fail.is_some() {
                 terminal_kind = TransactionEndKind::EventDeliveryFailed;
             }
+            true
         }
-        work_res = setup => {
-            if let Err(k) = work_res {
-                terminal_kind = k;
+        _ = tokio::time::sleep(deadline) => {
+            terminal_kind = TransactionEndKind::DeadlineExceeded;
+            true
+        }
+        work_res = work => {
+            match work_res {
+                Ok(()) => {
+                    terminal_kind = TransactionEndKind::Completed;
+                }
+                Err(k) => terminal_kind = k,
             }
+            false
         }
-    }
+    };
+    let _ = cancelled;
 
-    let _ = emitted;
     let result = ActorResult {
         kind: terminal_kind,
         prior: None,
@@ -162,6 +296,62 @@ async fn run_actor(spawn: ActorSpawn) {
         result,
     )
     .await;
+}
+
+fn map_exchange_failure(f: ExchangeFailure) -> TransactionEndKind {
+    match f {
+        ExchangeFailure::ChannelOpenFailed => TransactionEndKind::ChannelOpenFailed,
+        ExchangeFailure::EncodingFailed => TransactionEndKind::EncodingFailed,
+        ExchangeFailure::ConnectorFailed => TransactionEndKind::ConnectorFailed,
+        ExchangeFailure::InterpretationFailed => TransactionEndKind::InterpretationFailed,
+        ExchangeFailure::Cancelled => TransactionEndKind::Cancelled,
+        ExchangeFailure::Terminated => TransactionEndKind::Terminated,
+    }
+}
+
+async fn emit_unit_or_session(
+    event_tx: &mpsc::Sender<QueuedEvent>,
+    guard: &FinalizationGuard,
+    transaction_id: TransactionId,
+    channel_id: &ChannelId,
+    session_key: &Option<SessionKey>,
+    payload: TransactionEventPayload,
+) -> bool {
+    let seq = guard.sequencer().allocate();
+    let session_id = session_key
+        .as_ref()
+        .map(|k| k.session_id.clone())
+        .unwrap_or_else(SessionId::generate);
+    let event = TransactionEvent {
+        transaction_id,
+        channel_id: channel_id.clone(),
+        session_id,
+        sequence: seq,
+        payload,
+    };
+    event_tx
+        .send(QueuedEvent { event, ack: None })
+        .await
+        .is_ok()
+}
+
+async fn emit_canonical_unit(
+    event_tx: &mpsc::Sender<QueuedEvent>,
+    guard: &FinalizationGuard,
+    transaction_id: TransactionId,
+    channel_id: &ChannelId,
+    session_key: &Option<SessionKey>,
+    unit: CanonicalUnitEvent,
+) -> bool {
+    emit_unit_or_session(
+        event_tx,
+        guard,
+        transaction_id,
+        channel_id,
+        session_key,
+        TransactionEventPayload::CanonicalUnit(unit),
+    )
+    .await
 }
 
 async fn finalize_and_cleanup(

@@ -66,10 +66,10 @@ pub fn admit(
         ));
     }
 
-    let _resolved = resolve_tools(&ctx.tools, &request.tools)?;
+    let resolved = resolve_tools(&ctx.tools, &request.tools)?;
 
     let policy = liberal_option_policy();
-    let _effective = merge_effective_config(
+    let effective = merge_effective_config(
         &live.binding.defaults,
         request.session_config.as_ref(),
         None,
@@ -131,9 +131,18 @@ pub fn admit(
         transaction_id,
         channel_id: request.channel_id.clone(),
         channel_kind: live.binding.kind,
+        tool_mode: live.binding.tool_mode,
         session_key: session_key.clone(),
         provisional_external,
         sessions: live.instance.sessions.clone(),
+        connector: Arc::clone(&live.instance.connector),
+        encoder: Arc::clone(&live.binding.encoder),
+        interpreter: Arc::clone(&live.binding.interpreter),
+        endpoint_ref: live.binding.endpoint_ref.clone(),
+        credential_ref: live.binding.credential_ref.clone(),
+        input: request.input,
+        effective,
+        tools: resolved,
         guard: Arc::clone(&guard),
         control_rx,
         event_tx,
