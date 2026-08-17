@@ -42,7 +42,7 @@ pub use exchange::{
     ExchangeParams,
 };
 pub use fake_support::{EmptyBytesEncoder, RejectEncoder, TestTextEncoder};
-pub use finalization::{EventSequencer, FinalizationGuard};
+pub use finalization::{bound_diagnostics, EventSequencer, FinalizationGuard};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
 pub use loop_adapters::{dispatch_ready_tool, HostToolRuntime, ResolvedToolRegistry};
 /// Back-compat alias: the MCP gateway owns the loopback listener.

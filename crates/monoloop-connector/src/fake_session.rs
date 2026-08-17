@@ -370,6 +370,7 @@ pub struct FakeConnectorFactory {
     /// When true, instance includes a SessionAdapter (external agent).
     pub with_sessions: bool,
     session_config: FakeSessionAdapterConfig,
+    connector_config: crate::fake::FakeConnectorConfig,
 }
 
 impl FakeConnectorFactory {
@@ -378,6 +379,16 @@ impl FakeConnectorFactory {
         Self {
             with_sessions: false,
             session_config: FakeSessionAdapterConfig::default(),
+            connector_config: crate::fake::FakeConnectorConfig::default(),
+        }
+    }
+
+    /// Direct-LLM with custom FakeConnector timing/endpoint config (tests).
+    pub fn direct_llm_with_config(connector_config: crate::fake::FakeConnectorConfig) -> Self {
+        Self {
+            with_sessions: false,
+            session_config: FakeSessionAdapterConfig::default(),
+            connector_config,
         }
     }
 
@@ -386,6 +397,7 @@ impl FakeConnectorFactory {
         Self {
             with_sessions: true,
             session_config,
+            connector_config: crate::fake::FakeConnectorConfig::default(),
         }
     }
 }
@@ -393,7 +405,10 @@ impl FakeConnectorFactory {
 impl ConnectorFactory for FakeConnectorFactory {
     fn create(&self) -> Result<ConnectorInstance, ConnectorBuildError> {
         let instance_id = ConnectorInstanceId::generate();
-        let connector = Arc::new(FakeConnector::with_instance_id(instance_id.clone()));
+        let connector = Arc::new(FakeConnector::with_instance_id_and_config(
+            instance_id.clone(),
+            self.connector_config.clone(),
+        ));
         let sessions = if self.with_sessions {
             Some(Arc::new(FakeSessionAdapter::new(
                 instance_id.clone(),

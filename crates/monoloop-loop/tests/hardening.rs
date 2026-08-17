@@ -1199,6 +1199,225 @@ async fn callback_panic_does_not_kill_runtime() {
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
+/// D-015: max_distinct_sessions plus-one rejects a new session on the channel.
+#[tokio::test]
+async fn distinct_sessions_plus_one_rejected() {
+    let binding = ChannelBinding {
+        id: ChannelId::try_new("llm").unwrap(),
+        kind: ChannelKind::DirectLlm,
+        tool_mode: ToolExecutionMode::ModelToolCalls,
+        connector_factory: Arc::new(FakeConnectorFactory::direct_llm()),
+        encoder: Arc::new(TestTextEncoder),
+        interpreter: Arc::new(DefaultInterpreterFactory::new()),
+        endpoint_ref: "default".into(),
+        credential_ref: None,
+        defaults: ChannelDefaults::default(),
+        capabilities: caps(),
+        limits: ChannelLimits {
+            max_active_transactions: 8,
+            max_distinct_sessions: 2,
+            max_encoded_exchange_bytes: 4 * 1024 * 1024,
+        },
+    };
+    let rt = start_with_limits(
+        vec![binding],
+        TransactionLimits {
+            max_active_transactions: 8,
+            max_active_per_channel: 8,
+            ..Default::default()
+        },
+    )
+    .await;
+    let gate = Arc::new(Notify::new());
+    let ends = Arc::new(AtomicUsize::new(0));
+    for i in 0..2 {
+        let done = Arc::new(Notify::new());
+        TransactionRuntime::submit(
+            rt.as_ref(),
+            free_request(
+                "llm",
+                Some(SessionId::try_new(format!("ds-{i}")).unwrap()),
+                blocked_sink(Arc::clone(&gate)),
+                counting_completion(Arc::clone(&ends), done),
+            ),
+        )
+        .unwrap();
+    }
+    let err = TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            Some(SessionId::try_new("ds-overflow").unwrap()),
+            blocked_sink(Arc::clone(&gate)),
+            counting_completion(Arc::clone(&ends), Arc::new(Notify::new())),
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, AdmissionErrorKind::CapacityExceeded);
+    gate.notify_waiters();
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(2)).await;
+}
+
+/// D-015: channel max_encoded_exchange_bytes fails closed as EncodingFailed.
+#[tokio::test]
+async fn encoded_exchange_bytes_plus_one_fails() {
+    let binding = ChannelBinding {
+        id: ChannelId::try_new("llm").unwrap(),
+        kind: ChannelKind::DirectLlm,
+        tool_mode: ToolExecutionMode::ModelToolCalls,
+        connector_factory: Arc::new(FakeConnectorFactory::direct_llm()),
+        encoder: Arc::new(TestTextEncoder),
+        interpreter: Arc::new(DefaultInterpreterFactory::new()),
+        endpoint_ref: "default".into(),
+        credential_ref: None,
+        defaults: ChannelDefaults::default(),
+        capabilities: caps(),
+        limits: ChannelLimits {
+            max_active_transactions: 4,
+            max_distinct_sessions: 4,
+            max_encoded_exchange_bytes: 8, // tiny
+        },
+    };
+    let rt = start_with_limits(
+        vec![binding],
+        TransactionLimits {
+            max_input_bytes: 64 * 1024,
+            max_active_transactions: 4,
+            max_active_per_channel: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let ends = Arc::new(Mutex::new(Vec::<TransactionEndKind>::new()));
+    let done = Arc::new(Notify::new());
+    let ends_c = Arc::clone(&ends);
+    let done_c = Arc::clone(&done);
+    let mut req = free_request(
+        "llm",
+        None,
+        Arc::new(FnEventSink(|_| {
+            Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+        })),
+        Box::new(FnCompletionCallback(move |end: TransactionEnd| {
+            ends_c.lock().unwrap().push(end.kind);
+            done_c.notify_waiters();
+            Box::pin(async { Ok(()) }) as monoloop_contracts::CompletionDelivery
+        })),
+    );
+    // Body well over 8 encoded bytes once TestTextEncoder serializes it.
+    req.input = monoloop_contracts::user_text_input("0123456789abcdef-extra").unwrap();
+    TransactionRuntime::submit(rt.as_ref(), req).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done.notified())
+        .await
+        .expect("terminal after encode limit");
+    let kinds = ends.lock().unwrap().clone();
+    assert_eq!(kinds.len(), 1);
+    assert_eq!(kinds[0], TransactionEndKind::EncodingFailed);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-012: cancel while FakeConnector open is delayed leaves zero active capacity.
+#[tokio::test]
+async fn cancel_during_slow_open_releases_capacity() {
+    use monoloop_connector::FakeConnectorConfig;
+
+    let factory = FakeConnectorFactory::direct_llm_with_config(FakeConnectorConfig {
+        open_delay: Duration::from_secs(30),
+        ..Default::default()
+    });
+    let binding = ChannelBinding {
+        id: ChannelId::try_new("llm").unwrap(),
+        kind: ChannelKind::DirectLlm,
+        tool_mode: ToolExecutionMode::ModelToolCalls,
+        connector_factory: Arc::new(factory),
+        encoder: Arc::new(TestTextEncoder),
+        interpreter: Arc::new(DefaultInterpreterFactory::new()),
+        endpoint_ref: "default".into(),
+        credential_ref: None,
+        defaults: ChannelDefaults::default(),
+        capabilities: caps(),
+        limits: ChannelLimits {
+            max_active_transactions: 4,
+            max_distinct_sessions: 4,
+            max_encoded_exchange_bytes: 4 * 1024 * 1024,
+        },
+    };
+    let rt = start_with_limits(vec![binding], limits_cap(4, 4)).await;
+    let ends = Arc::new(Mutex::new(Vec::<TransactionEndKind>::new()));
+    let done = Arc::new(Notify::new());
+    let ends_c = Arc::clone(&ends);
+    let done_c = Arc::clone(&done);
+    let receipt = TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            Some(SessionId::try_new("slow-open").unwrap()),
+            Arc::new(FnEventSink(|_| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+            })),
+            Box::new(FnCompletionCallback(move |end: TransactionEnd| {
+                ends_c.lock().unwrap().push(end.kind);
+                done_c.notify_waiters();
+                Box::pin(async { Ok(()) }) as monoloop_contracts::CompletionDelivery
+            })),
+        ),
+    )
+    .unwrap();
+    // Allow actor to enter open with delay.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = TransactionRuntime::terminate(
+        rt.as_ref(),
+        TransactionSelector::Transaction(receipt.transaction_id),
+        TerminationMode::Cancel {
+            reason: CancellationReason {
+                code: CancellationReasonCode::CallerRequested,
+                detail: None,
+            },
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), done.notified())
+        .await
+        .expect("cancel during open must callback");
+    let kinds = ends.lock().unwrap().clone();
+    assert_eq!(kinds.len(), 1);
+    assert!(
+        matches!(
+            kinds[0],
+            TransactionEndKind::Cancelled | TransactionEndKind::Terminated
+        ),
+        "expected cancel path, got {:?}",
+        kinds[0]
+    );
+    for _ in 0..50 {
+        if rt.active_count() == 0 && rt.capacity().global_active() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rt.active_count(), 0);
+    assert_eq!(rt.capacity().global_active(), 0);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-015: bound_diagnostics truncates count and message bytes.
+#[test]
+fn bound_diagnostics_respects_limits() {
+    use monoloop_contracts::{SafeDiagnostic, TransactionDiagnostic};
+    use monoloop_loop::bound_diagnostics;
+
+    let make = |i: usize, msg: &str| TransactionDiagnostic {
+        diagnostic: SafeDiagnostic::try_new(format!("c{i}"), Some(msg), 10_000).unwrap(),
+    };
+    let diags = vec![
+        make(0, "aaaaaaaaaa"),
+        make(1, "bbbbbbbbbb"),
+        make(2, "cccccccccc"),
+    ];
+    let bounded = bound_diagnostics(diags, 2, 4);
+    assert_eq!(bounded.len(), 2);
+    assert!(bounded[0].diagnostic.message.as_ref().unwrap().len() <= 4);
+}
+
 /// D-012: configured cleanup_deadline is accepted and used (non-default value path).
 #[tokio::test]
 async fn cleanup_deadline_non_default_completes() {

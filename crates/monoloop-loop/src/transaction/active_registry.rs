@@ -63,14 +63,31 @@ impl ActiveTransactionRegistry {
         self.by_session.contains_key(key)
     }
 
+    /// Count distinct active sessions on a channel (D-015).
+    pub fn distinct_sessions_on_channel(&self, channel: &ChannelId) -> usize {
+        self.by_session
+            .keys()
+            .filter(|k| k.channel_id == *channel)
+            .count()
+    }
+
     /// Install a new active transaction. Fails if SessionKey already active.
+    ///
+    /// When `max_distinct_sessions` is `Some`, rejecting a new session that would
+    /// exceed the channel's concurrent distinct-session bound (D-015).
     pub fn insert(
         &mut self,
         entry: ActiveTransaction,
+        max_distinct_sessions: Option<usize>,
     ) -> Result<(), monoloop_contracts::AdmissionErrorKind> {
         if let Some(ref sk) = entry.session_key {
             if self.by_session.contains_key(sk) {
                 return Err(monoloop_contracts::AdmissionErrorKind::SessionAlreadyActive);
+            }
+            if let Some(max) = max_distinct_sessions {
+                if self.distinct_sessions_on_channel(&sk.channel_id) >= max {
+                    return Err(monoloop_contracts::AdmissionErrorKind::CapacityExceeded);
+                }
             }
         }
         if self.by_tx.contains_key(&entry.transaction_id) {
@@ -88,9 +105,15 @@ impl ActiveTransactionRegistry {
         &mut self,
         transaction_id: TransactionId,
         key: SessionKey,
+        max_distinct_sessions: Option<usize>,
     ) -> Result<(), ClaimSessionError> {
         if self.by_session.contains_key(&key) {
             return Err(ClaimSessionError::Collision);
+        }
+        if let Some(max) = max_distinct_sessions {
+            if self.distinct_sessions_on_channel(&key.channel_id) >= max {
+                return Err(ClaimSessionError::CapacityExceeded);
+            }
         }
         let entry = self
             .by_tx
@@ -153,4 +176,6 @@ pub enum ClaimSessionError {
     UnknownTransaction,
     /// Already has a session key.
     AlreadyClaimed,
+    /// Channel distinct-session capacity exceeded (D-015).
+    CapacityExceeded,
 }

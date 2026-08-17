@@ -143,3 +143,25 @@ pub fn build_transaction_end(
         diagnostics: vec![],
     }
 }
+
+/// Bound a diagnostic list by count and per-message bytes (D-015).
+pub fn bound_diagnostics(
+    mut diagnostics: Vec<monoloop_contracts::TransactionDiagnostic>,
+    max_count: usize,
+    max_message_bytes: usize,
+) -> Vec<monoloop_contracts::TransactionDiagnostic> {
+    if diagnostics.len() > max_count {
+        diagnostics.truncate(max_count.max(1));
+    }
+    for d in &mut diagnostics {
+        if let Some(ref mut msg) = d.diagnostic.message {
+            if msg.len() > max_message_bytes {
+                msg.truncate(max_message_bytes);
+                while !msg.is_char_boundary(msg.len()) {
+                    msg.pop();
+                }
+            }
+        }
+    }
+    diagnostics
+}

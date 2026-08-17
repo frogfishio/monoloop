@@ -108,6 +108,14 @@ pub struct ActorSpawn {
     pub max_tool_payload_bytes: usize,
     /// Transaction-wide tool output cap (D-015).
     pub max_tool_output_bytes: usize,
+    /// Channel-bound max encoded exchange body (D-015).
+    pub max_encoded_exchange_bytes: usize,
+    /// Channel-bound max concurrent distinct sessions (D-015).
+    pub max_distinct_sessions: usize,
+    /// Max diagnostics retained on terminal (D-015).
+    pub max_diagnostic_count: usize,
+    /// Max bytes per diagnostic message (D-015).
+    pub max_diagnostic_bytes: usize,
     /// Closed only after registry install succeeds (D-009).
     pub start_gate: oneshot::Receiver<()>,
 }
@@ -167,8 +175,13 @@ async fn run_actor(spawn: ActorSpawn) {
         max_tool_schema_bytes,
         max_tool_payload_bytes,
         max_tool_output_bytes,
+        max_encoded_exchange_bytes,
+        max_distinct_sessions,
+        max_diagnostic_count,
+        max_diagnostic_bytes,
         start_gate,
     } = spawn;
+    let _ = (max_diagnostic_count, max_diagnostic_bytes);
 
     // D-009: do not perform I/O or callbacks until admission installs us.
     match start_gate.await {
@@ -319,10 +332,17 @@ async fn run_actor(spawn: ActorSpawn) {
                 let key = SessionKey::new(channel_id.clone(), sid);
                 if session_key.is_none() {
                     let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-                    match reg.claim_session(transaction_id, key.clone()) {
+                    match reg.claim_session(
+                        transaction_id,
+                        key.clone(),
+                        Some(max_distinct_sessions),
+                    ) {
                         Ok(()) => {}
                         Err(ClaimSessionError::Collision) => {
                             return Err(TransactionEndKind::InvariantFailed);
+                        }
+                        Err(ClaimSessionError::CapacityExceeded) => {
+                            return Err(TransactionEndKind::LimitExceeded);
                         }
                         Err(_) => return Err(TransactionEndKind::InvariantFailed),
                     }
@@ -387,10 +407,13 @@ async fn run_actor(spawn: ActorSpawn) {
             let key = SessionKey::new(channel_id.clone(), sid.clone());
             {
                 let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-                match reg.claim_session(transaction_id, key.clone()) {
+                match reg.claim_session(transaction_id, key.clone(), Some(max_distinct_sessions)) {
                     Ok(()) => {}
                     Err(ClaimSessionError::Collision) => {
                         return Err(TransactionEndKind::InvariantFailed);
+                    }
+                    Err(ClaimSessionError::CapacityExceeded) => {
+                        return Err(TransactionEndKind::LimitExceeded);
                     }
                     Err(_) => return Err(TransactionEndKind::InvariantFailed),
                 }
@@ -456,6 +479,7 @@ async fn run_actor(spawn: ActorSpawn) {
             let event_tx_c = event_tx.clone();
             let guard_c = Arc::clone(&guard);
             let channel_c = channel_id.clone();
+            let max_distinct = max_distinct_sessions;
             let join = tokio::spawn(async move {
                 let Ok(ext) = sess_rx.await else {
                     return Ok::<(), TransactionEndKind>(());
@@ -464,10 +488,13 @@ async fn run_actor(spawn: ActorSpawn) {
                 let key = SessionKey::new(channel_c.clone(), sid);
                 {
                     let mut reg = registry_c.lock().unwrap_or_else(|e| e.into_inner());
-                    match reg.claim_session(transaction_id, key.clone()) {
+                    match reg.claim_session(transaction_id, key.clone(), Some(max_distinct)) {
                         Ok(()) => {}
                         Err(ClaimSessionError::Collision) => {
                             return Err(TransactionEndKind::InvariantFailed);
+                        }
+                        Err(ClaimSessionError::CapacityExceeded) => {
+                            return Err(TransactionEndKind::LimitExceeded);
                         }
                         Err(_) => return Err(TransactionEndKind::InvariantFailed),
                     }
@@ -529,6 +556,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 interpretation_limits: InterpretationLimits::default(),
                 deadline,
                 cleanup_deadline,
+                max_encoded_exchange_bytes,
                 unit_tx: Some(live_tx),
                 session_id_tx,
             }) => r,
@@ -682,8 +710,10 @@ async fn run_actor(spawn: ActorSpawn) {
                             },
                         )
                         .map_err(|_| TransactionEndKind::EncodingFailed)?;
-                    // D-015: continuation context + provider input aggregate bounds.
-                    if encoded.bytes.len() > max_continuation_context_bytes {
+                    // D-015: continuation context + channel encoded + provider input aggregates.
+                    if encoded.bytes.len() > max_continuation_context_bytes
+                        || encoded.bytes.len() > max_encoded_exchange_bytes
+                    {
                         return Err(TransactionEndKind::LimitExceeded);
                     }
                     provider_input_bytes = provider_input_bytes.saturating_add(encoded.bytes.len());
@@ -736,6 +766,7 @@ async fn run_actor(spawn: ActorSpawn) {
                             interpretation_limits: InterpretationLimits::default(),
                             deadline,
                             cleanup_deadline,
+                            max_encoded_exchange_bytes,
                             unit_tx: Some(live_tx2),
                         }) => r,
                     }

@@ -195,7 +195,9 @@ pub fn admit(
         capacity.release(&channel_for_release);
     });
 
-    let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(1);
+    // Control is cancel/force only; capacity is still taken from max_actor_commands (D-015).
+    let control_cap = ctx.limits.max_actor_commands.max(1);
+    let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(control_cap);
     let event_cap = ctx.limits.max_event_queue.max(1);
     let (raw_event_tx, event_rx) = mpsc::channel(event_cap);
     let event_tx = BoundedEventSender::new(raw_event_tx, ctx.limits.max_event_queue_bytes);
@@ -264,6 +266,10 @@ pub fn admit(
         max_tool_schema_bytes: ctx.limits.max_tool_schema_bytes,
         max_tool_payload_bytes: ctx.limits.max_tool_payload_bytes,
         max_tool_output_bytes: ctx.limits.max_tool_output_bytes,
+        max_encoded_exchange_bytes: live.binding.limits.max_encoded_exchange_bytes,
+        max_distinct_sessions: live.binding.limits.max_distinct_sessions,
+        max_diagnostic_count: ctx.limits.max_diagnostic_count,
+        max_diagnostic_bytes: ctx.limits.max_diagnostic_bytes,
         start_gate: start_rx,
     });
 
@@ -295,7 +301,7 @@ pub fn admit(
                 "runtime is not accepting submissions",
             ));
         }
-        if let Err(kind) = reg.insert(entry) {
+        if let Err(kind) = reg.insert(entry, Some(live.binding.limits.max_distinct_sessions)) {
             drop(reg);
             release_capacity();
             drop(start_tx);

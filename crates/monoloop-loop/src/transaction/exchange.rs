@@ -79,6 +79,8 @@ pub struct ExchangeParams<'a> {
     pub deadline: Duration,
     /// Join/abort grace for exchange children after cancel or terminal (D-012).
     pub cleanup_deadline: Duration,
+    /// Channel max encoded body size (D-015).
+    pub max_encoded_exchange_bytes: usize,
     /// Optional live unit sink (D-011); when set, units are forwarded as produced.
     pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
     /// Optional oneshot: authoritative external session id immediately after open (D-013).
@@ -109,6 +111,8 @@ pub struct EncodedExchangeParams<'a> {
     pub deadline: Duration,
     /// Join/abort grace for exchange children after cancel or terminal (D-012).
     pub cleanup_deadline: Duration,
+    /// Channel max encoded body size (D-015).
+    pub max_encoded_exchange_bytes: usize,
     /// Optional live unit sink (D-011); when set, units are forwarded as produced.
     pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
 }
@@ -126,6 +130,9 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
             tools: params.tools,
         })
         .map_err(|_| ExchangeFailure::EncodingFailed)?;
+    if encoded.bytes.len() > params.max_encoded_exchange_bytes {
+        return Err(ExchangeFailure::EncodingFailed);
+    }
 
     open_and_run(
         exchange_id,
@@ -148,6 +155,9 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
 pub async fn run_encoded_exchange(
     params: EncodedExchangeParams<'_>,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
+    if params.encoded.bytes.len() > params.max_encoded_exchange_bytes {
+        return Err(ExchangeFailure::EncodingFailed);
+    }
     open_and_run(
         params.exchange_id,
         params.connector,

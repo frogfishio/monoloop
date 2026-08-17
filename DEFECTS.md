@@ -336,7 +336,7 @@ for the entire response with no transaction byte/item bound.
 
 **Priority:** P1
 **Status:** Fixed (partial→stronger, 2026-08-18) — ExchangeGuard +
-`cleanup_deadline` join grace on cancel/terminal; residual deep matrix thin
+`cleanup_deadline` join grace; cancel-during-slow-open releases capacity
 **Affected:**
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - `crates/monoloop-loop/src/transaction/exchange.rs`
@@ -369,8 +369,10 @@ concurrent child cancellation/join.
       (not a hard-coded grace).
 - [x] Non-default `cleanup_deadline` path tested
       (`cleanup_deadline_non_default_completes`).
-- [ ] Residual: exhaustive open/send/response-wait matrix against a
-      deliberately non-responsive provider fixture.
+- [x] Cancel during delayed open leaves zero capacity
+      (`cancel_during_slow_open_releases_capacity`).
+- [ ] Residual: send/response-wait matrix against a deliberately
+      non-responsive provider body fixture.
 
 ## D-013: External session create and reuse do not attach authoritative provider sessions
 
@@ -461,8 +463,8 @@ incompatible.
 
 **Priority:** P1
 **Status:** Fixed (partial→stronger, 2026-08-18) — admission/actor/dispatcher
-enforce the high-value matrix; residual: actor-command byte queue, channel
-distinct-session tracking, diagnostic caps, full cleanup_deadline matrix
++ distinct sessions + encoded exchange + diagnostic bound helper; residual:
+actor-command *byte* budget (control is enum-only), full non-responsive matrix
 **Affected:**
 - `crates/monoloop-contracts/src/limits.rs`
 - `crates/monoloop-loop/src/transaction/admission.rs`
@@ -502,8 +504,14 @@ runtime configuration. Event queues are item-bounded only.
 - [x] Event queues enforce item and byte capacity (`BoundedEventSender`).
 - [x] Tool and provider aggregate limits select `LimitExceeded` / reject paths.
 - [x] Tests demonstrate configured non-default values, not only defaults.
-- [ ] Residual: actor-command byte budget, channel distinct sessions,
-      diagnostic count/bytes, full cleanup_deadline join matrix.
+- [x] Channel `max_distinct_sessions` plus-one at admission
+      (`distinct_sessions_plus_one_rejected`).
+- [x] Channel `max_encoded_exchange_bytes` fails closed
+      (`encoded_exchange_bytes_plus_one_fails`).
+- [x] `bound_diagnostics` enforces count + message bytes.
+- [x] Control channel capacity taken from `max_actor_commands`.
+- [ ] Residual: actor-command *byte* budget (messages are closed enums),
+      deeper non-responsive provider matrix.
 
 ## D-016: OpenAI tool calls can execute before the provider finishes declaring them
 
@@ -869,10 +877,10 @@ considered delivered while these remain.
 | D-009 | Fixed | start_gate; install under Accepting+registry lock |
 | D-010 | Fixed | shared Arc state; re-check under lock |
 | D-011 | Fixed | live canonical unit fan-out during exchange |
-| D-012 | Fixed (partial→stronger) | cleanup_deadline join grace; cancel joins live/claim; residual non-responsive matrix |
+| D-012 | Fixed (partial→stronger) | cleanup_deadline; cancel during slow open; residual send/wait matrix |
 | D-013 | Fixed | attach create+load; create_mode; provider id after open; known maps shared |
 | D-014 | Fixed | MCP install before attach; initial_mcp on create; no CreationOnly refresh |
-| D-015 | Fixed (partial→stronger) | admission messages/input/tools/schema; event bytes; tool payload/output caps; plus-one tests |
+| D-015 | Fixed (partial→stronger) | + distinct sessions; encoded exchange; bound_diagnostics; actor command cap |
 | D-016 | Fixed | Ready only on `tool_calls` finish |
 | D-017 | Fixed | single ExchangeId |
 | D-018 | Fixed | shared per-token service; real HTTP initialize/list/call; body 1MiB; scoped revoke |
@@ -882,4 +890,4 @@ considered delivered while these remain.
 | D-022 | Fixed | Rejected → CanonicalToolResult |
 | D-023 | Fixed | empty extension allowlist denies all extensions |
 | D-024 | Fixed | RegisteredTool::try_new validates policy vs handler supports_* |
-| D-025 | Partial | residual D-015/D-012/D-021 depth items; panic isolation + cleanup_deadline strengthened; full R-000 re-sign-off still open |
+| D-025 | Partial | residual depth items thin; limit/cancel matrix expanded; full R-000 re-sign-off still open |
