@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 /// High-level dialect family (not an encoder/decoder implementation).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DialectFamily {
-    /// OpenAI Responses-style SSE.
+    /// OpenAI Chat Completions v1 (streaming SSE) — first direct-LLM dialect.
+    OpenAiChatCompletions,
+    /// OpenAI Responses-style SSE (later dialect).
     OpenAiResponses,
     /// Anthropic Messages SSE.
     AnthropicMessages,
@@ -52,6 +54,16 @@ pub struct DialectDescriptor {
 }
 
 impl DialectDescriptor {
+    /// OpenAI Chat Completions streaming SSE (direct-LLM).
+    pub fn openai_chat_completions(version: impl Into<String>) -> Self {
+        Self {
+            family: DialectFamily::OpenAiChatCompletions,
+            version: version.into(),
+            framing: "sse".into(),
+            profile: Some("openai_chat_completions".into()),
+        }
+    }
+
     /// ACP / JSON-RPC dialect used by Grok Build.
     pub fn acp_json_rpc(version: impl Into<String>) -> Self {
         Self {
