@@ -108,18 +108,8 @@ pub fn spawn_delivery_task(
     tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
             let bytes = item.approx_bytes;
-            // D-021: host sink panics must not kill delivery without failure signal.
-            let deliver_fut = catch_unwind(AssertUnwindSafe(|| sink.deliver(item.event)));
-            let result = match deliver_fut {
-                Ok(fut) => {
-                    // Bound individual delivery waits (terminal path uses ack deadline separately).
-                    match tokio::time::timeout(deliver_deadline, fut).await {
-                        Ok(r) => r,
-                        Err(_) => Err(EventDeliveryError::Failed),
-                    }
-                }
-                Err(_) => Err(EventDeliveryError::Failed),
-            };
+            // D-021: host sink panics (invoke or poll) must not kill delivery.
+            let result = deliver_isolated(&sink, item.event, deliver_deadline).await;
             byte_counter.fetch_sub(
                 bytes.min(byte_counter.load(Ordering::SeqCst)),
                 Ordering::SeqCst,
@@ -147,4 +137,28 @@ pub fn spawn_delivery_task(
             }
         }
     })
+}
+
+/// Invoke sink.deliver and await its future with panic + deadline isolation (D-021).
+async fn deliver_isolated(
+    sink: &Arc<dyn TransactionEventSink>,
+    event: TransactionEvent,
+    deadline: Duration,
+) -> Result<(), EventDeliveryError> {
+    let deliver_fut = catch_unwind(AssertUnwindSafe(|| sink.deliver(event)));
+    let fut = match deliver_fut {
+        Ok(f) => f,
+        Err(_) => return Err(EventDeliveryError::Failed),
+    };
+    // Owned child task: Future::poll panics become JoinError, not delivery-task death.
+    let handle = tokio::spawn(fut);
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(deadline, handle).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => Err(EventDeliveryError::Failed),
+        Err(_) => {
+            abort.abort();
+            Err(EventDeliveryError::Failed)
+        }
+    }
 }

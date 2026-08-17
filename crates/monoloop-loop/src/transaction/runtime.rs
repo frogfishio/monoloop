@@ -261,24 +261,16 @@ impl DefaultTransactionRuntime {
                         entry.guard.sequencer().last_allocated(),
                     );
                     let cb_budget = cb_cfg.min(Duration::from_millis(50));
-                    let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        payload.callback.call(end)
-                    }));
-                    if let Ok(fut) = call {
-                        match tokio::time::timeout(cb_budget, fut).await {
-                            Ok(Ok(())) => supervisor_finalized += 1,
-                            Ok(Err(_)) => {
-                                supervisor_finalized += 1;
-                                callback_failed += 1;
-                            }
-                            Err(_) => {
-                                supervisor_finalized += 1;
-                                callback_aborted += 1;
-                            }
+                    match run_callback_isolated(payload.callback, end, cb_budget).await {
+                        CallbackRun::Ok => supervisor_finalized += 1,
+                        CallbackRun::Failed => {
+                            supervisor_finalized += 1;
+                            callback_failed += 1;
                         }
-                    } else {
-                        supervisor_finalized += 1;
-                        callback_failed += 1;
+                        CallbackRun::Aborted => {
+                            supervisor_finalized += 1;
+                            callback_aborted += 1;
+                        }
                     }
                 } else {
                     supervisor_finalized += 1;
@@ -305,24 +297,15 @@ impl DefaultTransactionRuntime {
                         let cb_budget = cb_cfg.min(
                             deadline_at.saturating_duration_since(tokio::time::Instant::now()),
                         );
-                        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            payload.callback.call(end)
-                        }));
-                        match call {
-                            Ok(fut) => match tokio::time::timeout(cb_budget, fut).await {
-                                Ok(Ok(())) => supervisor_finalized += 1,
-                                Ok(Err(_)) => {
-                                    supervisor_finalized += 1;
-                                    callback_failed += 1;
-                                }
-                                Err(_) => {
-                                    supervisor_finalized += 1;
-                                    callback_aborted += 1;
-                                }
-                            },
-                            Err(_) => {
+                        match run_callback_isolated(payload.callback, end, cb_budget).await {
+                            CallbackRun::Ok => supervisor_finalized += 1,
+                            CallbackRun::Failed => {
                                 supervisor_finalized += 1;
                                 callback_failed += 1;
+                            }
+                            CallbackRun::Aborted => {
+                                supervisor_finalized += 1;
+                                callback_aborted += 1;
                             }
                         }
                     } else {
@@ -340,12 +323,9 @@ impl DefaultTransactionRuntime {
                             EventDeliveryOutcome::Failed,
                             0,
                         );
-                        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            payload.callback.call(end)
-                        }));
-                        if let Ok(fut) = call {
-                            let _ = tokio::time::timeout(Duration::from_millis(50), fut).await;
-                        }
+                        let _ =
+                            run_callback_isolated(payload.callback, end, Duration::from_millis(50))
+                                .await;
                         supervisor_finalized += 1;
                     }
                 }
@@ -366,24 +346,15 @@ impl DefaultTransactionRuntime {
                         let cb_budget = cb_cfg
                             .min(deadline_at.saturating_duration_since(tokio::time::Instant::now()))
                             .min(Duration::from_millis(200));
-                        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            payload.callback.call(end)
-                        }));
-                        match call {
-                            Ok(fut) => match tokio::time::timeout(cb_budget, fut).await {
-                                Ok(Ok(())) => supervisor_finalized += 1,
-                                Ok(Err(_)) => {
-                                    supervisor_finalized += 1;
-                                    callback_failed += 1;
-                                }
-                                Err(_) => {
-                                    supervisor_finalized += 1;
-                                    callback_aborted += 1;
-                                }
-                            },
-                            Err(_) => {
+                        match run_callback_isolated(payload.callback, end, cb_budget).await {
+                            CallbackRun::Ok => supervisor_finalized += 1,
+                            CallbackRun::Failed => {
                                 supervisor_finalized += 1;
                                 callback_failed += 1;
+                            }
+                            CallbackRun::Aborted => {
+                                supervisor_finalized += 1;
+                                callback_aborted += 1;
                             }
                         }
                     } else {
@@ -408,6 +379,38 @@ impl DefaultTransactionRuntime {
             callback_aborted,
             invariant_failed,
         }
+    }
+}
+
+/// Outcome of a supervisor-invoked completion callback (D-021).
+enum CallbackRun {
+    Ok,
+    Failed,
+    Aborted,
+}
+
+/// Invoke + await host callback with panic isolation on a child task (D-021).
+async fn run_callback_isolated(
+    callback: Box<dyn monoloop_contracts::CompletionCallback>,
+    end: monoloop_contracts::TransactionEnd,
+    deadline: Duration,
+) -> CallbackRun {
+    let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
+    match call {
+        Ok(fut) => {
+            let handle = tokio::spawn(fut);
+            let abort = handle.abort_handle();
+            match tokio::time::timeout(deadline, handle).await {
+                Ok(Ok(Ok(()))) => CallbackRun::Ok,
+                Ok(Ok(Err(_))) => CallbackRun::Failed,
+                Ok(Err(_)) => CallbackRun::Failed, // join error = panic in future
+                Err(_) => {
+                    abort.abort();
+                    CallbackRun::Aborted
+                }
+            }
+        }
+        Err(_) => CallbackRun::Failed, // panic at invoke
     }
 }
 

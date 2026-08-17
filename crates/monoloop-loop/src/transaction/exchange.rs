@@ -77,6 +77,8 @@ pub struct ExchangeParams<'a> {
     pub interpretation_limits: InterpretationLimits,
     /// Overall deadline for the exchange.
     pub deadline: Duration,
+    /// Join/abort grace for exchange children after cancel or terminal (D-012).
+    pub cleanup_deadline: Duration,
     /// Optional live unit sink (D-011); when set, units are forwarded as produced.
     pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
     /// Optional oneshot: authoritative external session id immediately after open (D-013).
@@ -105,6 +107,8 @@ pub struct EncodedExchangeParams<'a> {
     pub interpretation_limits: InterpretationLimits,
     /// Overall deadline for the exchange.
     pub deadline: Duration,
+    /// Join/abort grace for exchange children after cancel or terminal (D-012).
+    pub cleanup_deadline: Duration,
     /// Optional live unit sink (D-011); when set, units are forwarded as produced.
     pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
 }
@@ -133,6 +137,7 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
         params.interpreter,
         params.interpretation_limits,
         params.deadline,
+        params.cleanup_deadline,
         params.unit_tx,
         params.session_id_tx,
     )
@@ -153,6 +158,7 @@ pub async fn run_encoded_exchange(
         params.interpreter,
         params.interpretation_limits,
         params.deadline,
+        params.cleanup_deadline,
         params.unit_tx,
         None,
     )
@@ -170,6 +176,7 @@ async fn open_and_run(
     interpreter: &dyn InterpreterFactory,
     interpretation_limits: InterpretationLimits,
     deadline: Duration,
+    cleanup_deadline: Duration,
     unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
     session_id_tx: Option<oneshot::Sender<monoloop_contracts::ExternalSessionId>>,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
@@ -203,6 +210,7 @@ async fn open_and_run(
         interpreter,
         interpretation_limits,
         deadline,
+        cleanup_deadline,
         unit_tx,
     )
     .await
@@ -217,8 +225,10 @@ async fn run_opened_exchange(
     interpreter: &dyn InterpreterFactory,
     limits: InterpretationLimits,
     deadline: Duration,
+    cleanup_deadline: Duration,
     unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
+    let join_grace = cleanup_deadline.max(Duration::from_millis(50));
     let connection_id = opened.connection_id.clone();
     let interpretation = interpreter
         .start(StartInterpretation {
@@ -320,7 +330,7 @@ async fn run_opened_exchange(
             let _ = open_control
                 .terminate(monoloop_connector::TerminationReason::CallerForced);
             units_task.abort();
-            let _ = tokio::time::timeout(Duration::from_millis(200), units_task).await;
+            let _ = tokio::time::timeout(join_grace, units_task).await;
             if let Some(mut joins) = guard.joins.take() {
                 abort_joins(&mut joins).await;
             }
@@ -335,10 +345,12 @@ async fn run_opened_exchange(
         } => ends,
     };
 
-    // Normal path: join children within cleanup grace (D-012).
-    let join_grace = Duration::from_millis(500);
+    // Normal path: join children within cleanup_deadline (D-012).
     if let Some(mut joins) = guard.joins.take() {
-        let _ = tokio::time::timeout(join_grace, joins.join_next()).await;
+        let _ = tokio::time::timeout(join_grace, async {
+            while joins.join_next().await.is_some() {}
+        })
+        .await;
         abort_joins(&mut joins).await;
     }
     let _ = guard.units_abort.take();
