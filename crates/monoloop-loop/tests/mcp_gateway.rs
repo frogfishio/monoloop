@@ -387,7 +387,7 @@ async fn http_active_capability_accepts_repeated_posts() {
     let client = reqwest::Client::new();
     // Minimal JSON-RPC-shaped posts; Streamable HTTP may reject protocol-incomplete
     // bodies, but must not 404 the active capability, and must stay consistent across calls.
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
     let mut statuses = Vec::new();
     for _ in 0..3 {
         let resp = client
@@ -409,6 +409,253 @@ async fn http_active_capability_accepts_repeated_posts() {
     // All three requests hit the same route (stable non-404 outcomes).
     assert_eq!(statuses[0], statuses[1]);
     assert_eq!(statuses[1], statuses[2]);
+    gw.shutdown().await;
+}
+
+const MCP_PROTOCOL: &str = "2025-03-26";
+
+fn mcp_init_body(id: u64) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id},"method":"initialize","params":{{"protocolVersion":"{MCP_PROTOCOL}","capabilities":{{}},"clientInfo":{{"name":"monoloop-e2e","version":"0"}}}}}}"#
+    )
+}
+
+/// Extract first JSON-RPC object from a JSON body or SSE `data:` frames.
+fn first_jsonrpc_value(body: &str) -> Option<serde_json::Value> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{') {
+        return serde_json::from_str(trimmed).ok();
+    }
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// D-018: real Streamable HTTP initialize → initialized → tools/list → tools/call.
+#[tokio::test]
+async fn http_mcp_initialize_list_call_sequence() {
+    let gw = McpGateway::bind_loopback(8).await.unwrap();
+    let (_, tools) = resolved_echo();
+    let d = build_dispatcher(tools.clone());
+    let pending = gw
+        .install_pending(TransactionId::generate(), tools, d, ExchangeId::generate())
+        .unwrap();
+    gw.activate(&pending.token).unwrap();
+    let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+    let client = reqwest::Client::new();
+
+    // 1) initialize
+    let init_resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", MCP_PROTOCOL)
+        .body(mcp_init_body(1))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        init_resp.status().is_success(),
+        "initialize status={}",
+        init_resp.status()
+    );
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .expect("Mcp-Session-Id on initialize response");
+    let init_body = init_resp.text().await.unwrap();
+    let init_msg = first_jsonrpc_value(&init_body)
+        .unwrap_or_else(|| panic!("initialize JSON-RPC body missing; body={init_body:?}"));
+    assert!(
+        init_msg.get("result").is_some(),
+        "initialize must return result, got {init_msg}"
+    );
+
+    // 2) notifications/initialized (same session)
+    let notify_resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL)
+        .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        notify_resp.status().is_success() || notify_resp.status() == reqwest::StatusCode::ACCEPTED,
+        "initialized notification status={}",
+        notify_resp.status()
+    );
+
+    // 3) tools/list
+    let list_resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL)
+        .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        list_resp.status().is_success(),
+        "tools/list status={}",
+        list_resp.status()
+    );
+    let list_body = list_resp.text().await.unwrap();
+    let list_msg = first_jsonrpc_value(&list_body).expect("tools/list JSON-RPC body");
+    let tools = list_msg
+        .pointer("/result/tools")
+        .and_then(|t| t.as_array())
+        .expect("result.tools array");
+    assert!(
+        tools
+            .iter()
+            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("echo")),
+        "tools/list must include echo: {list_msg}"
+    );
+
+    // 4) tools/call
+    let call_resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL)
+        .body(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"q":"hi"}}}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        call_resp.status().is_success(),
+        "tools/call status={}",
+        call_resp.status()
+    );
+    let call_body = call_resp.text().await.unwrap();
+    let call_msg = first_jsonrpc_value(&call_body).expect("tools/call JSON-RPC body");
+    assert!(
+        call_msg.get("result").is_some() && call_msg.get("error").is_none(),
+        "tools/call must succeed: {call_msg}"
+    );
+    // Echo handler returns JSON {"ok": true} as text content block.
+    let content_text = call_msg
+        .pointer("/result/content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|block| block.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    assert!(
+        content_text.contains("ok")
+            || call_msg.pointer("/result/isError") == Some(&serde_json::json!(false)),
+        "tools/call content unexpected: {call_msg}"
+    );
+
+    gw.shutdown().await;
+}
+
+/// D-018: pending (not activated) capability rejects tools/list after initialize.
+#[tokio::test]
+async fn http_mcp_pending_token_rejects_tools_list() {
+    let gw = McpGateway::bind_loopback(4).await.unwrap();
+    let (_, tools) = resolved_echo();
+    let d = build_dispatcher(tools.clone());
+    let pending = gw
+        .install_pending(TransactionId::generate(), tools, d, ExchangeId::generate())
+        .unwrap();
+    // deliberately not activated
+    let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+    let client = reqwest::Client::new();
+
+    let init_resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", MCP_PROTOCOL)
+        .body(mcp_init_body(1))
+        .send()
+        .await
+        .unwrap();
+    assert!(init_resp.status().is_success());
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .expect("session id");
+    let _ = init_resp.text().await;
+
+    let _ = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL)
+        .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    let list_resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", MCP_PROTOCOL)
+        .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+        .send()
+        .await
+        .unwrap();
+    let list_body = list_resp.text().await.unwrap();
+    let list_msg = first_jsonrpc_value(&list_body).expect("tools/list body");
+    assert!(
+        list_msg.get("error").is_some(),
+        "pending capability must error tools/list: {list_msg}"
+    );
+
+    gw.shutdown().await;
+}
+
+/// D-018: revoked capability 404s subsequent HTTP traffic.
+#[tokio::test]
+async fn http_mcp_revoked_token_is_404() {
+    let gw = McpGateway::bind_loopback(4).await.unwrap();
+    let (_, tools) = resolved_echo();
+    let d = build_dispatcher(tools.clone());
+    let pending = gw
+        .install_pending(TransactionId::generate(), tools, d, ExchangeId::generate())
+        .unwrap();
+    gw.activate(&pending.token).unwrap();
+    let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+    assert!(gw.revoke(&pending.token));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", MCP_PROTOCOL)
+        .body(mcp_init_body(1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     gw.shutdown().await;
 }
 

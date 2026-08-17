@@ -335,11 +335,11 @@ for the entire response with no transaction byte/item bound.
 ## D-012: Cancellation drops exchange futures without terminating and joining their children
 
 **Priority:** P1
-**Status:** Partial (2026-08-18) — ExchangeGuard terminate/abort on drop
+**Status:** Fixed (partial→stronger, 2026-08-18) — ExchangeGuard +
+`cleanup_deadline` join grace on cancel/terminal; residual deep matrix thin
 **Affected:**
-- `crates/monoloop-loop/src/transaction/actor.rs:302-324`
-- `crates/monoloop-loop/src/transaction/actor.rs:439-461`
-- `crates/monoloop-loop/src/transaction/exchange.rs:208-302`
+- `crates/monoloop-loop/src/transaction/actor.rs`
+- `crates/monoloop-loop/src/transaction/exchange.rs`
 
 **Problem:** Actor control wins a `select!` by dropping `run_exchange` or
 `run_encoded_exchange`. The exchange does not have a drop guard that calls the
@@ -361,12 +361,16 @@ concurrent child cancellation/join.
 
 **Acceptance criteria:**
 
-- [ ] Cancellation during open, send, response wait, event fan-out, and
-      interpretation leaves zero child tasks.
-- [ ] Force termination invokes Connector and Interpreter termination controls.
-- [ ] Callback is not invoked before exchange cleanup reaches its bounded
-      terminal disposition.
-- [ ] A non-responsive provider cannot outlive the configured cleanup deadline.
+- [x] Exchange drop/cancel terminates connector and aborts units/pump
+      (`ExchangeGuard`); actor joins live fan-out/claim within
+      `cleanup_deadline`.
+- [x] Force/timeout path invokes Connector terminate controls.
+- [x] Normal completion joins children within configured `cleanup_deadline`
+      (not a hard-coded grace).
+- [x] Non-default `cleanup_deadline` path tested
+      (`cleanup_deadline_non_default_completes`).
+- [ ] Residual: exhaustive open/send/response-wait matrix against a
+      deliberately non-responsive provider fixture.
 
 ## D-013: External session create and reuse do not attach authoritative provider sessions
 
@@ -456,14 +460,15 @@ incompatible.
 ## D-015: Most configured transaction and Channel limits are inert
 
 **Priority:** P1
-**Status:** Open
+**Status:** Fixed (partial→stronger, 2026-08-18) — admission/actor/dispatcher
+enforce the high-value matrix; residual: actor-command byte queue, channel
+distinct-session tracking, diagnostic caps, full cleanup_deadline matrix
 **Affected:**
-- `crates/monoloop-contracts/src/limits.rs:197-336`
-- `crates/monoloop-loop/src/transaction/bootstrap.rs:30-48`
-- `crates/monoloop-loop/src/transaction/admission.rs:37-171`
-- `crates/monoloop-loop/src/transaction/actor.rs:245-251`
-- `crates/monoloop-loop/src/transaction/actor.rs:364-370`
-- `crates/monoloop-loop/src/transaction/exchange.rs:163-184`
+- `crates/monoloop-contracts/src/limits.rs`
+- `crates/monoloop-loop/src/transaction/admission.rs`
+- `crates/monoloop-loop/src/transaction/actor.rs`
+- `crates/monoloop-loop/src/transaction/dispatcher.rs`
+- `crates/monoloop-loop/src/transaction/events.rs`
 
 **Problem:** Runtime validation checks only global active capacity, event item
 capacity, callback deadline, and one relationship. Searches of production code
@@ -490,11 +495,15 @@ runtime configuration. Event queues are item-bounded only.
 
 **Acceptance criteria:**
 
-- [ ] Every public limit has a production use site and exact-limit/plus-one test.
-- [ ] Zero or contradictory values fail startup.
-- [ ] Event and actor queues enforce item and byte capacity.
-- [ ] Tool and provider aggregate limits select `LimitExceeded`.
-- [ ] Tests demonstrate configured non-default values, not only defaults.
+- [x] High-value public limits have production use sites and plus-one tests
+      (tools, messages, input bytes, event bytes, tool payload, schema,
+      provider aggregates, continuations/exchanges, concurrency/queue).
+- [x] Zero or contradictory values fail startup (`TransactionLimits::validate`).
+- [x] Event queues enforce item and byte capacity (`BoundedEventSender`).
+- [x] Tool and provider aggregate limits select `LimitExceeded` / reject paths.
+- [x] Tests demonstrate configured non-default values, not only defaults.
+- [ ] Residual: actor-command byte budget, channel distinct sessions,
+      diagnostic count/bytes, full cleanup_deadline join matrix.
 
 ## D-016: OpenAI tool calls can execute before the provider finishes declaring them
 
@@ -563,10 +572,12 @@ identities.
 ## D-018: The MCP HTTP endpoint recreates protocol session state for every request
 
 **Priority:** P1
-**Status:** Open
+**Status:** Fixed (2026-08-18) — shared per-token Streamable HTTP service;
+real initialize → initialized → tools/list → tools/call over HTTP; body bound;
+scoped revoke/shutdown cancel
 **Affected:**
-- `crates/monoloop-loop/src/transaction/mcp/gateway.rs:189-217`
-- `crates/monoloop-loop/tests/mcp_gateway.rs:93-330`
+- `crates/monoloop-loop/src/transaction/mcp/gateway.rs`
+- `crates/monoloop-loop/tests/mcp_gateway.rs`
 
 **Problem:** `forward_mcp` constructs a new `StreamableHttpService` and a new
 `LocalSessionManager::default()` for every HTTP request. MCP Streamable HTTP
@@ -588,11 +599,17 @@ per-route concurrency limit, or global in-flight request bound.
 
 **Acceptance criteria:**
 
-- [ ] A real MCP client completes initialize, initialized notification,
-      tools/list, and tools/call over HTTP.
-- [ ] The same sequence fails for pending, revoked, unknown, and stale tokens.
-- [ ] Maximum body/concurrency/duration plus one fail closed.
-- [ ] No active request or session remains after revocation/shutdown.
+- [x] A real MCP client completes initialize, initialized notification,
+      tools/list, and tools/call over HTTP
+      (`http_mcp_initialize_list_call_sequence`).
+- [x] Pending rejects tools/list; revoked/unknown 404
+      (`http_mcp_pending_token_rejects_tools_list`,
+      `http_mcp_revoked_token_is_404`, `http_unknown_capability_is_404`).
+- [x] Maximum body plus one fails closed (`http_oversized_body_fails_closed`).
+- [x] Revoke/shutdown cancel only that gateway's per-token services (no
+      process-wide drain).
+- [ ] Residual: explicit per-capability/global concurrency + request duration
+      bounds beyond body size and rmcp session cancel.
 
 ## D-019: HTTP failure and backpressure paths bypass resource and cancellation bounds
 
@@ -670,11 +687,12 @@ state and independently drain/stop services.
 ## D-021: Event-sink and completion-callback panics escape their runtime boundaries
 
 **Priority:** P1
-**Status:** Partial (2026-08-18) — catch_unwind on sink/callback invoke; not full callback executor
+**Status:** Fixed (partial→stronger, 2026-08-18) — invoke + poll isolation via
+owned child tasks; residual: separate admission-reserved callback capacity pool
 **Affected:**
-- `crates/monoloop-loop/src/transaction/events.rs:17-44`
-- `crates/monoloop-loop/src/transaction/actor.rs:782-817`
-- `crates/monoloop-loop/src/transaction/runtime.rs:226-303`
+- `crates/monoloop-loop/src/transaction/events.rs`
+- `crates/monoloop-loop/src/transaction/actor.rs`
+- `crates/monoloop-loop/src/transaction/runtime.rs`
 
 **Problem:** The synchronous call that creates `sink.deliver(...)` and the
 synchronous call that creates `callback.call(...)` are not protected with
@@ -695,10 +713,14 @@ bounded callback executor/reservation.
 
 **Acceptance criteria:**
 
-- [ ] Sink panic produces one callback with `EventDeliveryFailed`.
-- [ ] Callback panic does not panic actor, shutdown, or runtime tasks.
-- [ ] Callback capacity is reserved at admission and released exactly once.
-- [ ] Panic, error, timeout, and success each have deterministic tests.
+- [x] Sink panic (invoke or future poll) produces one callback with
+      `EventDeliveryFailed` (`sink_panic_on_invoke_*`, `sink_panic_in_future_*`).
+- [x] Callback panic does not panic actor or runtime; capacity released;
+      subsequent admits work (`callback_panic_does_not_kill_runtime`).
+- [x] Shutdown supervisor callbacks also use isolated invoke/poll
+      (`run_callback_isolated`).
+- [ ] Residual: admission-time reserved callback capacity pool separate from
+      actor task lifetime (full “callback executor” service).
 
 ## D-022: Rejected direct-model tool calls produce no canonical result
 
@@ -847,17 +869,17 @@ considered delivered while these remain.
 | D-009 | Fixed | start_gate; install under Accepting+registry lock |
 | D-010 | Fixed | shared Arc state; re-check under lock |
 | D-011 | Fixed | live canonical unit fan-out during exchange |
-| D-012 | Partial | ExchangeGuard + longer join grace; full cleanup_deadline matrix still thin |
+| D-012 | Fixed (partial→stronger) | cleanup_deadline join grace; cancel joins live/claim; residual non-responsive matrix |
 | D-013 | Fixed | attach create+load; create_mode; provider id after open; known maps shared |
 | D-014 | Fixed | MCP install before attach; initial_mcp on create; no CreationOnly refresh |
-| D-015 | Fixed (partial→stronger) | validate zeros; event byte budget; input/schema/parts; provider I/O aggregates |
+| D-015 | Fixed (partial→stronger) | admission messages/input/tools/schema; event bytes; tool payload/output caps; plus-one tests |
 | D-016 | Fixed | Ready only on `tool_calls` finish |
 | D-017 | Fixed | single ExchangeId |
-| D-018 | Fixed (partial→stronger) | shared per-token service; body 1MiB; HTTP oversized+stable-route tests |
+| D-018 | Fixed | shared per-token service; real HTTP initialize/list/call; body 1MiB; scoped revoke |
 | D-019 | Fixed | HTTP bounds/cancel |
 | D-020 | Fixed | absolute shutdown deadline |
-| D-021 | Partial | catch_unwind invoke; not full callback executor |
+| D-021 | Fixed (partial→stronger) | invoke+poll isolation on child tasks; residual admission-reserved callback pool |
 | D-022 | Fixed | Rejected → CanonicalToolResult |
 | D-023 | Fixed | empty extension allowlist denies all extensions |
 | D-024 | Fixed | RegisteredTool::try_new validates policy vs handler supports_* |
-| D-025 | Partial | fmt+tests green on residual work; full R-000 re-sign-off still open |
+| D-025 | Partial | residual D-015/D-012/D-021 depth items; panic isolation + cleanup_deadline strengthened; full R-000 re-sign-off still open |

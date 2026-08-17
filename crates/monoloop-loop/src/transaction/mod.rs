@@ -32,7 +32,9 @@ pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncode
 pub use bootstrap::{RuntimeBootstrap, RuntimeConfig};
 pub use capacity::CapacityManagers;
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
-pub use dispatcher::{DispatchOutcome, DispatchRequest, TransactionToolDispatcher};
+pub use dispatcher::{
+    DispatchOutcome, DispatchRequest, DispatcherLimits, TransactionToolDispatcher,
+};
 pub use error::StartupError;
 pub use events::{BoundedEventSender, EventQueueFull, QueuedEvent};
 pub use exchange::{

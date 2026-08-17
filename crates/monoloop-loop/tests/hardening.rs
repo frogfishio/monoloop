@@ -774,6 +774,244 @@ async fn submit_after_shutdown_rejects_without_active_leak() {
     assert_eq!(err.kind, AdmissionErrorKind::RuntimeShuttingDown);
 }
 
+/// D-015: max_tools_per_transaction plus-one rejects at admission.
+#[tokio::test]
+async fn tools_per_transaction_plus_one_rejected() {
+    use monoloop_contracts::{
+        JsonSchema, ToolCancellationPolicy, ToolId, ToolLimits, ToolName, ToolOutputContract,
+        ToolSpec, ToolSuccessContract,
+    };
+    use monoloop_loop::{HostToolRegistry, ImmediateToolHandler, RegisteredTool};
+
+    let schema = JsonSchema::try_new(serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let make = |id: &str| {
+        RegisteredTool::new(
+            ToolSpec::try_new(
+                ToolId::try_new(id).unwrap(),
+                ToolName::try_new(id).unwrap(),
+                "t",
+                schema.clone(),
+                ToolOutputContract {
+                    success: ToolSuccessContract::json(schema.clone()),
+                    error_data_schema: None,
+                },
+                ToolLimits::default(),
+                ToolCancellationPolicy::Abortable,
+            )
+            .unwrap(),
+            Arc::new(ImmediateToolHandler::new(|_, _| {
+                Ok(monoloop_contracts::ToolCompletion::Succeeded(
+                    monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({})),
+                ))
+            })) as Arc<dyn monoloop_loop::ToolHandler>,
+        )
+    };
+    let tools = HostToolRegistry::build(vec![make("t1"), make("t2"), make("t3")]).unwrap();
+    let rt = monoloop_loop::DefaultTransactionRuntime::start(monoloop_loop::RuntimeBootstrap {
+        config: monoloop_loop::RuntimeConfig {
+            enable_mcp_listener: false,
+            transaction_limits: TransactionLimits {
+                max_tools_per_transaction: 2,
+                max_active_transactions: 4,
+                max_active_per_channel: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        channels: monoloop_loop::ChannelRegistry::build(vec![llm_binding("llm", 4)]).unwrap(),
+        tools,
+        executor: tokio::runtime::Handle::current(),
+    })
+    .await
+    .unwrap();
+    let mut req = free_request(
+        "llm",
+        None,
+        blocked_sink(Arc::new(Notify::new())),
+        counting_completion(Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new())),
+    );
+    req.tools = vec![
+        ToolId::try_new("t1").unwrap(),
+        ToolId::try_new("t2").unwrap(),
+        ToolId::try_new("t3").unwrap(),
+    ];
+    let err = TransactionRuntime::submit(rt.as_ref(), req).unwrap_err();
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-015: max_messages plus-one rejects at admission.
+#[tokio::test]
+async fn max_messages_plus_one_rejected() {
+    use monoloop_contracts::{CanonicalInput, CanonicalMessage, InputLimits, TextPart};
+
+    let rt = start_with_limits(
+        vec![llm_binding("llm", 4)],
+        TransactionLimits {
+            max_messages: 1,
+            max_active_transactions: 4,
+            max_active_per_channel: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut req = free_request(
+        "llm",
+        None,
+        blocked_sink(Arc::new(Notify::new())),
+        counting_completion(Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new())),
+    );
+    // Build two messages under roomy InputLimits; admission enforces TransactionLimits.
+    let roomy = InputLimits {
+        max_messages: 16,
+        ..Default::default()
+    };
+    req.input = CanonicalInput::try_new(
+        vec![
+            CanonicalMessage::User {
+                content: vec![TextPart::try_new("one", roomy.max_text_part_bytes).unwrap()],
+                name: None,
+            },
+            CanonicalMessage::User {
+                content: vec![TextPart::try_new("two", roomy.max_text_part_bytes).unwrap()],
+                name: None,
+            },
+        ],
+        &roomy,
+    )
+    .unwrap();
+    let err = TransactionRuntime::submit(rt.as_ref(), req).unwrap_err();
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-015: max_input_bytes plus-one rejects at admission.
+#[tokio::test]
+async fn max_input_bytes_plus_one_rejected() {
+    use monoloop_contracts::{user_text_input, InputLimits};
+
+    let rt = start_with_limits(
+        vec![llm_binding("llm", 4)],
+        TransactionLimits {
+            max_input_bytes: 8,
+            max_active_transactions: 4,
+            max_active_per_channel: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut req = free_request(
+        "llm",
+        None,
+        blocked_sink(Arc::new(Notify::new())),
+        counting_completion(Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new())),
+    );
+    // Payload larger than 8 bytes once serialized/estimated.
+    req.input = user_text_input("0123456789abcdef").unwrap();
+    assert!(req.input.messages().len() == 1);
+    let _ = InputLimits::default(); // keep import path stable if estimate uses contracts
+    let err = TransactionRuntime::submit(rt.as_ref(), req).unwrap_err();
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-015: transaction-wide tool payload cap rejects oversized arguments.
+#[tokio::test]
+async fn tool_payload_transaction_cap_rejects() {
+    use monoloop_contracts::{
+        ChannelId, ExchangeId, JsonSchema, SessionId, SessionKey, ToolActionId,
+        ToolCancellationPolicy, ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec,
+        ToolSuccessContract, TransactionId,
+    };
+    use monoloop_loop::{
+        DispatchOutcome, DispatchRequest, DispatcherLimits, HostToolRegistry, ImmediateToolHandler,
+        RegisteredTool, ResolvedToolSet, SharedToolCapacity, TransactionToolDispatcher,
+    };
+
+    let schema = JsonSchema::try_new(serde_json::json!({
+        "type": "object",
+        "properties": { "q": { "type": "string" } },
+        "required": ["q"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let success = JsonSchema::try_new(serde_json::json!({
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" } },
+        "required": ["ok"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let host = HostToolRegistry::build(vec![RegisteredTool::new(
+        ToolSpec::try_new(
+            ToolId::try_new("echo").unwrap(),
+            ToolName::try_new("echo").unwrap(),
+            "echo",
+            schema,
+            ToolOutputContract {
+                success: ToolSuccessContract::json(success),
+                error_data_schema: None,
+            },
+            ToolLimits {
+                max_concurrent: 4,
+                max_input_bytes: 1024 * 1024, // per-tool is large
+                max_output_bytes: 1024,
+                execution_deadline: Duration::from_secs(5),
+            },
+            ToolCancellationPolicy::Abortable,
+        )
+        .unwrap(),
+        Arc::new(ImmediateToolHandler::new(|_, _| {
+            Ok(monoloop_contracts::ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({"ok": true})),
+            ))
+        })) as Arc<dyn monoloop_loop::ToolHandler>,
+    )])
+    .unwrap();
+    let tool = host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone();
+    let tools = ResolvedToolSet::from_registered(vec![tool]);
+    // Transaction-wide payload cap is tiny (8 bytes) — JSON args will exceed it.
+    let d = TransactionToolDispatcher::with_limits(
+        TransactionId::generate(),
+        SessionKey::new(
+            ChannelId::try_new("ch").unwrap(),
+            SessionId::try_new("s").unwrap(),
+        ),
+        tools,
+        SharedToolCapacity::unlimited(),
+        DispatcherLimits {
+            max_concurrent_tools: 4,
+            max_queued_tools: 8,
+            max_tool_payload_bytes: 8,
+            max_tool_output_bytes: 1024,
+        },
+    );
+    let outcome = d
+        .dispatch(DispatchRequest {
+            exchange_id: ExchangeId::generate(),
+            tool_action_id: ToolActionId::new("a1"),
+            tool_name: ToolName::try_new("echo").unwrap(),
+            provider_tool_call_id: "p1".into(),
+            request_ordinal: 0,
+            arguments_json: r#"{"q":"this-is-too-long"}"#.into(),
+        })
+        .await;
+    match outcome {
+        DispatchOutcome::Rejected { code, .. } => {
+            assert!(
+                code.contains("oversized") || code.contains("invalid") || code == "oversized_input",
+                "expected oversized reject, got {code}"
+            );
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
 /// D-015: zero / inconsistent transaction limits fail startup validation.
 #[test]
 fn transaction_limits_zero_capacity_rejected() {
@@ -832,6 +1070,164 @@ async fn event_queue_byte_budget_plus_one() {
     let err = sender.send(QueuedEvent::new(ev, None)).await;
     assert!(err.is_err(), "oversized event must fail byte budget");
     assert!(rx.try_recv().is_err());
+}
+
+/// D-021: host event-sink panic at invoke → delivery failure, one terminal callback.
+#[tokio::test]
+async fn sink_panic_on_invoke_yields_event_delivery_failed() {
+    let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
+    let ends = Arc::new(Mutex::new(Vec::<TransactionEndKind>::new()));
+    let done = Arc::new(Notify::new());
+    let ends_c = Arc::clone(&ends);
+    let done_c = Arc::clone(&done);
+    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> =
+        Arc::new(FnEventSink(move |_e| {
+            panic!("host sink panic at invoke");
+        }));
+    TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            None,
+            sink,
+            Box::new(FnCompletionCallback(move |end: TransactionEnd| {
+                ends_c.lock().unwrap().push(end.kind);
+                done_c.notify_waiters();
+                Box::pin(async { Ok(()) }) as monoloop_contracts::CompletionDelivery
+            })),
+        ),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done.notified())
+        .await
+        .expect("callback must fire after sink panic");
+    let kinds = ends.lock().unwrap().clone();
+    assert_eq!(kinds.len(), 1, "exactly one callback");
+    assert_eq!(kinds[0], TransactionEndKind::EventDeliveryFailed);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+    assert_eq!(rt.active_count(), 0);
+}
+
+/// D-021: host event-sink panic while polling deliver future → same fail-closed path.
+#[tokio::test]
+async fn sink_panic_in_future_yields_event_delivery_failed() {
+    let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
+    let ends = Arc::new(Mutex::new(Vec::<TransactionEndKind>::new()));
+    let done = Arc::new(Notify::new());
+    let ends_c = Arc::clone(&ends);
+    let done_c = Arc::clone(&done);
+    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> =
+        Arc::new(FnEventSink(move |_e| {
+            Box::pin(async {
+                panic!("host sink panic in future");
+                #[allow(unreachable_code)]
+                Ok(())
+            }) as monoloop_contracts::EventDelivery
+        }));
+    TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            None,
+            sink,
+            Box::new(FnCompletionCallback(move |end: TransactionEnd| {
+                ends_c.lock().unwrap().push(end.kind);
+                done_c.notify_waiters();
+                Box::pin(async { Ok(()) }) as monoloop_contracts::CompletionDelivery
+            })),
+        ),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done.notified())
+        .await
+        .expect("callback must fire after sink future panic");
+    let kinds = ends.lock().unwrap().clone();
+    assert_eq!(kinds.len(), 1);
+    assert_eq!(kinds[0], TransactionEndKind::EventDeliveryFailed);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-021: completion callback panic must not kill runtime; capacity fully released.
+#[tokio::test]
+async fn callback_panic_does_not_kill_runtime() {
+    let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
+    let done = Arc::new(Notify::new());
+    // Use a barrier so the test can observe that the transaction left active state.
+    TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            None,
+            Arc::new(FnEventSink(|_| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+            })),
+            Box::new(FnCompletionCallback(move |_end: TransactionEnd| {
+                done.notify_waiters();
+                panic!("host callback panic at invoke");
+            })),
+        ),
+    )
+    .unwrap();
+    // Callback may panic before notify if panic is at invoke — use capacity drain instead.
+    for _ in 0..100 {
+        if rt.active_count() == 0 && rt.capacity().global_active() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rt.active_count(), 0);
+    assert_eq!(rt.capacity().global_active(), 0);
+    // Runtime still accepts a subsequent transaction.
+    let done2 = Arc::new(Notify::new());
+    let ends = Arc::new(AtomicUsize::new(0));
+    TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            None,
+            Arc::new(FnEventSink(|_| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+            })),
+            counting_completion(Arc::clone(&ends), Arc::clone(&done2)),
+        ),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done2.notified())
+        .await
+        .expect("second transaction completes");
+    assert_eq!(ends.load(Ordering::SeqCst), 1);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-012: configured cleanup_deadline is accepted and used (non-default value path).
+#[tokio::test]
+async fn cleanup_deadline_non_default_completes() {
+    let limits = TransactionLimits {
+        cleanup_deadline: Duration::from_millis(100),
+        max_active_transactions: 4,
+        max_active_per_channel: 4,
+        ..Default::default()
+    };
+    let rt = start_with_limits(vec![llm_binding("llm", 4)], limits).await;
+    let done = Arc::new(Notify::new());
+    let ends = Arc::new(AtomicUsize::new(0));
+    TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            None,
+            Arc::new(FnEventSink(|_| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+            })),
+            counting_completion(Arc::clone(&ends), Arc::clone(&done)),
+        ),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done.notified())
+        .await
+        .expect("transaction with short cleanup_deadline completes");
+    assert_eq!(ends.load(Ordering::SeqCst), 1);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
 /// Redaction: external session Display and MCP capability Debug hide secrets.

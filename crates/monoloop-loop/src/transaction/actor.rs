@@ -1,7 +1,7 @@
 //! Transaction actor: session establish + one provider exchange + finalization.
 
 use super::active_registry::{ActiveTransactionRegistry, ClaimSessionError, ControlMessage};
-use super::dispatcher::{DispatchOutcome, TransactionToolDispatcher};
+use super::dispatcher::{DispatchOutcome, DispatcherLimits, TransactionToolDispatcher};
 use super::events::{BoundedEventSender, QueuedEvent};
 use super::exchange::{
     run_encoded_exchange, run_exchange, EncodedExchangeParams, ExchangeFailure, ExchangeParams,
@@ -104,6 +104,10 @@ pub struct ActorSpawn {
     pub max_continuation_context_bytes: usize,
     /// Max tool schema aggregate for this transaction's resolved set.
     pub max_tool_schema_bytes: usize,
+    /// Transaction-wide tool payload cap (D-015).
+    pub max_tool_payload_bytes: usize,
+    /// Transaction-wide tool output cap (D-015).
+    pub max_tool_output_bytes: usize,
     /// Closed only after registry install succeeds (D-009).
     pub start_gate: oneshot::Receiver<()>,
 }
@@ -161,6 +165,8 @@ async fn run_actor(spawn: ActorSpawn) {
         max_total_provider_output_bytes,
         max_continuation_context_bytes,
         max_tool_schema_bytes,
+        max_tool_payload_bytes,
+        max_tool_output_bytes,
         start_gate,
     } = spawn;
 
@@ -207,8 +213,8 @@ async fn run_actor(spawn: ActorSpawn) {
             return;
         }
     }
-    // Reserved for exchange child join budgets after cancel/terminal (D-012).
-    let _cleanup_deadline = cleanup_deadline.max(Duration::from_millis(50));
+    // Join/abort grace for exchange children after cancel or terminal (D-012).
+    let cleanup_deadline = cleanup_deadline.max(Duration::from_millis(50));
 
     let mut terminal_kind = TransactionEndKind::Completed;
     let mut attachment: Option<Arc<monoloop_connector::SessionAttachment>> = None;
@@ -238,13 +244,17 @@ async fn run_actor(spawn: ActorSpawn) {
                     let sk = session_key.clone().unwrap_or_else(|| {
                         SessionKey::new(channel_id.clone(), SessionId::generate())
                     });
-                    let dispatcher = TransactionToolDispatcher::new(
+                    let dispatcher = TransactionToolDispatcher::with_limits(
                         transaction_id,
                         sk,
                         tools.clone(),
                         SharedToolCapacity::unlimited(),
-                        max_concurrent_tools,
-                        max_queued_tools,
+                        DispatcherLimits {
+                            max_concurrent_tools,
+                            max_queued_tools,
+                            max_tool_payload_bytes,
+                            max_tool_output_bytes,
+                        },
                     );
                     let pending = handle
                         .install_pending(
@@ -492,10 +502,13 @@ async fn run_actor(spawn: ActorSpawn) {
         let mut outcome = tokio::select! {
             biased;
             ctrl = control_rx.recv() => {
-                // Dropping the exchange future closes live_tx and cleans children (D-012).
+                // Drop exchange future → ExchangeGuard terminates connector + aborts units (D-012).
+                // Join sibling fan-out/claim tasks within cleanup_deadline.
                 live_join.abort();
-                if let Some(j) = &claim_join {
+                let _ = tokio::time::timeout(cleanup_deadline, live_join).await;
+                if let Some(j) = claim_join {
                     j.abort();
+                    let _ = tokio::time::timeout(cleanup_deadline, j).await;
                 }
                 return Err(match ctrl {
                     Some(ControlMessage::ForceTerminate) => TransactionEndKind::Terminated,
@@ -515,6 +528,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 tools: &tool_specs,
                 interpretation_limits: InterpretationLimits::default(),
                 deadline,
+                cleanup_deadline,
                 unit_tx: Some(live_tx),
                 session_id_tx,
             }) => r,
@@ -562,13 +576,17 @@ async fn run_actor(spawn: ActorSpawn) {
                 .clone()
                 .ok_or(TransactionEndKind::InvariantFailed)?;
 
-            let dispatcher = TransactionToolDispatcher::new(
+            let dispatcher = TransactionToolDispatcher::with_limits(
                 transaction_id,
                 sk.clone(),
                 tools.clone(),
                 SharedToolCapacity::unlimited(),
-                max_concurrent_tools,
-                max_queued_tools,
+                DispatcherLimits {
+                    max_concurrent_tools,
+                    max_queued_tools,
+                    max_tool_payload_bytes,
+                    max_tool_output_bytes,
+                },
             );
 
             let mut results: Vec<CanonicalToolResult> = Vec::with_capacity(ready.len());
@@ -698,6 +716,7 @@ async fn run_actor(spawn: ActorSpawn) {
                         biased;
                         ctrl = control_rx.recv() => {
                             live_join2.abort();
+                            let _ = tokio::time::timeout(cleanup_deadline, live_join2).await;
                             return Err(match ctrl {
                                 Some(ControlMessage::ForceTerminate) => {
                                     TransactionEndKind::Terminated
@@ -716,6 +735,7 @@ async fn run_actor(spawn: ActorSpawn) {
                             encoded,
                             interpretation_limits: InterpretationLimits::default(),
                             deadline,
+                            cleanup_deadline,
                             unit_tx: Some(live_tx2),
                         }) => r,
                     }
@@ -1084,12 +1104,29 @@ async fn finalize_and_cleanup(
     release_capacity();
 
     guard.mark_callback_scheduled();
-    // D-021: panics in host callback must not kill the actor task.
-    let call_result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| payload.callback.call(end)));
+    // D-021: invoke + poll panics must not kill the actor; run on an owned child task.
+    invoke_completion_callback(payload.callback, end, callback_deadline).await;
+}
+
+/// Run host completion callback with panic + deadline isolation (D-021).
+async fn invoke_completion_callback(
+    callback: Box<dyn monoloop_contracts::CompletionCallback>,
+    end: monoloop_contracts::TransactionEnd,
+    deadline: Duration,
+) {
+    let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
     match call_result {
         Ok(fut) => {
-            let _ = tokio::time::timeout(callback_deadline, fut).await;
+            let handle = tokio::spawn(fut);
+            let abort = handle.abort_handle();
+            match tokio::time::timeout(deadline, handle).await {
+                Ok(Ok(_)) | Ok(Err(_)) => {
+                    // Join error = panic inside future; terminal cause unchanged.
+                }
+                Err(_) => {
+                    abort.abort();
+                }
+            }
         }
         Err(_) => {
             // Callback panicked at invoke; terminal cause already selected.

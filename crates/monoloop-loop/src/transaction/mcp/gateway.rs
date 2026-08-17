@@ -66,7 +66,11 @@ impl McpGatewayHandle {
 
     /// Revoke one capability (idempotent).
     pub fn revoke(&self, token: &CapabilityToken) -> bool {
-        self.routes.revoke(token)
+        let removed = self.routes.revoke(token);
+        if removed {
+            drop_capability_service(&token.to_hex());
+        }
+        removed
     }
 }
 
@@ -162,9 +166,14 @@ impl McpGateway {
         self.handle.revoke(token)
     }
 
-    /// Shutdown: revoke all routes, stop listener, join serve task.
+    /// Shutdown: revoke this gateway's routes, cancel their MCP services, stop listener.
     pub async fn shutdown(self) {
-        self.handle.routes.revoke_all();
+        // Only drop services owned by this gateway (tokens in its route table).
+        // A process-wide drain would cancel concurrent tests/runtimes (D-018).
+        let tokens = self.handle.routes.revoke_all();
+        for hex in tokens {
+            drop_capability_service(&hex);
+        }
         self.cancel.cancel();
         let _ = self.join.await;
     }
@@ -189,6 +198,7 @@ async fn mcp_dispatch_rest(
 /// Per-capability Streamable HTTP service (shared across requests for one token).
 struct CapabilityHttpService {
     service: StreamableHttpService<TransactionMcpHandler, LocalSessionManager>,
+    cancel: CancellationToken,
 }
 
 /// Process-wide map: capability token hex → durable MCP session manager (D-018).
@@ -201,12 +211,18 @@ fn capability_services(
     CAPABILITY_SERVICES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Drop and cancel the per-token Streamable HTTP service (D-018 session cleanup).
+fn drop_capability_service(token_hex: &str) {
+    if let Ok(mut map) = capability_services().lock() {
+        if let Some(svc) = map.remove(token_hex) {
+            svc.cancel.cancel();
+        }
+    }
+}
+
 async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) -> Response<Body> {
     let Some(binding) = routes.get_by_hex(token_hex) else {
-        // Drop any stale service entry.
-        if let Ok(mut map) = capability_services().lock() {
-            map.remove(token_hex);
-        }
+        drop_capability_service(token_hex);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("unknown capability"))
@@ -235,15 +251,19 @@ async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) 
                 let handler = binding.handler.clone();
                 let cancel = CancellationToken::new();
                 let mut config = StreamableHttpServerConfig::default();
-                config.cancellation_token = cancel;
+                config.cancellation_token = cancel.clone();
+                // No long-lived SSE keep-alive; request streams complete with the response.
                 config.sse_keep_alive = None;
                 config.sse_retry = None;
+                // Prefer JSON when possible for simpler clients; SSE still used when needed.
+                config.json_response = true;
                 Arc::new(CapabilityHttpService {
                     service: StreamableHttpService::new(
                         move || Ok(handler.clone()),
                         Arc::new(LocalSessionManager::default()),
                         config,
                     ),
+                    cancel,
                 })
             })
             .clone()

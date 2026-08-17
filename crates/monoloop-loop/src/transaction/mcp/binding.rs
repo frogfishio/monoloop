@@ -276,12 +276,15 @@ impl McpRouteTable {
         }
     }
 
-    /// Revoke every route (shutdown).
-    pub fn revoke_all(&self) {
+    /// Revoke every route (shutdown). Returns hex tokens that were live.
+    pub fn revoke_all(&self) -> Vec<String> {
         let mut map = self.routes.lock().unwrap_or_else(|e| e.into_inner());
-        for (_, binding) in map.drain() {
+        let mut tokens = Vec::with_capacity(map.len());
+        for (token, binding) in map.drain() {
             binding.state.store(STATE_REVOKED, Ordering::SeqCst);
+            tokens.push(token.to_hex());
         }
+        tokens
     }
 
     /// Lookup live binding by token hex (from URL).

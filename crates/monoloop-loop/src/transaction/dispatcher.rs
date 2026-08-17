@@ -65,12 +65,40 @@ pub enum DispatchOutcome {
     },
 }
 
+/// Capacity and payload bounds for one transaction dispatcher (D-015).
+#[derive(Clone, Copy, Debug)]
+pub struct DispatcherLimits {
+    /// Max concurrent tool executions for this transaction.
+    pub max_concurrent_tools: usize,
+    /// Max queued tool starts for this transaction.
+    pub max_queued_tools: usize,
+    /// Transaction-wide payload cap; applied as min with per-tool limit.
+    pub max_tool_payload_bytes: usize,
+    /// Transaction-wide output cap; applied as min with per-tool limit.
+    pub max_tool_output_bytes: usize,
+}
+
+impl Default for DispatcherLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_tools: 16,
+            max_queued_tools: 64,
+            max_tool_payload_bytes: usize::MAX,
+            max_tool_output_bytes: usize::MAX,
+        }
+    }
+}
+
 /// Transaction-owned dispatcher: allowlist, validation, capacity, handler, output check.
 pub struct TransactionToolDispatcher {
     transaction_id: TransactionId,
     session_key: SessionKey,
     tools: ResolvedToolSet,
     capacity: Arc<TransactionToolCapacity>,
+    /// Transaction-wide payload cap (D-015); applied as min with per-tool limit.
+    max_tool_payload_bytes: usize,
+    /// Transaction-wide output cap (D-015); applied as min with per-tool limit.
+    max_tool_output_bytes: usize,
     max_error_message_bytes: usize,
     max_json_depth: u32,
 }
@@ -85,8 +113,33 @@ impl TransactionToolDispatcher {
         max_concurrent_tools: usize,
         max_queued_tools: usize,
     ) -> Arc<Self> {
-        let capacity =
-            TransactionToolCapacity::new(shared_capacity, max_concurrent_tools, max_queued_tools);
+        Self::with_limits(
+            transaction_id,
+            session_key,
+            tools,
+            shared_capacity,
+            DispatcherLimits {
+                max_concurrent_tools,
+                max_queued_tools,
+                max_tool_payload_bytes: usize::MAX,
+                max_tool_output_bytes: usize::MAX,
+            },
+        )
+    }
+
+    /// Build with explicit concurrency and payload/output caps (D-015).
+    pub fn with_limits(
+        transaction_id: TransactionId,
+        session_key: SessionKey,
+        tools: ResolvedToolSet,
+        shared_capacity: Arc<SharedToolCapacity>,
+        limits: DispatcherLimits,
+    ) -> Arc<Self> {
+        let capacity = TransactionToolCapacity::new(
+            shared_capacity,
+            limits.max_concurrent_tools,
+            limits.max_queued_tools,
+        );
         for spec in tools.specs() {
             capacity.configure_tool(spec.id.clone(), spec.limits.max_concurrent);
         }
@@ -95,6 +148,8 @@ impl TransactionToolDispatcher {
             session_key,
             tools,
             capacity,
+            max_tool_payload_bytes: limits.max_tool_payload_bytes.max(1),
+            max_tool_output_bytes: limits.max_tool_output_bytes.max(1),
             max_error_message_bytes: 1024,
             max_json_depth: DEFAULT_MAX_JSON_DEPTH,
         })
@@ -142,10 +197,12 @@ impl TransactionToolDispatcher {
         }
 
         // Input validation before capacity acquire for execution.
+        // Effective payload limit is min(per-tool, transaction-wide) (D-015).
+        let max_payload = spec.limits.max_input_bytes.min(self.max_tool_payload_bytes);
         let arguments = match validate_tool_input(
             &request.arguments_json,
             &spec.input_schema,
-            spec.limits.max_input_bytes,
+            max_payload,
             self.max_json_depth,
         ) {
             Ok(v) => v,
@@ -260,10 +317,11 @@ impl TransactionToolDispatcher {
         };
         drop(permit);
 
+        let max_output = spec.limits.max_output_bytes.min(self.max_tool_output_bytes);
         let validated = match validate_tool_completion(
             completion,
             &spec.output_contract,
-            spec.limits.max_output_bytes,
+            max_output,
             self.max_error_message_bytes,
             self.max_json_depth,
         ) {

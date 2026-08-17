@@ -32,7 +32,7 @@ pub use transaction::{
     dispatch_ready_tool, run_encoded_exchange, run_exchange, tool_definitions_from_resolved,
     validate_tool_completion, validate_tool_input, AcpPromptEncoder, AcpPromptWireShape,
     AsyncToolHandler, BoundedEventSender, CapabilityToken, CapacityManagers, ChannelBinding,
-    ChannelRegistry, DefaultTransactionRuntime, DispatchOutcome, DispatchRequest,
+    ChannelRegistry, DefaultTransactionRuntime, DispatchOutcome, DispatchRequest, DispatcherLimits,
     EmptyBytesEncoder, EncodedExchangeParams, EventQueueFull, EventSequencer, ExchangeFailure,
     ExchangeOutcome, ExchangeParams, FinalizationGuard, HeadlessPromptEncoder, HostToolRegistry,
     HostToolRuntime, ImmediateToolHandler, InputValidationFailure, LinkedToolExecutionHandle,

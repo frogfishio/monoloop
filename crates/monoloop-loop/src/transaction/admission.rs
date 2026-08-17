@@ -262,6 +262,8 @@ pub fn admit(
         max_total_provider_output_bytes: ctx.limits.max_total_provider_output_bytes,
         max_continuation_context_bytes: ctx.limits.max_continuation_context_bytes,
         max_tool_schema_bytes: ctx.limits.max_tool_schema_bytes,
+        max_tool_payload_bytes: ctx.limits.max_tool_payload_bytes,
+        max_tool_output_bytes: ctx.limits.max_tool_output_bytes,
         start_gate: start_rx,
     });
 
