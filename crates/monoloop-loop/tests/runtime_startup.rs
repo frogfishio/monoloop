@@ -221,9 +221,7 @@ async fn partial_startup_cleans_mcp_on_connector_failure() {
             &self,
         ) -> Result<monoloop_connector::ConnectorInstance, monoloop_connector::ConnectorBuildError>
         {
-            Err(monoloop_connector::ConnectorBuildError::ConfigurationInvalid(
-                "forced",
-            ))
+            Err(monoloop_connector::ConnectorBuildError::ConfigurationInvalid("forced"))
         }
     }
 
@@ -285,10 +283,9 @@ async fn capacity_managers_installed() {
 }
 
 fn dummy_request(channel: &str) -> TransactionRequest {
-    let events: Arc<dyn monoloop_contracts::TransactionEventSink> =
-        Arc::new(FnEventSink(|_e| {
-            Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
-        }));
+    let events: Arc<dyn monoloop_contracts::TransactionEventSink> = Arc::new(FnEventSink(|_e| {
+        Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+    }));
     let completion: Box<dyn monoloop_contracts::CompletionCallback> =
         Box::new(FnCompletionCallback(|_e| {
             Box::pin(async { Ok(()) }) as monoloop_contracts::CompletionDelivery

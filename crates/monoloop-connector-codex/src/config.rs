@@ -116,9 +116,11 @@ mod tests {
 
     #[test]
     fn opt_in_enables_auto_permissions() {
-        assert!(CodexAgentConfig::default()
-            .with_auto_allow_permissions()
-            .auto_allow_permissions);
+        assert!(
+            CodexAgentConfig::default()
+                .with_auto_allow_permissions()
+                .auto_allow_permissions
+        );
     }
 }
 
@@ -133,10 +135,7 @@ fn discover_acp_command() -> (PathBuf, Vec<String>) {
     }
     (
         PathBuf::from(std::env::var_os("NPX_BIN").unwrap_or_else(|| "npx".into())),
-        vec![
-            "--yes".into(),
-            "@agentclientprotocol/codex-acp".into(),
-        ],
+        vec!["--yes".into(), "@agentclientprotocol/codex-acp".into()],
     )
 }
 

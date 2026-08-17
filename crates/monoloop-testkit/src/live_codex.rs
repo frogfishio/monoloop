@@ -91,7 +91,9 @@ pub struct LiveCodexRunReport {
 }
 
 /// Run one prompt against live Codex ACP and write review artifacts.
-pub async fn run_live_codex_prompt(opts: LiveCodexRunOptions) -> Result<LiveCodexRunReport, String> {
+pub async fn run_live_codex_prompt(
+    opts: LiveCodexRunOptions,
+) -> Result<LiveCodexRunReport, String> {
     if let Some(parent) = opts.artifact_stem.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }

@@ -66,9 +66,8 @@ impl ManagedGrokServe {
         if let Some(ref log) = opts.log_path {
             if let Some(parent) = log.parent() {
                 if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        format!("create log dir {}: {e}", parent.display())
-                    })?;
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create log dir {}: {e}", parent.display()))?;
                 }
             }
         }

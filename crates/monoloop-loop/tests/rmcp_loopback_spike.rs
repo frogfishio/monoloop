@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use axum::Router;
 use rmcp::{
-    ServerHandler,
     model::{ServerCapabilities, ServerInfo},
     transport::streamable_http_server::{
-        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
+    ServerHandler,
 };
 use tokio_util::sync::CancellationToken;
 

@@ -11,6 +11,7 @@ use monoloop_contracts::{
 use monoloop_interpreter::{InterpreterFactory, StartInterpretation};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 /// Result of one exchange cycle.
@@ -21,6 +22,8 @@ pub struct ExchangeOutcome {
     pub connection_id: ConnectionId,
     /// Interpretation identity.
     pub interpretation_id: InterpretationId,
+    /// Authoritative external session id from open (create/load), if any.
+    pub external_session_id: Option<monoloop_contracts::ExternalSessionId>,
     /// Complete canonical unit events observed (not Ended).
     pub units: Vec<CanonicalUnitEvent>,
     /// Connector terminal.
@@ -74,12 +77,18 @@ pub struct ExchangeParams<'a> {
     pub interpretation_limits: InterpretationLimits,
     /// Overall deadline for the exchange.
     pub deadline: Duration,
+    /// Optional live unit sink (D-011); when set, units are forwarded as produced.
+    pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
+    /// Optional oneshot: authoritative external session id immediately after open (D-013).
+    pub session_id_tx: Option<oneshot::Sender<monoloop_contracts::ExternalSessionId>>,
 }
 
 /// Parameters for a continuation exchange (fresh identities, pre-encoded body).
 pub struct EncodedExchangeParams<'a> {
     /// Transaction id.
     pub transaction_id: TransactionId,
+    /// Single exchange identity shared with encoder (D-017).
+    pub exchange_id: ExchangeId,
     /// Connector instance.
     pub connector: &'a dyn Connector,
     /// Interpreter factory.
@@ -96,6 +105,8 @@ pub struct EncodedExchangeParams<'a> {
     pub interpretation_limits: InterpretationLimits,
     /// Overall deadline for the exchange.
     pub deadline: Duration,
+    /// Optional live unit sink (D-011); when set, units are forwarded as produced.
+    pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
 }
 
 /// Run one SendAndFinish exchange end-to-end (no raw bytes enter actor queues).
@@ -122,6 +133,8 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
         params.interpreter,
         params.interpretation_limits,
         params.deadline,
+        params.unit_tx,
+        params.session_id_tx,
     )
     .await
 }
@@ -130,9 +143,8 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
 pub async fn run_encoded_exchange(
     params: EncodedExchangeParams<'_>,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
-    let exchange_id = ExchangeId::generate();
     open_and_run(
-        exchange_id,
+        params.exchange_id,
         params.connector,
         params.endpoint_ref,
         params.credential_ref,
@@ -141,6 +153,8 @@ pub async fn run_encoded_exchange(
         params.interpreter,
         params.interpretation_limits,
         params.deadline,
+        params.unit_tx,
+        None,
     )
     .await
 }
@@ -156,6 +170,8 @@ async fn open_and_run(
     interpreter: &dyn InterpreterFactory,
     interpretation_limits: InterpretationLimits,
     deadline: Duration,
+    unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
+    session_id_tx: Option<oneshot::Sender<monoloop_contracts::ExternalSessionId>>,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
     let connection_id = ConnectionId::generate();
     let interpretation_id = InterpretationId::generate();
@@ -173,6 +189,12 @@ async fn open_and_run(
         Err(_) => return Err(ExchangeFailure::ChannelOpenFailed),
     };
 
+    if let Some(tx) = session_id_tx {
+        if let Some(ref ext) = opened.external_session_id {
+            let _ = tx.send(ext.clone());
+        }
+    }
+
     run_opened_exchange(
         exchange_id,
         interpretation_id,
@@ -181,10 +203,12 @@ async fn open_and_run(
         interpreter,
         interpretation_limits,
         deadline,
+        unit_tx,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_opened_exchange(
     exchange_id: ExchangeId,
     interpretation_id: InterpretationId,
@@ -193,6 +217,7 @@ async fn run_opened_exchange(
     interpreter: &dyn InterpreterFactory,
     limits: InterpretationLimits,
     deadline: Duration,
+    unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
     let connection_id = opened.connection_id.clone();
     let interpretation = interpreter
@@ -241,9 +266,7 @@ async fn run_opened_exchange(
     });
 
     // Send encoded request body.
-    if !encoded.bytes.is_empty()
-        && opened.input.send(encoded.bytes.clone()).await.is_err()
-    {
+    if !encoded.bytes.is_empty() && opened.input.send(encoded.bytes.clone()).await.is_err() {
         abort_joins(&mut joins).await;
         return Err(ExchangeFailure::ConnectorFailed);
     }
@@ -254,22 +277,24 @@ async fn run_opened_exchange(
                 return Err(ExchangeFailure::ConnectorFailed);
             }
         }
-        ExchangeInputPolicy::SendAndRetain => {
-            // Leave open for later writes (WP-06 continuations).
-        }
+        ExchangeInputPolicy::SendAndRetain => {}
     }
 
-    // Collect interpretation events in parallel with terminal waits.
+    // Collect interpretation events; optionally fan out live (D-011).
     let events_handle = interpretation.events;
     let units = Arc::new(tokio::sync::Mutex::new(Vec::<CanonicalUnitEvent>::new()));
     let units_task = {
         let units = Arc::clone(&units);
-        let events_handle = events_handle;
+        let unit_tx = unit_tx;
         tokio::spawn(async move {
             while let Some(ev) = events_handle.recv().await {
                 match ev {
                     monoloop_contracts::InterpreterOutputEvent::Unit(u) => {
-                        units.lock().await.push(*u);
+                        let unit = *u;
+                        if let Some(ref tx) = unit_tx {
+                            let _ = tx.send(unit.clone()).await;
+                        }
+                        units.lock().await.push(unit);
                     }
                     monoloop_contracts::InterpreterOutputEvent::Ended(_) => break,
                 }
@@ -277,16 +302,30 @@ async fn run_opened_exchange(
         })
     };
 
+    // D-012: abort pump + units collector + terminate connector if this future is dropped
+    // (e.g. actor cancel wins select). On normal completion, take handles and join.
+    let mut guard = ExchangeGuard {
+        control: Some(opened.control.clone()),
+        joins: Some(joins),
+        units_abort: Some(units_task.abort_handle()),
+    };
+
     let completion = interpretation.completion;
     let conn_completion = opened.completion;
+    let external_session_id = opened.external_session_id.clone();
+    let open_control = opened.control.clone();
 
     let (interp_end, conn_end) = tokio::select! {
         _ = tokio::time::sleep(deadline) => {
-            abort_joins(&mut joins).await;
-            units_task.abort();
-            let _ = opened
-                .control
+            let _ = open_control
                 .terminate(monoloop_connector::TerminationReason::CallerForced);
+            units_task.abort();
+            let _ = tokio::time::timeout(Duration::from_millis(200), units_task).await;
+            if let Some(mut joins) = guard.joins.take() {
+                abort_joins(&mut joins).await;
+            }
+            let _ = guard.control.take();
+            let _ = guard.units_abort.take();
             return Err(ExchangeFailure::ConnectorFailed);
         }
         ends = async {
@@ -296,24 +335,49 @@ async fn run_opened_exchange(
         } => ends,
     };
 
-    // Ensure pump finished.
-    let _ = tokio::time::timeout(Duration::from_millis(200), joins.join_next()).await;
-    abort_joins(&mut joins).await;
-    let _ = tokio::time::timeout(Duration::from_millis(100), units_task).await;
+    // Normal path: join children within a short grace (D-012).
+    if let Some(mut joins) = guard.joins.take() {
+        let _ = tokio::time::timeout(Duration::from_millis(200), joins.join_next()).await;
+        abort_joins(&mut joins).await;
+    }
+    let _ = guard.units_abort.take();
+    let _ = tokio::time::timeout(Duration::from_millis(200), units_task).await;
+    let _ = guard.control.take();
 
     let units = units.lock().await.clone();
-
     let failure = reconcile_terminals(&conn_end, &interp_end);
 
     Ok(ExchangeOutcome {
         exchange_id,
         connection_id,
         interpretation_id,
+        external_session_id,
         units,
         connection_end: conn_end,
         interpretation_end: interp_end,
         failure,
     })
+}
+
+/// Drop guard: terminate connector and abort child tasks if exchange is cancelled (D-012).
+struct ExchangeGuard {
+    control: Option<monoloop_connector::ConnectionControlHandle>,
+    joins: Option<JoinSet<()>>,
+    units_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for ExchangeGuard {
+    fn drop(&mut self) {
+        if let Some(ctrl) = self.control.take() {
+            let _ = ctrl.terminate(monoloop_connector::TerminationReason::CallerForced);
+        }
+        if let Some(h) = self.units_abort.take() {
+            h.abort();
+        }
+        if let Some(mut joins) = self.joins.take() {
+            joins.abort_all();
+        }
+    }
 }
 
 fn reconcile_terminals(

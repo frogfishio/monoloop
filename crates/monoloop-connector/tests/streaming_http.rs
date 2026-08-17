@@ -94,9 +94,8 @@ async fn fragmented_sse_body_round_trip() {
                 Bytes::from_static(b"1}\n\n"),
                 Bytes::from_static(b"data: [DONE]\n\n"),
             ];
-            let stream = futures_util::stream::iter(
-                chunks.into_iter().map(Ok::<_, std::io::Error>),
-            );
+            let stream =
+                futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
             Response::builder()
                 .status(StatusCode::OK)
                 .body(Body::from_stream(stream))
@@ -105,15 +104,11 @@ async fn fragmented_sse_body_round_trip() {
     );
     let (addr, _join) = bind_router(app).await;
     let url = format!("http://{addr}/v1/stream");
-    let c = connector(Arc::new(MapCredentialResolver::empty()), StreamingHttpConfig::default());
-    let opened = open_and_send(
-        &c,
-        url,
-        b"{\"hello\":1}",
-        None,
-        ConnectorLimits::default(),
-    )
-    .await;
+    let c = connector(
+        Arc::new(MapCredentialResolver::empty()),
+        StreamingHttpConfig::default(),
+    );
+    let opened = open_and_send(&c, url, b"{\"hello\":1}", None, ConnectorLimits::default()).await;
     let (body, kind) = read_all(opened).await;
     assert_eq!(kind, ConnectionEndKind::RemoteEof);
     assert_eq!(
@@ -134,7 +129,10 @@ async fn non_success_status_bounded_error() {
         }),
     );
     let (addr, _join) = bind_router(app).await;
-    let c = connector(Arc::new(MapCredentialResolver::empty()), StreamingHttpConfig::default());
+    let c = connector(
+        Arc::new(MapCredentialResolver::empty()),
+        StreamingHttpConfig::default(),
+    );
     let opened = open_and_send(
         &c,
         format!("http://{addr}/fail"),
@@ -226,11 +224,7 @@ async fn max_request_bytes_plus_one() {
     };
     let pending = c.begin_open(open);
     let opened = pending.opened.await.unwrap();
-    opened
-        .input
-        .send(Bytes::from(vec![b'x'; 9]))
-        .await
-        .unwrap();
+    opened.input.send(Bytes::from(vec![b'x'; 9])).await.unwrap();
     opened.input.finish().await.unwrap();
     let end = opened.completion.wait().await;
     assert_eq!(end.kind, ConnectionEndKind::TransportFailure);
@@ -278,7 +272,10 @@ async fn cancel_while_request_in_flight() {
         }),
     );
     let (addr, _join) = bind_router(app).await;
-    let c = connector(Arc::new(MapCredentialResolver::empty()), StreamingHttpConfig::default());
+    let c = connector(
+        Arc::new(MapCredentialResolver::empty()),
+        StreamingHttpConfig::default(),
+    );
     let mut open = OpenConnection::new(ConnectionId::generate(), format!("http://{addr}/ok"));
     open.limits.connect_deadline = Duration::from_secs(10);
     let pending = c.begin_open(open);
@@ -304,7 +301,10 @@ async fn cancel_while_request_in_flight() {
 async fn cancel_before_request_send() {
     let app = Router::new().route("/ok", post(|| async { StatusCode::OK }));
     let (addr, _join) = bind_router(app).await;
-    let c = connector(Arc::new(MapCredentialResolver::empty()), StreamingHttpConfig::default());
+    let c = connector(
+        Arc::new(MapCredentialResolver::empty()),
+        StreamingHttpConfig::default(),
+    );
     let pending = c.begin_open(OpenConnection::new(
         ConnectionId::generate(),
         format!("http://{addr}/ok"),
@@ -321,7 +321,10 @@ async fn cancel_before_request_send() {
 async fn terminate_during_open_collect() {
     let app = Router::new().route("/ok", post(|| async { StatusCode::OK }));
     let (addr, _join) = bind_router(app).await;
-    let c = connector(Arc::new(MapCredentialResolver::empty()), StreamingHttpConfig::default());
+    let c = connector(
+        Arc::new(MapCredentialResolver::empty()),
+        StreamingHttpConfig::default(),
+    );
     let pending = c.begin_open(OpenConnection::new(
         ConnectionId::generate(),
         format!("http://{addr}/ok"),
@@ -392,7 +395,10 @@ async fn connection_pool_reuse_no_semantic_session() {
         }),
     );
     let (addr, _join) = bind_router(app).await;
-    let c = connector(Arc::new(MapCredentialResolver::empty()), StreamingHttpConfig::default());
+    let c = connector(
+        Arc::new(MapCredentialResolver::empty()),
+        StreamingHttpConfig::default(),
+    );
     for _ in 0..3 {
         let opened = open_and_send(
             &c,
@@ -411,11 +417,11 @@ async fn connection_pool_reuse_no_semantic_session() {
 
 #[tokio::test]
 async fn malformed_endpoint_fails_open() {
-    let c = connector(Arc::new(MapCredentialResolver::empty()), StreamingHttpConfig::default());
-    let pending = c.begin_open(OpenConnection::new(
-        ConnectionId::generate(),
-        "not-a-url",
-    ));
+    let c = connector(
+        Arc::new(MapCredentialResolver::empty()),
+        StreamingHttpConfig::default(),
+    );
+    let pending = c.begin_open(OpenConnection::new(ConnectionId::generate(), "not-a-url"));
     let err = match pending.opened.await {
         Err(e) => e,
         Ok(_) => panic!("expected config failure"),
@@ -429,11 +435,7 @@ async fn health_get_unused() {
     let app = Router::new().route("/h", get(|| async { "ok" }));
     let (addr, join) = bind_router(app).await;
     let client = reqwest::Client::new();
-    let r = client
-        .get(format!("http://{addr}/h"))
-        .send()
-        .await
-        .unwrap();
+    let r = client.get(format!("http://{addr}/h")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     join.abort();
 }

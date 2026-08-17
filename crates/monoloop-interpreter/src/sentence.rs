@@ -323,9 +323,11 @@ mod tests {
         let text = "1. **CREATE** — Wrote the file.\n\n2. **READ** — File contained x.\n\n3. **UPDATE** — Done.\n\n";
         let done = s.push(text);
         assert_eq!(done.len(), 3, "{done:?}");
-        assert!(done
-            .iter()
-            .all(|x| !x.content.trim().chars().all(|c| c.is_ascii_digit() || c == '.')));
+        assert!(done.iter().all(|x| !x
+            .content
+            .trim()
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')));
         assert!(done[0].content.contains("CREATE"));
         assert!(done[1].content.contains("READ"));
         assert!(done[2].content.contains("UPDATE"));
@@ -525,7 +527,9 @@ mod tests {
             );
         }
         assert!(
-            texts.iter().any(|x| x.contains("No other files were touched")),
+            texts
+                .iter()
+                .any(|x| x.contains("No other files were touched")),
             "{texts:?}"
         );
     }

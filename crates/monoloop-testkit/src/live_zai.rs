@@ -123,7 +123,10 @@ pub async fn run_live_zai_prompt(opts: LiveZaiRunOptions) -> Result<LiveZaiRunRe
         }
     });
 
-    let outcome = run.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let outcome = run
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     let _ = pump.await;
     let _ = interp.input.finish_clean().await;
 

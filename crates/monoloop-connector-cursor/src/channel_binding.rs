@@ -5,12 +5,12 @@ use monoloop_connector::{
     Connector, ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId,
     ControlDisposition, McpServerDescriptor, PendingOperationControl, PendingSessionAttachment,
     PendingSessionConfiguration, SessionAdapter, SessionAttachError, SessionAttachRequest,
-    SessionAttachment, SessionAttachmentCompletion,     SessionConfigurationError, SessionRoute,
+    SessionAttachment, SessionAttachmentCompletion, SessionConfigurationError, SessionRoute,
 };
 use monoloop_contracts::{
-    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy,
-    DialectDescriptor, ExchangeMode, ExternalSessionId, McpConfigurationCapability, McpReachability,
-    SessionId, SessionMode, ToolExecutionMode,
+    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
+    ContinuationPolicy, DialectDescriptor, ExchangeMode, ExternalSessionId,
+    McpConfigurationCapability, McpReachability, SessionId, SessionMode, ToolExecutionMode,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ pub struct CursorConnectorFactory;
 impl CursorConnectorFactory {
     /// Default factory.
     /// Build a ChannelBinding for TransactionRuntime composition.
-pub fn new() -> Self {
+    pub fn new() -> Self {
         Self
     }
 }
@@ -77,14 +77,14 @@ impl PendingOperationControl for PendingCtrl {
 /// Explicit create/load session reservation (no most-recent heuristic).
 struct ProfileSessionAdapter {
     owner: ConnectorInstanceId,
-    known: Mutex<HashMap<String, monoloop_contracts::SessionConfig>>,
+    known: Arc<Mutex<HashMap<String, monoloop_contracts::SessionConfig>>>,
 }
 
 impl ProfileSessionAdapter {
     fn new(owner: ConnectorInstanceId) -> Self {
         Self {
             owner,
-            known: Mutex::new(HashMap::new()),
+            known: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -100,11 +100,7 @@ impl SessionAdapter for ProfileSessionAdapter {
         });
         let control_api: Arc<dyn PendingOperationControl> = control.clone();
         let owner = self.owner.clone();
-        let known_snapshot = self
-            .known
-            .lock()
-            .map_err(|_| SessionAttachError::SessionFailed)?
-            .clone();
+        let known = Arc::clone(&self.known);
 
         let completion: SessionAttachmentCompletion = Box::pin(async move {
             if control.terminate.load(std::sync::atomic::Ordering::SeqCst) {
@@ -113,26 +109,41 @@ impl SessionAdapter for ProfileSessionAdapter {
             if control.cancel.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(SessionAttachError::Cancelled);
             }
-            let (ext, cfg) = if let Some(ref sid) = request.requested_session_id {
-                let cfg = known_snapshot
+            let route = Arc::new(ProfileRoute {
+                owner: owner.clone(),
+            });
+            if let Some(ref sid) = request.requested_session_id {
+                let map = known
+                    .lock()
+                    .map_err(|_| SessionAttachError::SessionFailed)?;
+                let cfg = map
                     .get(sid.as_str())
                     .cloned()
                     .unwrap_or_else(|| request.session_config.clone());
                 let ext = ExternalSessionId::try_new(sid.as_str())
                     .map_err(|_| SessionAttachError::SessionFailed)?;
-                (ext, cfg)
+                monoloop_connector::validate_session_id_match(Some(sid), &ext)
+                    .map_err(|_| SessionAttachError::SessionIdMismatch)?;
+                Ok(Arc::new(SessionAttachment::new(owner, ext, cfg, route)))
             } else {
-                let sid = SessionId::generate();
-                let ext = ExternalSessionId::try_new(sid.as_str())
+                let provisional = SessionId::generate();
+                let ext = ExternalSessionId::try_new(provisional.as_str())
                     .map_err(|_| SessionAttachError::SessionFailed)?;
-                (ext, request.session_config)
-            };
-            Ok(Arc::new(SessionAttachment::new(
-                owner.clone(),
-                ext,
-                cfg,
-                Arc::new(ProfileRoute { owner }),
-            )))
+                known
+                    .lock()
+                    .map_err(|_| SessionAttachError::SessionFailed)?
+                    .insert(
+                        provisional.as_str().to_string(),
+                        request.session_config.clone(),
+                    );
+                Ok(Arc::new(SessionAttachment::new_create(
+                    owner,
+                    ext,
+                    request.session_config,
+                    route,
+                    request.initial_mcp,
+                )))
+            }
         });
         Ok(PendingSessionAttachment {
             control: control_api,

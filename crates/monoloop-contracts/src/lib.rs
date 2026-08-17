@@ -22,9 +22,9 @@ mod tool;
 mod transaction;
 
 pub use canonical::{
-    BoundaryKind, CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, DiagnosticKind,
-    FlowId, InterpretationEnd, InterpretationEndKind, InterpretationId, InterpreterOutputEvent,
-    LaneId, ModelDiagnostic, ParagraphBoundary, ParagraphKind, SemanticBoundary, SourceTimeObservation,
+    BoundaryKind, CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, DiagnosticKind, FlowId,
+    InterpretationEnd, InterpretationEndKind, InterpretationId, InterpreterOutputEvent, LaneId,
+    ModelDiagnostic, ParagraphBoundary, ParagraphKind, SemanticBoundary, SourceTimeObservation,
     StructuralAtom, StructureKind, TextChannel, TextSentence, TokenCount, ToolActionEvent,
     ToolActionId, ToolExecutionState, ToolRequestState, ToolResultState, ToolTerminalOutcome,
     UnitId, UnitState, UsageObservation,
@@ -44,21 +44,19 @@ pub use encoder::{
     ContinuationContext, EncodedExchange, EncodingError, ExchangeInputPolicy, InitialEncodeRequest,
     OutboundDialectEncoder, ToolContinuationEncodeRequest,
 };
-pub use error::{
-    ConnectorError, ConnectorErrorKind, InterpreterError, InterpreterErrorKind,
-};
+pub use error::{ConnectorError, ConnectorErrorKind, InterpreterError, InterpreterErrorKind};
 pub use id::{
-    validate_identity_string, ChannelId, ConnectionId, ExchangeId, ExternalSessionId, GrokSessionId,
-    IdentityError, MonoloopRunId, RequestId, SessionId, SessionKey, ToolId, ToolName, TransactionId,
-    MAX_IDENTITY_BYTES,
+    validate_identity_string, ChannelId, ConnectionId, ExchangeId, ExternalSessionId,
+    GrokSessionId, IdentityError, MonoloopRunId, RequestId, SessionId, SessionKey, ToolId,
+    ToolName, TransactionId, MAX_IDENTITY_BYTES,
 };
 pub use input::{
     user_text_input, CanonicalAssistantToolCall, CanonicalInput, CanonicalMessage,
     InputValidationError, TextPart,
 };
 pub use limits::{
-    ChannelLimits, ConnectorLimits, ExtensionLimits, InputLimits, InterpretationLimits, LimitsError,
-    ToolLimits, TransactionLimits, TransportBufferLimits,
+    ChannelLimits, ConnectorLimits, ExtensionLimits, InputLimits, InterpretationLimits,
+    LimitsError, ToolLimits, TransactionLimits, TransportBufferLimits,
 };
 pub use loop_types::{
     LoopEnd, LoopEndKind, LoopError, LoopErrorKind, LoopId, LoopLimits, LoopOutputEvent, LoopScope,
@@ -67,15 +65,15 @@ pub use loop_types::{
 pub use safe::{DiagnosticCode, SafeDiagnostic, SafeDiagnosticError};
 pub use tool::{
     CanonicalToolError, CanonicalToolOutput, CanonicalToolResult, CanonicalToolResultOutcome,
-    JsonSchema, ToolCall, ToolCallContext, ToolCancellationPolicy, ToolCompletion, ToolContractError,
-    ToolLifecycleEvent, ToolOutputContract, ToolRuntimeError, ToolSpec, ToolStartError,
-    ToolSuccessContract,
+    JsonSchema, ToolCall, ToolCallContext, ToolCancellationPolicy, ToolCompletion,
+    ToolContractError, ToolLifecycleEvent, ToolOutputContract, ToolRuntimeError, ToolSpec,
+    ToolStartError, ToolSuccessContract,
 };
 pub use transaction::{
-    AdmissionError, AdmissionErrorKind, AdmissionReceipt, CancellationReason, CancellationReasonCode,
-    CompletionCallback, CompletionDelivery, CompletionDeliveryError, EventDelivery,
-    EventDeliveryError, EventDeliveryOutcome, FnCompletionCallback, FnEventSink, Shutdown,
-    ShutdownDisposition, TerminationDisposition, TerminationMode, TerminationReason,
+    AdmissionError, AdmissionErrorKind, AdmissionReceipt, CancellationReason,
+    CancellationReasonCode, CompletionCallback, CompletionDelivery, CompletionDeliveryError,
+    EventDelivery, EventDeliveryError, EventDeliveryOutcome, FnCompletionCallback, FnEventSink,
+    Shutdown, ShutdownDisposition, TerminationDisposition, TerminationMode, TerminationReason,
     TerminationReasonCode, TransactionDiagnostic, TransactionEnd, TransactionEndKind,
     TransactionEvent, TransactionEventPayload, TransactionEventSink, TransactionRequest,
     TransactionRuntime, TransactionSelector, TransactionUsage,

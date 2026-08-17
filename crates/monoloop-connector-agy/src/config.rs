@@ -123,9 +123,11 @@ mod tests {
 
     #[test]
     fn skip_permissions_opts_in() {
-        assert!(AgyAgentConfig::default()
-            .with_skip_permissions()
-            .auto_allow_permissions);
+        assert!(
+            AgyAgentConfig::default()
+                .with_skip_permissions()
+                .auto_allow_permissions
+        );
     }
 }
 

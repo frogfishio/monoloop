@@ -511,9 +511,7 @@ fn render_full_page(
     }
 
     body.push_str("<section id=\"interleaved\">\n");
-    body.push_str(
-        "<h2>Interleaved stream <span class=\"badge-truth\">event order</span></h2>\n",
-    );
+    body.push_str("<h2>Interleaved stream <span class=\"badge-truth\">event order</span></h2>\n");
     body.push_str(
         "<p class=\"meta\">Tools appear at first sighting (card updates to terminal state). \
          Text blocks flush between tools. This is the order the Interpreter emitted units.</p>\n",
@@ -871,27 +869,29 @@ mod tests {
     };
 
     fn text_ev(content: &str, n: u64) -> InterpreterOutputEvent {
-        InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
-            unit_id: UnitId::new(format!("s{n}")),
-            unit_generation: 1,
-            unit_state: UnitState::Complete,
-            interpretation_id: InterpretationId::new("i1"),
-            connection_id: ConnectionId::new("c1"),
-            external_session_id: None,
-            flow_id: FlowId::main(),
-            lane_id: LaneId::response(),
-            lane_ordinal: n,
-            causal_parent_id: None,
-            source_time: None,
-            source_step: None,
-            unit: CanonicalUnit::Text(TextSentence {
-                sentence_id: UnitId::new(format!("s{n}")),
-                channel: TextChannel::PublicResponse,
-                paragraph_id: None,
-                sentence_ordinal: n,
-                content: content.into(),
-            }),
-        })))
+        InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
+            CanonicalUnitSnapshot {
+                unit_id: UnitId::new(format!("s{n}")),
+                unit_generation: 1,
+                unit_state: UnitState::Complete,
+                interpretation_id: InterpretationId::new("i1"),
+                connection_id: ConnectionId::new("c1"),
+                external_session_id: None,
+                flow_id: FlowId::main(),
+                lane_id: LaneId::response(),
+                lane_ordinal: n,
+                causal_parent_id: None,
+                source_time: None,
+                source_step: None,
+                unit: CanonicalUnit::Text(TextSentence {
+                    sentence_id: UnitId::new(format!("s{n}")),
+                    channel: TextChannel::PublicResponse,
+                    paragraph_id: None,
+                    sentence_ordinal: n,
+                    content: content.into(),
+                }),
+            },
+        )))
     }
 
     #[test]
@@ -929,7 +929,10 @@ mod tests {
                 || report.full_page_html.contains("Interleaved stream")
         );
         assert!(report.full_page_html.contains("Chat projection"));
-        assert!(report.chat_projection.disclaimer.contains("not ground truth"));
+        assert!(report
+            .chat_projection
+            .disclaimer
+            .contains("not ground truth"));
         assert!(report.timeline_rows >= 3);
     }
 

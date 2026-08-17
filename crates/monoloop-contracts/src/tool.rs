@@ -52,7 +52,9 @@ impl ToolSuccessContract {
     /// Construct text success contract with validated media type.
     pub fn text(media_type: impl Into<String>) -> Result<Self, ToolContractError> {
         let media_type = media_type.into();
-        if media_type.is_empty() || media_type.len() > 128 || media_type.chars().any(|c| c.is_control())
+        if media_type.is_empty()
+            || media_type.len() > 128
+            || media_type.chars().any(|c| c.is_control())
         {
             return Err(ToolContractError::InvalidMediaType);
         }

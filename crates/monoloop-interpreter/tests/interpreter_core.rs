@@ -73,11 +73,7 @@ fn text_contents(events: &[InterpreterOutputEvent]) -> Vec<String> {
 async fn fragmentation_invariant_plain_text() {
     let full = b"Hello world. Next sentence!";
     let a = run_chunks(test_d(), &[full]).await;
-    let b = run_chunks(
-        test_d(),
-        &[b"Hel", b"lo wor", b"ld. Ne", b"xt sentence!"],
-    )
-    .await;
+    let b = run_chunks(test_d(), &[b"Hel", b"lo wor", b"ld. Ne", b"xt sentence!"]).await;
     let c = run_chunks(
         test_d(),
         &full.iter().map(std::slice::from_ref).collect::<Vec<_>>(),
@@ -149,7 +145,11 @@ async fn acp_message_chunks_assemble_sentences() {
     let split_at = stream.len() / 3;
     let frag = run_chunks(
         acp(),
-        &[&stream[..split_at], &stream[split_at..split_at * 2], &stream[split_at * 2..]],
+        &[
+            &stream[..split_at],
+            &stream[split_at..split_at * 2],
+            &stream[split_at * 2..],
+        ],
     )
     .await;
 
@@ -183,7 +183,10 @@ async fn acp_tool_waiting_then_ready() {
     assert_eq!(tools[0].1, ToolRequestState::Assembling);
     assert!(tools[0].2.is_none(), "waiting must not expose partial args");
     assert_eq!(tools[0].3, UnitState::Waiting);
-    let ready_ev = tools.iter().find(|t| t.1 == ToolRequestState::Ready).unwrap();
+    let ready_ev = tools
+        .iter()
+        .find(|t| t.1 == ToolRequestState::Ready)
+        .unwrap();
     assert!(ready_ev.2.as_ref().unwrap().contains("path"));
 }
 
@@ -214,7 +217,8 @@ async fn acp_grok_tool_content_update_reaches_terminal_success() {
 
     assert!(
         tools.iter().any(|(req, _, _, payload, _, _)| {
-            *req == ToolRequestState::Ready && payload.as_ref().is_some_and(|p| p.contains("file_path"))
+            *req == ToolRequestState::Ready
+                && payload.as_ref().is_some_and(|p| p.contains("file_path"))
         }),
         "ready with args: {tools:?}"
     );
@@ -247,10 +251,7 @@ async fn acp_source_step_propagates_to_sentences_and_tools() {
             _ => None,
         })
         .collect();
-    assert!(
-        tool_steps.contains(&3),
-        "tool source_step: {tool_steps:?}"
-    );
+    assert!(tool_steps.contains(&3), "tool source_step: {tool_steps:?}");
 
     let text_steps: Vec<_> = events
         .iter()
@@ -292,8 +293,7 @@ async fn acp_agent_timestamp_propagates_to_sentences_and_tools() {
         .collect();
     assert!(
         texts.iter().any(|(c, st)| {
-            c == "Hello world."
-                && st.is_some_and(|s| s.first_ms == 1000 && s.last_ms == 1005)
+            c == "Hello world." && st.is_some_and(|s| s.first_ms == 1000 && s.last_ms == 1005)
         }),
         "sentence must span first/last fragment times: {texts:?}"
     );
@@ -316,7 +316,9 @@ async fn acp_agent_timestamp_propagates_to_sentences_and_tools() {
         })
         .collect();
     assert!(
-        tools.iter().any(|s| s.first_ms == 2000 && s.last_ms == 2000),
+        tools
+            .iter()
+            .any(|s| s.first_ms == 2000 && s.last_ms == 2000),
         "tool source time: {tools:?}"
     );
 
@@ -387,27 +389,45 @@ async fn reasoning_and_response_lane_ordinals_independent() {
     let mut response_ords = Vec::new();
     let mut reasoning_ords = Vec::new();
     for e in &events {
-        let InterpreterOutputEvent::Unit(u) = e else { continue };
-        let CanonicalUnitEvent::Created(s) = u.as_ref() else { continue };
-        let CanonicalUnit::Text(t) = &s.unit else { continue };
+        let InterpreterOutputEvent::Unit(u) = e else {
+            continue;
+        };
+        let CanonicalUnitEvent::Created(s) = u.as_ref() else {
+            continue;
+        };
+        let CanonicalUnit::Text(t) = &s.unit else {
+            continue;
+        };
         match t.channel {
             TextChannel::PublicResponse => {
-                response_ords.push((s.lane_id.as_str().to_string(), s.lane_ordinal, t.sentence_ordinal));
+                response_ords.push((
+                    s.lane_id.as_str().to_string(),
+                    s.lane_ordinal,
+                    t.sentence_ordinal,
+                ));
             }
             TextChannel::PublicReasoningSummary => {
-                reasoning_ords.push((s.lane_id.as_str().to_string(), s.lane_ordinal, t.sentence_ordinal));
+                reasoning_ords.push((
+                    s.lane_id.as_str().to_string(),
+                    s.lane_ordinal,
+                    t.sentence_ordinal,
+                ));
             }
             _ => {}
         }
     }
     // At least one response unit with matching ordinals on response lane.
     assert!(
-        response_ords.iter().any(|(lane, lo, so)| lane == "response" && *lo == *so && *lo >= 1),
+        response_ords
+            .iter()
+            .any(|(lane, lo, so)| lane == "response" && *lo == *so && *lo >= 1),
         "response lane ordinals: {response_ords:?}"
     );
     if !reasoning_ords.is_empty() {
         assert!(
-            reasoning_ords.iter().all(|(lane, lo, so)| lane == "reasoning" && *lo == *so && *lo >= 1),
+            reasoning_ords
+                .iter()
+                .all(|(lane, lo, so)| lane == "reasoning" && *lo == *so && *lo >= 1),
             "reasoning lane ordinals: {reasoning_ords:?}"
         );
         // Independent sequences: both can start at 1.

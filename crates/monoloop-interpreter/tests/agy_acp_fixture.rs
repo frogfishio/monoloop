@@ -101,9 +101,9 @@ async fn agy_tool_call_lifecycle() {
         "{tools:?}"
     );
     assert!(
-        tools.iter().any(|(_, t)| {
-            *t == Some(monoloop_contracts::ToolTerminalOutcome::Success)
-        }),
+        tools
+            .iter()
+            .any(|(_, t)| { *t == Some(monoloop_contracts::ToolTerminalOutcome::Success) }),
         "{tools:?}"
     );
 }

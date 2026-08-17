@@ -6,12 +6,12 @@ use monoloop_contracts::{
     CanonicalToolResultOutcome, ExchangeId, ToolActionId, ToolName, TransactionId,
 };
 use rmcp::{
-    ErrorData as McpError, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
         ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
+    ErrorData as McpError, RoleServer, ServerHandler,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -94,9 +94,8 @@ impl TransactionMcpHandler {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
         self.ensure_active()?;
-        let tool_name = ToolName::try_new(name).map_err(|_| {
-            McpError::new(ErrorCode::INVALID_PARAMS, "invalid tool name", None)
-        })?;
+        let tool_name = ToolName::try_new(name)
+            .map_err(|_| McpError::new(ErrorCode::INVALID_PARAMS, "invalid tool name", None))?;
         if !self.tools.contains_name(&tool_name) {
             return Err(McpError::new(
                 ErrorCode::METHOD_NOT_FOUND,
@@ -124,11 +123,7 @@ impl TransactionMcpHandler {
 
 impl ServerHandler for TransactionMcpHandler {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -192,5 +187,3 @@ fn map_dispatch_to_call_result(outcome: DispatchOutcome) -> Result<CallToolResul
         )),
     }
 }
-
-

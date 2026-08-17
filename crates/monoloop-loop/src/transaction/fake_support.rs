@@ -1,8 +1,9 @@
 //! Test encoders used by startup and exchange tests.
 
 use monoloop_contracts::{
-    Bytes, CanonicalMessage, DialectDescriptor, EncodedExchange, EncodingError, ExchangeInputPolicy,
-    InitialEncodeRequest, OutboundDialectEncoder, ToolContinuationEncodeRequest,
+    Bytes, CanonicalMessage, DialectDescriptor, EncodedExchange, EncodingError,
+    ExchangeInputPolicy, InitialEncodeRequest, OutboundDialectEncoder,
+    ToolContinuationEncodeRequest,
 };
 
 /// Encoder that rejects all encode calls.

@@ -176,8 +176,10 @@ async fn open_fake(
     validate_open_attachment_owner(&instance_id, request.session_attachment.as_deref())?;
 
     if config.fail_open {
-        return Err(ConnectorError::connection_failed("fake configured to fail open")
-            .with_connection_id(request.connection_id.as_str()));
+        return Err(
+            ConnectorError::connection_failed("fake configured to fail open")
+                .with_connection_id(request.connection_id.as_str()),
+        );
     }
 
     if config.open_delay > Duration::ZERO {
@@ -206,11 +208,23 @@ async fn open_fake(
 
     let connection_id = request.connection_id.clone();
     let max_chunk = request.limits.buffers.max_chunk_bytes;
-    let external_session_id = request
+    // D-013: create_mode → allocate authoritative id; load uses attachment/request id.
+    let external_session_id = if request
         .session_attachment
         .as_ref()
-        .map(|a| a.external_session_id.clone())
-        .or(request.external_session_id.clone());
+        .is_some_and(|a| a.create_mode)
+    {
+        Some(ExternalSessionId::new(format!(
+            "fake-created-{}",
+            uuid::Uuid::new_v4()
+        )))
+    } else {
+        request
+            .session_attachment
+            .as_ref()
+            .map(|a| a.external_session_id.clone())
+            .or(request.external_session_id.clone())
+    };
 
     let input = RawInputHandle::new(
         connection_id.clone(),
@@ -275,9 +289,9 @@ async fn register_pair(
     my_out_tx: mpsc::Sender<Bytes>,
 ) -> Result<mpsc::Sender<Bytes>, ConnectorError> {
     let waiter = {
-        let mut state = pairs
-            .lock()
-            .map_err(|_| ConnectorError::new(ConnectorErrorKind::InvariantViolation, "pair lock"))?;
+        let mut state = pairs.lock().map_err(|_| {
+            ConnectorError::new(ConnectorErrorKind::InvariantViolation, "pair lock")
+        })?;
         if let Some(half) = state.waiting.remove(pair_key) {
             // Second half: give first half our out_tx; take their out_tx as peer.
             let _ = half.ready.send(my_out_tx);

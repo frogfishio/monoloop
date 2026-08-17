@@ -237,11 +237,7 @@ impl McpRouteTable {
             map.insert(token.clone(), binding);
         }
 
-        let url = format!(
-            "{}/mcp/{}",
-            base_url.trim_end_matches('/'),
-            token.to_hex()
-        );
+        let url = format!("{}/mcp/{}", base_url.trim_end_matches('/'), token.to_hex());
         let descriptor = McpServerDescriptor::try_new("monoloop", "2024-11-05", url)
             .map_err(|_| McpInstallError::InvalidDescriptor)?;
 

@@ -89,10 +89,7 @@ impl AcpDialect {
             // Terminal prompt response often has result.stopReason
             _ => {
                 if value.get("result").is_some() && value.get("id").is_some() {
-                    if let Some(sr) = value
-                        .pointer("/result/stopReason")
-                        .and_then(|v| v.as_str())
-                    {
+                    if let Some(sr) = value.pointer("/result/stopReason").and_then(|v| v.as_str()) {
                         if sr == "end_turn" || sr == "max_tokens" || sr == "cancelled" {
                             out.push(AcpFragment::ResponseFinished);
                         }
@@ -222,19 +219,17 @@ fn extract_source_step(params: &Value, update: &Value) -> Option<u64> {
                 .and_then(|t| t.as_u64().or_else(|| t.as_i64().map(|i| i as u64)))
         })
     };
-    step_from(update)
-        .or_else(|| step_from(params))
-        .or_else(|| {
-            update
-                .get("messageId")
-                .and_then(|m| m.as_u64().or_else(|| m.as_i64().map(|i| i as u64)))
-                .or_else(|| {
-                    update
-                        .get("messageId")
-                        .and_then(|m| m.as_str())
-                        .and_then(|s| s.parse().ok())
-                })
-        })
+    step_from(update).or_else(|| step_from(params)).or_else(|| {
+        update
+            .get("messageId")
+            .and_then(|m| m.as_u64().or_else(|| m.as_i64().map(|i| i as u64)))
+            .or_else(|| {
+                update
+                    .get("messageId")
+                    .and_then(|m| m.as_str())
+                    .and_then(|s| s.parse().ok())
+            })
+    })
 }
 
 fn extract_text_content(update: &Value) -> Option<String> {
@@ -327,7 +322,14 @@ fn map_tool_call(
 
     let explicit_terminal = matches!(
         status.as_str(),
-        "completed" | "complete" | "success" | "failed" | "failure" | "error" | "cancelled" | "canceled"
+        "completed"
+            | "complete"
+            | "success"
+            | "failed"
+            | "failure"
+            | "error"
+            | "cancelled"
+            | "canceled"
     );
     let explicit_failure = matches!(
         status.as_str(),
@@ -445,8 +447,8 @@ pub fn drain_json_values(buffer: &mut Vec<u8>) -> Result<Vec<Value>, String> {
         match find_complete_json_end(buffer) {
             Some(end) => {
                 let slice = &buffer[..end];
-                let value: Value = serde_json::from_slice(slice)
-                    .map_err(|e| format!("json parse: {e}"))?;
+                let value: Value =
+                    serde_json::from_slice(slice).map_err(|e| format!("json parse: {e}"))?;
                 out.push(value);
                 buffer.drain(..end);
             }
@@ -520,7 +522,12 @@ mod tests {
         assert!(drain_json_values(&mut buf).unwrap().is_empty());
         buf.extend_from_slice(&raw[mid..]);
         let vals = drain_json_values(&mut buf).unwrap();
-        assert_eq!(vals.len(), 1, "buf leftover={}", String::from_utf8_lossy(&buf));
+        assert_eq!(
+            vals.len(),
+            1,
+            "buf leftover={}",
+            String::from_utf8_lossy(&buf)
+        );
         let frags = AcpDialect::map_message(&vals[0]);
         assert!(matches!(
             &frags[0],
@@ -634,15 +641,18 @@ mod tests {
             }
         });
         let frags = AcpDialect::map_message(&text);
-        assert!(matches!(
-            &frags[0],
-            AcpFragment::TextDelta {
-                text,
-                source_step: Some(11),
-                source_time_ms: None,
-                ..
-            } if text == "Done."
-        ), "{frags:?}");
+        assert!(
+            matches!(
+                &frags[0],
+                AcpFragment::TextDelta {
+                    text,
+                    source_step: Some(11),
+                    source_time_ms: None,
+                    ..
+                } if text == "Done."
+            ),
+            "{frags:?}"
+        );
     }
 
     /// Grok Build live shape: null/absent status + rawInput on tool_call.
@@ -762,10 +772,7 @@ mod tests {
         assert!(matches!(
             &frags[0],
             AcpFragment::Tool {
-                signal: ToolSignal::Resolved {
-                    success: false,
-                    ..
-                },
+                signal: ToolSignal::Resolved { success: false, .. },
                 ..
             }
         ));

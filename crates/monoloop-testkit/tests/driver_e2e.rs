@@ -15,7 +15,11 @@ async fn e2e_text_console_no_tool_dispatch() {
     )
     .await;
 
-    assert!(report.console_text.contains("Hello world."), "{}", report.console_text);
+    assert!(
+        report.console_text.contains("Hello world."),
+        "{}",
+        report.console_text
+    );
     assert_eq!(report.tools_unavailable, 0);
     assert!(matches!(
         report.loop_end.kind,
@@ -96,5 +100,8 @@ async fn console_and_loop_independent() {
     .await;
     assert!(!report.console_text.is_empty());
     assert!(!report.interpreter_events.is_empty());
-    assert_eq!(report.loop_end.delivery_events_received, report.loop_end.delivery_events_received);
+    assert_eq!(
+        report.loop_end.delivery_events_received,
+        report.loop_end.delivery_events_received
+    );
 }

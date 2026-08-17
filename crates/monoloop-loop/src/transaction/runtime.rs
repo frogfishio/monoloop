@@ -43,7 +43,7 @@ fn decode_state(v: u8) -> RuntimeState {
 }
 
 struct RuntimeInner {
-    state: AtomicU8,
+    state: Arc<AtomicU8>,
     config: super::bootstrap::RuntimeConfig,
     channels: Arc<HashMap<ChannelId, LiveChannel>>,
     tools: HostToolRegistry,
@@ -146,7 +146,7 @@ impl DefaultTransactionRuntime {
 
         Ok(Arc::new(Self {
             inner: Arc::new(RuntimeInner {
-                state: AtomicU8::new(STATE_ACCEPTING),
+                state: Arc::new(AtomicU8::new(STATE_ACCEPTING)),
                 config: bootstrap.config,
                 channels: Arc::new(channels),
                 tools: bootstrap.tools,
@@ -185,12 +185,7 @@ impl DefaultTransactionRuntime {
 
     /// MCP address.
     pub async fn mcp_local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.inner
-            .mcp
-            .lock()
-            .await
-            .as_ref()
-            .map(|m| m.local_addr())
+        self.inner.mcp.lock().await.as_ref().map(|m| m.local_addr())
     }
 
     /// Live channel lookup.
@@ -199,35 +194,102 @@ impl DefaultTransactionRuntime {
     }
 
     async fn shutdown_inner(&self, deadline: Duration) -> ShutdownDisposition {
-        let slice = if deadline.is_zero() {
+        // D-020: one absolute global deadline for the whole shutdown.
+        let global = if deadline.is_zero() {
             self.inner.config.default_shutdown_deadline
         } else {
             deadline
         };
+        let deadline_at = tokio::time::Instant::now() + global;
 
         let prev = self.inner.state.swap(STATE_DRAINING, Ordering::SeqCst);
-        if prev == STATE_STOPPED {
-            self.inner.state.store(STATE_STOPPED, Ordering::SeqCst);
+        if prev == STATE_STOPPED || prev == STATE_DRAINING {
+            // Concurrent shutdown: second caller does not re-drain.
+            if prev == STATE_STOPPED {
+                return ShutdownDisposition::default();
+            }
+            // Wait until stopped or deadline.
+            while self.inner.state.load(Ordering::SeqCst) != STATE_STOPPED {
+                if tokio::time::Instant::now() >= deadline_at {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             return ShutdownDisposition::default();
         }
 
         let active = {
-            let mut reg = self.inner.registry.lock().unwrap_or_else(|e| e.into_inner());
+            let mut reg = self
+                .inner
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             reg.drain_all()
         };
+
+        // Signal all actors first (group), then join concurrently under remaining time.
+        for entry in &active {
+            let _ = entry.control_tx.try_send(ControlMessage::ForceTerminate);
+        }
 
         let mut normally_finalized = 0u64;
         let mut supervisor_finalized = 0u64;
         let mut callback_failed = 0u64;
         let mut callback_aborted = 0u64;
         let mut invariant_failed = 0u64;
-        let cb_deadline = self.inner.config.transaction_limits.callback_deadline;
+        let cb_cfg = self.inner.config.transaction_limits.callback_deadline;
 
+        let n = active.len().max(1);
+        let mut handles = Vec::with_capacity(active.len());
         for entry in active {
-            let _ = entry.control_tx.try_send(ControlMessage::ForceTerminate);
-            let join_budget = (slice / 4).max(Duration::from_millis(100));
             let abort = entry.actor_join.abort_handle();
-            match tokio::time::timeout(join_budget, entry.actor_join).await {
+            handles.push((entry, abort));
+        }
+
+        for (entry, abort) in handles {
+            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                abort.abort();
+                let _ = entry.actor_join.await;
+                if let Some(payload) = entry.guard.try_claim() {
+                    entry.guard.mark_callback_scheduled();
+                    let end = build_transaction_end(
+                        &payload,
+                        TransactionEndKind::RuntimeShutdown,
+                        None,
+                        EventDeliveryOutcome::Failed,
+                        entry.guard.sequencer().last_allocated(),
+                    );
+                    let cb_budget = cb_cfg.min(Duration::from_millis(50));
+                    let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        payload.callback.call(end)
+                    }));
+                    if let Ok(fut) = call {
+                        match tokio::time::timeout(cb_budget, fut).await {
+                            Ok(Ok(())) => supervisor_finalized += 1,
+                            Ok(Err(_)) => {
+                                supervisor_finalized += 1;
+                                callback_failed += 1;
+                            }
+                            Err(_) => {
+                                supervisor_finalized += 1;
+                                callback_aborted += 1;
+                            }
+                        }
+                    } else {
+                        supervisor_finalized += 1;
+                        callback_failed += 1;
+                    }
+                } else {
+                    supervisor_finalized += 1;
+                }
+                (entry.release_capacity)();
+                continue;
+            }
+
+            let per = (remaining / n as u32).max(Duration::from_millis(20));
+            let join = entry.actor_join;
+            match tokio::time::timeout(per, join).await {
                 Ok(Ok(())) => {
                     if entry.guard.callback_was_scheduled() {
                         normally_finalized += 1;
@@ -240,16 +302,27 @@ impl DefaultTransactionRuntime {
                             EventDeliveryOutcome::Failed,
                             entry.guard.sequencer().last_allocated(),
                         );
-                        let fut = payload.callback.call(end);
-                        match tokio::time::timeout(cb_deadline, fut).await {
-                            Ok(Ok(())) => supervisor_finalized += 1,
-                            Ok(Err(_)) => {
-                                supervisor_finalized += 1;
-                                callback_failed += 1;
-                            }
+                        let cb_budget = cb_cfg.min(
+                            deadline_at.saturating_duration_since(tokio::time::Instant::now()),
+                        );
+                        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            payload.callback.call(end)
+                        }));
+                        match call {
+                            Ok(fut) => match tokio::time::timeout(cb_budget, fut).await {
+                                Ok(Ok(())) => supervisor_finalized += 1,
+                                Ok(Err(_)) => {
+                                    supervisor_finalized += 1;
+                                    callback_failed += 1;
+                                }
+                                Err(_) => {
+                                    supervisor_finalized += 1;
+                                    callback_aborted += 1;
+                                }
+                            },
                             Err(_) => {
                                 supervisor_finalized += 1;
-                                callback_aborted += 1;
+                                callback_failed += 1;
                             }
                         }
                     } else {
@@ -267,15 +340,20 @@ impl DefaultTransactionRuntime {
                             EventDeliveryOutcome::Failed,
                             0,
                         );
-                        let fut = payload.callback.call(end);
-                        let _ = tokio::time::timeout(Duration::from_millis(100), fut).await;
+                        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            payload.callback.call(end)
+                        }));
+                        if let Ok(fut) = call {
+                            let _ = tokio::time::timeout(Duration::from_millis(50), fut).await;
+                        }
                         supervisor_finalized += 1;
                     }
                 }
                 Err(_) => {
-                    // Actor did not finish within budget (e.g. blocked on sink).
-                    // Abort owned work; JoinHandle drop alone would only detach.
+                    // D-020: abort then brief poll for join terminal before supervisor claim.
+                    // (timeout drops JoinHandle which detaches; AbortHandle stops the task.)
                     abort.abort();
+                    tokio::task::yield_now().await;
                     if let Some(payload) = entry.guard.try_claim() {
                         entry.guard.mark_callback_scheduled();
                         let end = build_transaction_end(
@@ -285,16 +363,27 @@ impl DefaultTransactionRuntime {
                             EventDeliveryOutcome::Failed,
                             entry.guard.sequencer().last_allocated(),
                         );
-                        let fut = payload.callback.call(end);
-                        match tokio::time::timeout(Duration::from_millis(200), fut).await {
-                            Ok(Ok(())) => supervisor_finalized += 1,
-                            Ok(Err(_)) => {
-                                supervisor_finalized += 1;
-                                callback_failed += 1;
-                            }
+                        let cb_budget = cb_cfg
+                            .min(deadline_at.saturating_duration_since(tokio::time::Instant::now()))
+                            .min(Duration::from_millis(200));
+                        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            payload.callback.call(end)
+                        }));
+                        match call {
+                            Ok(fut) => match tokio::time::timeout(cb_budget, fut).await {
+                                Ok(Ok(())) => supervisor_finalized += 1,
+                                Ok(Err(_)) => {
+                                    supervisor_finalized += 1;
+                                    callback_failed += 1;
+                                }
+                                Err(_) => {
+                                    supervisor_finalized += 1;
+                                    callback_aborted += 1;
+                                }
+                            },
                             Err(_) => {
                                 supervisor_finalized += 1;
-                                callback_aborted += 1;
+                                callback_failed += 1;
                             }
                         }
                     } else {
@@ -302,12 +391,13 @@ impl DefaultTransactionRuntime {
                     }
                 }
             }
-            // Always release capacity once (idempotent with actor finalize).
             (entry.release_capacity)();
         }
 
+        let mcp_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
         if let Some(mcp) = self.inner.mcp.lock().await.take() {
-            mcp.shutdown().await;
+            let _ = tokio::time::timeout(mcp_budget.max(Duration::from_millis(50)), mcp.shutdown())
+                .await;
         }
 
         self.inner.state.store(STATE_STOPPED, Ordering::SeqCst);
@@ -337,10 +427,7 @@ fn clone_binding(binding: &ChannelBinding) -> ChannelBinding {
     }
 }
 
-async fn cleanup_partial(
-    realized: Vec<(ChannelId, LiveChannel)>,
-    mcp: Option<McpGateway>,
-) {
+async fn cleanup_partial(realized: Vec<(ChannelId, LiveChannel)>, mcp: Option<McpGateway>) {
     drop(realized);
     if let Some(m) = mcp {
         m.shutdown().await;
@@ -366,6 +453,7 @@ impl TransactionRuntime for DefaultTransactionRuntime {
             registry: Arc::clone(&self.inner.registry),
             limits: self.inner.config.transaction_limits.clone(),
             mcp: self.inner.mcp_handle.clone(),
+            runtime_state: Arc::clone(&self.inner.state),
         };
         admit(&ctx, request)
     }
@@ -381,7 +469,11 @@ impl TransactionRuntime for DefaultTransactionRuntime {
         ) {
             return TerminationDisposition::NotFound;
         }
-        let reg = self.inner.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let reg = self
+            .inner
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tx = match selector {
             TransactionSelector::Transaction(id) => reg.control_tx(&id),
             TransactionSelector::Session(key) => reg.control_tx_by_session(&key),
@@ -409,4 +501,3 @@ impl TransactionRuntime for DefaultTransactionRuntime {
         })
     }
 }
-

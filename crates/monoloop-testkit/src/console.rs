@@ -142,10 +142,7 @@ impl ConsoleRenderer {
             CanonicalUnit::Tool(t) => {
                 let state = tool_state_label(t);
                 let name = t.tool_name.as_deref().unwrap_or("?");
-                let mut content = t
-                    .waiting_for
-                    .clone()
-                    .unwrap_or_else(|| state.clone());
+                let mut content = t.waiting_for.clone().unwrap_or_else(|| state.clone());
                 if self.config.show_tool_payloads {
                     if let Some(ref p) = t.request_payload {
                         content.push_str(" args=");
@@ -178,11 +175,7 @@ impl ConsoleRenderer {
                 TextChannel::PublicResponse.label().into(),
                 String::new(),
             ),
-            CanonicalUnit::Usage(u) => (
-                "usage".into(),
-                "tokens".into(),
-                format!("{u:?}"),
-            ),
+            CanonicalUnit::Usage(u) => ("usage".into(), "tokens".into(), format!("{u:?}")),
         };
         format!("{corr} {kind_state} {label} {content}\n")
     }

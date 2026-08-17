@@ -93,9 +93,11 @@ mod tests {
 
     #[test]
     fn opt_in_enables_auto_permissions() {
-        assert!(CursorAgentConfig::default()
-            .with_auto_allow_permissions()
-            .auto_allow_permissions);
+        assert!(
+            CursorAgentConfig::default()
+                .with_auto_allow_permissions()
+                .auto_allow_permissions
+        );
     }
 }
 

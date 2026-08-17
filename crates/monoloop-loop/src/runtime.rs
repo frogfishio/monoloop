@@ -174,9 +174,7 @@ fn spawn_loop(request: StartLoop) -> Result<LoopHandle, LoopError> {
             diagnostics: Vec::new(),
             ended: false,
         };
-        owner
-            .run(request.subscription, end_tx)
-            .await;
+        owner.run(request.subscription, end_tx).await;
     });
 
     Ok(LoopHandle {
@@ -288,9 +286,7 @@ impl LoopOwner {
         }
         self.last_seq = delivered.delivery_sequence;
         self.delivery_events += 1;
-        self.health
-            .events_received
-            .fetch_add(1, Ordering::Relaxed);
+        self.health.events_received.fetch_add(1, Ordering::Relaxed);
 
         match delivered.event {
             InterpreterOutputEvent::Unit(ev) => self.on_unit(*ev).await,
@@ -375,13 +371,16 @@ impl LoopOwner {
         unit_id: UnitId,
         generation: u64,
     ) {
-        let rec = self.actions.entry(key.to_string()).or_insert_with(|| ActionRecord {
-            tool_action_id,
-            unit_id,
-            last_generation: 0,
-            state: ActionState::ObservedWaiting,
-            dispatched: false,
-        });
+        let rec = self
+            .actions
+            .entry(key.to_string())
+            .or_insert_with(|| ActionRecord {
+                tool_action_id,
+                unit_id,
+                last_generation: 0,
+                state: ActionState::ObservedWaiting,
+                dispatched: false,
+            });
         if generation < rec.last_generation {
             return; // stale
         }
@@ -406,13 +405,16 @@ impl LoopOwner {
             return Err(LoopEndKind::InvariantFailed);
         }
 
-        let rec = self.actions.entry(key.to_string()).or_insert_with(|| ActionRecord {
-            tool_action_id: tool_action_id.clone(),
-            unit_id: unit_id.clone(),
-            last_generation: 0,
-            state: ActionState::RequestReady,
-            dispatched: false,
-        });
+        let rec = self
+            .actions
+            .entry(key.to_string())
+            .or_insert_with(|| ActionRecord {
+                tool_action_id: tool_action_id.clone(),
+                unit_id: unit_id.clone(),
+                last_generation: 0,
+                state: ActionState::RequestReady,
+                dispatched: false,
+            });
 
         if generation < rec.last_generation {
             return Ok(()); // stale
@@ -581,10 +583,7 @@ impl LoopOwner {
         Ok(())
     }
 
-    async fn on_interpretation_end(
-        &mut self,
-        _end: InterpretationEnd,
-    ) -> Result<(), LoopEndKind> {
+    async fn on_interpretation_end(&mut self, _end: InterpretationEnd) -> Result<(), LoopEndKind> {
         // Not turn completion. Do not expand scope.
         Ok(())
     }

@@ -90,7 +90,10 @@ impl GrokServerConfig {
             crate::error::GrokConnectorError::configuration("websocket endpoint missing host")
         })?;
         let is_loopback = host == "localhost"
-            || host.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false);
+            || host
+                .parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
         if !is_loopback && !self.allow_non_loopback {
             return Err(crate::error::GrokConnectorError::configuration(
                 "non-loopback endpoint requires allow_non_loopback=true and authenticated transport policy",

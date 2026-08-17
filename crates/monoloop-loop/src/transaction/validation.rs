@@ -103,7 +103,9 @@ fn validate_success_output(
             if t.len() > max_output_bytes {
                 return Err(OutputValidationFailure::OversizedOutput);
             }
-            if t.chars().any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') {
+            if t.chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r')
+            {
                 return Err(OutputValidationFailure::SuccessShapeMismatch);
             }
             Ok(())

@@ -343,7 +343,9 @@ impl TransactionToolDispatcher {
 fn reject_input(action: ToolActionId, f: InputValidationFailure) -> DispatchOutcome {
     let (code, message) = match f {
         InputValidationFailure::OversizedInput => ("oversized_input", "tool input exceeds limit"),
-        InputValidationFailure::InvalidJson => ("invalid_json", "tool arguments are not valid JSON"),
+        InputValidationFailure::InvalidJson => {
+            ("invalid_json", "tool arguments are not valid JSON")
+        }
         InputValidationFailure::DepthExceeded => ("json_depth_exceeded", "tool arguments too deep"),
         InputValidationFailure::SchemaInvalid => {
             ("schema_invalid", "tool arguments fail input schema")

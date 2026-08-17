@@ -25,8 +25,42 @@ impl std::fmt::Debug for RegisteredTool {
 
 impl RegisteredTool {
     /// Construct a registered tool.
+    ///
+    /// Prefer [`Self::try_new`] so cancellation policy is checked against the handler.
     pub fn new(spec: ToolSpec, handler: Arc<dyn ToolHandler>) -> Self {
-        Self { spec, handler }
+        Self::try_new(spec, handler).expect("handler supports declared ToolCancellationPolicy")
+    }
+
+    /// Construct a registered tool, rejecting unstoppable / mismatched policy (D-024).
+    pub fn try_new(
+        spec: ToolSpec,
+        handler: Arc<dyn ToolHandler>,
+    ) -> Result<Self, super::StartupError> {
+        use monoloop_contracts::ToolCancellationPolicy;
+        match &spec.cancellation {
+            ToolCancellationPolicy::Abortable => {
+                if !handler.supports_abort() {
+                    return Err(super::StartupError::ToolRegistry(
+                        "Abortable tool requires supports_abort handler",
+                    ));
+                }
+            }
+            ToolCancellationPolicy::IsolatedKillable { .. } => {
+                if !handler.supports_isolated_kill() {
+                    return Err(super::StartupError::ToolRegistry(
+                        "IsolatedKillable tool requires supports_isolated_kill handler",
+                    ));
+                }
+            }
+            ToolCancellationPolicy::Cooperative { .. } => {
+                if !handler.supports_abort() {
+                    return Err(super::StartupError::ToolRegistry(
+                        "Cooperative tool requires supports_abort handler",
+                    ));
+                }
+            }
+        }
+        Ok(Self { spec, handler })
     }
 }
 

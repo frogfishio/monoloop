@@ -4,9 +4,7 @@ use monoloop_contracts::{
     ConnectionId, DialectBinding, DialectDescriptor, ExternalSessionId, InterpretationId,
     InterpretationLimits, InterpreterOutputEvent,
 };
-use monoloop_interpreter::{
-    DefaultInterpreterFactory, InterpreterFactory, StartInterpretation,
-};
+use monoloop_interpreter::{DefaultInterpreterFactory, InterpreterFactory, StartInterpretation};
 use std::sync::Arc;
 
 use crate::console::{ConsoleRenderer, ConsoleRendererConfig, ConsoleSink, SyncMemorySink};
@@ -42,7 +40,12 @@ pub async fn interpret_bytes(
     bytes: &[u8],
     external_session_id: Option<ExternalSessionId>,
 ) -> Vec<InterpreterOutputEvent> {
-    feed_chunks(dialect, &[bytes::Bytes::copy_from_slice(bytes)], external_session_id).await
+    feed_chunks(
+        dialect,
+        &[bytes::Bytes::copy_from_slice(bytes)],
+        external_session_id,
+    )
+    .await
 }
 
 /// Feed arbitrary fragmentation of the same logical stream.
@@ -63,11 +66,7 @@ pub async fn feed_chunks(
         .expect("start");
 
     for chunk in chunks {
-        interp
-            .input
-            .push_bytes(chunk.clone())
-            .await
-            .expect("push");
+        interp.input.push_bytes(chunk.clone()).await.expect("push");
     }
     interp.input.finish_clean().await.expect("finish");
     collect_interpretation(&interp).await

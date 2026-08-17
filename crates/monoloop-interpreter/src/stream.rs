@@ -12,9 +12,7 @@ pub struct CanonicalEventStream {
 
 impl CanonicalEventStream {
     pub(crate) fn new(rx: mpsc::Receiver<InterpreterOutputEvent>) -> Self {
-        Self {
-            rx: Mutex::new(rx),
-        }
+        Self { rx: Mutex::new(rx) }
     }
 
     /// Receive the next event. `None` when the stream is closed after terminal end
@@ -53,7 +51,10 @@ impl EventPublisher {
         &self,
         event: InterpreterOutputEvent,
     ) -> Result<(), InterpreterError> {
-        self.tx.send(event).await.map_err(|_| InterpreterError::backpressure())?;
+        self.tx
+            .send(event)
+            .await
+            .map_err(|_| InterpreterError::backpressure())?;
         self.count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())

@@ -356,7 +356,10 @@ mod tests {
         let data = b"abcde\n"; // 6 bytes with newline
         let mut r = BufReader::new(Cursor::new(&data[..]));
         let err = read_line_bounded(&mut r, 5).await.unwrap_err();
-        assert_eq!(err.kind, monoloop_contracts::ConnectorErrorKind::ProtocolFailed);
+        assert_eq!(
+            err.kind,
+            monoloop_contracts::ConnectorErrorKind::ProtocolFailed
+        );
     }
 
     #[tokio::test]
@@ -364,6 +367,9 @@ mod tests {
         let data = b"abcdefghij"; // no newline
         let mut r = BufReader::new(Cursor::new(&data[..]));
         let err = read_line_bounded(&mut r, 5).await.unwrap_err();
-        assert_eq!(err.kind, monoloop_contracts::ConnectorErrorKind::ProtocolFailed);
+        assert_eq!(
+            err.kind,
+            monoloop_contracts::ConnectorErrorKind::ProtocolFailed
+        );
     }
 }

@@ -1,8 +1,7 @@
 //! Runtime-owned event delivery task (ordered, backpressured).
 
-use monoloop_contracts::{
-    EventDeliveryError, TransactionEvent, TransactionEventSink,
-};
+use monoloop_contracts::{EventDeliveryError, TransactionEvent, TransactionEventSink};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -22,7 +21,12 @@ pub fn spawn_delivery_task(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(item) = rx.recv().await {
-            let result = sink.deliver(item.event).await;
+            // D-021: host sink panics must not kill delivery without failure signal.
+            let deliver_fut = catch_unwind(AssertUnwindSafe(|| sink.deliver(item.event)));
+            let result = match deliver_fut {
+                Ok(fut) => fut.await,
+                Err(_) => Err(EventDeliveryError::Failed),
+            };
             let ok = result.is_ok();
             if let Some(ack) = item.ack {
                 let _ = ack.send(if ok {

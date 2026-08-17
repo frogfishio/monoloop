@@ -5,8 +5,8 @@ use crate::error::GrokConnectorError;
 use crate::jsonrpc::{session_id_from_params, JsonRpcMessage, JsonRpcRequest, RpcId};
 use crate::secret::SecretResolver;
 use crate::session::{
-    GrokSessionFactory, GrokSessionHandle, GrokSessionHealth, PendingGrokSession, SessionCompletion,
-    SessionInner, SessionMap,
+    GrokSessionFactory, GrokSessionHandle, GrokSessionHealth, PendingGrokSession,
+    SessionCompletion, SessionInner, SessionMap,
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -136,9 +136,7 @@ async fn open_as_raw_connection(
     let _ = &mut config;
 
     let connector = GrokConnector::new(secrets);
-    let pending = connector
-        .connect(config)
-        .map_err(|e| e.into_connector())?;
+    let pending = connector.connect(config).map_err(|e| e.into_connector())?;
     let server = timeout(request.limits.connect_deadline, pending.opened)
         .await
         .map_err(|_| {
@@ -714,9 +712,10 @@ async fn connect_server(
     }
 
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    let mut request = url.as_str().into_client_request().map_err(|_| {
-        GrokConnectorError::configuration("invalid websocket endpoint for request")
-    })?;
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|_| GrokConnectorError::configuration("invalid websocket endpoint for request"))?;
     if let Ok(val) = secret.parse() {
         request.headers_mut().insert("X-Secret-Key", val);
     }
@@ -736,9 +735,7 @@ async fn connect_server(
                 "websocket connect deadline exceeded",
             ))
         })?
-        .map_err(|e| {
-            GrokConnectorError::connection(format!("websocket connect failed: {e}"))
-        })?;
+        .map_err(|e| GrokConnectorError::connection(format!("websocket connect failed: {e}")))?;
 
     let (write_tx, write_rx) = mpsc::channel::<WriteCmd>(64);
     let (end_tx, end_rx) = oneshot::channel();
@@ -783,7 +780,11 @@ async fn connect_server(
         }
     });
     let _init_result = inner
-        .rpc_call("initialize", Some(init_params), config.limits.request_deadline)
+        .rpc_call(
+            "initialize",
+            Some(init_params),
+            config.limits.request_deadline,
+        )
         .await?;
 
     let control_handle = GrokServerControl {
@@ -950,20 +951,17 @@ async fn run_connection(
     }
 }
 
-async fn handle_inbound(
-    inner: &Arc<ServerInner>,
-    bytes: Bytes,
-) -> Result<(), GrokConnectorError> {
+async fn handle_inbound(inner: &Arc<ServerInner>, bytes: Bytes) -> Result<(), GrokConnectorError> {
     let msg = JsonRpcMessage::parse(&bytes)?;
     if msg.is_response() {
-        let id = msg.id.ok_or_else(|| {
-            GrokConnectorError::protocol("response missing id")
-        })?;
+        let id = msg
+            .id
+            .ok_or_else(|| GrokConnectorError::protocol("response missing id"))?;
         let id_num = match id {
             RpcId::Number(n) => n,
-            RpcId::String(s) => s.parse().map_err(|_| {
-                GrokConnectorError::protocol("string rpc id not numeric")
-            })?,
+            RpcId::String(s) => s
+                .parse()
+                .map_err(|_| GrokConnectorError::protocol("string rpc id not numeric"))?,
         };
         let waiter = {
             let mut pending = inner.pending.lock().await;
@@ -981,9 +979,7 @@ async fn handle_inbound(
                 let _ = tx.send(Ok(msg.result.unwrap_or(serde_json::Value::Null)));
             }
         } else {
-            return Err(GrokConnectorError::protocol(
-                "response for unknown rpc id",
-            ));
+            return Err(GrokConnectorError::protocol("response for unknown rpc id"));
         }
         return Ok(());
     }
@@ -1010,7 +1006,9 @@ async fn handle_inbound(
         return Ok(());
     }
 
-    Err(GrokConnectorError::protocol("unrecognized json-rpc message"))
+    Err(GrokConnectorError::protocol(
+        "unrecognized json-rpc message",
+    ))
 }
 
 /// Max bytes returned for a single `fs/read_text_file` (fail closed beyond).
@@ -1131,7 +1129,10 @@ fn validate_client_fs_path(path: &str) -> Result<(), (i64, String)> {
     Ok(())
 }
 
-fn json_rpc_result(id: RpcId, result: serde_json::Value) -> Result<bytes::Bytes, GrokConnectorError> {
+fn json_rpc_result(
+    id: RpcId,
+    result: serde_json::Value,
+) -> Result<bytes::Bytes, GrokConnectorError> {
     let v = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -1142,7 +1143,11 @@ fn json_rpc_result(id: RpcId, result: serde_json::Value) -> Result<bytes::Bytes,
     Ok(bytes::Bytes::from(raw))
 }
 
-fn json_rpc_error(id: RpcId, code: i64, message: impl Into<String>) -> Result<bytes::Bytes, GrokConnectorError> {
+fn json_rpc_error(
+    id: RpcId,
+    code: i64,
+    message: impl Into<String>,
+) -> Result<bytes::Bytes, GrokConnectorError> {
     let v = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,

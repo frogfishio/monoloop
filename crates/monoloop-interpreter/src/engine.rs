@@ -117,9 +117,7 @@ impl InterpretationCompletion {
     /// Wait for exactly one terminal InterpretationEnd.
     pub async fn wait(self) -> InterpretationEnd {
         let mut guard = self.rx.lock().await;
-        let rx = guard
-            .take()
-            .expect("InterpretationCompletion polled twice");
+        let rx = guard.take().expect("InterpretationCompletion polled twice");
         rx.await.unwrap_or_else(|_| InterpretationEnd {
             interpretation_id: InterpretationId::new("unknown"),
             connection_id: ConnectionId::new("unknown"),
@@ -174,7 +172,9 @@ pub(crate) fn spawn_interpretation(
             unresolved_bytes_at_end: 0,
             openai,
         };
-        owner.run(cmd_rx, end_tx, status_terminal, status_bytes).await;
+        owner
+            .run(cmd_rx, end_tx, status_terminal, status_bytes)
+            .await;
     });
 
     Ok(Interpretation {
@@ -257,8 +257,7 @@ impl ChannelAssembly {
         source_step: Option<u64>,
     ) -> Vec<(String, SentenceSourceMeta)> {
         if !text.is_empty() {
-            self.spans
-                .push((text.len(), source_time_ms, source_step));
+            self.spans.push((text.len(), source_time_ms, source_step));
         }
         let completed = self.segmenter.push(text);
         completed
@@ -404,18 +403,12 @@ impl Owner {
                 InputCmd::FinishClean => {
                     match self.seal_clean().await {
                         Ok(()) => {
-                            self.finish(
-                                InterpretationEndKind::Complete,
-                                end_tx,
-                                status_terminal,
-                            )
-                            .await;
+                            self.finish(InterpretationEndKind::Complete, end_tx, status_terminal)
+                                .await;
                         }
                         Err(e) => {
                             let kind = match e.kind {
-                                InterpreterErrorKind::Cancelled => {
-                                    InterpretationEndKind::Cancelled
-                                }
+                                InterpreterErrorKind::Cancelled => InterpretationEndKind::Cancelled,
                                 InterpreterErrorKind::FrameLimitExceeded
                                 | InterpreterErrorKind::SentenceLimitExceeded
                                 | InterpreterErrorKind::StructureLimitExceeded
@@ -515,8 +508,8 @@ impl Owner {
         if self.frame_buf.len() > self.request.limits.max_frame_bytes {
             return Err(InterpreterError::limit("frame buffer limit exceeded"));
         }
-        let values = drain_json_values(&mut self.frame_buf)
-            .map_err(InterpreterError::malformed_frame)?;
+        let values =
+            drain_json_values(&mut self.frame_buf).map_err(InterpreterError::malformed_frame)?;
         for value in values {
             if !self.response_started {
                 self.response_started = true;
@@ -685,9 +678,9 @@ impl Owner {
                     let snap = self.tool_snapshot_from(&id);
                     if let Some(s) = snap {
                         self.pub_
-                            .publish(InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Incomplete(
-                                s,
-                            ))))
+                            .publish(InterpreterOutputEvent::Unit(Box::new(
+                                CanonicalUnitEvent::Incomplete(s),
+                            )))
                             .await?;
                     }
                 }
@@ -885,9 +878,9 @@ impl Owner {
         );
         // Created-and-complete: emit Created (complete state)
         self.pub_
-            .publish(InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
-                snap,
-            ))))
+            .publish(InterpreterOutputEvent::Unit(Box::new(
+                CanonicalUnitEvent::Created(snap),
+            )))
             .await
     }
 
@@ -905,9 +898,9 @@ impl Owner {
             unit,
         );
         self.pub_
-            .publish(InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
-                snap,
-            ))))
+            .publish(InterpreterOutputEvent::Unit(Box::new(
+                CanonicalUnitEvent::Created(snap),
+            )))
             .await
     }
 
@@ -929,9 +922,9 @@ impl Owner {
             unit,
         );
         self.pub_
-            .publish(InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
-                snap,
-            ))))
+            .publish(InterpreterOutputEvent::Unit(Box::new(
+                CanonicalUnitEvent::Created(snap),
+            )))
             .await
     }
 

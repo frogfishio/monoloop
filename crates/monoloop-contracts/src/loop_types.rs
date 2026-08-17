@@ -2,8 +2,8 @@
 //!
 //! See `doc/THE_LOOP.md`. No concrete tools or dialect encoding.
 
-use crate::id::{ConnectionId, ExternalSessionId, MonoloopRunId};
 use crate::canonical::{InterpretationId, ToolActionId, UnitId};
+use crate::id::{ConnectionId, ExternalSessionId, MonoloopRunId};
 use serde::{Deserialize, Serialize};
 
 /// Loop instance identity.
@@ -302,7 +302,10 @@ impl LoopError {
 
     /// Gap.
     pub fn gap() -> Self {
-        Self::new(LoopErrorKind::DeliverySequenceGap, "subscription gap detected")
+        Self::new(
+            LoopErrorKind::DeliverySequenceGap,
+            "subscription gap detected",
+        )
     }
 
     /// Limit.

@@ -10,15 +10,15 @@ use crate::handles::{
     ConnectionCompletionHandle, ConnectionEndKind, ConnectionOwner, EndInitiator, RawInputHandle,
     RawInputMessage, RawOutputHandle,
 };
-use crate::instance::{ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId};
+use crate::instance::{
+    ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId,
+};
 use crate::open::{OpenConnection, OpenedRawConnection, PendingRawConnection};
 use crate::session::validate_open_attachment_owner;
 use crate::traits::Connector;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use monoloop_contracts::{
-    ConnectionId, ConnectorError, DialectBinding, DialectDescriptor,
-};
+use monoloop_contracts::{ConnectionId, ConnectorError, DialectBinding, DialectDescriptor};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -214,10 +214,8 @@ impl fmt::Debug for StreamingHttpConnectorFactory {
 
 impl ConnectorFactory for StreamingHttpConnectorFactory {
     fn create(&self) -> Result<ConnectorInstance, ConnectorBuildError> {
-        let connector = StreamingHttpConnector::try_new(
-            self.config.clone(),
-            Arc::clone(&self.credentials),
-        )?;
+        let connector =
+            StreamingHttpConnector::try_new(self.config.clone(), Arc::clone(&self.credentials))?;
         let id = connector.instance_id().clone();
         Ok(ConnectorInstance::new(id, Arc::new(connector), None))
     }
@@ -443,7 +441,8 @@ async fn run_http_owner(
             owner.finish(kind, EndInitiator::LocalControl, None);
             return;
         }
-        r = timeout(connect_deadline.max(config.request_timeout), send_fut) => {
+        // D-019: use the shorter of connect and overall request bounds, not max.
+        r = timeout(connect_deadline.min(config.request_timeout), send_fut) => {
             match r {
                 Ok(Ok(resp)) => resp,
                 Ok(Err(_)) => {
@@ -468,8 +467,8 @@ async fn run_http_owner(
 
     let status = response.status();
     if !status.is_success() {
-        // Drain body bounded then fail — no provider body in diagnostics.
-        let _ = response.bytes().await;
+        // D-019: do not buffer unbounded error bodies; discard without retain.
+        drop(response);
         owner.finish(
             ConnectionEndKind::TransportFailure,
             EndInitiator::Remote,
@@ -480,6 +479,7 @@ async fn run_http_owner(
 
     let mut stream = response.bytes_stream();
     let mut total_response: usize = 0;
+    // D-019: one absolute overall deadline from response start.
     let deadline = Instant::now() + config.request_timeout;
 
     loop {
@@ -535,13 +535,28 @@ async fn run_http_owner(
                         }
                         total_response += chunk.len();
                         let len = chunk.len() as u64;
-                        if out_tx.send(chunk).await.is_err() {
-                            owner.finish(
-                                ConnectionEndKind::TransportFailure,
-                                EndInitiator::LocalTransport,
-                                Some("output closed".into()),
-                            );
-                            return;
+                        // D-019: enqueue must not ignore cancel while blocked on full queue.
+                        tokio::select! {
+                            biased;
+                            _ = wait_control(&control) => {
+                                let kind = if control.terminate_requested() {
+                                    ConnectionEndKind::Terminated
+                                } else {
+                                    ConnectionEndKind::Cancelled
+                                };
+                                owner.finish(kind, EndInitiator::LocalControl, None);
+                                return;
+                            }
+                            send_res = out_tx.send(chunk) => {
+                                if send_res.is_err() {
+                                    owner.finish(
+                                        ConnectionEndKind::TransportFailure,
+                                        EndInitiator::LocalTransport,
+                                        Some("output closed".into()),
+                                    );
+                                    return;
+                                }
+                            }
                         }
                         owner.bytes_received += len;
                     }

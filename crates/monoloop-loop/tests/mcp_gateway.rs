@@ -1,9 +1,9 @@
 //! WP-07: MCP capability lifecycle, list/call parity, isolation.
 
 use monoloop_contracts::{
-    CanonicalToolOutput, ChannelId, ExchangeId, JsonSchema, SessionId, SessionKey,
-    ToolActionId, ToolCancellationPolicy, ToolCompletion, ToolId, ToolLimits, ToolName,
-    ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionId,
+    CanonicalToolOutput, ChannelId, ExchangeId, JsonSchema, SessionId, SessionKey, ToolActionId,
+    ToolCancellationPolicy, ToolCompletion, ToolId, ToolLimits, ToolName, ToolOutputContract,
+    ToolSpec, ToolSuccessContract, TransactionId,
 };
 use monoloop_loop::{
     dispatch_ready_tool, tool_definitions_from_resolved, CapabilityToken, DispatchOutcome,
@@ -116,7 +116,11 @@ async fn pending_rejects_list_and_call_until_active() {
     assert!(binding.handler.list_tool_defs().is_err());
     let mut args = serde_json::Map::new();
     args.insert("q".into(), serde_json::json!("hi"));
-    assert!(binding.handler.call_tool_direct("echo", Some(args)).await.is_err());
+    assert!(binding
+        .handler
+        .call_tool_direct("echo", Some(args))
+        .await
+        .is_err());
 
     gw.activate(&pending.token).unwrap();
     assert_eq!(
@@ -129,7 +133,11 @@ async fn pending_rejects_list_and_call_until_active() {
 
     let mut args = serde_json::Map::new();
     args.insert("q".into(), serde_json::json!("hi"));
-    let result = binding.handler.call_tool_direct("echo", Some(args)).await.unwrap();
+    let result = binding
+        .handler
+        .call_tool_direct("echo", Some(args))
+        .await
+        .unwrap();
     assert_eq!(result.is_error, Some(false));
 
     gw.shutdown().await;
@@ -156,7 +164,12 @@ async fn unknown_revoked_cross_transaction_isolation() {
     let (_, tools_a) = resolved_echo();
     let d_a = build_dispatcher(tools_a.clone());
     let a = gw
-        .install_pending(TransactionId::generate(), tools_a, d_a, ExchangeId::generate())
+        .install_pending(
+            TransactionId::generate(),
+            tools_a,
+            d_a,
+            ExchangeId::generate(),
+        )
         .unwrap();
     gw.activate(&a.token).unwrap();
 
@@ -173,7 +186,12 @@ async fn unknown_revoked_cross_transaction_isolation() {
     let (_, tools_b) = resolved_echo();
     let d_b = build_dispatcher(tools_b.clone());
     let b = gw
-        .install_pending(TransactionId::generate(), tools_b, d_b, ExchangeId::generate())
+        .install_pending(
+            TransactionId::generate(),
+            tools_b,
+            d_b,
+            ExchangeId::generate(),
+        )
         .unwrap();
     assert_ne!(a.token, b.token);
     assert!(gw.routes().get(&a.token).is_none());
@@ -190,7 +208,12 @@ async fn delayed_capability_a_cannot_enter_b() {
     let (_, tools) = resolved_echo();
     let d1 = build_dispatcher(tools.clone());
     let a = gw
-        .install_pending(TransactionId::generate(), tools.clone(), d1, ExchangeId::generate())
+        .install_pending(
+            TransactionId::generate(),
+            tools.clone(),
+            d1,
+            ExchangeId::generate(),
+        )
         .unwrap();
     gw.activate(&a.token).unwrap();
     let token_a = a.token.clone();
@@ -198,7 +221,12 @@ async fn delayed_capability_a_cannot_enter_b() {
 
     let d2 = build_dispatcher(tools);
     let b = gw
-        .install_pending(TransactionId::generate(), ResolvedToolSet::empty(), d2, ExchangeId::generate())
+        .install_pending(
+            TransactionId::generate(),
+            ResolvedToolSet::empty(),
+            d2,
+            ExchangeId::generate(),
+        )
         .unwrap();
     gw.activate(&b.token).unwrap();
 
@@ -273,7 +301,11 @@ async fn mcp_and_local_paths_same_handler_and_definitions() {
     let binding = gw.routes().get(&pending.token).unwrap();
     let mut args = serde_json::Map::new();
     args.insert("q".into(), serde_json::json!("hi"));
-    let mcp = binding.handler.call_tool_direct("echo", Some(args)).await.unwrap();
+    let mcp = binding
+        .handler
+        .call_tool_direct("echo", Some(args))
+        .await
+        .unwrap();
     assert_eq!(mcp.is_error, Some(false));
 
     // Disallowed tool on MCP
@@ -327,5 +359,3 @@ async fn token_hex_roundtrip() {
     assert!(CapabilityToken::from_hex("short").is_none());
     assert!(CapabilityToken::from_hex(&"zz".repeat(32)).is_none());
 }
-
-

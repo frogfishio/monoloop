@@ -35,9 +35,7 @@ impl Default for ClaudeAgentConfig {
             command: discover_claude_bin(),
             extra_args: Vec::new(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            model: std::env::var("CLAUDE_MODEL")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            model: std::env::var("CLAUDE_MODEL").ok().filter(|s| !s.is_empty()),
             skip_permissions: false,
             run_deadline: Duration::from_secs(15 * 60),
             max_stdout_bytes: 16 * 1024 * 1024,

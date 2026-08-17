@@ -3,17 +3,17 @@
 use monoloop_connector::FakeConnectorFactory;
 use monoloop_contracts::{
     user_text_input, AdmissionErrorKind, CancellationReason, CancellationReasonCode,
-    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy,
-    DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink, InvocationConfig,
-    McpConfigurationCapability, McpReachability, SessionConfig, SessionId, SessionMode,
-    TerminationMode, ToolExecutionMode, ToolId, TransactionEnd, TransactionEndKind,
+    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
+    ContinuationPolicy, DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink,
+    InvocationConfig, McpConfigurationCapability, McpReachability, SessionConfig, SessionId,
+    SessionMode, TerminationMode, ToolExecutionMode, ToolId, TransactionEnd, TransactionEndKind,
     TransactionEvent, TransactionEventPayload, TransactionRequest, TransactionRuntime,
     TransactionSelector,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
-    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, TestTextEncoder,
-    RuntimeBootstrap, RuntimeConfig,
+    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, RuntimeBootstrap,
+    RuntimeConfig, TestTextEncoder,
 };
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -390,7 +390,10 @@ async fn generated_and_supplied_direct_llm_sessions() {
     let r2 = Recorders::new();
     let receipt2 =
         TransactionRuntime::submit(rt.as_ref(), r2.request("llm", Some(supplied.clone()))).unwrap();
-    assert_eq!(receipt2.session_id.as_ref().map(|s| s.as_str()), Some("explicit-sess"));
+    assert_eq!(
+        receipt2.session_id.as_ref().map(|s| s.as_str()),
+        Some("explicit-sess")
+    );
     tokio::time::timeout(Duration::from_secs(2), r2.done.notified())
         .await
         .ok();

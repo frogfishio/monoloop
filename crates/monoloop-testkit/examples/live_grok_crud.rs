@@ -22,8 +22,8 @@ use monoloop_contracts::{
 };
 use monoloop_interpreter::{DefaultInterpreterFactory, InterpreterFactory, StartInterpretation};
 use monoloop_testkit::{
-    build_html_report, write_html_report, HtmlReportParams, SyncMemorySink, ConsoleRenderer,
-    ConsoleRendererConfig, ConsoleSink,
+    build_html_report, write_html_report, ConsoleRenderer, ConsoleRendererConfig, ConsoleSink,
+    HtmlReportParams, SyncMemorySink,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -69,9 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.limits = limits;
     let config = config.with_raw_dump(Arc::clone(&dump));
 
-    println!(
-        "timeouts: prompt={prompt_timeout_secs}s request_deadline={request_deadline_secs}s"
-    );
+    println!("timeouts: prompt={prompt_timeout_secs}s request_deadline={request_deadline_secs}s");
 
     let pending = connector
         .connect(config)
@@ -168,23 +166,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Bounded wait: real model + tools, but never hang an operator forever.
-    let result = match tokio::time::timeout(
-        Duration::from_secs(prompt_timeout_secs),
-        exchange.response,
-    )
-    .await
-    {
-        Ok(Ok(Ok(v))) => v,
-        Ok(Ok(Err(e))) => return Err(format!("session/prompt failed: {e}").into()),
-        Ok(Err(_)) => return Err("prompt response channel dropped".into()),
-        Err(_) => {
-            return Err(format!(
-                "session/prompt timed out after {prompt_timeout_secs}s \
+    let result =
+        match tokio::time::timeout(Duration::from_secs(prompt_timeout_secs), exchange.response)
+            .await
+        {
+            Ok(Ok(Ok(v))) => v,
+            Ok(Ok(Err(e))) => return Err(format!("session/prompt failed: {e}").into()),
+            Ok(Err(_)) => return Err("prompt response channel dropped".into()),
+            Err(_) => {
+                return Err(format!(
+                    "session/prompt timed out after {prompt_timeout_secs}s \
                  (raise GROK_PROMPT_TIMEOUT_SECS if needed)"
-            )
-            .into());
-        }
-    };
+                )
+                .into());
+            }
+        };
 
     println!("prompt terminal result: {result}");
 

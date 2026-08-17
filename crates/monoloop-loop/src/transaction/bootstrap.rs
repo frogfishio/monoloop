@@ -30,16 +30,14 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     /// Validate non-zero and consistent bounds.
     pub fn validate(&self) -> Result<(), super::StartupError> {
-        self.transaction_limits
-            .validate()
-            .map_err(|e| match e {
-                monoloop_contracts::LimitsError::ZeroCapacity(f) => {
-                    super::StartupError::InvalidConfig(f)
-                }
-                monoloop_contracts::LimitsError::Inconsistent(_) => {
-                    super::StartupError::InvalidConfig("inconsistent transaction limits")
-                }
-            })?;
+        self.transaction_limits.validate().map_err(|e| match e {
+            monoloop_contracts::LimitsError::ZeroCapacity(f) => {
+                super::StartupError::InvalidConfig(f)
+            }
+            monoloop_contracts::LimitsError::Inconsistent(_) => {
+                super::StartupError::InvalidConfig("inconsistent transaction limits")
+            }
+        })?;
         if self.default_shutdown_deadline.is_zero() {
             return Err(super::StartupError::InvalidConfig(
                 "default_shutdown_deadline",

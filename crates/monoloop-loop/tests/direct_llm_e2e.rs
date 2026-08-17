@@ -13,13 +13,13 @@ use monoloop_connector::{
     AnonymousCredentialResolver, StreamingHttpConfig, StreamingHttpConnectorFactory,
 };
 use monoloop_contracts::{
-    user_text_input, ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
-    ContinuationPolicy, DialectBinding, DialectDescriptor, ExchangeMode, FnCompletionCallback,
-    FnEventSink, InvocationConfig, JsonSchema, McpConfigurationCapability, McpReachability,
-    SessionMode, ToolCancellationPolicy, ToolCompletion, ToolExecutionMode, ToolId, ToolLimits,
-    ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEnd,
-    TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionRequest,
-    TransactionRuntime, CanonicalToolOutput,
+    user_text_input, CanonicalToolOutput, ChannelCapabilities, ChannelDefaults, ChannelId,
+    ChannelKind, ChannelLimits, ContinuationPolicy, DialectBinding, DialectDescriptor,
+    ExchangeMode, FnCompletionCallback, FnEventSink, InvocationConfig, JsonSchema,
+    McpConfigurationCapability, McpReachability, SessionMode, ToolCancellationPolicy,
+    ToolCompletion, ToolExecutionMode, ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec,
+    ToolSuccessContract, TransactionEnd, TransactionEndKind, TransactionEvent,
+    TransactionEventPayload, TransactionRequest, TransactionRuntime,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
@@ -187,14 +187,13 @@ async fn run_tx(
     let end_kind = Arc::new(Mutex::new(TransactionEndKind::InvariantFailed));
 
     let events_s = Arc::clone(&events);
-    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> =
-        Arc::new(FnEventSink(move |e| {
-            let events_s = Arc::clone(&events_s);
-            Box::pin(async move {
-                events_s.lock().unwrap().push(e);
-                Ok(())
-            }) as monoloop_contracts::EventDelivery
-        }));
+    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> = Arc::new(FnEventSink(move |e| {
+        let events_s = Arc::clone(&events_s);
+        Box::pin(async move {
+            events_s.lock().unwrap().push(e);
+            Ok(())
+        }) as monoloop_contracts::EventDelivery
+    }));
 
     let done_s = Arc::clone(&done);
     let end_s = Arc::clone(&end_kind);
@@ -325,10 +324,9 @@ async fn caller_controlled_tool_exchange_is_continuation_required() {
     )
     .await;
     assert_eq!(kind, TransactionEndKind::ContinuationRequired);
-    assert!(evs.iter().any(|e| matches!(
-        e.payload,
-        TransactionEventPayload::ToolLifecycle(_)
-    )));
+    assert!(evs
+        .iter()
+        .any(|e| matches!(e.payload, TransactionEventPayload::ToolLifecycle(_))));
 
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
     join.abort();
@@ -489,10 +487,9 @@ async fn concurrent_direct_llm_isolated() {
         let notify = Arc::new(Notify::new());
         let f2 = Arc::clone(&finished);
         let n2 = Arc::clone(&notify);
-        let sink: Arc<dyn monoloop_contracts::TransactionEventSink> =
-            Arc::new(FnEventSink(|_| {
-                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
-            }));
+        let sink: Arc<dyn monoloop_contracts::TransactionEventSink> = Arc::new(FnEventSink(|_| {
+            Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+        }));
         let completion: Box<dyn monoloop_contracts::CompletionCallback> =
             Box::new(FnCompletionCallback(move |end: TransactionEnd| {
                 let f2 = Arc::clone(&f2);

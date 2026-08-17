@@ -21,8 +21,8 @@ async fn initialize_session_new_and_prompt_roundtrip() {
     secrets.insert("GROK_WS_SECRET", secret);
 
     let connector = GrokConnector::new(secrets);
-    let config = GrokServerConfig::loopback(addr.port(), SecretRef::new("GROK_WS_SECRET"))
-        .expect("config");
+    let config =
+        GrokServerConfig::loopback(addr.port(), SecretRef::new("GROK_WS_SECRET")).expect("config");
     let pending = connector.connect(config).expect("connect pending");
     let server = tokio::time::timeout(Duration::from_secs(5), pending.opened)
         .await
@@ -163,7 +163,9 @@ async fn raw_dump_captures_exact_inbound_from_grok() {
         snap.format_text()
     );
     assert!(
-        values.iter().any(|v| v.get("result").is_some() || v.get("method").is_some()),
+        values
+            .iter()
+            .any(|v| v.get("result").is_some() || v.get("method").is_some()),
         "unexpected JSON shapes: {values:?}"
     );
 

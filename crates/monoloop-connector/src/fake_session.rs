@@ -301,8 +301,9 @@ async fn run_attach(
         return Err(SessionAttachError::SessionFailed);
     }
 
-    let (external_id, effective_config) = if let Some(ref requested) = request.requested_session_id
-    {
+    let route = Arc::new(FakeSessionRoute::new(state.owner.clone()));
+    if let Some(ref requested) = request.requested_session_id {
+        // Explicit load only — never create a replacement session (D-013).
         let table = state.table.lock().expect("session table");
         let known = table
             .by_id
@@ -315,28 +316,34 @@ async fn run_attach(
         let external = ExternalSessionId::try_new(requested.as_str())
             .map_err(|_| SessionAttachError::SessionFailed)?;
         validate_session_id_match(Some(requested), &external)?;
-        (external, known)
+        Ok(Arc::new(SessionAttachment::new(
+            state.owner.clone(),
+            external,
+            known,
+            route,
+        )))
     } else {
-        let id = format!("fake-sess-{}", Uuid::new_v4());
-        let external =
-            ExternalSessionId::try_new(&id).map_err(|_| SessionAttachError::SessionFailed)?;
+        // Create: provisional placeholder; Connector returns authoritative id on open.
+        let provisional = format!("fake-pending-{}", Uuid::new_v4());
+        let external = ExternalSessionId::try_new(&provisional)
+            .map_err(|_| SessionAttachError::SessionFailed)?;
         let effective = request.session_config.clone();
+        // Reserve a create slot so concurrent reuse keys are distinct; open will
+        // register the provider id (see FakeConnector create_mode).
         state
             .table
             .lock()
             .expect("session table")
             .by_id
-            .insert(id, effective.clone());
-        (external, effective)
-    };
-
-    let route = Arc::new(FakeSessionRoute::new(state.owner.clone()));
-    Ok(Arc::new(SessionAttachment::new(
-        state.owner.clone(),
-        external_id,
-        effective_config,
-        route,
-    )))
+            .insert(provisional, effective.clone());
+        Ok(Arc::new(SessionAttachment::new_create(
+            state.owner.clone(),
+            external,
+            effective,
+            route,
+            request.initial_mcp,
+        )))
+    }
 }
 
 fn configs_conflict(requested: &SessionConfig, known: &SessionConfig) -> bool {

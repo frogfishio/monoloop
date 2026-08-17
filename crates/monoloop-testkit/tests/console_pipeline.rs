@@ -64,7 +64,10 @@ async fn console_renders_acp_session_stream() {
     .await;
 
     assert!(text.contains("Working on it."), "{text}");
-    assert!(text.contains("tool/waiting") || text.contains("tool/ready"), "{text}");
+    assert!(
+        text.contains("tool/waiting") || text.contains("tool/ready"),
+        "{text}"
+    );
     assert!(text.contains("bash"), "{text}");
     assert!(text.contains("Done."), "{text}");
     assert!(text.contains("interpretation/Complete"), "{text}");
@@ -114,7 +117,10 @@ async fn append_only_preserves_tool_generations() {
     }
     assert!(records.len() >= 2, "waiting + ready generations");
     assert!(records[0].line.contains("g:1"), "{}", records[0].line);
-    assert!(records.iter().any(|r| r.line.contains("g:2")), "{records:?}");
+    assert!(
+        records.iter().any(|r| r.line.contains("g:2")),
+        "{records:?}"
+    );
 }
 
 #[tokio::test]

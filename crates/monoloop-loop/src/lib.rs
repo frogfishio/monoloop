@@ -17,31 +17,32 @@ pub use registry::{
     EmptyToolRegistry, ResolveToolRequest, ToolDescriptorRef, ToolRegistry, ToolRegistryError,
     ToolResolution,
 };
-pub use runtime::{DefaultLoopRuntime, LoopCompletion, LoopControl, LoopHandle, LoopHealth, StartLoop};
+pub use runtime::{
+    DefaultLoopRuntime, LoopCompletion, LoopControl, LoopHandle, LoopHealth, StartLoop,
+};
 pub use subscription::{
-    CanonicalEventSubscription, DeliveredEvent, SubscriberId, SubscriptionGap, SubscriptionPublisher,
-    SubscriptionStatus,
+    CanonicalEventSubscription, DeliveredEvent, SubscriberId, SubscriptionGap,
+    SubscriptionPublisher, SubscriptionStatus,
 };
 pub use tools::{
     NoToolRuntime, StartToolExecution, ToolExecutionHandle, ToolRuntime, ToolRuntimeError,
     ToolRuntimeTerminal,
 };
 pub use transaction::{
-    dispatch_ready_tool, tool_definitions_from_resolved, AcpPromptEncoder, AcpPromptWireShape,
+    dispatch_ready_tool, run_encoded_exchange, run_exchange, tool_definitions_from_resolved,
+    validate_tool_completion, validate_tool_input, AcpPromptEncoder, AcpPromptWireShape,
     AsyncToolHandler, CapabilityToken, CapacityManagers, ChannelBinding, ChannelRegistry,
-    DefaultTransactionRuntime, DispatchOutcome, HeadlessPromptEncoder,
-    DispatchRequest, EmptyBytesEncoder, EncodedExchangeParams, EventSequencer, ExchangeFailure,
-    ExchangeOutcome, ExchangeParams, FinalizationGuard, HostToolRegistry, HostToolRuntime,
-    ImmediateToolHandler,
-    InputValidationFailure, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
-    McpBindingState, McpGateway, McpGatewayHandle, McpInstallError, McpListenerShell, McpRouteTable,
-    OpenAiChatCompletionsEncoder, OpenAiEncoderOptions, OutputValidationFailure, PanicOnStartHandler,
-    PendingMcpBinding, RegisteredTool, RejectEncoder, ResolvedTool, ResolvedToolRegistry,
-    ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeState, SharedToolCapacity,
-    StartFailHandler, Startup, StartupError, TestTextEncoder, ToolExecutionCompletion,
-    ToolExecutionControl, ToolHandler, TransactionMcpHandler, TransactionToolCapacity,
-    TransactionToolDispatcher, validate_tool_completion, validate_tool_input, run_encoded_exchange,
-    run_exchange,
+    DefaultTransactionRuntime, DispatchOutcome, DispatchRequest, EmptyBytesEncoder,
+    EncodedExchangeParams, EventSequencer, ExchangeFailure, ExchangeOutcome, ExchangeParams,
+    FinalizationGuard, HeadlessPromptEncoder, HostToolRegistry, HostToolRuntime,
+    ImmediateToolHandler, InputValidationFailure, LinkedToolExecutionHandle, LiveChannel,
+    LostCompletionHandler, McpBindingState, McpGateway, McpGatewayHandle, McpInstallError,
+    McpListenerShell, McpRouteTable, OpenAiChatCompletionsEncoder, OpenAiEncoderOptions,
+    OutputValidationFailure, PanicOnStartHandler, PendingMcpBinding, RegisteredTool, RejectEncoder,
+    ResolvedTool, ResolvedToolRegistry, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig,
+    RuntimeState, SharedToolCapacity, StartFailHandler, Startup, StartupError, TestTextEncoder,
+    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, TransactionMcpHandler,
+    TransactionToolCapacity, TransactionToolDispatcher,
 };
 
 pub use monoloop_contracts::{

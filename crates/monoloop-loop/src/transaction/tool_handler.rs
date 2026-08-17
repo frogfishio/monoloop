@@ -17,6 +17,17 @@ pub trait ToolHandler: Send + Sync {
         call: ToolCall,
         context: ToolCallContext,
     ) -> Result<LinkedToolExecutionHandle, ToolStartError>;
+
+    /// Whether cooperative/abort cancellation is honored (D-024).
+    /// Default true: handlers must observe [`ToolExecutionControl`].
+    fn supports_abort(&self) -> bool {
+        true
+    }
+
+    /// Whether isolated kill after grace is available (D-024).
+    fn supports_isolated_kill(&self) -> bool {
+        false
+    }
 }
 
 /// Cancellation control for a running linked tool.

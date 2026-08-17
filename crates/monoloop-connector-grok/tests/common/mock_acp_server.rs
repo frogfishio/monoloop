@@ -40,11 +40,7 @@ struct AuthCallback {
 }
 
 impl Callback for AuthCallback {
-    fn on_request(
-        self,
-        request: &Request,
-        response: Response,
-    ) -> Result<Response, ErrorResponse> {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
         let uri = request
             .uri()
             .path_and_query()

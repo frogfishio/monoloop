@@ -84,10 +84,7 @@ impl OpenAiChatCompletionsEncoder {
                     body.insert("response_format".into(), json!({ "type": "text" }));
                 }
                 ResponseFormat::JsonObject => {
-                    body.insert(
-                        "response_format".into(),
-                        json!({ "type": "json_object" }),
-                    );
+                    body.insert("response_format".into(), json!({ "type": "json_object" }));
                 }
             }
         }
@@ -204,8 +201,8 @@ fn encode_message(msg: &CanonicalMessage) -> Result<Value, EncodingError> {
                 let calls: Vec<Value> = tool_calls
                     .iter()
                     .map(|c| {
-                        let args = serde_json::to_string(&c.arguments)
-                            .unwrap_or_else(|_| "{}".into());
+                        let args =
+                            serde_json::to_string(&c.arguments).unwrap_or_else(|_| "{}".into());
                         json!({
                             "id": c.tool_call_id,
                             "type": "function",
@@ -257,12 +254,12 @@ fn join_text(parts: &[monoloop_contracts::TextPart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monoloop_contracts::{
-        user_text_input, CanonicalInput, ChannelDefaults, EffectiveConfig, InvocationConfig,
-        JsonSchema, ToolCancellationPolicy, ToolId, ToolLimits, ToolName, ToolOutputContract,
-        ToolSuccessContract, TransactionId, ExchangeId,
-    };
     use monoloop_contracts::merge_effective_config;
+    use monoloop_contracts::{
+        user_text_input, CanonicalInput, ChannelDefaults, EffectiveConfig, ExchangeId,
+        InvocationConfig, JsonSchema, ToolCancellationPolicy, ToolId, ToolLimits, ToolName,
+        ToolOutputContract, ToolSuccessContract, TransactionId,
+    };
     use monoloop_contracts::{ExtensionLimits, OptionPolicy};
 
     fn effective(model: &str) -> EffectiveConfig {
@@ -400,7 +397,10 @@ mod tests {
                 tools: &[],
             })
             .unwrap_err();
-        assert!(matches!(err, EncodingError::Unsupported("reasoning_effort")));
+        assert!(matches!(
+            err,
+            EncodingError::Unsupported("reasoning_effort")
+        ));
     }
 
     #[test]

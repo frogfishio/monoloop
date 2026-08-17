@@ -214,11 +214,7 @@ impl ProcessInner {
         Ok(())
     }
 
-    pub async fn request(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, AgyConnectorError> {
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value, AgyConnectorError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(AgyConnectorError::connection("agent process closed"));
         }
@@ -274,8 +270,7 @@ impl ProcessInner {
             let _ = c.kill().await;
             let _ = c.wait().await;
         }
-        self.fail_all_pending(AgyConnectorError::cancelled())
-            .await;
+        self.fail_all_pending(AgyConnectorError::cancelled()).await;
     }
 }
 

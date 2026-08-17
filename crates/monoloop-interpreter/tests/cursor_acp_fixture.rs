@@ -101,11 +101,9 @@ async fn cursor_tool_call_ready_and_thought_suppressed() {
         .iter()
         .filter_map(|e| match e {
             InterpreterOutputEvent::Unit(u) => match &u.snapshot().unit {
-                CanonicalUnit::Tool(t) => Some((
-                    t.tool_name.clone(),
-                    t.request_state,
-                    t.terminal_outcome,
-                )),
+                CanonicalUnit::Tool(t) => {
+                    Some((t.tool_name.clone(), t.request_state, t.terminal_outcome))
+                }
                 _ => None,
             },
             _ => None,

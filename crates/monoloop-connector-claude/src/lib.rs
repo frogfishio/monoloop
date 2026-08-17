@@ -25,8 +25,8 @@ pub use run::{run_claude_print, ClaudeRunOutcome};
 
 use monoloop_connector::{
     ConnectionCompletionHandle, ConnectionControlHandle, ConnectionEnd, ConnectionEndKind,
-    Connector, ConnectorDescriptor, ControlState, EndInitiator, OpenConnection, OpenedRawConnection,
-    PendingRawConnection, RawInputHandle, RawInputMessage, RawOutputHandle,
+    Connector, ConnectorDescriptor, ControlState, EndInitiator, OpenConnection,
+    OpenedRawConnection, PendingRawConnection, RawInputHandle, RawInputMessage, RawOutputHandle,
 };
 use monoloop_contracts::{DialectBinding, DialectDescriptor};
 use std::sync::Arc;

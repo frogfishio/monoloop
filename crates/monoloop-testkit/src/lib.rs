@@ -35,9 +35,7 @@ pub use console::{
     ConsoleRenderRecord, ConsoleRenderer, ConsoleRendererConfig, ConsoleSink, StdoutSink,
     SyncMemorySink,
 };
-pub use distribute::{
-    pump_interpreter_to_distributor, EventDistributor, SubscriberPolicy,
-};
+pub use distribute::{pump_interpreter_to_distributor, EventDistributor, SubscriberPolicy};
 pub use driver::{
     run_bytes_pipeline, run_bytes_pipeline_with_params, DriverRunReport, PipelineParams,
     PipelineRawDump, RawInputFrame,
@@ -59,11 +57,11 @@ pub use live_codex::{
 pub use live_cursor::{
     run_live_cursor_prompt, LiveCursorArtifactPaths, LiveCursorRunOptions, LiveCursorRunReport,
 };
-pub use live_zai::{
-    run_live_zai_prompt, LiveZaiArtifactPaths, LiveZaiRunOptions, LiveZaiRunReport,
-};
 pub use live_grok::{
     run_live_grok_prompt, LiveGrokArtifactPaths, LiveGrokRunOptions, LiveGrokRunReport,
+};
+pub use live_zai::{
+    run_live_zai_prompt, LiveZaiArtifactPaths, LiveZaiRunOptions, LiveZaiRunReport,
 };
 pub use pipeline::{
     acp_binding, agy_acp_binding, claude_code_binding, codex_acp_binding, collect_interpretation,

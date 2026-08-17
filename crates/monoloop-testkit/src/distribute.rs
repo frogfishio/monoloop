@@ -44,11 +44,7 @@ impl EventDistributor {
     ) -> CanonicalEventSubscription {
         let name = name.into();
         let (pub_, sub) = SubscriptionPublisher::channel(name.clone(), capacity);
-        self.subs.push(Sub {
-            name,
-            policy,
-            pub_,
-        });
+        self.subs.push(Sub { name, policy, pub_ });
         sub
     }
 

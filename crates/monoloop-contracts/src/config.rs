@@ -7,7 +7,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// How the runtime continues after model tool calls.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub enum ContinuationPolicy {
     /// Runtime encodes tool results and continues the provider exchange.
     InlineToolContinuation,
@@ -157,7 +159,8 @@ pub struct OptionPolicy {
     pub supported_invocation: BTreeSet<ConfigOption>,
     /// Options frozen for an existing external session (must match or fail).
     pub session_immutable: BTreeSet<ConfigOption>,
-    /// Allowed extension key namespaces (exact keys). Empty = no extensions.
+    /// Allowed extension key namespaces (exact keys).
+    /// Empty means **no extensions permitted** (D-023).
     pub allowed_extension_keys: BTreeSet<ExtensionKey>,
 }
 
@@ -394,6 +397,15 @@ fn validate_extensions(
             max: limits.max_keys,
         });
     }
+    // D-023: empty allowlist denies all extensions (not unrestricted).
+    if !map.is_empty() && policy.allowed_extension_keys.is_empty() {
+        let first = map
+            .keys()
+            .next()
+            .map(|k| k.as_str().to_string())
+            .unwrap_or_default();
+        return Err(ConfigError::UnknownExtension(first));
+    }
     let mut total = 0usize;
     for (k, v) in map {
         if k.as_str().len() > limits.max_key_bytes {
@@ -402,9 +414,7 @@ fn validate_extensions(
                 max: limits.max_key_bytes,
             });
         }
-        if !policy.allowed_extension_keys.is_empty()
-            && !policy.allowed_extension_keys.contains(k)
-        {
+        if !policy.allowed_extension_keys.contains(k) {
             return Err(ConfigError::UnknownExtension(k.as_str().to_string()));
         }
         let depth = json_depth(&v.value);
@@ -416,7 +426,9 @@ fn validate_extensions(
         }
         let encoded =
             serde_json::to_vec(&v.value).map_err(|_| ConfigError::ExtensionEncodeFailed)?;
-        total = total.saturating_add(encoded.len()).saturating_add(k.as_str().len());
+        total = total
+            .saturating_add(encoded.len())
+            .saturating_add(k.as_str().len());
     }
     if total > limits.max_serialized_bytes {
         return Err(ConfigError::ExtensionsTooLarge {
@@ -604,7 +616,7 @@ mod tests {
         );
         let mut policy = open_policy();
         policy.allowed_extension_keys.clear(); // empty means unrestricted in our validate when empty
-        // With empty allowed set we currently allow all — re-check validate_extensions
+                                               // With empty allowed set we currently allow all — re-check validate_extensions
         let err = merge_effective_config(
             &ChannelDefaults::default(),
             None,

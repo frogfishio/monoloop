@@ -115,9 +115,7 @@ pub struct LiveGrokArtifactPaths {
 /// Start Grok serve, run one prompt to completion, tear everything down.
 ///
 /// Cleanup is guaranteed: serve is stopped even if the prompt fails.
-pub async fn run_live_grok_prompt(
-    opts: LiveGrokRunOptions,
-) -> Result<LiveGrokRunReport, String> {
+pub async fn run_live_grok_prompt(opts: LiveGrokRunOptions) -> Result<LiveGrokRunReport, String> {
     if let Some(parent) = opts.artifact_stem.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -132,10 +130,7 @@ pub async fn run_live_grok_prompt(
     let serve = ManagedGrokServe::start(opts.serve.clone()).await?;
     let port = serve.port();
     let secret = serve.secret().to_string();
-    println!(
-        "live-grok: serve up pid={:?} port={port}",
-        serve.pid()
-    );
+    println!("live-grok: serve up pid={:?} port={port}", serve.pid());
 
     let result = run_session_with_serve(&opts, &serve, &secret, port).await;
 
@@ -321,10 +316,8 @@ async fn run_session_with_serve(
         chat: PathBuf::from(format!("{}.chat.txt", opts.artifact_stem.display())),
     };
 
-    std::fs::write(&paths.raw, raw.format_text())
-        .map_err(|e| format!("write raw: {e}"))?;
-    std::fs::write(&paths.sequence, &sequence_text)
-        .map_err(|e| format!("write sequence: {e}"))?;
+    std::fs::write(&paths.raw, raw.format_text()).map_err(|e| format!("write raw: {e}"))?;
+    std::fs::write(&paths.sequence, &sequence_text).map_err(|e| format!("write sequence: {e}"))?;
     write_html_report(&paths.html, &html).map_err(|e| format!("write html: {e}"))?;
     std::fs::write(&paths.chat, &html.chat_projection.plain_text)
         .map_err(|e| format!("write chat: {e}"))?;

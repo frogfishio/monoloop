@@ -98,7 +98,10 @@ pub struct TextPart {
 
 impl TextPart {
     /// Construct a non-empty text part.
-    pub fn try_new(text: impl Into<String>, max_bytes: usize) -> Result<Self, InputValidationError> {
+    pub fn try_new(
+        text: impl Into<String>,
+        max_bytes: usize,
+    ) -> Result<Self, InputValidationError> {
         let text = text.into();
         if text.is_empty() {
             return Err(InputValidationError::EmptyTextPart);
@@ -189,10 +192,7 @@ impl CanonicalMessage {
     }
 }
 
-fn validate_name(
-    name: &Option<String>,
-    limits: &InputLimits,
-) -> Result<(), InputValidationError> {
+fn validate_name(name: &Option<String>, limits: &InputLimits) -> Result<(), InputValidationError> {
     if let Some(n) = name {
         if n.is_empty() {
             return Err(InputValidationError::EmptyName);
@@ -280,12 +280,8 @@ fn validate_json_value(
 
 fn json_depth(value: &serde_json::Value) -> u32 {
     match value {
-        serde_json::Value::Array(items) => {
-            1 + items.iter().map(json_depth).max().unwrap_or(0)
-        }
-        serde_json::Value::Object(map) => {
-            1 + map.values().map(json_depth).max().unwrap_or(0)
-        }
+        serde_json::Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
         _ => 1,
     }
 }

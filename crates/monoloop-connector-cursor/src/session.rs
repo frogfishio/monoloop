@@ -4,9 +4,7 @@ use crate::config::{CursorAgentConfig, CursorSessionConfig};
 use crate::error::CursorConnectorError;
 use crate::process::ProcessInner;
 use crate::raw_dump::CursorRawDump;
-use monoloop_contracts::{
-    DialectBinding, DialectDescriptor, ExternalSessionId,
-};
+use monoloop_contracts::{DialectBinding, DialectDescriptor, ExternalSessionId};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -21,10 +19,7 @@ pub struct CursorAgentHandle {
 impl CursorAgentHandle {
     /// Spawn `agent acp`, run initialize + authenticate.
     pub async fn connect(config: CursorAgentConfig) -> Result<Self, CursorConnectorError> {
-        let dump = Arc::new(CursorRawDump::new(
-            config.raw_dump_path.clone(),
-            10_000,
-        ));
+        let dump = Arc::new(CursorRawDump::new(config.raw_dump_path.clone(), 10_000));
         let (update_tx, updates) = mpsc::channel(config.max_output_queue);
         let inner = ProcessInner::spawn(config.clone(), update_tx, Arc::clone(&dump)).await?;
 

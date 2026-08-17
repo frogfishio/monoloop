@@ -26,8 +26,8 @@ pub use session::{CursorAgentHandle, CursorSession};
 
 use monoloop_connector::{
     ConnectionCompletionHandle, ConnectionControlHandle, ConnectionEnd, ConnectionEndKind,
-    Connector, ConnectorDescriptor, ControlState, EndInitiator, OpenConnection, OpenedRawConnection,
-    PendingRawConnection, RawInputHandle, RawInputMessage, RawOutputHandle,
+    Connector, ConnectorDescriptor, ControlState, EndInitiator, OpenConnection,
+    OpenedRawConnection, PendingRawConnection, RawInputHandle, RawInputMessage, RawOutputHandle,
 };
 use monoloop_contracts::{DialectBinding, DialectDescriptor, ExternalSessionId};
 use std::sync::Arc;
@@ -86,9 +86,8 @@ impl Connector for CursorConnector {
         let control_state = ControlState::new();
         let control = ConnectionControlHandle::new(Arc::clone(&control_state));
         let control_open = control.clone();
-        let opened = Box::pin(async move {
-            open_raw(config, request, control_open, control_state).await
-        });
+        let opened =
+            Box::pin(async move { open_raw(config, request, control_open, control_state).await });
         PendingRawConnection {
             connection_id,
             control,
@@ -240,7 +239,9 @@ fn safe_prompt_error(e: &CursorConnectorError) -> String {
             "prompt_rpc_deadline_exceeded".into()
         }
         monoloop_contracts::ConnectorErrorKind::Cancelled => "prompt_cancelled".into(),
-        monoloop_contracts::ConnectorErrorKind::ConnectionFailed => "prompt_connection_failed".into(),
+        monoloop_contracts::ConnectorErrorKind::ConnectionFailed => {
+            "prompt_connection_failed".into()
+        }
         monoloop_contracts::ConnectorErrorKind::ProtocolFailed => "prompt_protocol_failed".into(),
         monoloop_contracts::ConnectorErrorKind::SessionFailed => "prompt_session_failed".into(),
         _ => "prompt_failed".into(),

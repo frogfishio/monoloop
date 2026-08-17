@@ -1,8 +1,6 @@
 //! Pipeline raw dump: exact chunks as presented to the Interpreter.
 
-use monoloop_testkit::{
-    acp_binding, run_bytes_pipeline_with_params, PipelineParams,
-};
+use monoloop_testkit::{acp_binding, run_bytes_pipeline_with_params, PipelineParams};
 
 #[tokio::test]
 async fn pipeline_raw_dump_matches_fed_chunks_exactly() {

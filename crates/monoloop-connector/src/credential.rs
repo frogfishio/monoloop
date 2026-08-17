@@ -70,9 +70,7 @@ impl MapCredentialResolver {
         for (k, v) in entries {
             map.insert(k.into(), SecretString::from(v.into()));
         }
-        Self {
-            map: Arc::new(map),
-        }
+        Self { map: Arc::new(map) }
     }
 
     /// Empty resolver (any ref fails).

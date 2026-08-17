@@ -6,9 +6,7 @@ use monoloop_connector::{
     FakeSessionAdapterConfig, FakeSessionRoute, OpenConnection, SessionAdapter, SessionAttachError,
     SessionAttachRequest, SessionAttachment, SessionRoute,
 };
-use monoloop_contracts::{
-    ChannelId, ConnectionId, SessionConfig, SessionId, TransactionId,
-};
+use monoloop_contracts::{ChannelId, ConnectionId, SessionConfig, SessionId, TransactionId};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -217,7 +215,18 @@ async fn blocked_session_does_not_block_unrelated() {
         .await
         .unwrap();
     assert!(start.elapsed() < Duration::from_millis(100));
-    assert!(fast.external_session_id.as_str().starts_with("fake-sess-"));
+    // D-013: attach create_mode uses provisional pending id; open assigns fake-created-*.
+    assert!(
+        fast.external_session_id
+            .as_str()
+            .starts_with("fake-pending-")
+            || fast
+                .external_session_id
+                .as_str()
+                .starts_with("fake-created-")
+            || fast.external_session_id.as_str().starts_with("fake-sess-")
+    );
+    assert!(fast.create_mode);
     // Slow still completes independently.
     let _ = slow.completion.await.unwrap();
 }

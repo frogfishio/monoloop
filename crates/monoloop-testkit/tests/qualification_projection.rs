@@ -68,10 +68,7 @@ fn public_texts(events: &[InterpreterOutputEvent]) -> Vec<String> {
         .filter_map(|e| match e {
             InterpreterOutputEvent::Unit(u) => match &u.snapshot().unit {
                 CanonicalUnit::Text(t)
-                    if matches!(
-                        t.channel,
-                        monoloop_contracts::TextChannel::PublicResponse
-                    ) =>
+                    if matches!(t.channel, monoloop_contracts::TextChannel::PublicResponse) =>
                 {
                     Some(t.content.clone())
                 }
@@ -82,7 +79,9 @@ fn public_texts(events: &[InterpreterOutputEvent]) -> Vec<String> {
         .collect()
 }
 
-fn tool_actions(events: &[InterpreterOutputEvent]) -> Vec<(String, ToolRequestState, Option<ToolTerminalOutcome>)> {
+fn tool_actions(
+    events: &[InterpreterOutputEvent],
+) -> Vec<(String, ToolRequestState, Option<ToolTerminalOutcome>)> {
     events
         .iter()
         .filter_map(|e| match e {
@@ -116,8 +115,16 @@ fn unique_tool_ids(events: &[InterpreterOutputEvent]) -> Vec<String> {
 async fn q_tools_first_equal_list_steps_structural_zip() {
     let parts = vec![
         tool_pending("t1", "write"),
-        tool_ready("t1", "Write `a.txt`", r#"{"file_path":"a.txt","content":"x"}"#),
-        tool_done("t1", "Write `a.txt`", r#"{"file_path":"a.txt","content":"x"}"#),
+        tool_ready(
+            "t1",
+            "Write `a.txt`",
+            r#"{"file_path":"a.txt","content":"x"}"#,
+        ),
+        tool_done(
+            "t1",
+            "Write `a.txt`",
+            r#"{"file_path":"a.txt","content":"x"}"#,
+        ),
         tool_pending("t2", "read_file"),
         tool_ready("t2", "Read `a.txt`", r#"{"target_file":"a.txt"}"#),
         tool_done("t2", "Read `a.txt`", r#"{"target_file":"a.txt"}"#),
@@ -136,10 +143,17 @@ async fn q_tools_first_equal_list_steps_structural_zip() {
     let events = feed_chunks(acp_binding(), &stream(&parts), None).await;
     let texts = public_texts(&events);
     assert!(
-        texts.iter().any(|t| t.contains("1.") && t.contains("CREATE")),
+        texts
+            .iter()
+            .any(|t| t.contains("1.") && t.contains("CREATE")),
         "list step attached: {texts:?}"
     );
-    assert_eq!(unique_tool_ids(&events).len(), 3, "tools={:?}", unique_tool_ids(&events));
+    assert_eq!(
+        unique_tool_ids(&events).len(),
+        3,
+        "tools={:?}",
+        unique_tool_ids(&events)
+    );
 
     let chat = project_chat(&events);
     assert_eq!(
@@ -152,13 +166,21 @@ async fn q_tools_first_equal_list_steps_structural_zip() {
     assert_eq!(chat.confidence, ProjectionConfidence::StructuralReorder);
     let roles: Vec<_> = chat.lines.iter().map(|l| l.role).collect();
     assert!(
-        roles.windows(2).any(|w| w == [ChatRole::Tool, ChatRole::Agent]),
+        roles
+            .windows(2)
+            .any(|w| w == [ChatRole::Tool, ChatRole::Agent]),
         "tool then step: {roles:?}"
     );
 
     let html = build_html_report(&events, &HtmlReportParams::default());
     assert!(html.full_page_html.contains("Chat projection"));
-    assert!(html.full_page_html.contains("StructuralOrdinalZip") || html.chat_projection.plain_text.contains("StructuralOrdinalZip"));
+    assert!(
+        html.full_page_html.contains("StructuralOrdinalZip")
+            || html
+                .chat_projection
+                .plain_text
+                .contains("StructuralOrdinalZip")
+    );
     assert!(!html.assembled_markdown.contains("create.CRUD"));
 }
 
@@ -170,8 +192,16 @@ async fn q_tools_first_free_prose_chronological() {
         tool_ready("t1", "Read `README.md`", r#"{"target_file":"README.md"}"#),
         tool_done("t1", "Read `README.md`", r#"{"target_file":"README.md"}"#),
         tool_pending("t2", "read_file"),
-        tool_ready("t2", "Read `DECISIONS.md`", r#"{"target_file":"DECISIONS.md"}"#),
-        tool_done("t2", "Read `DECISIONS.md`", r#"{"target_file":"DECISIONS.md"}"#),
+        tool_ready(
+            "t2",
+            "Read `DECISIONS.md`",
+            r#"{"target_file":"DECISIONS.md"}"#,
+        ),
+        tool_done(
+            "t2",
+            "Read `DECISIONS.md`",
+            r#"{"target_file":"DECISIONS.md"}"#,
+        ),
         msg_chunk("I skimmed the docs. "),
         msg_chunk("Monoloop looks solid as a three-component kernel."),
         end_turn().into(),
@@ -181,11 +211,20 @@ async fn q_tools_first_free_prose_chronological() {
     let chat = project_chat(&events);
     assert_eq!(chat.strategy, ProjectionStrategy::ChronologicalChat);
     assert_eq!(chat.confidence, ProjectionConfidence::EmitOrder);
-    assert!(chat.strategy_reason.contains("without numbered list") || chat.strategy_reason.contains("chronological") || chat.strategy_reason.contains("emit-order") || chat.strategy_reason.contains("list"));
+    assert!(
+        chat.strategy_reason.contains("without numbered list")
+            || chat.strategy_reason.contains("chronological")
+            || chat.strategy_reason.contains("emit-order")
+            || chat.strategy_reason.contains("list")
+    );
     // Tools before agent speech in emit order.
     let first_tool = chat.lines.iter().position(|l| l.role == ChatRole::Tool);
     let first_agent = chat.lines.iter().position(|l| l.role == ChatRole::Agent);
-    assert!(first_tool < first_agent, "tools-first chrono: {:?}", chat.lines);
+    assert!(
+        first_tool < first_agent,
+        "tools-first chrono: {:?}",
+        chat.lines
+    );
 }
 
 /// Shape C: natural interleave text → tool → text → tool.
@@ -198,8 +237,16 @@ async fn q_interleaved_speech_and_tools() {
         tool_done("t1", "Read `x.txt`", r#"{"target_file":"x.txt"}"#),
         msg_chunk("Looks empty; I'll write content. "),
         tool_pending("t2", "write"),
-        tool_ready("t2", "Write `x.txt`", r#"{"file_path":"x.txt","content":"hi"}"#),
-        tool_done("t2", "Write `x.txt`", r#"{"file_path":"x.txt","content":"hi"}"#),
+        tool_ready(
+            "t2",
+            "Write `x.txt`",
+            r#"{"file_path":"x.txt","content":"hi"}"#,
+        ),
+        tool_done(
+            "t2",
+            "Write `x.txt`",
+            r#"{"file_path":"x.txt","content":"hi"}"#,
+        ),
         msg_chunk("All set."),
         end_turn().into(),
     ];
@@ -244,11 +291,15 @@ async fn q_missing_space_after_period_splits() {
         "must not glue: {texts:?}"
     );
     assert!(
-        texts.iter().any(|t| t.ends_with("create.") || t.contains("with create.")),
+        texts
+            .iter()
+            .any(|t| t.ends_with("create.") || t.contains("with create.")),
         "{texts:?}"
     );
     assert!(
-        texts.iter().any(|t| t.starts_with("CRUD") || t.contains("CRUD exercise")),
+        texts
+            .iter()
+            .any(|t| t.starts_with("CRUD") || t.contains("CRUD exercise")),
         "{texts:?}"
     );
 }
@@ -344,12 +395,7 @@ async fn q_acp_byte_fragmentation_invariant() {
         full.push('\n');
     }
     let bytes = full.into_bytes();
-    let whole = feed_chunks(
-        acp_binding(),
-        &[bytes::Bytes::from(bytes.clone())],
-        None,
-    )
-    .await;
+    let whole = feed_chunks(acp_binding(), &[bytes::Bytes::from(bytes.clone())], None).await;
     let mid = bytes.len() / 2;
     let frag = feed_chunks(
         acp_binding(),
@@ -366,16 +412,23 @@ async fn q_acp_byte_fragmentation_invariant() {
 /// Shape I: HTML report always carries disclaimer + dual sections.
 #[tokio::test]
 async fn q_html_report_has_projection_and_truth_sections() {
-    let parts = vec![
-        msg_chunk("Only text."),
-        end_turn().into(),
-    ];
+    let parts = vec![msg_chunk("Only text."), end_turn().into()];
     let events = feed_chunks(acp_binding(), &stream(&parts), None).await;
     let html = build_html_report(&events, &HtmlReportParams::default());
     assert!(html.full_page_html.contains("Chat projection"));
-    assert!(html.full_page_html.contains("not ground truth") || html.chat_projection.disclaimer.contains("not ground truth"));
-    assert!(html.full_page_html.contains("Interleaved stream") || html.full_page_html.contains("event order"));
-    assert!(html.full_page_html.contains("Text-only assembly") || html.full_page_html.contains("timeline") || html.full_page_html.contains("Timeline"));
+    assert!(
+        html.full_page_html.contains("not ground truth")
+            || html.chat_projection.disclaimer.contains("not ground truth")
+    );
+    assert!(
+        html.full_page_html.contains("Interleaved stream")
+            || html.full_page_html.contains("event order")
+    );
+    assert!(
+        html.full_page_html.contains("Text-only assembly")
+            || html.full_page_html.contains("timeline")
+            || html.full_page_html.contains("Timeline")
+    );
     assert_eq!(html.sentence_count, 1);
 }
 
@@ -406,7 +459,9 @@ async fn q_replay_saved_live_dumps_if_present() {
         let chat = project_chat(&events);
         let html = build_html_report(&events, &HtmlReportParams::default());
         assert!(
-            !chat.plain_text.is_empty() || html.sentence_count > 0 || !unique_tool_ids(&events).is_empty(),
+            !chat.plain_text.is_empty()
+                || html.sentence_count > 0
+                || !unique_tool_ids(&events).is_empty(),
             "replay produced nothing for {}",
             path.display()
         );
@@ -416,8 +471,7 @@ async fn q_replay_saved_live_dumps_if_present() {
             assert!(
                 matches!(
                     chat.confidence,
-                    ProjectionConfidence::EmitOrder
-                        | ProjectionConfidence::DialectSourceTime
+                    ProjectionConfidence::EmitOrder | ProjectionConfidence::DialectSourceTime
                 ),
                 "unexpected confidence {:?}",
                 chat.confidence

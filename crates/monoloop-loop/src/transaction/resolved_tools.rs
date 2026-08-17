@@ -94,9 +94,7 @@ impl ResolvedToolSet {
 
     /// Lookup by name.
     pub fn get_by_name(&self, name: &ToolName) -> Option<&ResolvedTool> {
-        self.by_name
-            .get(name)
-            .and_then(|id| self.by_id.get(id))
+        self.by_name.get(name).and_then(|id| self.by_id.get(id))
     }
 
     /// Whether name is allowlisted.

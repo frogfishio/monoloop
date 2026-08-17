@@ -78,14 +78,13 @@ async fn chat_projection_from_transaction_events_only() {
     let events = Arc::new(Mutex::new(Vec::<TransactionEvent>::new()));
     let done = Arc::new(Notify::new());
     let events_s = Arc::clone(&events);
-    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> =
-        Arc::new(FnEventSink(move |e| {
-            let events_s = Arc::clone(&events_s);
-            Box::pin(async move {
-                events_s.lock().unwrap().push(e);
-                Ok(())
-            }) as monoloop_contracts::EventDelivery
-        }));
+    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> = Arc::new(FnEventSink(move |e| {
+        let events_s = Arc::clone(&events_s);
+        Box::pin(async move {
+            events_s.lock().unwrap().push(e);
+            Ok(())
+        }) as monoloop_contracts::EventDelivery
+    }));
     let done_s = Arc::clone(&done);
     let completion: Box<dyn monoloop_contracts::CompletionCallback> =
         Box::new(FnCompletionCallback(move |end: TransactionEnd| {

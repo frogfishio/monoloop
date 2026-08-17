@@ -214,11 +214,7 @@ impl ProcessInner {
         Ok(())
     }
 
-    pub async fn request(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, CodexConnectorError> {
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value, CodexConnectorError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(CodexConnectorError::connection("agent process closed"));
         }

@@ -164,7 +164,10 @@ impl ConnectorDescriptor {
             implementation_id: "monoloop.claude_code".into(),
             implementation_version: env!("CARGO_PKG_VERSION").into(),
             transport_kind: "process_stdio".into(),
-            supported_dialects: vec!["claude_code/stream_json".into(), "claude_code/ndjson".into()],
+            supported_dialects: vec![
+                "claude_code/stream_json".into(),
+                "claude_code/ndjson".into(),
+            ],
             raw_boundary: RawBoundary::ProcessPipe,
             control_capabilities: ControlCapabilities::default(),
         }

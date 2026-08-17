@@ -44,11 +44,12 @@ impl JsonRpcRequest {
 
     /// Serialize to bytes with size bound.
     pub fn to_bytes(&self, max_bytes: usize) -> Result<bytes::Bytes, GrokConnectorError> {
-        let raw = serde_json::to_vec(self).map_err(|e| {
-            GrokConnectorError::protocol(format!("serialize request failed: {e}"))
-        })?;
+        let raw = serde_json::to_vec(self)
+            .map_err(|e| GrokConnectorError::protocol(format!("serialize request failed: {e}")))?;
         if raw.len() > max_bytes {
-            return Err(GrokConnectorError::resource("json-rpc request exceeds max_message_bytes"));
+            return Err(GrokConnectorError::resource(
+                "json-rpc request exceeds max_message_bytes",
+            ));
         }
         Ok(bytes::Bytes::from(raw))
     }

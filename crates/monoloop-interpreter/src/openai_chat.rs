@@ -6,9 +6,7 @@
 //! OpenAI Responses and non-streaming JSON are unsupported.
 
 use crate::acp::{AcpFragment, ToolSignal};
-use monoloop_contracts::{
-    InterpreterError, InterpreterErrorKind, TextChannel, ToolActionId,
-};
+use monoloop_contracts::{InterpreterError, InterpreterErrorKind, TextChannel, ToolActionId};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -189,10 +187,7 @@ impl OpenAiSseState {
             return Ok(());
         };
         for choice in choices {
-            let index = choice
-                .get("index")
-                .and_then(|i| i.as_u64())
-                .unwrap_or(0) as u32;
+            let index = choice.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
             if index != self.choice_index {
                 // Unsupported extra choices are ignored (not executed).
                 continue;
@@ -226,10 +221,7 @@ impl OpenAiSseState {
         call: &Value,
         out: &mut Vec<AcpFragment>,
     ) -> Result<(), InterpreterError> {
-        let idx = call
-            .get("index")
-            .and_then(|i| i.as_u64())
-            .unwrap_or(0) as u32;
+        let idx = call.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
         let entry = self.tools.entry(idx).or_default();
         if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
             if !id.is_empty() {
@@ -252,7 +244,8 @@ impl OpenAiSseState {
                 entry.arguments.push_str(args);
             }
         }
-        // Emit Waiting once we have an id (no partial args escape as Ready).
+        // D-016: accumulate deltas only. Waiting once we have an id; Ready only
+        // on qualified finish_reason == "tool_calls" (never mid-stream).
         if !entry.id.is_empty() && !entry.emitted_waiting && !entry.ready {
             entry.emitted_waiting = true;
             out.push(AcpFragment::Tool {
@@ -269,23 +262,6 @@ impl OpenAiSseState {
                 source_step: None,
             });
         }
-        // Promote to Ready only when arguments are complete JSON and name known.
-        if !entry.ready
-            && !entry.id.is_empty()
-            && !entry.name.is_empty()
-            && is_complete_json_value(&entry.arguments)
-        {
-            entry.ready = true;
-            out.push(AcpFragment::Tool {
-                action_id: ToolActionId::new(entry.id.clone()),
-                signal: ToolSignal::RequestReady {
-                    tool_name: entry.name.clone(),
-                    arguments_json: entry.arguments.clone(),
-                },
-                source_time_ms: None,
-                source_step: None,
-            });
-        }
         Ok(())
     }
 
@@ -295,20 +271,25 @@ impl OpenAiSseState {
         out: &mut Vec<AcpFragment>,
     ) -> Result<(), InterpreterError> {
         match reason {
-            "stop" | "tool_calls" | "length" | "content_filter" | "null" => {
-                // Try promote any complete tools still pending (some providers
-                // finish arguments only at finish_reason).
+            // D-016: only tool_calls finish may promote Ready; length/content_filter
+            // must not execute incomplete argument fragments.
+            "tool_calls" => {
                 let keys: Vec<u32> = self.tools.keys().copied().collect();
                 for k in keys {
                     let Some(entry) = self.tools.get_mut(&k) else {
                         continue;
                     };
-                    if entry.ready
-                        || entry.id.is_empty()
+                    if entry.ready {
+                        continue;
+                    }
+                    if entry.id.is_empty()
                         || entry.name.is_empty()
                         || !is_complete_json_value(&entry.arguments)
                     {
-                        continue;
+                        return Err(InterpreterError::new(
+                            InterpreterErrorKind::MalformedSemanticPayload,
+                            "incomplete tool call at tool_calls finish",
+                        ));
                     }
                     entry.ready = true;
                     out.push(AcpFragment::Tool {
@@ -321,6 +302,10 @@ impl OpenAiSseState {
                         source_step: None,
                     });
                 }
+                Ok(())
+            }
+            "stop" | "length" | "content_filter" | "null" => {
+                // Do not promote incomplete tools (D-016).
                 Ok(())
             }
             other => Err(InterpreterError::new(

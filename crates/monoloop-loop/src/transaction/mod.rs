@@ -41,15 +41,13 @@ pub use exchange::{
 pub use fake_support::{EmptyBytesEncoder, RejectEncoder, TestTextEncoder};
 pub use finalization::{EventSequencer, FinalizationGuard};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
-pub use loop_adapters::{
-    dispatch_ready_tool, HostToolRuntime, ResolvedToolRegistry,
-};
+pub use loop_adapters::{dispatch_ready_tool, HostToolRuntime, ResolvedToolRegistry};
+/// Back-compat alias: the MCP gateway owns the loopback listener.
+pub use mcp::McpGateway as McpListenerShell;
 pub use mcp::{
     tool_definitions_from_resolved, CapabilityToken, McpBindingState, McpGateway, McpGatewayHandle,
     McpInstallError, McpRouteTable, PendingMcpBinding, TransactionMcpHandler,
 };
-/// Back-compat alias: the MCP gateway owns the loopback listener.
-pub use mcp::McpGateway as McpListenerShell;
 pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};
 pub use resolved_tools::{ResolvedTool, ResolvedToolSet};
 pub use runtime::{DefaultTransactionRuntime, Startup};

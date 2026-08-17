@@ -100,7 +100,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn parse_args(args: &[String], project: &std::path::Path) -> Result<(Option<String>, String), String> {
+fn parse_args(
+    args: &[String],
+    project: &std::path::Path,
+) -> Result<(Option<String>, String), String> {
     if args.is_empty() {
         return Ok((Some("analyze".into()), analyze_prompt(project)));
     }

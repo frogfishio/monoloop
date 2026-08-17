@@ -131,14 +131,9 @@ impl RawInputHandle {
 
     fn control_interrupt(&self) -> Option<ConnectorError> {
         if self.control.terminate_requested() {
-            Some(
-                ConnectorError::terminated()
-                    .with_connection_id(self.connection_id.as_str()),
-            )
+            Some(ConnectorError::terminated().with_connection_id(self.connection_id.as_str()))
         } else if self.control.cancel_requested() {
-            Some(
-                ConnectorError::cancelled().with_connection_id(self.connection_id.as_str()),
-            )
+            Some(ConnectorError::cancelled().with_connection_id(self.connection_id.as_str()))
         } else {
             None
         }
@@ -215,14 +210,9 @@ impl RawOutputHandle {
 
     fn control_interrupt_if_no_data(&self) -> Option<ConnectorError> {
         if self.control.terminate_requested() {
-            Some(
-                ConnectorError::terminated()
-                    .with_connection_id(self.connection_id.as_str()),
-            )
+            Some(ConnectorError::terminated().with_connection_id(self.connection_id.as_str()))
         } else if self.control.cancel_requested() {
-            Some(
-                ConnectorError::cancelled().with_connection_id(self.connection_id.as_str()),
-            )
+            Some(ConnectorError::cancelled().with_connection_id(self.connection_id.as_str()))
         } else {
             None
         }
@@ -246,7 +236,9 @@ impl ConnectionCompletionHandle {
     /// Wait for exactly one terminal outcome. Safe to call only once.
     pub async fn wait(self) -> ConnectionEnd {
         let mut guard = self.rx.lock().await;
-        let rx = guard.take().expect("ConnectionCompletionHandle polled twice");
+        let rx = guard
+            .take()
+            .expect("ConnectionCompletionHandle polled twice");
         match rx.await {
             Ok(end) => end,
             Err(_) => ConnectionEnd {

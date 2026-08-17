@@ -1,8 +1,8 @@
 //! WP-09: OpenAI Chat Completions SSE Interpreter fragmentation suite.
 
 use monoloop_contracts::{
-    DialectBinding, DialectDescriptor, InterpretationEndKind, InterpretationId, InterpretationLimits,
-    InterpreterOutputEvent, LoopId, ToolRequestState, CanonicalUnit, ConnectionId,
+    CanonicalUnit, ConnectionId, DialectBinding, DialectDescriptor, InterpretationEndKind,
+    InterpretationId, InterpretationLimits, InterpreterOutputEvent, LoopId, ToolRequestState,
 };
 use monoloop_interpreter::{DefaultInterpreterFactory, InterpreterFactory, StartInterpretation};
 use std::time::Duration;
@@ -22,7 +22,9 @@ fn start() -> monoloop_interpreter::Interpretation {
 async fn feed_and_finish(chunks: &[&[u8]]) -> (Vec<InterpreterOutputEvent>, InterpretationEndKind) {
     let interp = start();
     for c in chunks {
-        interp.input.push_bytes(bytes::Bytes::copy_from_slice(c))
+        interp
+            .input
+            .push_bytes(bytes::Bytes::copy_from_slice(c))
             .await
             .unwrap();
     }
@@ -104,7 +106,8 @@ async fn invalid_json_arguments_not_ready() {
         b"data: [DONE]\n\n",
     ];
     let (events, kind) = feed_and_finish(chunks).await;
-    assert_eq!(kind, InterpretationEndKind::Complete);
+    // D-016: incomplete/invalid args at tool_calls finish must not Ready-execute.
+    assert_ne!(kind, InterpretationEndKind::Complete);
     let ready = events.iter().any(|e| match e {
         InterpreterOutputEvent::Unit(u) => match &u.snapshot().unit {
             CanonicalUnit::Tool(t) => t.request_state == ToolRequestState::Ready,

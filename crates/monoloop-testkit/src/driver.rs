@@ -319,11 +319,7 @@ pub async fn run_bytes_pipeline_with_params(
     };
 
     for chunk in chunks {
-        interp
-            .input
-            .push_bytes(chunk.clone())
-            .await
-            .expect("push");
+        interp.input.push_bytes(chunk.clone()).await.expect("push");
     }
     interp.input.finish_clean().await.expect("finish");
 

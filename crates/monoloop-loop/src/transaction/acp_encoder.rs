@@ -4,8 +4,9 @@
 //! transports bytes — no prompt on process argv.
 
 use monoloop_contracts::{
-    Bytes, CanonicalMessage, DialectDescriptor, EncodedExchange, EncodingError, ExchangeInputPolicy,
-    InitialEncodeRequest, OutboundDialectEncoder, ToolContinuationEncodeRequest,
+    Bytes, CanonicalMessage, DialectDescriptor, EncodedExchange, EncodingError,
+    ExchangeInputPolicy, InitialEncodeRequest, OutboundDialectEncoder,
+    ToolContinuationEncodeRequest,
 };
 use serde_json::json;
 

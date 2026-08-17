@@ -25,8 +25,8 @@ pub use session::{AgyAgentHandle, AgySession};
 
 use monoloop_connector::{
     ConnectionCompletionHandle, ConnectionControlHandle, ConnectionEnd, ConnectionEndKind,
-    Connector, ConnectorDescriptor, ControlState, EndInitiator, OpenConnection, OpenedRawConnection,
-    PendingRawConnection, RawInputHandle, RawInputMessage, RawOutputHandle,
+    Connector, ConnectorDescriptor, ControlState, EndInitiator, OpenConnection,
+    OpenedRawConnection, PendingRawConnection, RawInputHandle, RawInputMessage, RawOutputHandle,
 };
 use monoloop_contracts::{DialectBinding, DialectDescriptor, ExternalSessionId};
 use std::sync::Arc;
@@ -238,7 +238,9 @@ fn safe_prompt_error(e: &AgyConnectorError) -> String {
             "prompt_rpc_deadline_exceeded".into()
         }
         monoloop_contracts::ConnectorErrorKind::Cancelled => "prompt_cancelled".into(),
-        monoloop_contracts::ConnectorErrorKind::ConnectionFailed => "prompt_connection_failed".into(),
+        monoloop_contracts::ConnectorErrorKind::ConnectionFailed => {
+            "prompt_connection_failed".into()
+        }
         monoloop_contracts::ConnectorErrorKind::ProtocolFailed => "prompt_protocol_failed".into(),
         monoloop_contracts::ConnectorErrorKind::SessionFailed => "prompt_session_failed".into(),
         _ => "prompt_failed".into(),

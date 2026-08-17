@@ -104,10 +104,7 @@ impl FinalizationGuard {
         {
             return None;
         }
-        self.payload
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take())
+        self.payload.lock().ok().and_then(|mut g| g.take())
     }
 
     /// Whether already claimed.

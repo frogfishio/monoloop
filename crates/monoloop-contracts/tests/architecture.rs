@@ -33,11 +33,10 @@ fn deps_under_section(toml: &str, section: &str) -> Vec<String> {
             in_section = trimmed == section
                 || trimmed.starts_with(&format!("{section}."))
                 || (section == "[dependencies]"
-                    && (trimmed == "[dependencies]"
-                        || trimmed.starts_with("[dependencies.")));
+                    && (trimmed == "[dependencies]" || trimmed.starts_with("[dependencies.")));
             if section == "[dev-dependencies]" {
-                in_section = trimmed == "[dev-dependencies]"
-                    || trimmed.starts_with("[dev-dependencies.");
+                in_section =
+                    trimmed == "[dev-dependencies]" || trimmed.starts_with("[dev-dependencies.");
             }
             if section == "[build-dependencies]" {
                 in_section = trimmed == "[build-dependencies]"

@@ -7,11 +7,9 @@ use monoloop_connector_cursor::cursor_channel_binding;
 use monoloop_connector_grok::{grok_channel_binding, InMemorySecretResolver};
 use monoloop_connector_zai::zai_channel_binding;
 use monoloop_contracts::{user_text_input, ExchangeId, TransactionId};
+use monoloop_contracts::{EffectiveConfig, InitialEncodeRequest, OutboundDialectEncoder};
 use monoloop_interpreter::DefaultInterpreterFactory;
-use monoloop_loop::{
-    AcpPromptEncoder, ChannelRegistry, HeadlessPromptEncoder, AcpPromptWireShape,
-};
-use monoloop_contracts::{InitialEncodeRequest, OutboundDialectEncoder, EffectiveConfig};
+use monoloop_loop::{AcpPromptEncoder, AcpPromptWireShape, ChannelRegistry, HeadlessPromptEncoder};
 use std::sync::Arc;
 
 fn bare_cfg() -> EffectiveConfig {

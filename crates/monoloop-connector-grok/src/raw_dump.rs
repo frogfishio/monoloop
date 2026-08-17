@@ -134,16 +134,14 @@ impl RawDumpSnapshot {
         if needle.is_empty() {
             return true;
         }
-        self.frames.iter().any(|f| {
-            f.bytes.windows(needle.len()).any(|w| w == needle)
-        })
+        self.frames
+            .iter()
+            .any(|f| f.bytes.windows(needle.len()).any(|w| w == needle))
     }
 
     /// True if any frame's UTF-8 lossy text contains `needle`.
     pub fn contains_str(&self, needle: &str) -> bool {
-        self.frames
-            .iter()
-            .any(|f| f.utf8_lossy().contains(needle))
+        self.frames.iter().any(|f| f.utf8_lossy().contains(needle))
     }
 
     /// Parse each frame as JSON where possible.
@@ -224,10 +222,7 @@ impl RawDumpCollector {
         }
 
         let retained_so_far = self.total_retained.load(Ordering::Relaxed) as usize;
-        let room = self
-            .params
-            .max_total_bytes
-            .saturating_sub(retained_so_far);
+        let room = self.params.max_total_bytes.saturating_sub(retained_so_far);
         if room == 0 {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
@@ -255,11 +250,7 @@ impl RawDumpCollector {
 
     /// Snapshot for assertions / printing.
     pub fn snapshot(&self) -> RawDumpSnapshot {
-        let frames = self
-            .frames
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        let frames = self.frames.lock().map(|g| g.clone()).unwrap_or_default();
         RawDumpSnapshot {
             frames,
             total_original_bytes: self.total_original.load(Ordering::Relaxed),

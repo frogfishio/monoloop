@@ -1,4 +1,7 @@
-//! Synchronous admission: validate, reserve, install, spawn (no I/O).
+//! Synchronous admission: validate, reserve, install, then start (no I/O).
+//!
+//! Normative order (D-009): SessionKey + capacity reserve → create resources →
+//! install active entry while Accepting → only then start actor/delivery work.
 
 use super::active_registry::{ActiveTransaction, ActiveTransactionRegistry, ControlMessage};
 use super::actor::{spawn_actor, ActorSpawn};
@@ -11,12 +14,16 @@ use super::mcp::McpGatewayHandle;
 use super::resolved_tools::ResolvedToolSet;
 use monoloop_contracts::{
     merge_effective_config, AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId,
-    ChannelKind, ConfigOption, ExtensionLimits, OptionPolicy, SessionId, SessionKey, TransactionId,
-    TransactionLimits, TransactionRequest,
+    ChannelKind, ConfigOption, ExtensionLimits, McpConfigurationCapability, OptionPolicy,
+    SessionId, SessionKey, ToolExecutionMode, TransactionId, TransactionLimits, TransactionRequest,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+/// Runtime state constants (must match `runtime.rs`).
+pub const STATE_ACCEPTING: u8 = 1;
 
 /// Shared state used by admission.
 pub struct AdmissionContext {
@@ -32,6 +39,8 @@ pub struct AdmissionContext {
     pub limits: TransactionLimits,
     /// Optional MCP gateway handle (loopback listener).
     pub mcp: Option<McpGatewayHandle>,
+    /// Shared runtime lifecycle atomic (Accepting / Draining / Stopped).
+    pub runtime_state: Arc<AtomicU8>,
 }
 
 /// Perform synchronous admission (no network/tool I/O).
@@ -69,9 +78,36 @@ pub fn admit(
         ));
     }
 
+    // D-014: CreationOnly + existing session + tools → fail at admission (no callback).
+    if live.binding.tool_mode == ToolExecutionMode::McpGateway
+        && live.binding.capabilities.mcp_configuration == McpConfigurationCapability::CreationOnly
+        && request.session_id.is_some()
+        && !request.tools.is_empty()
+    {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::CapabilityMismatch,
+            "CreationOnly MCP cannot refresh tools on an existing session",
+        ));
+    }
+
     let resolved = resolve_tools(&ctx.tools, &request.tools)?;
 
-    let policy = liberal_option_policy();
+    // D-015: enforce aggregate input bound at admission.
+    let input_bytes = estimate_input_bytes(&request.input);
+    if input_bytes > ctx.limits.max_input_bytes {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::InvalidInput,
+            "canonical input exceeds max_input_bytes",
+        ));
+    }
+    if request.input.messages().len() > ctx.limits.max_messages {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::InvalidInput,
+            "canonical input exceeds max_messages",
+        ));
+    }
+
+    let policy = channel_option_policy(&live.binding.defaults);
     let effective = merge_effective_config(
         &live.binding.defaults,
         request.session_config.as_ref(),
@@ -89,9 +125,13 @@ pub fn admit(
 
     let transaction_id = TransactionId::generate();
     let existing_session = request.session_id.is_some();
-    let (session_id, session_key, provisional_external) =
-        allocate_session(live.binding.kind, &request.channel_id, request.session_id.clone())?;
+    let (session_id, session_key, provisional_external) = allocate_session(
+        live.binding.kind,
+        &request.channel_id,
+        request.session_id.clone(),
+    )?;
 
+    // Fast path session check (still re-checked under registry lock).
     if let Some(ref sk) = session_key {
         let reg = ctx.registry.lock().unwrap_or_else(|e| e.into_inner());
         if reg.session_active(sk) {
@@ -100,6 +140,13 @@ pub fn admit(
                 "session already has an active transaction",
             ));
         }
+    }
+
+    if ctx.runtime_state.load(Ordering::SeqCst) != STATE_ACCEPTING {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::RuntimeShuttingDown,
+            "runtime is not accepting submissions",
+        ));
     }
 
     if !ctx.capacity.try_reserve(&request.channel_id) {
@@ -111,10 +158,9 @@ pub fn admit(
 
     let channel_for_release = request.channel_id.clone();
     let capacity = Arc::clone(&ctx.capacity);
-    // Once-only: actor finalize and shutdown supervisor may both observe the entry.
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let release_capacity: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        if released.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if released.swap(true, Ordering::SeqCst) {
             return;
         }
         capacity.release(&channel_for_release);
@@ -124,6 +170,8 @@ pub fn admit(
     let event_cap = ctx.limits.max_event_queue.max(1);
     let (event_tx, event_rx) = mpsc::channel(event_cap);
     let (fail_tx, fail_rx) = mpsc::channel::<()>(1);
+    // D-009: actor must not run work until install succeeds.
+    let (start_tx, start_rx) = oneshot::channel::<()>();
 
     let sequencer = Arc::new(EventSequencer::new());
     let guard = FinalizationGuard::new(
@@ -168,6 +216,10 @@ pub fn admit(
             .unwrap_or(ctx.limits.transaction_deadline),
         max_continuations: ctx.limits.max_continuations,
         max_provider_exchanges: ctx.limits.max_provider_exchanges,
+        max_concurrent_tools: ctx.limits.max_concurrent_tools_per_transaction,
+        max_queued_tools: ctx.limits.max_queued_tools_per_transaction,
+        cleanup_deadline: ctx.limits.cleanup_deadline,
+        start_gate: start_rx,
     });
 
     let reaper = tokio::spawn(async move {
@@ -185,13 +237,29 @@ pub fn admit(
         release_capacity: Arc::clone(&release_capacity),
     };
 
+    // D-009 + D-010: Accepting check + session claim + insert under one lock.
     {
         let mut reg = ctx.registry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(kind) = reg.insert(entry) {
+        if ctx.runtime_state.load(Ordering::SeqCst) != STATE_ACCEPTING {
+            drop(reg);
             release_capacity();
+            // Do not start actor; drop start_tx (actor sees cancel).
+            drop(start_tx);
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::RuntimeShuttingDown,
+                "runtime is not accepting submissions",
+            ));
+        }
+        if let Err(kind) = reg.insert(entry) {
+            drop(reg);
+            release_capacity();
+            drop(start_tx);
             return Err(AdmissionError::new(kind, "registry install failed"));
         }
     }
+
+    // Start work only after a successful install.
+    let _ = start_tx.send(());
 
     Ok(AdmissionReceipt {
         transaction_id,
@@ -245,7 +313,7 @@ fn allocate_session(
     }
 }
 
-fn liberal_option_policy() -> OptionPolicy {
+fn channel_option_policy(defaults: &monoloop_contracts::ChannelDefaults) -> OptionPolicy {
     let mut p = OptionPolicy::default();
     p.supported_invocation.extend([
         ConfigOption::Model,
@@ -258,5 +326,34 @@ fn liberal_option_policy() -> OptionPolicy {
         ConfigOption::Deadline,
         ConfigOption::Extensions,
     ]);
+    // D-023: only Channel-declared default extension keys are allowed (if any).
+    p.allowed_extension_keys = defaults.extensions.keys().cloned().collect();
     p
+}
+
+fn estimate_input_bytes(input: &monoloop_contracts::CanonicalInput) -> usize {
+    input
+        .messages()
+        .iter()
+        .map(|m| match m {
+            monoloop_contracts::CanonicalMessage::System { content, .. }
+            | monoloop_contracts::CanonicalMessage::User { content, .. } => {
+                content.iter().map(|p| p.text().len()).sum()
+            }
+            monoloop_contracts::CanonicalMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                content.iter().map(|p| p.text().len()).sum::<usize>()
+                    + tool_calls
+                        .iter()
+                        .map(|c| c.tool_call_id.len() + c.tool_name.as_str().len())
+                        .sum::<usize>()
+            }
+            monoloop_contracts::CanonicalMessage::Tool { content, .. } => {
+                content.iter().map(|p| p.text().len()).sum()
+            }
+        })
+        .sum()
 }

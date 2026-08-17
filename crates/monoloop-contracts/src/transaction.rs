@@ -2,11 +2,11 @@
 
 use crate::canonical::CanonicalUnitEvent;
 use crate::config::{InvocationConfig, SessionConfig};
+use crate::id::ToolId;
 use crate::id::{ChannelId, SessionId, SessionKey, TransactionId};
 use crate::input::CanonicalInput;
 use crate::safe::SafeDiagnostic;
 use crate::tool::ToolLifecycleEvent;
-use crate::id::ToolId;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
@@ -398,9 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn sink_adapters_return_futures() {
-        let sink = FnEventSink(|_e| {
-            Box::pin(async { Ok(()) }) as EventDelivery
-        });
+        let sink = FnEventSink(|_e| Box::pin(async { Ok(()) }) as EventDelivery);
         let events: Arc<dyn TransactionEventSink> = Arc::new(sink);
         let end = TransactionEnd {
             transaction_id: TransactionId::generate(),

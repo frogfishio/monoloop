@@ -25,7 +25,11 @@ async fn html_assembles_markdown_from_complete_sentences() {
     .await;
 
     let html = report.html_report.expect("html built");
-    assert!(html.sentence_count >= 2, "sentences={}", html.sentence_count);
+    assert!(
+        html.sentence_count >= 2,
+        "sentences={}",
+        html.sentence_count
+    );
     assert!(
         html.assembled_markdown.contains("Hello **world**."),
         "md={}",
@@ -50,10 +54,7 @@ async fn html_assembles_markdown_from_complete_sentences() {
 
 #[tokio::test]
 async fn html_file_written_for_visual_review() {
-    let dir = std::env::temp_dir().join(format!(
-        "monoloop-html-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("monoloop-html-{}", std::process::id()));
     let path = dir.join("interpretation.html");
 
     // Use r## so embedded JSON with # characters is safe.
@@ -99,8 +100,8 @@ fn build_html_report_standalone() {
         InterpretationId, InterpreterOutputEvent, LaneId, TextChannel, TextSentence, UnitId,
         UnitState,
     };
-    let events = vec![InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
-        CanonicalUnitSnapshot {
+    let events = vec![InterpreterOutputEvent::Unit(Box::new(
+        CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
             unit_id: UnitId::new("s1"),
             unit_generation: 1,
             unit_state: UnitState::Complete,
@@ -120,8 +121,8 @@ fn build_html_report_standalone() {
                 sentence_ordinal: 1,
                 content: "Only complete units appear.".into(),
             }),
-        },
-    )))];
+        }),
+    ))];
     let r = build_html_report(&events, &HtmlReportParams::default());
     assert_eq!(r.sentence_count, 1);
     assert!(r.assembled_markdown.contains("Only complete units appear."));

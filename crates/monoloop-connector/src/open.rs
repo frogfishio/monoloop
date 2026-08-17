@@ -3,9 +3,7 @@
 use crate::control::ConnectionControlHandle;
 use crate::handles::{ConnectionCompletionHandle, RawInputHandle, RawOutputHandle};
 use crate::session::SessionAttachment;
-use monoloop_contracts::{
-    ConnectionId, ConnectorLimits, DialectBinding, ExternalSessionId,
-};
+use monoloop_contracts::{ConnectionId, ConnectorLimits, DialectBinding, ExternalSessionId};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,8 +42,14 @@ impl OpenConnection {
     }
 
     /// Attach a session attachment (runtime path after SessionAdapter success).
+    ///
+    /// Load (`create_mode == false`): sets `external_session_id` for provider load.
+    /// Create (`create_mode == true`): leaves `external_session_id` unset so the
+    /// Connector performs provider create and returns the authoritative id.
     pub fn with_session_attachment(mut self, attachment: Arc<SessionAttachment>) -> Self {
-        self.external_session_id = Some(attachment.external_session_id.clone());
+        if !attachment.create_mode {
+            self.external_session_id = Some(attachment.external_session_id.clone());
+        }
         self.session_attachment = Some(attachment);
         self
     }
@@ -65,8 +69,11 @@ pub struct PendingRawConnection {
 }
 
 /// Future resolving to an opened connection or error.
-pub type OpenCompletion =
-    Pin<Box<dyn Future<Output = Result<OpenedRawConnection, monoloop_contracts::ConnectorError>> + Send>>;
+pub type OpenCompletion = Pin<
+    Box<
+        dyn Future<Output = Result<OpenedRawConnection, monoloop_contracts::ConnectorError>> + Send,
+    >,
+>;
 
 /// Successfully opened raw connection.
 pub struct OpenedRawConnection {

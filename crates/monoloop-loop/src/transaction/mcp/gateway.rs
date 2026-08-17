@@ -186,34 +186,71 @@ async fn mcp_dispatch_rest(
     forward_mcp(routes, &token, req).await
 }
 
-async fn forward_mcp(
-    routes: Arc<McpRouteTable>,
-    token_hex: &str,
-    req: Request,
-) -> Response<Body> {
+/// Per-capability Streamable HTTP service (shared across requests for one token).
+struct CapabilityHttpService {
+    service: StreamableHttpService<TransactionMcpHandler, LocalSessionManager>,
+}
+
+/// Process-wide map: capability token hex → durable MCP session manager (D-018).
+static CAPABILITY_SERVICES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<CapabilityHttpService>>>,
+> = std::sync::OnceLock::new();
+
+fn capability_services(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<CapabilityHttpService>>> {
+    CAPABILITY_SERVICES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) -> Response<Body> {
     let Some(binding) = routes.get_by_hex(token_hex) else {
+        // Drop any stale service entry.
+        if let Ok(mut map) = capability_services().lock() {
+            map.remove(token_hex);
+        }
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("unknown capability"))
             .unwrap_or_else(|_| Response::new(Body::empty()));
     };
 
-    let handler = binding.handler.clone();
-    let cancel = CancellationToken::new();
-    let mut config = StreamableHttpServerConfig::default();
-    config.cancellation_token = cancel;
-    config.sse_keep_alive = None;
-    config.sse_retry = None;
+    // Bound body size before protocol dispatch (D-018).
+    let (parts, body) = req.into_parts();
+    let collected = match axum::body::to_bytes(body, 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Body::from("request body exceeds bound"))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+        }
+    };
+    let req = Request::from_parts(parts, Body::from(collected));
 
-    let service: StreamableHttpService<TransactionMcpHandler, LocalSessionManager> =
-        StreamableHttpService::new(
-            move || Ok(handler.clone()),
-            Arc::new(LocalSessionManager::default()),
-            config,
-        );
+    let service = {
+        let mut map = capability_services()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(token_hex.to_string())
+            .or_insert_with(|| {
+                let handler = binding.handler.clone();
+                let cancel = CancellationToken::new();
+                let mut config = StreamableHttpServerConfig::default();
+                config.cancellation_token = cancel;
+                config.sse_keep_alive = None;
+                config.sse_retry = None;
+                Arc::new(CapabilityHttpService {
+                    service: StreamableHttpService::new(
+                        move || Ok(handler.clone()),
+                        Arc::new(LocalSessionManager::default()),
+                        config,
+                    ),
+                })
+            })
+            .clone()
+    };
 
     let req = rewrite_path(req, token_hex);
-    let response = service.handle(req).await;
+    let response = service.service.handle(req).await;
     response.map(Body::new)
 }
 

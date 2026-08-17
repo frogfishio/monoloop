@@ -18,13 +18,9 @@ mod server;
 mod session;
 
 pub use channel_binding::{grok_channel_binding, validate_grok_endpoint, GrokConnectorFactory};
-pub use config::{
-    GrokConnectorLimits, GrokServerConfig, GrokSessionConfig, GrokSessionLoadConfig,
-};
-pub use raw_dump::{
-    RawDumpCollector, RawDumpFrame, RawDumpParams, RawDumpSnapshot,
-};
+pub use config::{GrokConnectorLimits, GrokServerConfig, GrokSessionConfig, GrokSessionLoadConfig};
 pub use error::GrokConnectorError;
+pub use raw_dump::{RawDumpCollector, RawDumpFrame, RawDumpParams, RawDumpSnapshot};
 pub use secret::{EnvSecretResolver, InMemorySecretResolver, SecretRef, SecretResolver};
 pub use server::{
     GrokConnector, GrokServerCompletion, GrokServerControl, GrokServerHandle, GrokServerHealth,
@@ -35,9 +31,9 @@ pub use session::{
     GrokSessionHealth, GrokSessionInput, PendingGrokExchange, PendingGrokSession,
 };
 
-pub use monoloop_contracts::{DialectBinding, GrokSessionId};
 pub use monoloop_connector::{
     CancellationReason, ConnectionEnd, ConnectionEndKind, ConnectionId, Connector,
     ConnectorDescriptor, ControlDisposition, OpenConnection, OpenedRawConnection,
     PendingRawConnection, RawOutputHandle, TerminationReason,
 };
+pub use monoloop_contracts::{DialectBinding, GrokSessionId};

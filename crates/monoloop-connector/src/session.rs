@@ -2,9 +2,7 @@
 
 use crate::control::ControlDisposition;
 use crate::instance::ConnectorInstanceId;
-use monoloop_contracts::{
-    ChannelId, ExternalSessionId, SessionConfig, SessionId, TransactionId,
-};
+use monoloop_contracts::{ChannelId, ExternalSessionId, SessionConfig, SessionId, TransactionId};
 use secrecy::{ExposeSecret, SecretString};
 use std::fmt;
 use std::future::Future;
@@ -23,12 +21,18 @@ pub trait SessionRoute: Send + Sync {
 pub struct SessionAttachment {
     /// Connector instance that created this attachment.
     pub owner: ConnectorInstanceId,
-    /// Authoritative external session id.
+    /// External session id: authoritative on load; provisional placeholder on create
+    /// until the Connector returns the provider id (see [`Self::create_mode`]).
     pub external_session_id: ExternalSessionId,
     /// Effective immutable session configuration after normalize/validate.
     pub effective_session_config: SessionConfig,
     /// Opaque route; only meaningful to the owning instance.
     pub route: Arc<dyn SessionRoute>,
+    /// When true, Connector MUST perform provider create (`session/new`), not load.
+    /// [`OpenConnection::with_session_attachment`] leaves `external_session_id` unset.
+    pub create_mode: bool,
+    /// Optional MCP descriptor for CreationOnly install at create time (D-014).
+    pub initial_mcp: Option<McpServerDescriptor>,
 }
 
 impl fmt::Debug for SessionAttachment {
@@ -38,12 +42,17 @@ impl fmt::Debug for SessionAttachment {
             .field("external_session_id", &"<redacted>")
             .field("effective_session_config", &self.effective_session_config)
             .field("route_owner", self.route.owner())
+            .field("create_mode", &self.create_mode)
+            .field(
+                "initial_mcp",
+                &self.initial_mcp.as_ref().map(|_| "<present>"),
+            )
             .finish()
     }
 }
 
 impl SessionAttachment {
-    /// Construct an attachment.
+    /// Construct a load attachment (explicit external session id).
     pub fn new(
         owner: ConnectorInstanceId,
         external_session_id: ExternalSessionId,
@@ -55,6 +64,26 @@ impl SessionAttachment {
             external_session_id,
             effective_session_config,
             route,
+            create_mode: false,
+            initial_mcp: None,
+        }
+    }
+
+    /// Construct a create attachment: Connector owns authoritative id allocation.
+    pub fn new_create(
+        owner: ConnectorInstanceId,
+        provisional_id: ExternalSessionId,
+        effective_session_config: SessionConfig,
+        route: Arc<dyn SessionRoute>,
+        initial_mcp: Option<McpServerDescriptor>,
+    ) -> Self {
+        Self {
+            owner,
+            external_session_id: provisional_id,
+            effective_session_config,
+            route,
+            create_mode: true,
+            initial_mcp,
         }
     }
 }
@@ -173,9 +202,8 @@ pub struct PendingSessionAttachment {
 }
 
 /// Future completing MCP refresh / removal.
-pub type SessionConfigurationCompletion = Pin<
-    Box<dyn Future<Output = Result<(), SessionConfigurationError>> + Send + 'static>,
->;
+pub type SessionConfigurationCompletion =
+    Pin<Box<dyn Future<Output = Result<(), SessionConfigurationError>> + Send + 'static>>;
 
 /// Pending MCP configuration operation.
 pub struct PendingSessionConfiguration {

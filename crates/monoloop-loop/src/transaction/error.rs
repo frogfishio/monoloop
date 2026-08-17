@@ -1,7 +1,7 @@
 //! Startup errors (typed, safe).
 
-use monoloop_contracts::ChannelCapabilityError;
 use monoloop_connector::ConnectorBuildError;
+use monoloop_contracts::ChannelCapabilityError;
 use thiserror::Error;
 
 /// Failure starting the transaction runtime (no partially started runtime is exposed).

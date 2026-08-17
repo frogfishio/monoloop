@@ -10,27 +10,29 @@ use monoloop_contracts::{
 use monoloop_loop::{DefaultLoopRuntime, SubscriptionPublisher};
 
 fn text_event(interp: &str, content: &str) -> InterpreterOutputEvent {
-    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
-        unit_id: UnitId::new("s1"),
-        unit_generation: 1,
-        unit_state: UnitState::Complete,
-        interpretation_id: InterpretationId::new(interp),
-        connection_id: ConnectionId::new("c1"),
-        external_session_id: None,
-        flow_id: FlowId::main(),
-        lane_id: LaneId::response(),
-        lane_ordinal: 1,
-        causal_parent_id: None,
-        source_time: None,
-        source_step: None,
-        unit: CanonicalUnit::Text(TextSentence {
-            sentence_id: UnitId::new("s1"),
-            channel: TextChannel::PublicResponse,
-            paragraph_id: None,
-            sentence_ordinal: 1,
-            content: content.into(),
-        }),
-    })))
+    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
+        CanonicalUnitSnapshot {
+            unit_id: UnitId::new("s1"),
+            unit_generation: 1,
+            unit_state: UnitState::Complete,
+            interpretation_id: InterpretationId::new(interp),
+            connection_id: ConnectionId::new("c1"),
+            external_session_id: None,
+            flow_id: FlowId::main(),
+            lane_id: LaneId::response(),
+            lane_ordinal: 1,
+            causal_parent_id: None,
+            source_time: None,
+            source_step: None,
+            unit: CanonicalUnit::Text(TextSentence {
+                sentence_id: UnitId::new("s1"),
+                channel: TextChannel::PublicResponse,
+                paragraph_id: None,
+                sentence_ordinal: 1,
+                content: content.into(),
+            }),
+        },
+    )))
 }
 
 fn tool_ready(
@@ -40,59 +42,63 @@ fn tool_ready(
     payload: &str,
     gen: u64,
 ) -> InterpreterOutputEvent {
-    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
-        unit_id: UnitId::new(format!("tool-{action}")),
-        unit_generation: gen,
-        unit_state: UnitState::Waiting,
-        interpretation_id: InterpretationId::new(interp),
-        connection_id: ConnectionId::new("c1"),
-        external_session_id: Some(ExternalSessionId::new("sess-1")),
-        flow_id: FlowId::main(),
-        lane_id: LaneId::tool(),
-        lane_ordinal: 1,
-        causal_parent_id: None,
-        source_time: None,
-        source_step: None,
-        unit: CanonicalUnit::Tool(ToolActionEvent {
-            tool_action_id: ToolActionId::new(action),
-            tool_name: Some(name.into()),
-            request_state: ToolRequestState::Ready,
-            execution_state: ToolExecutionState::Waiting,
-            result_state: ToolResultState::Absent,
-            request_payload: Some(payload.into()),
-            result_payload: None,
-            terminal_outcome: None,
-            waiting_for: Some("external execution".into()),
-        }),
-    })))
+    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
+        CanonicalUnitSnapshot {
+            unit_id: UnitId::new(format!("tool-{action}")),
+            unit_generation: gen,
+            unit_state: UnitState::Waiting,
+            interpretation_id: InterpretationId::new(interp),
+            connection_id: ConnectionId::new("c1"),
+            external_session_id: Some(ExternalSessionId::new("sess-1")),
+            flow_id: FlowId::main(),
+            lane_id: LaneId::tool(),
+            lane_ordinal: 1,
+            causal_parent_id: None,
+            source_time: None,
+            source_step: None,
+            unit: CanonicalUnit::Tool(ToolActionEvent {
+                tool_action_id: ToolActionId::new(action),
+                tool_name: Some(name.into()),
+                request_state: ToolRequestState::Ready,
+                execution_state: ToolExecutionState::Waiting,
+                result_state: ToolResultState::Absent,
+                request_payload: Some(payload.into()),
+                result_payload: None,
+                terminal_outcome: None,
+                waiting_for: Some("external execution".into()),
+            }),
+        },
+    )))
 }
 
 fn tool_waiting(interp: &str, action: &str, gen: u64) -> InterpreterOutputEvent {
-    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
-        unit_id: UnitId::new(format!("tool-{action}")),
-        unit_generation: gen,
-        unit_state: UnitState::Waiting,
-        interpretation_id: InterpretationId::new(interp),
-        connection_id: ConnectionId::new("c1"),
-        external_session_id: None,
-        flow_id: FlowId::main(),
-        lane_id: LaneId::tool(),
-        lane_ordinal: 1,
-        causal_parent_id: None,
-        source_time: None,
-        source_step: None,
-        unit: CanonicalUnit::Tool(ToolActionEvent {
-            tool_action_id: ToolActionId::new(action),
-            tool_name: Some("bash".into()),
-            request_state: ToolRequestState::Assembling,
-            execution_state: ToolExecutionState::Waiting,
-            result_state: ToolResultState::Absent,
-            request_payload: None,
-            result_payload: None,
-            terminal_outcome: None,
-            waiting_for: Some("args".into()),
-        }),
-    })))
+    InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
+        CanonicalUnitSnapshot {
+            unit_id: UnitId::new(format!("tool-{action}")),
+            unit_generation: gen,
+            unit_state: UnitState::Waiting,
+            interpretation_id: InterpretationId::new(interp),
+            connection_id: ConnectionId::new("c1"),
+            external_session_id: None,
+            flow_id: FlowId::main(),
+            lane_id: LaneId::tool(),
+            lane_ordinal: 1,
+            causal_parent_id: None,
+            source_time: None,
+            source_step: None,
+            unit: CanonicalUnit::Tool(ToolActionEvent {
+                tool_action_id: ToolActionId::new(action),
+                tool_name: Some("bash".into()),
+                request_state: ToolRequestState::Assembling,
+                execution_state: ToolExecutionState::Waiting,
+                result_state: ToolResultState::Absent,
+                request_payload: None,
+                result_payload: None,
+                terminal_outcome: None,
+                waiting_for: Some("args".into()),
+            }),
+        },
+    )))
 }
 
 fn open_scope(run: MonoloopRunId, loop_id: LoopId) -> LoopScope {
@@ -121,7 +127,9 @@ async fn text_does_not_dispatch() {
         )
         .unwrap();
 
-    pub_.publish(text_event("i1", "Hello world.")).await.unwrap();
+    pub_.publish(text_event("i1", "Hello world."))
+        .await
+        .unwrap();
     drop(pub_);
 
     let end = handle.completion.wait().await;
@@ -146,13 +154,11 @@ async fn empty_registry_unavailable_zero_effects() {
         .unwrap();
 
     pub_.publish(tool_waiting("i1", "t1", 1)).await.unwrap();
-    pub_
-        .publish(tool_ready("i1", "t1", "bash", r#"{"cmd":"ls"}"#, 2))
+    pub_.publish(tool_ready("i1", "t1", "bash", r#"{"cmd":"ls"}"#, 2))
         .await
         .unwrap();
     // Duplicate ready must not double-dispatch
-    pub_
-        .publish(tool_ready("i1", "t1", "bash", r#"{"cmd":"ls"}"#, 2))
+    pub_.publish(tool_ready("i1", "t1", "bash", r#"{"cmd":"ls"}"#, 2))
         .await
         .unwrap();
     drop(pub_);

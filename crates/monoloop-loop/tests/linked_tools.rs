@@ -1,18 +1,18 @@
 //! WP-06: linked tools — registry, dispatcher validation, Loop adapters.
 
+use monoloop_contracts::OutboundToolOutcome;
 use monoloop_contracts::{
     CanonicalToolError, CanonicalToolOutput, ChannelId, ExchangeId, JsonSchema, SessionId,
     SessionKey, ToolActionId, ToolCancellationPolicy, ToolCompletion, ToolId, ToolLimits, ToolName,
     ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionId,
 };
 use monoloop_loop::{
-    dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, HostToolRegistry, HostToolRuntime,
-    ImmediateToolHandler, LostCompletionHandler, PanicOnStartHandler, RegisteredTool,
-    ResolvedToolRegistry, ResolvedToolSet, SharedToolCapacity, StartFailHandler,
-    StartToolExecution, ToolHandler, ToolRegistry, ToolRuntime, TransactionToolDispatcher,
-    EmptyToolRegistry, ResolveToolRequest, ToolResolution, ToolUnavailableReason,
+    dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, EmptyToolRegistry, HostToolRegistry,
+    HostToolRuntime, ImmediateToolHandler, LostCompletionHandler, PanicOnStartHandler,
+    RegisteredTool, ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet, SharedToolCapacity,
+    StartFailHandler, StartToolExecution, ToolHandler, ToolRegistry, ToolResolution, ToolRuntime,
+    ToolUnavailableReason, TransactionToolDispatcher,
 };
-use monoloop_contracts::OutboundToolOutcome;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,10 +93,7 @@ fn build_registry(tools: Vec<(&str, &str, Arc<dyn ToolHandler>)>) -> HostToolReg
     HostToolRegistry::build(registered).unwrap()
 }
 
-fn dispatcher_from(
-    host: &HostToolRegistry,
-    ids: &[&str],
-) -> Arc<TransactionToolDispatcher> {
+fn dispatcher_from(host: &HostToolRegistry, ids: &[&str]) -> Arc<TransactionToolDispatcher> {
     let tools: Vec<_> = ids
         .iter()
         .map(|id| host.get(&ToolId::try_new(*id).unwrap()).unwrap().clone())
@@ -151,7 +148,13 @@ async fn empty_resolved_set_rejects_dispatch() {
         r#"{"q":"hi"}"#,
     )
     .await;
-    assert!(matches!(out, DispatchOutcome::Rejected { code: "tool_not_allowed", .. }));
+    assert!(matches!(
+        out,
+        DispatchOutcome::Rejected {
+            code: "tool_not_allowed",
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -253,9 +256,7 @@ async fn start_failure_panic_lost_completion() {
         (
             "sf",
             "sf",
-            Arc::new(StartFailHandler {
-                reason: "nope",
-            }) as Arc<dyn ToolHandler>,
+            Arc::new(StartFailHandler { reason: "nope" }) as Arc<dyn ToolHandler>,
         ),
         (
             "panic",

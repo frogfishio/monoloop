@@ -40,9 +40,7 @@ pub use http::{
     validate_endpoint_url, HttpMethod, StreamingHttpConfig, StreamingHttpConnector,
     StreamingHttpConnectorFactory,
 };
-pub use instance::{
-    ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId,
-};
+pub use instance::{ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId};
 pub use open::{OpenConnection, OpenedRawConnection, PendingRawConnection};
 pub use proxy::{ConnectorProxy, ConnectorProxyBuilder, ProxyRoute};
 pub use session::{

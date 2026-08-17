@@ -2,8 +2,9 @@
 
 use bytes::Bytes;
 use monoloop_connector::{
-    CancellationReason, ConnectionEndKind, ConnectionId, Connector, ConnectorProxy, ControlDisposition,
-    FakeConnector, FakeConnectorConfig, FakeEndpoint, OpenConnection, ProxyRoute, TerminationReason,
+    CancellationReason, ConnectionEndKind, ConnectionId, Connector, ConnectorProxy,
+    ControlDisposition, FakeConnector, FakeConnectorConfig, FakeEndpoint, OpenConnection,
+    ProxyRoute, TerminationReason,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,10 +13,7 @@ use std::time::Duration;
 #[tokio::test]
 async fn echo_preserves_order_and_bytes() {
     let connector = FakeConnector::echo();
-    let pending = connector.begin_open(OpenConnection::new(
-        ConnectionId::new("c1"),
-        "default",
-    ));
+    let pending = connector.begin_open(OpenConnection::new(ConnectionId::new("c1"), "default"));
     let opened = pending.opened.await.expect("open");
     opened
         .input
@@ -160,10 +158,7 @@ async fn proxy_routes_by_prefix() {
         .build()
         .unwrap();
 
-    let pending = proxy.begin_open(OpenConnection::new(
-        ConnectionId::new("p1"),
-        "fake:default",
-    ));
+    let pending = proxy.begin_open(OpenConnection::new(ConnectionId::new("p1"), "fake:default"));
     let opened = pending.opened.await.unwrap();
     opened.input.send(Bytes::from_static(b"z")).await.unwrap();
     let got = opened.output.receive().await.unwrap().unwrap();
@@ -218,5 +213,8 @@ async fn send_after_finish_fails() {
         .send(Bytes::from_static(b"nope"))
         .await
         .unwrap_err();
-    assert_eq!(err.kind, monoloop_connector::ConnectorErrorKind::WriteFailed);
+    assert_eq!(
+        err.kind,
+        monoloop_connector::ConnectorErrorKind::WriteFailed
+    );
 }

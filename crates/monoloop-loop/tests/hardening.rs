@@ -5,10 +5,10 @@
 use monoloop_connector::FakeConnectorFactory;
 use monoloop_contracts::{
     user_text_input, AdmissionErrorKind, CancellationReason, CancellationReasonCode,
-    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy,
-    DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink, InvocationConfig,
-    McpConfigurationCapability, McpReachability, SessionId, SessionMode, TerminationMode,
-    ToolExecutionMode, TransactionEnd, TransactionEndKind, TransactionEvent,
+    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
+    ContinuationPolicy, DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink,
+    InvocationConfig, McpConfigurationCapability, McpReachability, SessionId, SessionMode,
+    TerminationMode, ToolExecutionMode, TransactionEnd, TransactionEndKind, TransactionEvent,
     TransactionEventPayload, TransactionLimits, TransactionRequest, TransactionRuntime,
     TransactionSelector,
 };
@@ -83,7 +83,11 @@ fn limits_cap(global: usize, per_channel: usize) -> TransactionLimits {
     }
 }
 
-fn limits_cap_events(global: usize, per_channel: usize, max_event_queue: usize) -> TransactionLimits {
+fn limits_cap_events(
+    global: usize,
+    per_channel: usize,
+    max_event_queue: usize,
+) -> TransactionLimits {
     TransactionLimits {
         max_active_transactions: global,
         max_active_per_channel: per_channel,
@@ -410,11 +414,7 @@ async fn identical_session_strings_different_channels() {
 #[tokio::test]
 async fn subscriber_backpressure_isolated() {
     // Keep event queue small so backpressure is visible on the slow txn only.
-    let rt = start_with_limits(
-        vec![llm_binding("llm", 8)],
-        limits_cap_events(8, 8, 4),
-    )
-    .await;
+    let rt = start_with_limits(vec![llm_binding("llm", 8)], limits_cap_events(8, 8, 4)).await;
 
     let slow_gate = Arc::new(Notify::new());
     let slow_ends = Arc::new(AtomicUsize::new(0));
@@ -473,14 +473,13 @@ async fn zero_events_after_ended_and_single_callback() {
     let ends = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(Notify::new());
     let events_s = Arc::clone(&events);
-    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> =
-        Arc::new(FnEventSink(move |e| {
-            let events_s = Arc::clone(&events_s);
-            Box::pin(async move {
-                events_s.lock().unwrap().push(e);
-                Ok(())
-            }) as monoloop_contracts::EventDelivery
-        }));
+    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> = Arc::new(FnEventSink(move |e| {
+        let events_s = Arc::clone(&events_s);
+        Box::pin(async move {
+            events_s.lock().unwrap().push(e);
+            Ok(())
+        }) as monoloop_contracts::EventDelivery
+    }));
 
     TransactionRuntime::submit(
         rt.as_ref(),
@@ -733,6 +732,46 @@ fn tool_capacity_plus_one() {
     assert!(cap.try_enqueue());
     let p2 = cap.try_acquire(&tool).expect("slot free after release");
     drop(p2);
+}
+
+/// D-009: actor does not run (no callback) when start gate is dropped before install start signal.
+/// Covered indirectly: after shutdown, capacity is zero and submits reject.
+#[tokio::test]
+async fn submit_after_shutdown_rejects_without_active_leak() {
+    let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
+    let done = Arc::new(Notify::new());
+    let ends = Arc::new(AtomicUsize::new(0));
+    TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            None,
+            Arc::new(FnEventSink(|_| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+            })),
+            counting_completion(Arc::clone(&ends), Arc::clone(&done)),
+        ),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done.notified())
+        .await
+        .ok();
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(2)).await;
+    assert_eq!(rt.active_count(), 0);
+    assert_eq!(rt.capacity().global_active(), 0);
+    let err = TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            None,
+            Arc::new(FnEventSink(|_| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+            })),
+            counting_completion(Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new())),
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, AdmissionErrorKind::RuntimeShuttingDown);
 }
 
 /// Redaction: external session Display and MCP capability Debug hide secrets.

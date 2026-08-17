@@ -63,14 +63,13 @@ async fn fake_provider_transaction_emits_canonical_units() {
     let done = Arc::new(Notify::new());
 
     let events_s = Arc::clone(&events);
-    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> =
-        Arc::new(FnEventSink(move |e| {
-            let events_s = Arc::clone(&events_s);
-            Box::pin(async move {
-                events_s.lock().unwrap().push(e);
-                Ok(())
-            }) as monoloop_contracts::EventDelivery
-        }));
+    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> = Arc::new(FnEventSink(move |e| {
+        let events_s = Arc::clone(&events_s);
+        Box::pin(async move {
+            events_s.lock().unwrap().push(e);
+            Ok(())
+        }) as monoloop_contracts::EventDelivery
+    }));
 
     let ends_s = Arc::clone(&ends);
     let done_s = Arc::clone(&done);
@@ -153,10 +152,9 @@ async fn concurrent_transactions_isolated() {
         let finished2 = Arc::clone(&finished);
         let notify2 = Arc::clone(&notify);
         let ch_mark = ch.clone();
-        let sink: Arc<dyn monoloop_contracts::TransactionEventSink> =
-            Arc::new(FnEventSink(|_| {
-                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
-            }));
+        let sink: Arc<dyn monoloop_contracts::TransactionEventSink> = Arc::new(FnEventSink(|_| {
+            Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+        }));
         let completion: Box<dyn monoloop_contracts::CompletionCallback> =
             Box::new(FnCompletionCallback(move |end: TransactionEnd| {
                 let finished2 = Arc::clone(&finished2);

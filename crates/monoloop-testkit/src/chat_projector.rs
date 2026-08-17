@@ -370,9 +370,7 @@ fn extract(events: &[InterpreterOutputEvent]) -> Extracted {
         }
     }
 
-    let tools_before_public = !tools.is_empty()
-        && !public.is_empty()
-        && !tool_after_public;
+    let tools_before_public = !tools.is_empty() && !public.is_empty() && !tool_after_public;
 
     Extracted {
         chrono,
@@ -432,9 +430,7 @@ fn apply_source_order(chrono: &mut [ChronoBlock]) -> SourceOrderApplied {
     }
     let before: Vec<usize> = chrono.iter().map(block_emit_index).collect();
     chrono.sort_by_key(|b| {
-        let t = block_source_time(b)
-            .map(|s| s.first_ms)
-            .unwrap_or(u64::MAX);
+        let t = block_source_time(b).map(|s| s.first_ms).unwrap_or(u64::MAX);
         let step = block_source_step(b).unwrap_or(u64::MAX);
         (t, step, block_emit_index(b))
     });
@@ -469,10 +465,7 @@ fn block_emit_index(b: &ChronoBlock) -> usize {
     }
 }
 
-fn format_source_meta(
-    st: Option<SourceTimeObservation>,
-    step: Option<u64>,
-) -> Option<String> {
+fn format_source_meta(st: Option<SourceTimeObservation>, step: Option<u64>) -> Option<String> {
     match (st, step) {
         (Some(t), Some(s)) => {
             if t.first_ms == t.last_ms {
@@ -528,10 +521,7 @@ fn display_verb(title: &str, args: Option<&str>) -> String {
 
 // ── strategy ────────────────────────────────────────────────────────────────
 
-fn choose_strategy(
-    ex: &Extracted,
-    opts: &ProjectChatOptions,
-) -> (ProjectionStrategy, String) {
+fn choose_strategy(ex: &Extracted, opts: &ProjectChatOptions) -> (ProjectionStrategy, String) {
     if !opts.allow_structural_zip {
         return (
             ProjectionStrategy::ChronologicalChat,
@@ -542,8 +532,7 @@ fn choose_strategy(
     if !ex.tools_before_public {
         return (
             ProjectionStrategy::ChronologicalChat,
-            "emit-order chat (tools not strictly before public text, or no tools/text)"
-                .into(),
+            "emit-order chat (tools not strictly before public text, or no tools/text)".into(),
         );
     }
 
@@ -553,8 +542,7 @@ fn choose_strategy(
     if list_steps == 0 {
         return (
             ProjectionStrategy::ChronologicalChat,
-            "tools-first dump without numbered list steps — chronological (no safe zip)"
-                .into(),
+            "tools-first dump without numbered list steps — chronological (no safe zip)".into(),
         );
     }
 
@@ -578,7 +566,10 @@ fn choose_strategy(
 }
 
 fn count_list_steps(public: &[String]) -> usize {
-    public.iter().filter(|s| looks_like_list_item(s.trim())).count()
+    public
+        .iter()
+        .filter(|s| looks_like_list_item(s.trim()))
+        .count()
 }
 
 // ── assembly ────────────────────────────────────────────────────────────────
@@ -1055,27 +1046,29 @@ mod tests {
         source_time: Option<SourceTimeObservation>,
         source_step: Option<u64>,
     ) -> InterpreterOutputEvent {
-        InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
-            unit_id: UnitId::new(format!("s{n}")),
-            unit_generation: 1,
-            unit_state: UnitState::Complete,
-            interpretation_id: InterpretationId::new("i1"),
-            connection_id: ConnectionId::new("c1"),
-            external_session_id: None,
-            flow_id: FlowId::main(),
-            lane_id: LaneId::response(),
-            lane_ordinal: n,
-            causal_parent_id: None,
-            source_time,
-            source_step,
-            unit: CanonicalUnit::Text(TextSentence {
-                sentence_id: UnitId::new(format!("s{n}")),
-                channel: TextChannel::PublicResponse,
-                paragraph_id: None,
-                sentence_ordinal: n,
-                content: content.into(),
-            }),
-        })))
+        InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
+            CanonicalUnitSnapshot {
+                unit_id: UnitId::new(format!("s{n}")),
+                unit_generation: 1,
+                unit_state: UnitState::Complete,
+                interpretation_id: InterpretationId::new("i1"),
+                connection_id: ConnectionId::new("c1"),
+                external_session_id: None,
+                flow_id: FlowId::main(),
+                lane_id: LaneId::response(),
+                lane_ordinal: n,
+                causal_parent_id: None,
+                source_time,
+                source_step,
+                unit: CanonicalUnit::Text(TextSentence {
+                    sentence_id: UnitId::new(format!("s{n}")),
+                    channel: TextChannel::PublicResponse,
+                    paragraph_id: None,
+                    sentence_ordinal: n,
+                    content: content.into(),
+                }),
+            },
+        )))
     }
 
     fn tool_ev(id: &str, name: &str, n: u64) -> InterpreterOutputEvent {
@@ -1102,31 +1095,33 @@ mod tests {
         source_time: Option<SourceTimeObservation>,
         source_step: Option<u64>,
     ) -> InterpreterOutputEvent {
-        InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
-            unit_id: UnitId::new(format!("t{n}")),
-            unit_generation: 1,
-            unit_state: UnitState::Complete,
-            interpretation_id: InterpretationId::new("i1"),
-            connection_id: ConnectionId::new("c1"),
-            external_session_id: None,
-            flow_id: FlowId::main(),
-            lane_id: LaneId::response(),
-            lane_ordinal: n,
-            causal_parent_id: None,
-            source_time,
-            source_step,
-            unit: CanonicalUnit::Tool(ToolActionEvent {
-                tool_action_id: ToolActionId::new(id),
-                tool_name: Some(name.into()),
-                request_state: ToolRequestState::Ready,
-                execution_state: ToolExecutionState::Terminal,
-                result_state: ToolResultState::Complete,
-                request_payload: Some("{}".into()),
-                result_payload: None,
-                terminal_outcome: Some(ToolTerminalOutcome::Success),
-                waiting_for: None,
-            }),
-        })))
+        InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
+            CanonicalUnitSnapshot {
+                unit_id: UnitId::new(format!("t{n}")),
+                unit_generation: 1,
+                unit_state: UnitState::Complete,
+                interpretation_id: InterpretationId::new("i1"),
+                connection_id: ConnectionId::new("c1"),
+                external_session_id: None,
+                flow_id: FlowId::main(),
+                lane_id: LaneId::response(),
+                lane_ordinal: n,
+                causal_parent_id: None,
+                source_time,
+                source_step,
+                unit: CanonicalUnit::Tool(ToolActionEvent {
+                    tool_action_id: ToolActionId::new(id),
+                    tool_name: Some(name.into()),
+                    request_state: ToolRequestState::Ready,
+                    execution_state: ToolExecutionState::Terminal,
+                    result_state: ToolResultState::Complete,
+                    request_payload: Some("{}".into()),
+                    result_payload: None,
+                    terminal_outcome: Some(ToolTerminalOutcome::Success),
+                    waiting_for: None,
+                }),
+            },
+        )))
     }
 
     fn st(ms: u64) -> SourceTimeObservation {
@@ -1154,7 +1149,9 @@ mod tests {
         assert!(p.lines[0].text.contains("I'll run"));
         let roles: Vec<ChatRole> = p.lines.iter().map(|l| l.role).collect();
         assert!(
-            roles.windows(2).any(|w| w == [ChatRole::Tool, ChatRole::Agent]),
+            roles
+                .windows(2)
+                .any(|w| w == [ChatRole::Tool, ChatRole::Agent]),
             "expected tool then step: {roles:?}"
         );
         // Ordinal: first tool before first step text.
@@ -1177,10 +1174,7 @@ mod tests {
         assert!(p.strategy_reason.contains("≠") || p.strategy_reason.contains("refuse"));
         // All tools before text in emit order.
         let roles: Vec<_> = p.lines.iter().map(|l| l.role).collect();
-        assert_eq!(
-            roles,
-            vec![ChatRole::Tool, ChatRole::Tool, ChatRole::Agent]
-        );
+        assert_eq!(roles, vec![ChatRole::Tool, ChatRole::Tool, ChatRole::Agent]);
         assert!(p.lines.iter().all(|l| !l.reordered));
     }
 
@@ -1224,10 +1218,7 @@ mod tests {
 
     #[test]
     fn force_chronological_option() {
-        let events = vec![
-            tool_ev("a1", "Write `f`", 1),
-            text_ev("1. Wrote it.", 2),
-        ];
+        let events = vec![tool_ev("a1", "Write `f`", 1), text_ev("1. Wrote it.", 2)];
         let p = project_chat_with(
             &events,
             &ProjectChatOptions {
@@ -1277,9 +1268,7 @@ mod tests {
             "human order: speech intro then tools: {roles:?}"
         );
         assert!(
-            p.lines[0]
-                .text
-                .contains("I'll run the CRUD steps"),
+            p.lines[0].text.contains("I'll run the CRUD steps"),
             "intro first: {:?}",
             p.lines[0]
         );
@@ -1298,10 +1287,7 @@ mod tests {
 
     #[test]
     fn without_source_times_emit_order_unchanged() {
-        let events = vec![
-            tool_ev("a1", "Write `f`", 1),
-            text_ev("I'll start.", 2),
-        ];
+        let events = vec![tool_ev("a1", "Write `f`", 1), text_ev("I'll start.", 2)];
         let p = project_chat_with(
             &events,
             &ProjectChatOptions {
@@ -1366,10 +1352,7 @@ mod tests {
 
     #[test]
     fn text_only_is_one_agent_bubble() {
-        let p = project_chat(&[
-            text_ev("Hello.", 1),
-            text_ev("World.", 2),
-        ]);
+        let p = project_chat(&[text_ev("Hello.", 1), text_ev("World.", 2)]);
         assert_eq!(p.strategy, ProjectionStrategy::ChronologicalChat);
         assert_eq!(p.lines.len(), 1);
         assert_eq!(p.lines[0].role, ChatRole::Agent);

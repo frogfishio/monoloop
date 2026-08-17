@@ -24,10 +24,7 @@ pub fn map_chat_message_line(line: &str) -> Vec<AcpFragment> {
 
 /// Map a parsed OpenAI-style chat message object.
 pub fn map_chat_message(value: &Value) -> Vec<AcpFragment> {
-    let role = value
-        .get("role")
-        .and_then(|r| r.as_str())
-        .unwrap_or("");
+    let role = value.get("role").and_then(|r| r.as_str()).unwrap_or("");
     match role {
         "assistant" => map_assistant(value),
         "tool" => map_tool_result(value),
@@ -63,10 +60,7 @@ fn map_assistant(value: &Value) -> Vec<AcpFragment> {
 }
 
 fn map_tool_call(call: &Value) -> Vec<AcpFragment> {
-    let id = call
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
     if id.is_empty() {
         return vec![AcpFragment::Diagnostic {
             message: "zai_cli: tool_call missing id".into(),

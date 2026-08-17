@@ -21,10 +21,7 @@ struct ChannelCapacity {
 
 impl CapacityManagers {
     /// Build managers from runtime and Channel limits.
-    pub fn new(
-        max_global: usize,
-        channels: impl IntoIterator<Item = (ChannelId, usize)>,
-    ) -> Self {
+    pub fn new(max_global: usize, channels: impl IntoIterator<Item = (ChannelId, usize)>) -> Self {
         let mut per_channel = HashMap::new();
         for (id, max) in channels {
             per_channel.insert(

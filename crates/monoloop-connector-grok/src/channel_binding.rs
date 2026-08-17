@@ -14,9 +14,9 @@ use monoloop_connector::{
     SessionAttachment, SessionAttachmentCompletion, SessionConfigurationError, SessionRoute,
 };
 use monoloop_contracts::{
-    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy,
-    DialectDescriptor, ExchangeMode, ExternalSessionId, McpConfigurationCapability, McpReachability,
-    SessionId, SessionMode, ToolExecutionMode,
+    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
+    ContinuationPolicy, DialectDescriptor, ExchangeMode, ExternalSessionId,
+    McpConfigurationCapability, McpReachability, SessionId, SessionMode, ToolExecutionMode,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -59,19 +59,27 @@ impl SessionRoute for GrokRoute {
 /// Identity SessionAdapter: reserves create/load session keys explicitly.
 ///
 /// Provider `session/new` / `session/load` still run on Connector open using the
-/// attachment's external id (load) or create path when no prior load record exists.
+/// attachment's external id (load) or create path (`create_mode`).
 /// Never selects a most-recent session.
 pub struct GrokSessionAdapter {
     owner: ConnectorInstanceId,
-    /// Known external session ids from prior create/load in this process.
-    known: Mutex<HashMap<String, monoloop_contracts::SessionConfig>>,
+    /// Known external session ids from prior create/load in this process (shared).
+    known: Arc<Mutex<HashMap<String, monoloop_contracts::SessionConfig>>>,
 }
 
 impl GrokSessionAdapter {
     fn new(owner: ConnectorInstanceId) -> Self {
         Self {
             owner,
-            known: Mutex::new(HashMap::new()),
+            known: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Record a provider-authoritative session id after successful create (runtime).
+    #[allow(dead_code)]
+    pub fn remember(&self, session_id: &str, config: monoloop_contracts::SessionConfig) {
+        if let Ok(mut m) = self.known.lock() {
+            m.insert(session_id.to_string(), config);
         }
     }
 }
@@ -83,10 +91,7 @@ struct PendingCtrl {
 
 impl PendingOperationControl for PendingCtrl {
     fn cancel(&self) -> ControlDisposition {
-        if self
-            .cancel
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.cancel.swap(true, std::sync::atomic::Ordering::SeqCst) {
             ControlDisposition::AlreadyRequested
         } else {
             ControlDisposition::Accepted
@@ -116,12 +121,7 @@ impl SessionAdapter for GrokSessionAdapter {
         });
         let control_api: Arc<dyn PendingOperationControl> = control.clone();
         let owner = self.owner.clone();
-        let known = Arc::new(Mutex::new(
-            self.known
-                .lock()
-                .map_err(|_| SessionAttachError::SessionFailed)?
-                .clone(),
-        ));
+        let known = Arc::clone(&self.known);
 
         let completion: SessionAttachmentCompletion = Box::pin(async move {
             if control.terminate.load(std::sync::atomic::Ordering::SeqCst) {
@@ -130,35 +130,43 @@ impl SessionAdapter for GrokSessionAdapter {
             if control.cancel.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(SessionAttachError::Cancelled);
             }
-            let (ext, cfg) = if let Some(ref sid) = request.requested_session_id {
-                // Explicit load only — never invent most-recent.
-                let map = known.lock().map_err(|_| SessionAttachError::SessionFailed)?;
+            let route = Arc::new(GrokRoute {
+                owner: owner.clone(),
+            });
+            if let Some(ref sid) = request.requested_session_id {
+                // Explicit load — never invent most-recent; never create a replacement.
+                let map = known
+                    .lock()
+                    .map_err(|_| SessionAttachError::SessionFailed)?;
                 let cfg = map
                     .get(sid.as_str())
                     .cloned()
                     .unwrap_or_else(|| request.session_config.clone());
-                // Allow load of unknown id: Connector will fail closed on provider load.
                 let ext = ExternalSessionId::try_new(sid.as_str())
                     .map_err(|_| SessionAttachError::SessionFailed)?;
-                (ext, cfg)
+                monoloop_connector::validate_session_id_match(Some(sid), &ext)
+                    .map_err(|_| SessionAttachError::SessionIdMismatch)?;
+                Ok(Arc::new(SessionAttachment::new(owner, ext, cfg, route)))
             } else {
-                // Create: allocate correlation id; Connector open performs session/new
-                // when it sees a create reservation (see OpenConnection without load hit).
-                // Use a fresh SessionId as provisional external id; open maps create when
-                // id is not yet provider-known.
-                let sid = SessionId::generate();
-                let ext = ExternalSessionId::try_new(sid.as_str())
+                // Create: provisional placeholder only; Connector open does session/new.
+                let provisional = SessionId::generate();
+                let ext = ExternalSessionId::try_new(provisional.as_str())
                     .map_err(|_| SessionAttachError::SessionFailed)?;
-                let mut map = known.lock().map_err(|_| SessionAttachError::SessionFailed)?;
-                map.insert(sid.as_str().to_string(), request.session_config.clone());
-                (ext, request.session_config)
-            };
-            let route = Arc::new(GrokRoute {
-                owner: owner.clone(),
-            });
-            Ok(Arc::new(SessionAttachment::new(
-                owner, ext, cfg, route,
-            )))
+                known
+                    .lock()
+                    .map_err(|_| SessionAttachError::SessionFailed)?
+                    .insert(
+                        provisional.as_str().to_string(),
+                        request.session_config.clone(),
+                    );
+                Ok(Arc::new(SessionAttachment::new_create(
+                    owner,
+                    ext,
+                    request.session_config,
+                    route,
+                    request.initial_mcp,
+                )))
+            }
         });
 
         Ok(PendingSessionAttachment {

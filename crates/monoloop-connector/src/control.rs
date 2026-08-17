@@ -115,12 +115,9 @@ impl ControlState {
             return ControlDisposition::AlreadyRequested;
         }
         // Terminate already preferred wins over later cancel.
-        let _ = self.preferred_end.compare_exchange(
-            0,
-            1,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        let _ = self
+            .preferred_end
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst);
         self.notify.notify_waiters();
         ControlDisposition::Accepted
     }
