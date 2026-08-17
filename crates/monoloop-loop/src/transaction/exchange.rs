@@ -335,13 +335,14 @@ async fn run_opened_exchange(
         } => ends,
     };
 
-    // Normal path: join children within a short grace (D-012).
+    // Normal path: join children within cleanup grace (D-012).
+    let join_grace = Duration::from_millis(500);
     if let Some(mut joins) = guard.joins.take() {
-        let _ = tokio::time::timeout(Duration::from_millis(200), joins.join_next()).await;
+        let _ = tokio::time::timeout(join_grace, joins.join_next()).await;
         abort_joins(&mut joins).await;
     }
     let _ = guard.units_abort.take();
-    let _ = tokio::time::timeout(Duration::from_millis(200), units_task).await;
+    let _ = tokio::time::timeout(join_grace, units_task).await;
     let _ = guard.control.take();
 
     let units = units.lock().await.clone();

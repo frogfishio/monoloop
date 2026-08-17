@@ -316,20 +316,77 @@ mod duration_secs {
 }
 
 impl TransactionLimits {
-    /// Validate non-zero capacities and basic consistency.
+    /// Validate non-zero capacities and basic consistency (D-015).
     pub fn validate(&self) -> Result<(), LimitsError> {
-        if self.max_active_transactions == 0 {
-            return Err(LimitsError::ZeroCapacity("max_active_transactions"));
-        }
-        if self.max_event_queue == 0 {
-            return Err(LimitsError::ZeroCapacity("max_event_queue"));
+        for (name, v) in [
+            ("max_active_transactions", self.max_active_transactions),
+            ("max_active_per_channel", self.max_active_per_channel),
+            ("max_actor_commands", self.max_actor_commands),
+            ("max_actor_command_bytes", self.max_actor_command_bytes),
+            ("max_event_queue", self.max_event_queue),
+            ("max_event_queue_bytes", self.max_event_queue_bytes),
+            ("max_input_bytes", self.max_input_bytes),
+            ("max_messages", self.max_messages),
+            ("max_content_parts", self.max_content_parts),
+            ("max_tools_per_transaction", self.max_tools_per_transaction),
+            ("max_tool_schema_bytes", self.max_tool_schema_bytes),
+            ("max_tool_payload_bytes", self.max_tool_payload_bytes),
+            ("max_tool_output_bytes", self.max_tool_output_bytes),
+            (
+                "max_concurrent_tools_per_transaction",
+                self.max_concurrent_tools_per_transaction,
+            ),
+            (
+                "max_queued_tools_per_transaction",
+                self.max_queued_tools_per_transaction,
+            ),
+            ("max_continuations", self.max_continuations.max(1)), // 0 continuations allowed
+            ("max_provider_exchanges", self.max_provider_exchanges),
+            (
+                "max_continuation_context_bytes",
+                self.max_continuation_context_bytes,
+            ),
+            (
+                "max_total_provider_input_bytes",
+                self.max_total_provider_input_bytes,
+            ),
+            (
+                "max_total_provider_output_bytes",
+                self.max_total_provider_output_bytes,
+            ),
+            ("max_diagnostic_count", self.max_diagnostic_count),
+            ("max_diagnostic_bytes", self.max_diagnostic_bytes),
+        ] {
+            // Continuations may be zero (CallerControlled-only channels).
+            if name == "max_continuations" {
+                continue;
+            }
+            if v == 0 {
+                return Err(LimitsError::ZeroCapacity(name));
+            }
         }
         if self.callback_deadline.is_zero() {
             return Err(LimitsError::ZeroCapacity("callback_deadline"));
         }
+        if self.cleanup_deadline.is_zero() {
+            return Err(LimitsError::ZeroCapacity("cleanup_deadline"));
+        }
+        if self.terminal_event_delivery_deadline.is_zero() {
+            return Err(LimitsError::ZeroCapacity(
+                "terminal_event_delivery_deadline",
+            ));
+        }
+        if self.transaction_deadline.is_zero() {
+            return Err(LimitsError::ZeroCapacity("transaction_deadline"));
+        }
         if self.max_active_per_channel > self.max_active_transactions {
             return Err(LimitsError::Inconsistent(
                 "max_active_per_channel exceeds max_active_transactions",
+            ));
+        }
+        if self.max_event_queue_bytes < self.max_event_queue {
+            return Err(LimitsError::Inconsistent(
+                "max_event_queue_bytes smaller than max_event_queue items",
             ));
         }
         Ok(())

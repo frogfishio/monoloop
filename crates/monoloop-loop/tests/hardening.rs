@@ -774,6 +774,66 @@ async fn submit_after_shutdown_rejects_without_active_leak() {
     assert_eq!(err.kind, AdmissionErrorKind::RuntimeShuttingDown);
 }
 
+/// D-015: zero / inconsistent transaction limits fail startup validation.
+#[test]
+fn transaction_limits_zero_capacity_rejected() {
+    use monoloop_contracts::{LimitsError, TransactionLimits};
+    let limits = TransactionLimits {
+        max_event_queue: 0,
+        ..Default::default()
+    };
+    assert!(matches!(
+        limits.validate(),
+        Err(LimitsError::ZeroCapacity("max_event_queue"))
+    ));
+    let base = TransactionLimits::default();
+    let limits = TransactionLimits {
+        max_active_per_channel: base.max_active_transactions + 1,
+        ..base
+    };
+    assert!(matches!(
+        limits.validate(),
+        Err(LimitsError::Inconsistent(_))
+    ));
+}
+
+/// D-015: event byte budget rejects oversized enqueue.
+#[tokio::test]
+async fn event_queue_byte_budget_plus_one() {
+    use monoloop_contracts::{
+        ChannelId, SessionId, TransactionEvent, TransactionEventPayload, TransactionId,
+    };
+    use monoloop_contracts::{
+        EventDeliveryOutcome, TransactionEnd, TransactionEndKind, TransactionUsage,
+    };
+    use monoloop_loop::{BoundedEventSender, QueuedEvent};
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    // Tiny byte budget so one Ended event exceeds it.
+    let sender = BoundedEventSender::new(tx, 32);
+    let end = TransactionEnd {
+        transaction_id: TransactionId::generate(),
+        session_id: Some(SessionId::try_new("s").unwrap()),
+        channel_id: ChannelId::try_new("ch").unwrap(),
+        kind: TransactionEndKind::Completed,
+        prior_terminal_cause: None,
+        event_delivery: EventDeliveryOutcome::Accepted,
+        emitted_events: 1,
+        usage: TransactionUsage::default(),
+        diagnostics: vec![],
+    };
+    let ev = TransactionEvent {
+        transaction_id: end.transaction_id,
+        channel_id: end.channel_id.clone(),
+        session_id: SessionId::try_new("s").unwrap(),
+        sequence: 1,
+        payload: TransactionEventPayload::Ended(end),
+    };
+    let err = sender.send(QueuedEvent::new(ev, None)).await;
+    assert!(err.is_err(), "oversized event must fail byte budget");
+    assert!(rx.try_recv().is_err());
+}
+
 /// Redaction: external session Display and MCP capability Debug hide secrets.
 #[test]
 fn security_redaction_surfaces() {

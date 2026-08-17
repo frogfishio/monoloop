@@ -2,7 +2,7 @@
 
 use super::active_registry::{ActiveTransactionRegistry, ClaimSessionError, ControlMessage};
 use super::dispatcher::{DispatchOutcome, TransactionToolDispatcher};
-use super::events::QueuedEvent;
+use super::events::{BoundedEventSender, QueuedEvent};
 use super::exchange::{
     run_encoded_exchange, run_exchange, EncodedExchangeParams, ExchangeFailure, ExchangeParams,
 };
@@ -72,8 +72,8 @@ pub struct ActorSpawn {
     pub guard: Arc<FinalizationGuard>,
     /// Control receiver (capacity 1).
     pub control_rx: mpsc::Receiver<ControlMessage>,
-    /// Event queue to delivery task.
-    pub event_tx: mpsc::Sender<QueuedEvent>,
+    /// Event queue to delivery task (item + byte bounded).
+    pub event_tx: BoundedEventSender,
     /// Delivery failure signal.
     pub delivery_fail_rx: mpsc::Receiver<()>,
     /// Shared registry.
@@ -92,6 +92,18 @@ pub struct ActorSpawn {
     pub max_queued_tools: usize,
     /// Cleanup budget after terminal selection.
     pub cleanup_deadline: Duration,
+    /// Terminal Ended delivery budget.
+    pub terminal_event_delivery_deadline: Duration,
+    /// Callback deadline.
+    pub callback_deadline: Duration,
+    /// Max total provider input bytes across exchanges.
+    pub max_total_provider_input_bytes: usize,
+    /// Max total provider output bytes across exchanges.
+    pub max_total_provider_output_bytes: usize,
+    /// Max continuation context bytes.
+    pub max_continuation_context_bytes: usize,
+    /// Max tool schema aggregate for this transaction's resolved set.
+    pub max_tool_schema_bytes: usize,
     /// Closed only after registry install succeeds (D-009).
     pub start_gate: oneshot::Receiver<()>,
 }
@@ -143,6 +155,12 @@ async fn run_actor(spawn: ActorSpawn) {
         max_concurrent_tools,
         max_queued_tools,
         cleanup_deadline,
+        terminal_event_delivery_deadline,
+        callback_deadline,
+        max_total_provider_input_bytes,
+        max_total_provider_output_bytes,
+        max_continuation_context_bytes,
+        max_tool_schema_bytes,
         start_gate,
     } = spawn;
 
@@ -156,7 +174,41 @@ async fn run_actor(spawn: ActorSpawn) {
             return;
         }
     }
-    let _ = cleanup_deadline;
+
+    // D-015: reject oversized tool schema aggregates at start.
+    {
+        let mut schema_total = 0usize;
+        for spec in tools.specs() {
+            schema_total = schema_total.saturating_add(
+                serde_json::to_vec(spec.input_schema.as_value())
+                    .map(|b| b.len())
+                    .unwrap_or(0),
+            );
+        }
+        if schema_total > max_tool_schema_bytes {
+            let result = ActorResult {
+                kind: TransactionEndKind::LimitExceeded,
+                prior: None,
+                delivery: EventDeliveryOutcome::Failed,
+                session_key: session_key.clone(),
+            };
+            finalize_and_cleanup(
+                transaction_id,
+                channel_id,
+                guard,
+                event_tx,
+                registry,
+                release_capacity,
+                result,
+                terminal_event_delivery_deadline,
+                callback_deadline,
+            )
+            .await;
+            return;
+        }
+    }
+    // Reserved for exchange child join budgets after cancel/terminal (D-012).
+    let _cleanup_deadline = cleanup_deadline.max(Duration::from_millis(50));
 
     let mut terminal_kind = TransactionEndKind::Completed;
     let mut attachment: Option<Arc<monoloop_connector::SessionAttachment>> = None;
@@ -359,6 +411,9 @@ async fn run_actor(spawn: ActorSpawn) {
         let max_inline = max_continuations;
         let mut exchanges_done = 0usize;
         let mut continuations_done = 0usize;
+        let mut provider_input_bytes = 0usize;
+        let mut provider_output_bytes = 0usize;
+        let _ = max_total_provider_output_bytes;
 
         // D-011: fan units to the event sink as they are produced (not only after EOF).
         let (live_tx, mut live_rx) =
@@ -466,6 +521,12 @@ async fn run_actor(spawn: ActorSpawn) {
         }
         .map_err(map_exchange_failure)?;
         exchanges_done += 1;
+        for u in &outcome.units {
+            provider_output_bytes = provider_output_bytes.saturating_add(estimate_unit_bytes(u));
+        }
+        if provider_output_bytes > max_total_provider_output_bytes {
+            return Err(TransactionEndKind::LimitExceeded);
+        }
         if let Some(j) = claim_join {
             j.await.map_err(|_| TransactionEndKind::InvariantFailed)??;
             if let Some(ext) = outcome.external_session_id.clone() {
@@ -603,6 +664,14 @@ async fn run_actor(spawn: ActorSpawn) {
                             },
                         )
                         .map_err(|_| TransactionEndKind::EncodingFailed)?;
+                    // D-015: continuation context + provider input aggregate bounds.
+                    if encoded.bytes.len() > max_continuation_context_bytes {
+                        return Err(TransactionEndKind::LimitExceeded);
+                    }
+                    provider_input_bytes = provider_input_bytes.saturating_add(encoded.bytes.len());
+                    if provider_input_bytes > max_total_provider_input_bytes {
+                        return Err(TransactionEndKind::LimitExceeded);
+                    }
                     let (live_tx2, mut live_rx2) = mpsc::channel::<CanonicalUnitEvent>(64);
                     let event_tx_live = event_tx.clone();
                     let guard_live = Arc::clone(&guard);
@@ -721,6 +790,8 @@ async fn run_actor(spawn: ActorSpawn) {
         registry,
         release_capacity,
         result,
+        terminal_event_delivery_deadline,
+        callback_deadline,
     )
     .await;
 }
@@ -733,6 +804,19 @@ fn map_exchange_failure(f: ExchangeFailure) -> TransactionEndKind {
         ExchangeFailure::InterpretationFailed => TransactionEndKind::InterpretationFailed,
         ExchangeFailure::Cancelled => TransactionEndKind::Cancelled,
         ExchangeFailure::Terminated => TransactionEndKind::Terminated,
+    }
+}
+
+fn estimate_unit_bytes(unit: &CanonicalUnitEvent) -> usize {
+    match unit.snapshot().unit {
+        CanonicalUnit::Text(ref t) => t.content.len().saturating_add(32),
+        CanonicalUnit::Tool(ref t) => t
+            .request_payload
+            .as_ref()
+            .map(|p| p.len())
+            .unwrap_or(0)
+            .saturating_add(64),
+        _ => 64,
     }
 }
 
@@ -806,7 +890,7 @@ fn build_continuation_context(
 }
 
 async fn emit_unit_or_session(
-    event_tx: &mpsc::Sender<QueuedEvent>,
+    event_tx: &BoundedEventSender,
     guard: &FinalizationGuard,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
@@ -825,14 +909,11 @@ async fn emit_unit_or_session(
         sequence: seq,
         payload,
     };
-    event_tx
-        .send(QueuedEvent { event, ack: None })
-        .await
-        .is_ok()
+    event_tx.send(QueuedEvent::new(event, None)).await.is_ok()
 }
 
 async fn emit_canonical_unit(
-    event_tx: &mpsc::Sender<QueuedEvent>,
+    event_tx: &BoundedEventSender,
     guard: &FinalizationGuard,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
@@ -851,7 +932,7 @@ async fn emit_canonical_unit(
 }
 
 async fn emit_dispatch_outcome(
-    event_tx: &mpsc::Sender<QueuedEvent>,
+    event_tx: &BoundedEventSender,
     guard: &FinalizationGuard,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
@@ -915,7 +996,7 @@ async fn emit_dispatch_outcome(
 }
 
 async fn emit_tool_lifecycle(
-    event_tx: &mpsc::Sender<QueuedEvent>,
+    event_tx: &BoundedEventSender,
     guard: &FinalizationGuard,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
@@ -933,14 +1014,17 @@ async fn emit_tool_lifecycle(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_and_cleanup(
     transaction_id: TransactionId,
     channel_id: ChannelId,
     guard: Arc<FinalizationGuard>,
-    event_tx: mpsc::Sender<QueuedEvent>,
+    event_tx: BoundedEventSender,
     registry: Arc<Mutex<ActiveTransactionRegistry>>,
     release_capacity: Arc<dyn Fn() + Send + Sync>,
     result: ActorResult,
+    terminal_event_delivery_deadline: Duration,
+    callback_deadline: Duration,
 ) {
     let Some(payload) = guard.try_claim() else {
         release_capacity();
@@ -971,10 +1055,7 @@ async fn finalize_and_cleanup(
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let send_ok = event_tx
-        .send(QueuedEvent {
-            event,
-            ack: Some(ack_tx),
-        })
+        .send(QueuedEvent::new(event, Some(ack_tx)))
         .await
         .is_ok();
 
@@ -983,7 +1064,7 @@ async fn finalize_and_cleanup(
         prior = Some(kind);
         kind = TransactionEndKind::EventDeliveryFailed;
     } else {
-        match tokio::time::timeout(Duration::from_secs(5), ack_rx).await {
+        match tokio::time::timeout(terminal_event_delivery_deadline, ack_rx).await {
             Ok(Ok(Ok(()))) => {}
             _ => {
                 delivery = EventDeliveryOutcome::Failed;
@@ -1008,7 +1089,7 @@ async fn finalize_and_cleanup(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| payload.callback.call(end)));
     match call_result {
         Ok(fut) => {
-            let _ = tokio::time::timeout(Duration::from_secs(5), fut).await;
+            let _ = tokio::time::timeout(callback_deadline, fut).await;
         }
         Err(_) => {
             // Callback panicked at invoke; terminal cause already selected.

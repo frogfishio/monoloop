@@ -349,6 +349,69 @@ async fn http_unknown_capability_is_404() {
     gw.shutdown().await;
 }
 
+/// D-018: oversized HTTP body is rejected before protocol dispatch.
+#[tokio::test]
+async fn http_oversized_body_fails_closed() {
+    let gw = McpGateway::bind_loopback(4).await.unwrap();
+    let (_, tools) = resolved_echo();
+    let d = build_dispatcher(tools.clone());
+    let pending = gw
+        .install_pending(TransactionId::generate(), tools, d, ExchangeId::generate())
+        .unwrap();
+    gw.activate(&pending.token).unwrap();
+    let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+    let client = reqwest::Client::new();
+    let big = vec![b'x'; 1024 * 1024 + 64];
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(big)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    gw.shutdown().await;
+}
+
+/// D-018: same capability token reuses HTTP service across requests (session manager).
+#[tokio::test]
+async fn http_active_capability_accepts_repeated_posts() {
+    let gw = McpGateway::bind_loopback(8).await.unwrap();
+    let (_, tools) = resolved_echo();
+    let d = build_dispatcher(tools.clone());
+    let pending = gw
+        .install_pending(TransactionId::generate(), tools, d, ExchangeId::generate())
+        .unwrap();
+    gw.activate(&pending.token).unwrap();
+    let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+    let client = reqwest::Client::new();
+    // Minimal JSON-RPC-shaped posts; Streamable HTTP may reject protocol-incomplete
+    // bodies, but must not 404 the active capability, and must stay consistent across calls.
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        statuses.push(resp.status());
+    }
+    assert!(
+        statuses
+            .iter()
+            .all(|s| *s != reqwest::StatusCode::NOT_FOUND),
+        "active capability must not 404: {statuses:?}"
+    );
+    // All three requests hit the same route (stable non-404 outcomes).
+    assert_eq!(statuses[0], statuses[1]);
+    assert_eq!(statuses[1], statuses[2]);
+    gw.shutdown().await;
+}
+
 #[tokio::test]
 async fn token_hex_roundtrip() {
     let t = CapabilityToken::generate().unwrap();

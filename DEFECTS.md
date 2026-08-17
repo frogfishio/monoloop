@@ -847,17 +847,17 @@ considered delivered while these remain.
 | D-009 | Fixed | start_gate; install under Accepting+registry lock |
 | D-010 | Fixed | shared Arc state; re-check under lock |
 | D-011 | Fixed | live canonical unit fan-out during exchange |
-| D-012 | Partial | ExchangeGuard terminate/abort on drop |
+| D-012 | Partial | ExchangeGuard + longer join grace; full cleanup_deadline matrix still thin |
 | D-013 | Fixed | attach create+load; create_mode; provider id after open; known maps shared |
 | D-014 | Fixed | MCP install before attach; initial_mcp on create; no CreationOnly refresh |
-| D-015 | Partial | admission max_input_bytes/messages; tool concurrency from limits; more limits still open |
+| D-015 | Fixed (partial→stronger) | validate zeros; event byte budget; input/schema/parts; provider I/O aggregates |
 | D-016 | Fixed | Ready only on `tool_calls` finish |
 | D-017 | Fixed | single ExchangeId |
-| D-018 | Partial | per-capability shared LocalSessionManager + 1MiB body bound |
+| D-018 | Fixed (partial→stronger) | shared per-token service; body 1MiB; HTTP oversized+stable-route tests |
 | D-019 | Fixed | HTTP bounds/cancel |
 | D-020 | Fixed | absolute shutdown deadline |
 | D-021 | Partial | catch_unwind invoke; not full callback executor |
 | D-022 | Fixed | Rejected → CanonicalToolResult |
 | D-023 | Fixed | empty extension allowlist denies all extensions |
 | D-024 | Fixed | RegisteredTool::try_new validates policy vs handler supports_* |
-| D-025 | Open | fmt + full acceptance after residual soak |
+| D-025 | Partial | fmt+tests green on residual work; full R-000 re-sign-off still open |

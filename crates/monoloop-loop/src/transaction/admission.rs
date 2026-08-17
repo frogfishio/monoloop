@@ -7,7 +7,7 @@ use super::active_registry::{ActiveTransaction, ActiveTransactionRegistry, Contr
 use super::actor::{spawn_actor, ActorSpawn};
 use super::capacity::CapacityManagers;
 use super::channel_registry::LiveChannel;
-use super::events::spawn_delivery_task;
+use super::events::{spawn_delivery_task, BoundedEventSender};
 use super::finalization::{EventSequencer, FinalizationGuard};
 use super::host_tools::HostToolRegistry;
 use super::mcp::McpGatewayHandle;
@@ -106,6 +106,35 @@ pub fn admit(
             "canonical input exceeds max_messages",
         ));
     }
+    for msg in request.input.messages() {
+        let parts = match msg {
+            monoloop_contracts::CanonicalMessage::System { content, .. }
+            | monoloop_contracts::CanonicalMessage::User { content, .. }
+            | monoloop_contracts::CanonicalMessage::Assistant { content, .. }
+            | monoloop_contracts::CanonicalMessage::Tool { content, .. } => content.len(),
+        };
+        if parts > ctx.limits.max_content_parts {
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::InvalidInput,
+                "canonical message exceeds max_content_parts",
+            ));
+        }
+    }
+    // Tool schema aggregate for selected tools.
+    let mut schema_total = 0usize;
+    for spec in resolved.specs() {
+        schema_total = schema_total.saturating_add(
+            serde_json::to_vec(spec.input_schema.as_value())
+                .map(|b| b.len())
+                .unwrap_or(0),
+        );
+    }
+    if schema_total > ctx.limits.max_tool_schema_bytes {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::InvalidInput,
+            "selected tool schemas exceed max_tool_schema_bytes",
+        ));
+    }
 
     let policy = channel_option_policy(&live.binding.defaults);
     let effective = merge_effective_config(
@@ -168,7 +197,9 @@ pub fn admit(
 
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>(1);
     let event_cap = ctx.limits.max_event_queue.max(1);
-    let (event_tx, event_rx) = mpsc::channel(event_cap);
+    let (raw_event_tx, event_rx) = mpsc::channel(event_cap);
+    let event_tx = BoundedEventSender::new(raw_event_tx, ctx.limits.max_event_queue_bytes);
+    let byte_counter = event_tx.byte_counter();
     let (fail_tx, fail_rx) = mpsc::channel::<()>(1);
     // D-009: actor must not run work until install succeeds.
     let (start_tx, start_rx) = oneshot::channel::<()>();
@@ -182,7 +213,13 @@ pub fn admit(
         Arc::clone(&sequencer),
     );
 
-    let delivery_join = spawn_delivery_task(event_rx, request.events, fail_tx);
+    let delivery_join = spawn_delivery_task(
+        event_rx,
+        request.events,
+        fail_tx,
+        byte_counter,
+        ctx.limits.terminal_event_delivery_deadline,
+    );
 
     let actor_join = spawn_actor(ActorSpawn {
         transaction_id,
@@ -219,6 +256,12 @@ pub fn admit(
         max_concurrent_tools: ctx.limits.max_concurrent_tools_per_transaction,
         max_queued_tools: ctx.limits.max_queued_tools_per_transaction,
         cleanup_deadline: ctx.limits.cleanup_deadline,
+        terminal_event_delivery_deadline: ctx.limits.terminal_event_delivery_deadline,
+        callback_deadline: ctx.limits.callback_deadline,
+        max_total_provider_input_bytes: ctx.limits.max_total_provider_input_bytes,
+        max_total_provider_output_bytes: ctx.limits.max_total_provider_output_bytes,
+        max_continuation_context_bytes: ctx.limits.max_continuation_context_bytes,
+        max_tool_schema_bytes: ctx.limits.max_tool_schema_bytes,
         start_gate: start_rx,
     });
 

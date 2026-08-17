@@ -34,6 +34,7 @@ pub use capacity::CapacityManagers;
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
 pub use dispatcher::{DispatchOutcome, DispatchRequest, TransactionToolDispatcher};
 pub use error::StartupError;
+pub use events::{BoundedEventSender, EventQueueFull, QueuedEvent};
 pub use exchange::{
     run_encoded_exchange, run_exchange, EncodedExchangeParams, ExchangeFailure, ExchangeOutcome,
     ExchangeParams,
