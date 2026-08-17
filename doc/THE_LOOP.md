@@ -1,4 +1,4 @@
-# Component 03 — The Loop
+# Component 03 — The Inner Loop Runtime
 
 **Status:** Foundational component specification
 
@@ -18,6 +18,9 @@ results
 
 **Parent index:** [README.md](README.md)
 
+**Production composition:** [Transaction Runtime Design](TRANSACTION_RUNTIME_DESIGN.md)
+and [Implementation Specification](TRANSACTION_RUNTIME_IMPLEMENTATION.md)
+
 The words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, and
 **MAY** are normative requirements.
 
@@ -25,8 +28,10 @@ The words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, and
 
 ## 1. Purpose
 
-The Loop subscribes to canonical in-memory events and reacts to complete tool
-requests.
+This document specifies Component 3's inner `LoopRuntime`: it subscribes to
+canonical in-memory events and reacts to complete tool requests. Component 3
+also contains the production `TransactionRuntime` composition layer specified
+in the linked transaction documents.
 
 Its initial responsibility is deliberately narrow:
 
@@ -81,7 +86,7 @@ shared between runs or survive its owning run.
 
 ## 4. Initial scope
 
-Component 03 implements:
+The inner `LoopRuntime` implements:
 
 - loop instance lifecycle;
 - lossless canonical event consumption;
@@ -95,15 +100,15 @@ Component 03 implements:
 - loop events, health, and terminal reporting; and
 - empty-tool behavior.
 
-It does not implement the complete Channel exchange. In the initial test
-composition, the Driver owns exchange continuation and a separate outbound
-encoder owns dialect encoding. A later production host may provide equivalent
-composition. Prompt construction and higher-product completion remain outside
-Monoloop entirely.
+It does not implement the complete Channel exchange. The test-kit Driver owns
+that exchange in conformance composition. In production, Component 3's
+`TransactionRuntime` owns equivalent composition and invokes a separate
+outbound encoder. Prompt construction and higher-product completion remain
+outside Monoloop entirely.
 
 ## 5. Explicit non-responsibilities
 
-The Loop MUST NOT:
+The inner `LoopRuntime` MUST NOT:
 
 - consume raw Connector bytes or dialect-native events;
 - parse or reassemble text, Markdown, JSON fragments, or tool fragments;
@@ -207,8 +212,9 @@ one accepted canonical event
     -> future subscribers         independently bounded
 ```
 
-Component 03 does not implement or own the process-wide distributor. It requires
-a `CanonicalEventSubscription` with:
+The inner `LoopRuntime` does not implement or own the transaction event
+distributor. Component 3's `TransactionRuntime` supplies it and gives the inner
+runtime a `CanonicalEventSubscription` with:
 
 ```text
 subscriber_id
@@ -528,9 +534,10 @@ execution_lost
 The result is provider-neutral. The Loop does not serialize it as OpenAI,
 Anthropic, ACP, Cursor, Grok Build, JSONL, or any other dialect.
 
-The test kit's separate outbound Encoder consumes this product and its Driver
-writes the encoded bytes through the Connector input. A later host may provide
-the same seams. Neither responsibility enters The Loop.
+The test kit's separate outbound encoder consumes this product and its Driver
+writes the encoded bytes through the Connector input. In production, Component
+3's `TransactionRuntime` provides the same seams. Neither responsibility enters
+the inner `LoopRuntime`.
 
 ## 22. Output publication rule
 
@@ -612,8 +619,9 @@ Cancellation:
 - releases the subscription and output handles; and
 - resolves Loop completion exactly once.
 
-The Loop does not directly cancel Connector connections. The test Driver or a
-future host may signal both from one higher-level cancellation decision.
+The inner `LoopRuntime` does not directly cancel Connector connections. The test
+Driver or production `TransactionRuntime` may signal both from one higher-level
+cancellation decision.
 
 ## 27. Subscription gap and loss
 
@@ -977,9 +985,10 @@ The slice proves:
 - no product UI, host agent, persistence, concrete tools, or prompt engine is
   required.
 
-This Component 01–03 slice alone does not send the outbound result back to the
-external system. The test Driver's outbound Encoder seam, or an equivalent
-future host composition, supplies that behavior.
+The inner `LoopRuntime` alone does not send the outbound result back to the
+external system. The test Driver's outbound encoder supplies that behavior in
+conformance tests; the production `TransactionRuntime` supplies it in a live
+transaction.
 
 ## 39. Deferred work
 
@@ -991,12 +1000,13 @@ Explicitly deferred:
 - durable command/effect receipts and crash recovery;
 - retry and scheduling policy beyond bounded FIFO;
 - outbound dialect encoding and Connector input, which belong to the test
-  Driver or future host composition;
+  Driver or production `TransactionRuntime` composition layer;
 - Channel continuation and invocation lifecycle, which belong to the test
-  Driver or future host coordinator;
+  Driver or production `TransactionRuntime`;
 - context/prompt compilation;
 - product/task/turn state;
-- event distributor implementation;
+- event distributor implementation inside the inner `LoopRuntime` (production
+  distribution is owned by `TransactionRuntime`);
 - product UI projections and controls; and
 - human interaction tools.
 

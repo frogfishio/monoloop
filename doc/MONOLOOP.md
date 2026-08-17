@@ -34,21 +34,23 @@ The words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, and
 Monoloop is exactly three independently testable Rust components:
 
 ```text
-Connector -> Interpreter -> minimal extensible Loop
+Connector -> Interpreter -> transaction-composing Loop
 ```
 
 The Connector moves dialect-labelled bytes and owns connection/session routing
 required by its transport profile. The Interpreter converts inbound dialect
-events into provider-neutral canonical events. The Loop consumes those events
-through the smallest useful extensible event-driven state machine.
+events into provider-neutral canonical events. Component 3 contains the
+production transaction composition layer and an inner extensible `LoopRuntime`
+that consumes complete canonical tool events.
 
 It is not a chat application, an agent, a prompt engine, a memory system, a task
 system, a model router, or a persistence service.
 
 The Driver described in this document is test-kit composition. It demonstrates
-the three components together but is not a fourth component, a production
-runtime, or a mandatory facade. A later host may compose the components through
-its own driver while preserving their contracts.
+the three components together but is not a fourth component or the production
+facade. Production composition is `TransactionRuntime`, specified by
+`TRANSACTION_RUNTIME_DESIGN.md` and
+`TRANSACTION_RUNTIME_IMPLEMENTATION.md`, inside Component 3.
 
 ## 2. Test composition outcome
 
@@ -75,6 +77,11 @@ pub struct MonoloopRun {
 The run emits canonical events in real time and resolves exactly once with a
 terminal processing result. This facade belongs to `monoloop-testkit`; it is not
 a required public facade over the three product components.
+
+Production callers instead use the push-based `TransactionRuntime`: bounded
+submission returns an admission receipt immediately, canonical events are
+pushed to the attached sink, and exactly one asynchronous callback is invoked
+after terminal event delivery. Callers do not poll a production run handle.
 
 ## 3. Durability and in-memory state
 
@@ -136,6 +143,27 @@ must not create ambient current identity or cross-run correlation.
 
 ## 5. Canonical request
 
+The production request is:
+
+```text
+TransactionRequest
+    selected ChannelId
+    SessionId?
+    CanonicalInput
+    InvocationConfig
+    requested ToolId[]
+    event sink
+    completion callback
+```
+
+Admission generates a `TransactionId`. The caller may provide a `SessionId`;
+direct-LLM admission generates an ephemeral one when absent, while a new
+external-agent session supplies its authoritative ID asynchronously. Exact
+types and the first text-message input schema are fixed in
+`TRANSACTION_RUNTIME_IMPLEMENTATION.md`.
+
+The test-kit retains this lower-level conformance request:
+
 ```text
 MonoloopRequest
     run_id
@@ -150,9 +178,9 @@ MonoloopRequest
     continuation_policy
 ```
 
-`canonical_input` is a complete provider-neutral request product. Initially it
-may contain one text prompt and minimal model-interaction options. It is never a
-provider-native JSON object or raw wire body.
+`canonical_input` is a complete provider-neutral request product. The first
+production form is ordered role-bearing messages with text content parts. It is
+never a provider-native JSON object or raw wire body.
 
 The caller explicitly selects `selected_channel`. Monoloop does not rank,
 recommend, or choose channels.
@@ -232,9 +260,9 @@ caller explicitly supplies the Grok session ID through the supported load
 contract. Monoloop has no ambient "current Grok session", "current Cursor
 session", or most-recent-session fallback.
 
-Different Grok sessions progress concurrently. Requests that mutate one Grok
-session are serialized unless negotiated capabilities explicitly declare them
-safe to run concurrently. Monoloop never infers concurrency safety from timing.
+Different Grok sessions progress concurrently. Only one transaction may be in
+flow for a given session ID. A second request for that active session is
+rejected immediately and is never queued, regardless of provider capability.
 
 An external session may outlive a Monoloop run or local network connection. A
 Connector detaching its local route does not claim to close or delete the Grok
@@ -265,8 +293,9 @@ pub trait OutboundDialectEncoder: Send + Sync {
 }
 ```
 
-This is a required supporting seam whose detailed component specification is
-deferred. Until it exists, tests may use a deterministic test dialect encoder.
+This is a required supporting seam. Its production contract is fixed by
+`TRANSACTION_RUNTIME_IMPLEMENTATION.md`; tests may also use a deterministic
+test dialect encoder.
 
 The encoder:
 
@@ -275,13 +304,15 @@ The encoder:
 - returns complete bounded bytes plus safe metadata;
 - contains no routing, prompting, tool execution, persistence, or session state;
   and
-- is not implemented inside Console Input, Connector, Interpreter, or The Loop.
+- is not implemented inside Console Input, Connector, Interpreter, or the inner
+  `LoopRuntime`. Component 3's `TransactionRuntime` selects and invokes it.
 
 ## 8. End-to-end composition
 
 ```text
 caller
-  -> MonoloopRequest + explicit ChannelBinding
+  -> TransactionRuntime.submit(TransactionRequest)
+  -> bounded admission + explicit ChannelBinding
   -> outbound dialect encoder
   -> Connector raw input
   -> external channel
@@ -290,15 +321,16 @@ caller
   -> canonical event distributor
        +-> caller event subscription
        +-> Console Renderer subscription (test only)
-       +-> The Loop lossless subscription
+       +-> inner LoopRuntime lossless subscription
               -> abstract ToolRegistry/ToolRuntime
               -> OutboundToolResult
               -> continuation policy
                    +-> inline: outbound dialect encoder -> next Channel exchange
                    +-> caller-controlled: terminal continuation evidence
   -> canonical terminal events
-  -> MonoloopRunEnd
-  -> destroy all run state
+  -> TransactionEnd
+  -> destroy all transaction state
+  -> one completion callback
 ```
 
 No component may bypass this flow with a provider-specific side channel.
@@ -588,14 +620,16 @@ or global current state.
 
 Monoloop is asynchronous from the first implementation:
 
-- `process` returns a live handle immediately;
+- test-kit `process` returns a live handle immediately; production `submit`
+  returns an admission receipt after bounded synchronous work;
 - connection, interpretation, loop, tools, event distribution, and output writes
   progress independently within one owned cancellation domain;
 - all queues and concurrency are bounded;
 - no blocking I/O runs on an async worker;
 - no busy polling or UI polling drives progress;
 - every spawned task has an owner and terminal result;
-- completion handles are awaited/joined exactly once safely;
+- internal component completion handles are awaited/joined exactly once by
+  their owner, while production callers receive one push callback;
 - shutdown wakes every blocked operation; and
 - thousands of fake concurrent runs can be qualified without cross-run state.
 

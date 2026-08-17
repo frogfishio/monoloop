@@ -11,7 +11,7 @@ maxChars: 4500
 **Monoloop** is a ground-zero **async Rust kernel** for multi-channel LLM I/O:
 
 ```text
-Connector → Interpreter → minimal extensible Loop
+Connector → Interpreter → transaction-composing Loop
 ```
 
 - **Language / runtime**: Rust, Tokio multi-thread async.
@@ -30,6 +30,9 @@ It is **prohibited** as a product dependency.
 | Concern | Source |
 |---|---|
 | Product + composition | `doc/MONOLOOP.md` |
+| Requirements | `doc/REQUIREMENTS.md` |
+| Transaction architecture | `doc/TRANSACTION_RUNTIME_DESIGN.md` |
+| Development contract | `doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md` |
 | Component 01 | `doc/CONNECTOR.md` |
 | Component 02 | `doc/INTERPRETER.md` |
 | Component 03 | `doc/THE_LOOP.md` |
@@ -43,8 +46,9 @@ spec revision** — do not silently expand component responsibilities.
 ## Operating rules for agents in this workspace
 
 1. **Preserve the three-component boundary.** Before adding code or types, ask:
-   which of Connector / Interpreter / Loop / testkit owns this? If none, it is
-   either a deferred seam (e.g. outbound encoder) or **out of product**.
+   which of Connector / Interpreter / Loop / testkit owns this? Component 3's
+   transaction layer owns production composition and its specified encoder,
+   tool, and MCP adapters; unspecified responsibilities remain **out of product**.
 2. **No responsibility by accident.** Do not pull in prompt augmentation, session
    history storage, UI, concrete tools, routers, or host-agent modules because a
    demo “needs them.” Cross-component behavior requires an explicit `doc/` contract.

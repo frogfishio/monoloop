@@ -6,6 +6,12 @@
 
 **Product specification:** [MONOLOOP.md](MONOLOOP.md)
 
+**Requirements register:** [REQUIREMENTS.md](REQUIREMENTS.md)
+
+**Transaction runtime design:** [TRANSACTION_RUNTIME_DESIGN.md](TRANSACTION_RUNTIME_DESIGN.md)
+
+**Development specification:** [TRANSACTION_RUNTIME_IMPLEMENTATION.md](TRANSACTION_RUNTIME_IMPLEMENTATION.md)
+
 This directory defines Monoloop from first principles. It does not describe a
 refactor of a previous implementation loop. Existing code may later supply
 adapters or reusable implementations only after it satisfies these contracts.
@@ -14,7 +20,7 @@ Monoloop consists of exactly three product components:
 
 1. a Connector;
 2. an Interpreter; and
-3. the smallest useful extensible Loop.
+3. a transaction-composing Loop with a separately testable inner tool runtime.
 
 The components are asynchronous, non-blocking, independently testable Rust
 libraries. A Connector may intentionally retain bounded in-memory state for
@@ -30,7 +36,7 @@ must not become production dependencies.
 |---|---|---|
 | 01 | [Connector](CONNECTOR.md) | Dialect-labelled transport, explicit external-session routing, cancellation, and termination |
 | 02 | [Interpreter](INTERPRETER.md) | Async incremental dialect interpretation and immediate in-memory canonical-unit events |
-| 03 | [The Loop](THE_LOOP.md) | Minimal lossless event loop with an empty-capable extension/tool boundary |
+| 03 | [The Loop](THE_LOOP.md) | Bounded transaction composition plus a lossless complete-unit tool runtime |
 
 Initial Connector implementation profiles:
 
@@ -53,11 +59,11 @@ Test infrastructure:
 - [Console Input](CONSOLE_INPUT.md)
 - [Console Renderer](CONSOLE_RENDERER.md)
 
-Required supporting seam, contractually defined in
-[Monoloop §7](MONOLOOP.md#7-outbound-encoder-seam) and intentionally awaiting a
-separate implementation specification: canonical outbound request/result
-encoding into the selected channel dialect. In the initial project it is
-provided by the test kit Driver. It never becomes a fourth product component.
+Required supporting seams—canonical outbound encoding and MCP exposure—are
+specified by the transaction design and development specification. Production
+implementations are adapters owned by Component 3's transaction layer; test
+composition may provide deterministic substitutes. They never become additional
+product components.
 
 No component acquires responsibilities merely because the current application
 already combines them. Cross-component behavior is added only through an

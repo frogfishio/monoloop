@@ -5,7 +5,9 @@ entries. Specs under `doc/` remain normative; this file captures *why*.
 
 ## 2026-08 — Three-component kernel only
 
-- **Decision**: Monoloop is exactly Connector + Interpreter + minimal extensible Loop.
+- **Decision**: Monoloop is exactly Connector + Interpreter + an extensible Loop
+  component. Its provider-neutral inner runtime remains minimal; the later
+  2026-08-17 decision adds production transaction composition inside Component 3.
 - **Rationale**: Keep a ground-zero cognitive runtime small, independently testable,
   and free of chat/agent/prompt/memory/task product surface. Hosts compose; the
   kernel does not grow into a monolith.
@@ -128,6 +130,63 @@ entries. Specs under `doc/` remain normative; this file captures *why*.
   `ConnectorProxy` to route hosts to named backends without ambient state.
 - **Implication**: Product interpreters/loop depend on contracts + abstract
   connector traits; Grok is an optional backend crate.
+
+## 2026-08-17 — Component 3 owns production transaction composition
+
+- **Decision**: Monoloop remains exactly three components. Component 3 contains
+  a production `TransactionRuntime` composition layer and a separately testable,
+  provider-neutral inner `LoopRuntime`.
+- **Rationale**: Admission, correlation, event delivery, continuations,
+  termination, and completion require one production owner. Treating that owner
+  as an unspecified future host leaves the product API unimplemented.
+- **Implication**: The transaction layer may compose Connector, Interpreter,
+  outbound encoder, MCP adapter, and inner Loop handles. The inner Loop still
+  does not encode dialects, write Connector input, or host MCP transport. This
+  refines the earlier “minimal Loop” decision without creating a fourth
+  component.
+
+## 2026-08-17 — Push completion and one active transaction per session
+
+- **Decision**: Production submission performs bounded synchronous admission,
+  streams canonical events to an attached sink, and invokes one asynchronous
+  completion callback. A second request for an active `SessionId` is rejected
+  immediately and is not queued.
+- **Rationale**: Calling systems must not poll or block, and mutable session
+  routing must remain unambiguous.
+- **Implication**: Awaitable run handles remain test-kit internals. Provider
+  capability cannot enable concurrent transactions on one session.
+
+## 2026-08-17 — Request-scoped tools use one linked execution path
+
+- **Decision**: The host registry is immutable and linked at startup; requests
+  select tools by stable ID. MCP and direct-LLM projections derive from the same
+  resolved set and delegate to the same dispatcher and handler.
+- **Rationale**: Tool availability may differ per transaction without dynamic
+  code loading or schema drift between agents and direct LLMs.
+- **Implication**: MCP is a bounded Component 3 adapter, initially implemented
+  with a maintained Rust MCP SDK over loopback Streamable HTTP. Profiles that
+  cannot provide request-scoped MCP tools reject non-empty tool requests.
+
+## 2026-08-17 — First direct-LLM dialect is Chat Completions
+
+- **Decision**: The first OpenAI-compatible implementation is OpenAI Chat
+  Completions v1 over streaming HTTP/SSE.
+- **Rationale**: “OpenAI-compatible” is not one protocol. Chat Completions and
+  Responses have different request, stream, tool, and terminal semantics.
+- **Implication**: Add a distinct `OpenAiChatCompletions` dialect. OpenAI
+  Responses, non-streaming JSON, and provider-specific NDJSON require separately
+  qualified dialects.
+
+## 2026-08-17 — First canonical input is ordered text messages
+
+- **Decision**: The first input schema is caller-authored ordered messages with
+  roles and ordered text parts, plus bounded tool-call correlation fields.
+- **Rationale**: A single text string cannot faithfully carry existing
+  conversation/tool context, while arbitrary multimodal payloads would create
+  unqualified scope.
+- **Implication**: Monoloop validates and mechanically encodes this product but
+  never authors or rewrites it. New content-part kinds require versioned
+  contracts and dialect tests.
 
 ## Template for new entries
 

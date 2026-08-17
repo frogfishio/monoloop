@@ -9,10 +9,14 @@ Long-term facts that should persist across sessions.
 
 ## Product DNA
 
-- **Monoloop** = Connector + Interpreter + minimal extensible Loop only.
+- **Monoloop** = Connector + Interpreter + transaction-composing Loop only.
+- Component 3 contains production `TransactionRuntime` composition and the
+  separately testable provider-neutral inner `LoopRuntime`.
 - Language: **Rust**; async runtime: **Tokio multi-thread**.
 - Authoritative specs: `doc/` (RFC-style MUST/MUST NOT).
 - Test kit (Driver, Console, fixtures, outbound test encoder) is **not** product.
+- Production events and completion are push-based; one active transaction is
+  permitted per `SessionId`, with duplicates rejected rather than queued.
 - Initial Connector: **Grok Build** — ACP/JSON-RPC 2.0 over authenticated WebSocket;
   one server, many sessions; correlation ID = Grok `sessionId`.
 

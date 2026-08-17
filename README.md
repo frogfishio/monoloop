@@ -5,7 +5,7 @@ components:
 
 1. Connector
 2. Interpreter
-3. the smallest extensible Loop
+3. a transaction-composing Loop with a separately testable inner tool runtime
 
 The initial Connector talks to one authenticated Grok Build server using
 ACP/JSON-RPC over WebSocket. That single Grok instance hosts multiple logical
@@ -16,8 +16,10 @@ in memory.
 The Driver, stdin/stdout adapters, deterministic fixtures, and console renderer
 are a separate test kit. They are not additional product components.
 
-See the [documentation index](doc/README.md), the [Grok Build Connector
-profile](doc/GROK_BUILD_CONNECTOR.md), and the [Test Kit and
+See the [documentation index](doc/README.md), [requirements
+register](doc/REQUIREMENTS.md), [transaction design](doc/TRANSACTION_RUNTIME_DESIGN.md),
+[development specification](doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md), [Grok
+Build Connector profile](doc/GROK_BUILD_CONNECTOR.md), and [Test Kit and
 Driver](doc/TEST_KIT.md).
 
 ## Workspace (implementation in progress)
@@ -28,7 +30,7 @@ crates/
   monoloop-connector        # abstract Connector, FakeConnector, ConnectorProxy
   monoloop-connector-grok   # Grok Build ACP/WebSocket profile
   monoloop-interpreter      # reassemble raw dialect bytes → complete canonical events
-  monoloop-loop             # lossless subscription; empty-tool path (ToolUnavailable)
+  monoloop-loop             # transaction runtime; inner tool loop; MCP/tool adapters
   monoloop-testkit          # distributor, console, Driver (NOT a product dependency)
 ```
 
