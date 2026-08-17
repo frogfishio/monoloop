@@ -14,6 +14,9 @@
 
 **Engineering delivery plan:** [TRANSACTION_RUNTIME_DELIVERY_PLAN.md](TRANSACTION_RUNTIME_DELIVERY_PLAN.md)
 
+**WP-00 evidence:** [WP00_BASELINE_EVIDENCE.md](WP00_BASELINE_EVIDENCE.md) ·
+[WP00_PROFILE_CAPABILITY_WORKSHEET.md](WP00_PROFILE_CAPABILITY_WORKSHEET.md)
+
 This directory defines Monoloop from first principles. It does not describe a
 refactor of a previous implementation loop. Existing code may later supply
 adapters or reusable implementations only after it satisfies these contracts.

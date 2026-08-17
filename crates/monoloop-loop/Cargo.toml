@@ -14,4 +14,13 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
+tokio-util = { workspace = true }
+# WP-00 dependency qualification only (no production MCP gateway yet — WP-07).
+axum = { workspace = true }
+jsonschema = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+secrecy = { workspace = true }
+serde_json = { workspace = true }

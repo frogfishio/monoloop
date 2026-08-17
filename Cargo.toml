@@ -31,7 +31,8 @@ default-members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.75"
+# Raised to 1.88 in WP-00 for maintained `rmcp` Streamable HTTP SDK (see DECISIONS.md).
+rust-version = "1.88"
 
 [workspace.dependencies]
 bytes = "1.10"
@@ -48,3 +49,15 @@ url = "2.5"
 http = "1.3"
 base64 = "0.22"
 pulldown-cmark = "0.13"
+
+# WP-00 qualified dependencies for TransactionRuntime (HTTP connector, MCP gateway,
+# tool schema validation, secrets, CSPRNG). Feature sets pin Rustls and avoid
+# default native-TLS / unwanted system linkage. See doc/WP00_BASELINE_EVIDENCE.md.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "http2"] }
+rmcp = { version = "3.1.2", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tower = { version = "0.5", default-features = false }
+jsonschema = { version = "0.49", default-features = false }
+secrecy = { version = "0.10", features = ["serde"] }
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
+getrandom = "0.3"
