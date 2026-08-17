@@ -1,6 +1,7 @@
 //! Transaction actor: session establish + one provider exchange + finalization.
 
 use super::active_registry::{ActiveTransactionRegistry, ClaimSessionError, ControlMessage};
+use super::callback_service::CallbackService;
 use super::dispatcher::{DispatchOutcome, DispatcherLimits, TransactionToolDispatcher};
 use super::events::{BoundedEventSender, QueuedEvent};
 use super::exchange::{
@@ -116,6 +117,8 @@ pub struct ActorSpawn {
     pub max_diagnostic_count: usize,
     /// Max bytes per diagnostic message (D-015).
     pub max_diagnostic_bytes: usize,
+    /// Runtime-owned completion callback service (D-021).
+    pub callbacks: CallbackService,
     /// Closed only after registry install succeeds (D-009).
     pub start_gate: oneshot::Receiver<()>,
 }
@@ -179,6 +182,7 @@ async fn run_actor(spawn: ActorSpawn) {
         max_distinct_sessions,
         max_diagnostic_count,
         max_diagnostic_bytes,
+        callbacks,
         start_gate,
     } = spawn;
     let _ = (max_diagnostic_count, max_diagnostic_bytes);
@@ -221,6 +225,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 result,
                 terminal_event_delivery_deadline,
                 callback_deadline,
+                &callbacks,
             )
             .await;
             return;
@@ -843,6 +848,7 @@ async fn run_actor(spawn: ActorSpawn) {
         result,
         terminal_event_delivery_deadline,
         callback_deadline,
+        &callbacks,
     )
     .await;
 }
@@ -1076,6 +1082,7 @@ async fn finalize_and_cleanup(
     result: ActorResult,
     terminal_event_delivery_deadline: Duration,
     callback_deadline: Duration,
+    callbacks: &CallbackService,
 ) {
     let Some(payload) = guard.try_claim() else {
         release_capacity();
@@ -1135,32 +1142,6 @@ async fn finalize_and_cleanup(
     release_capacity();
 
     guard.mark_callback_scheduled();
-    // D-021: invoke + poll panics must not kill the actor; run on an owned child task.
-    invoke_completion_callback(payload.callback, end, callback_deadline).await;
-}
-
-/// Run host completion callback with panic + deadline isolation (D-021).
-async fn invoke_completion_callback(
-    callback: Box<dyn monoloop_contracts::CompletionCallback>,
-    end: monoloop_contracts::TransactionEnd,
-    deadline: Duration,
-) {
-    let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
-    match call_result {
-        Ok(fut) => {
-            let handle = tokio::spawn(fut);
-            let abort = handle.abort_handle();
-            match tokio::time::timeout(deadline, handle).await {
-                Ok(Ok(_)) | Ok(Err(_)) => {
-                    // Join error = panic inside future; terminal cause unchanged.
-                }
-                Err(_) => {
-                    abort.abort();
-                }
-            }
-        }
-        Err(_) => {
-            // Callback panicked at invoke; terminal cause already selected.
-        }
-    }
+    // D-021: schedule on runtime-owned service; actor does not await host callback.
+    callbacks.schedule(payload.callback, end, Some(callback_deadline));
 }

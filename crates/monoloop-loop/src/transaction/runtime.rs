@@ -3,6 +3,7 @@
 use super::active_registry::{ActiveTransactionRegistry, ControlMessage};
 use super::admission::{admit, AdmissionContext};
 use super::bootstrap::RuntimeBootstrap;
+use super::callback_service::CallbackService;
 use super::capacity::CapacityManagers;
 use super::channel_registry::{ChannelBinding, LiveChannel};
 use super::error::StartupError;
@@ -52,6 +53,8 @@ struct RuntimeInner {
     mcp: AsyncMutex<Option<McpGateway>>,
     /// Cloneable handle for admission/actors (None when MCP listener disabled).
     mcp_handle: Option<super::mcp::McpGatewayHandle>,
+    /// Runtime-owned completion callbacks (D-021).
+    callbacks: CallbackService,
 }
 
 /// Production transaction runtime.
@@ -139,6 +142,16 @@ impl DefaultTransactionRuntime {
             capacity_pairs,
         ));
 
+        // One concurrent callback slot per active-transaction budget (D-021).
+        let callbacks = CallbackService::new(
+            bootstrap
+                .config
+                .transaction_limits
+                .max_active_transactions
+                .max(1),
+            bootstrap.config.transaction_limits.callback_deadline,
+        );
+
         let mut channels = HashMap::with_capacity(realized.len());
         for (id, live) in realized {
             channels.insert(id, live);
@@ -154,6 +167,7 @@ impl DefaultTransactionRuntime {
                 registry: Arc::new(Mutex::new(ActiveTransactionRegistry::new())),
                 mcp: AsyncMutex::new(mcp),
                 mcp_handle,
+                callbacks,
             }),
         }))
     }
@@ -371,6 +385,12 @@ impl DefaultTransactionRuntime {
                 .await;
         }
 
+        // Drain runtime-owned host callbacks (D-021).
+        let cb_drain = deadline_at
+            .saturating_duration_since(tokio::time::Instant::now())
+            .max(Duration::from_millis(50));
+        self.inner.callbacks.drain(cb_drain).await;
+
         self.inner.state.store(STATE_STOPPED, Ordering::SeqCst);
         ShutdownDisposition {
             normally_finalized,
@@ -457,6 +477,7 @@ impl TransactionRuntime for DefaultTransactionRuntime {
             limits: self.inner.config.transaction_limits.clone(),
             mcp: self.inner.mcp_handle.clone(),
             runtime_state: Arc::clone(&self.inner.state),
+            callbacks: self.inner.callbacks.clone(),
         };
         admit(&ctx, request)
     }

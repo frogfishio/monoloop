@@ -1147,6 +1147,66 @@ async fn sink_panic_in_future_yields_event_delivery_failed() {
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
+/// D-021: slow host callback does not hold transaction capacity (runtime-owned service).
+#[tokio::test]
+async fn slow_callback_does_not_block_capacity_release() {
+    let rt = start_with_limits(vec![llm_binding("llm", 2)], limits_cap(2, 2)).await;
+    let hold = Arc::new(Notify::new());
+    let started = Arc::new(AtomicUsize::new(0));
+    for i in 0..2 {
+        let hold_c = Arc::clone(&hold);
+        let started_c = Arc::clone(&started);
+        TransactionRuntime::submit(
+            rt.as_ref(),
+            free_request(
+                "llm",
+                Some(SessionId::try_new(format!("slow-cb-{i}")).unwrap()),
+                Arc::new(FnEventSink(|_| {
+                    Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+                })),
+                Box::new(FnCompletionCallback(move |_end: TransactionEnd| {
+                    started_c.fetch_add(1, Ordering::SeqCst);
+                    let hold_c = Arc::clone(&hold_c);
+                    Box::pin(async move {
+                        hold_c.notified().await;
+                        Ok(())
+                    }) as monoloop_contracts::CompletionDelivery
+                })),
+            ),
+        )
+        .unwrap();
+    }
+    // Capacity must free even while callbacks are still held.
+    for _ in 0..100 {
+        if rt.active_count() == 0 && rt.capacity().global_active() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rt.active_count(), 0);
+    assert_eq!(rt.capacity().global_active(), 0);
+    // Subsequent admit succeeds while prior callbacks still run.
+    let done = Arc::new(Notify::new());
+    let ends = Arc::new(AtomicUsize::new(0));
+    TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            Some(SessionId::try_new("after-slow-cb").unwrap()),
+            Arc::new(FnEventSink(|_| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+            })),
+            counting_completion(Arc::clone(&ends), Arc::clone(&done)),
+        ),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done.notified())
+        .await
+        .expect("admit after slow callbacks");
+    hold.notify_waiters();
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(2)).await;
+}
+
 /// D-021: completion callback panic must not kill runtime; capacity fully released.
 #[tokio::test]
 async fn callback_panic_does_not_kill_runtime() {
@@ -1313,6 +1373,92 @@ async fn encoded_exchange_bytes_plus_one_fails() {
     let kinds = ends.lock().unwrap().clone();
     assert_eq!(kinds.len(), 1);
     assert_eq!(kinds[0], TransactionEndKind::EncodingFailed);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-012: cancel while FakeConnector hangs after open (response wait) releases capacity.
+#[tokio::test]
+async fn cancel_during_response_wait_releases_capacity() {
+    use monoloop_connector::{FakeConnectorConfig, FakeEndpoint};
+
+    let factory = FakeConnectorFactory::direct_llm_with_config(FakeConnectorConfig {
+        default_endpoint: FakeEndpoint::Hang,
+        ..Default::default()
+    });
+    let binding = ChannelBinding {
+        id: ChannelId::try_new("llm").unwrap(),
+        kind: ChannelKind::DirectLlm,
+        tool_mode: ToolExecutionMode::ModelToolCalls,
+        connector_factory: Arc::new(factory),
+        encoder: Arc::new(TestTextEncoder),
+        interpreter: Arc::new(DefaultInterpreterFactory::new()),
+        endpoint_ref: "default".into(),
+        credential_ref: None,
+        defaults: ChannelDefaults::default(),
+        capabilities: caps(),
+        limits: ChannelLimits {
+            max_active_transactions: 4,
+            max_distinct_sessions: 4,
+            max_encoded_exchange_bytes: 4 * 1024 * 1024,
+        },
+    };
+    let rt = start_with_limits(vec![binding], limits_cap(4, 4)).await;
+    let ends = Arc::new(Mutex::new(Vec::<TransactionEndKind>::new()));
+    let done = Arc::new(Notify::new());
+    let ends_c = Arc::clone(&ends);
+    let done_c = Arc::clone(&done);
+    let receipt = TransactionRuntime::submit(
+        rt.as_ref(),
+        free_request(
+            "llm",
+            Some(SessionId::try_new("hang-resp").unwrap()),
+            Arc::new(FnEventSink(|_| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+            })),
+            Box::new(FnCompletionCallback(move |end: TransactionEnd| {
+                ends_c.lock().unwrap().push(end.kind);
+                done_c.notify_waiters();
+                Box::pin(async { Ok(()) }) as monoloop_contracts::CompletionDelivery
+            })),
+        ),
+    )
+    .unwrap();
+    // Allow open + encode + send into hang owner.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = TransactionRuntime::terminate(
+        rt.as_ref(),
+        TransactionSelector::Transaction(receipt.transaction_id),
+        TerminationMode::Cancel {
+            reason: CancellationReason {
+                code: CancellationReasonCode::CallerRequested,
+                detail: None,
+            },
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(5), done.notified())
+        .await
+        .expect("cancel during hang must callback");
+    let kinds = ends.lock().unwrap().clone();
+    assert_eq!(kinds.len(), 1);
+    assert!(
+        matches!(
+            kinds[0],
+            TransactionEndKind::Cancelled
+                | TransactionEndKind::Terminated
+                | TransactionEndKind::ConnectorFailed
+                | TransactionEndKind::DeadlineExceeded
+        ),
+        "expected cancel/terminal path, got {:?}",
+        kinds[0]
+    );
+    for _ in 0..50 {
+        if rt.active_count() == 0 && rt.capacity().global_active() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rt.active_count(), 0);
+    assert_eq!(rt.capacity().global_active(), 0);
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 

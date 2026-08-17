@@ -9,6 +9,7 @@ mod active_registry;
 mod actor;
 mod admission;
 mod bootstrap;
+mod callback_service;
 mod capacity;
 mod channel_registry;
 mod dispatcher;
@@ -30,6 +31,7 @@ mod validation;
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
 pub use bootstrap::{RuntimeBootstrap, RuntimeConfig};
+pub use callback_service::CallbackService;
 pub use capacity::CapacityManagers;
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
 pub use dispatcher::{

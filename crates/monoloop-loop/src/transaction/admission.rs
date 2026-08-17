@@ -5,6 +5,7 @@
 
 use super::active_registry::{ActiveTransaction, ActiveTransactionRegistry, ControlMessage};
 use super::actor::{spawn_actor, ActorSpawn};
+use super::callback_service::CallbackService;
 use super::capacity::CapacityManagers;
 use super::channel_registry::LiveChannel;
 use super::events::{spawn_delivery_task, BoundedEventSender};
@@ -41,6 +42,8 @@ pub struct AdmissionContext {
     pub mcp: Option<McpGatewayHandle>,
     /// Shared runtime lifecycle atomic (Accepting / Draining / Stopped).
     pub runtime_state: Arc<AtomicU8>,
+    /// Runtime-owned completion callbacks (D-021).
+    pub callbacks: CallbackService,
 }
 
 /// Perform synchronous admission (no network/tool I/O).
@@ -270,6 +273,7 @@ pub fn admit(
         max_distinct_sessions: live.binding.limits.max_distinct_sessions,
         max_diagnostic_count: ctx.limits.max_diagnostic_count,
         max_diagnostic_bytes: ctx.limits.max_diagnostic_bytes,
+        callbacks: ctx.callbacks.clone(),
         start_gate: start_rx,
     });
 

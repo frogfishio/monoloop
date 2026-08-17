@@ -36,6 +36,8 @@ pub enum FakeEndpoint {
         /// Shared pairing key.
         pair_key: String,
     },
+    /// Accept input but never produce output until cancel/terminate (D-012 response-wait).
+    Hang,
 }
 
 /// Configuration for [`FakeConnector`].
@@ -270,6 +272,16 @@ async fn open_fake(
                 end_tx,
             ));
         }
+        FakeEndpoint::Hang => {
+            // Never emit output; hold until local cancel/terminate.
+            drop(out_tx);
+            tokio::spawn(run_hang_owner(
+                connection_id.clone(),
+                control_state,
+                in_rx,
+                end_tx,
+            ));
+        }
     }
 
     Ok(OpenedRawConnection {
@@ -459,6 +471,49 @@ async fn run_pair_owner(
                             EndInitiator::LocalTransport,
                             None,
                         );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Drain input while producing no output; finish only on cancel/terminate (D-012).
+async fn run_hang_owner(
+    connection_id: ConnectionId,
+    control: Arc<ControlState>,
+    mut in_rx: mpsc::Receiver<RawInputMessage>,
+    end_tx: oneshot::Sender<crate::handles::ConnectionEnd>,
+) {
+    let mut owner = ConnectionOwner::new(connection_id, Arc::clone(&control), end_tx);
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_control(&control) => {
+                let kind = if control.terminate_requested() {
+                    ConnectionEndKind::Terminated
+                } else {
+                    ConnectionEndKind::Cancelled
+                };
+                owner.finish(kind, EndInitiator::LocalControl, None);
+                return;
+            }
+            msg = in_rx.recv() => {
+                match msg {
+                    Some(RawInputMessage::Bytes(bytes)) => {
+                        owner.bytes_accepted += bytes.len() as u64;
+                        // Deliberately do not emit on output.
+                    }
+                    Some(RawInputMessage::Finish) | None => {
+                        // Stay open without EOF: hang until cancel/terminate only.
+                        wait_control(&control).await;
+                        let kind = if control.terminate_requested() {
+                            ConnectionEndKind::Terminated
+                        } else {
+                            ConnectionEndKind::Cancelled
+                        };
+                        owner.finish(kind, EndInitiator::LocalControl, None);
                         return;
                     }
                 }

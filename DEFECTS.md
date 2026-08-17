@@ -335,8 +335,8 @@ for the entire response with no transaction byte/item bound.
 ## D-012: Cancellation drops exchange futures without terminating and joining their children
 
 **Priority:** P1
-**Status:** Fixed (partial→stronger, 2026-08-18) — ExchangeGuard +
-`cleanup_deadline` join grace; cancel-during-slow-open releases capacity
+**Status:** Fixed (2026-08-18) — ExchangeGuard + cleanup_deadline; cancel
+during open and hang-response wait both release capacity
 **Affected:**
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - `crates/monoloop-loop/src/transaction/exchange.rs`
@@ -371,8 +371,8 @@ concurrent child cancellation/join.
       (`cleanup_deadline_non_default_completes`).
 - [x] Cancel during delayed open leaves zero capacity
       (`cancel_during_slow_open_releases_capacity`).
-- [ ] Residual: send/response-wait matrix against a deliberately
-      non-responsive provider body fixture.
+- [x] Cancel during hang (no provider body) after open/send
+      (`cancel_during_response_wait_releases_capacity`, `FakeEndpoint::Hang`).
 
 ## D-013: External session create and reuse do not attach authoritative provider sessions
 
@@ -695,12 +695,13 @@ state and independently drain/stop services.
 ## D-021: Event-sink and completion-callback panics escape their runtime boundaries
 
 **Priority:** P1
-**Status:** Fixed (partial→stronger, 2026-08-18) — invoke + poll isolation via
-owned child tasks; residual: separate admission-reserved callback capacity pool
+**Status:** Fixed (2026-08-18) — invoke/poll isolation + runtime-owned
+`CallbackService` with bounded concurrency; actor does not await host callback
 **Affected:**
 - `crates/monoloop-loop/src/transaction/events.rs`
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - `crates/monoloop-loop/src/transaction/runtime.rs`
+- `crates/monoloop-loop/src/transaction/callback_service.rs`
 
 **Problem:** The synchronous call that creates `sink.deliver(...)` and the
 synchronous call that creates `callback.call(...)` are not protected with
@@ -727,8 +728,9 @@ bounded callback executor/reservation.
       subsequent admits work (`callback_panic_does_not_kill_runtime`).
 - [x] Shutdown supervisor callbacks also use isolated invoke/poll
       (`run_callback_isolated`).
-- [ ] Residual: admission-time reserved callback capacity pool separate from
-      actor task lifetime (full “callback executor” service).
+- [x] Runtime-owned `CallbackService`: bounded concurrent slots, schedule
+      without holding actor capacity; shutdown drains inflight
+      (`slow_callback_does_not_block_capacity_release`).
 
 ## D-022: Rejected direct-model tool calls produce no canonical result
 
@@ -877,7 +879,7 @@ considered delivered while these remain.
 | D-009 | Fixed | start_gate; install under Accepting+registry lock |
 | D-010 | Fixed | shared Arc state; re-check under lock |
 | D-011 | Fixed | live canonical unit fan-out during exchange |
-| D-012 | Fixed (partial→stronger) | cleanup_deadline; cancel during slow open; residual send/wait matrix |
+| D-012 | Fixed | cleanup_deadline; cancel during open + Hang response-wait |
 | D-013 | Fixed | attach create+load; create_mode; provider id after open; known maps shared |
 | D-014 | Fixed | MCP install before attach; initial_mcp on create; no CreationOnly refresh |
 | D-015 | Fixed (partial→stronger) | + distinct sessions; encoded exchange; bound_diagnostics; actor command cap |
@@ -886,8 +888,8 @@ considered delivered while these remain.
 | D-018 | Fixed | shared per-token service; real HTTP initialize/list/call; body 1MiB; scoped revoke |
 | D-019 | Fixed | HTTP bounds/cancel |
 | D-020 | Fixed | absolute shutdown deadline |
-| D-021 | Fixed (partial→stronger) | invoke+poll isolation on child tasks; residual admission-reserved callback pool |
+| D-021 | Fixed | CallbackService + panic isolation; capacity free while callback runs |
 | D-022 | Fixed | Rejected → CanonicalToolResult |
 | D-023 | Fixed | empty extension allowlist denies all extensions |
 | D-024 | Fixed | RegisteredTool::try_new validates policy vs handler supports_* |
-| D-025 | Partial | residual depth items thin; limit/cancel matrix expanded; full R-000 re-sign-off still open |
+| D-025 | Partial | D-009–D-024 largely fixed; full R-000 re-sign-off still open |
