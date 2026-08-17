@@ -22,8 +22,9 @@ pub use subscription::{
 pub use tools::{NoToolRuntime, ToolRuntime};
 pub use transaction::{
     CapacityManagers, ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, EmptyBytesEncoder,
-    HostToolRegistry, LiveChannel, McpListenerShell, RejectEncoder, RuntimeBootstrap, RuntimeConfig,
-    RuntimeState, Startup, StartupError,
+    EventSequencer, FinalizationGuard, HostToolRegistry, LiveChannel, McpListenerShell,
+    RejectEncoder, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeState, Startup,
+    StartupError,
 };
 
 pub use monoloop_contracts::{

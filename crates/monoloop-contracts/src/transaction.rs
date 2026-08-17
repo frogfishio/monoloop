@@ -156,6 +156,8 @@ pub enum TerminationDisposition {
     Accepted,
     /// Already terminal or already requested.
     AlreadyRequested,
+    /// Transaction already terminal.
+    AlreadyTerminal,
     /// Unknown selector.
     NotFound,
 }

@@ -1,25 +1,28 @@
-//! DefaultTransactionRuntime startup, state, and shutdown shell.
+//! DefaultTransactionRuntime: start, admit, terminate, shutdown.
 
+use super::active_registry::{ActiveTransactionRegistry, ControlMessage};
+use super::admission::{admit, AdmissionContext};
 use super::bootstrap::RuntimeBootstrap;
 use super::capacity::CapacityManagers;
-use super::channel_registry::ChannelBinding;
+use super::channel_registry::{ChannelBinding, LiveChannel};
 use super::error::StartupError;
+use super::finalization::build_transaction_end;
 use super::host_tools::HostToolRegistry;
 use super::mcp_shell::McpListenerShell;
 use super::state::RuntimeState;
-use monoloop_connector::ConnectorInstance;
 use monoloop_contracts::{
-    AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId, ChannelKind, Shutdown,
-    ShutdownDisposition, TerminationDisposition, TerminationMode, TransactionRequest,
-    TransactionRuntime, TransactionSelector,
+    AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId, ChannelKind,
+    EventDeliveryOutcome, Shutdown, ShutdownDisposition, TerminationDisposition, TerminationMode,
+    TransactionEndKind, TransactionRequest, TransactionRuntime, TransactionSelector,
 };
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Startup future type.
 pub type Startup = Pin<
@@ -39,30 +42,23 @@ fn decode_state(v: u8) -> RuntimeState {
     }
 }
 
-/// Live Channel after connector instance realization.
-pub struct LiveChannel {
-    /// Static binding.
-    pub binding: ChannelBinding,
-    /// Matched connector instance.
-    pub instance: ConnectorInstance,
-}
-
 struct RuntimeInner {
     state: AtomicU8,
     config: super::bootstrap::RuntimeConfig,
-    channels: HashMap<ChannelId, LiveChannel>,
+    channels: Arc<HashMap<ChannelId, LiveChannel>>,
     tools: HostToolRegistry,
     capacity: Arc<CapacityManagers>,
-    mcp: Mutex<Option<McpListenerShell>>,
+    registry: Arc<Mutex<ActiveTransactionRegistry>>,
+    mcp: AsyncMutex<Option<McpListenerShell>>,
 }
 
-/// Production transaction runtime (WP-03: start/stop; admission in WP-04).
+/// Production transaction runtime.
 pub struct DefaultTransactionRuntime {
     inner: Arc<RuntimeInner>,
 }
 
 impl DefaultTransactionRuntime {
-    /// Only startup path. Returns after `Accepting` or cleans up and errors.
+    /// Only startup path.
     pub fn start(bootstrap: RuntimeBootstrap) -> Startup {
         Box::pin(async move { Self::start_inner(bootstrap).await })
     }
@@ -147,10 +143,11 @@ impl DefaultTransactionRuntime {
             inner: Arc::new(RuntimeInner {
                 state: AtomicU8::new(STATE_ACCEPTING),
                 config: bootstrap.config,
-                channels,
+                channels: Arc::new(channels),
                 tools: bootstrap.tools,
                 capacity,
-                mcp: Mutex::new(mcp),
+                registry: Arc::new(Mutex::new(ActiveTransactionRegistry::new())),
+                mcp: AsyncMutex::new(mcp),
             }),
         }))
     }
@@ -160,7 +157,7 @@ impl DefaultTransactionRuntime {
         decode_state(self.inner.state.load(Ordering::SeqCst))
     }
 
-    /// Immutable tools shell.
+    /// Tools shell.
     pub fn tools(&self) -> &HostToolRegistry {
         &self.inner.tools
     }
@@ -170,12 +167,17 @@ impl DefaultTransactionRuntime {
         &self.inner.capacity
     }
 
-    /// Number of live Channels.
+    /// Active transaction count.
+    pub fn active_count(&self) -> usize {
+        self.inner.registry.lock().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// Channel count.
     pub fn channel_count(&self) -> usize {
         self.inner.channels.len()
     }
 
-    /// MCP loopback address when enabled.
+    /// MCP address.
     pub async fn mcp_local_addr(&self) -> Option<std::net::SocketAddr> {
         self.inner
             .mcp
@@ -191,7 +193,7 @@ impl DefaultTransactionRuntime {
     }
 
     async fn shutdown_inner(&self, deadline: Duration) -> ShutdownDisposition {
-        let _deadline = if deadline.is_zero() {
+        let slice = if deadline.is_zero() {
             self.inner.config.default_shutdown_deadline
         } else {
             deadline
@@ -203,17 +205,106 @@ impl DefaultTransactionRuntime {
             return ShutdownDisposition::default();
         }
 
+        let active = {
+            let mut reg = self.inner.registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.drain_all()
+        };
+
+        let mut normally_finalized = 0u64;
+        let mut supervisor_finalized = 0u64;
+        let mut callback_failed = 0u64;
+        let mut callback_aborted = 0u64;
+        let mut invariant_failed = 0u64;
+        let cb_deadline = self.inner.config.transaction_limits.callback_deadline;
+
+        for entry in active {
+            let _ = entry.control_tx.try_send(ControlMessage::ForceTerminate);
+            match tokio::time::timeout(slice / 4 + Duration::from_millis(50), entry.actor_join).await
+            {
+                Ok(Ok(())) => {
+                    if entry.guard.callback_was_scheduled() {
+                        normally_finalized += 1;
+                    } else if let Some(payload) = entry.guard.try_claim() {
+                        entry.guard.mark_callback_scheduled();
+                        let end = build_transaction_end(
+                            &payload,
+                            TransactionEndKind::RuntimeShutdown,
+                            None,
+                            EventDeliveryOutcome::Failed,
+                            entry.guard.sequencer().last_allocated(),
+                        );
+                        let fut = payload.callback.call(end);
+                        match tokio::time::timeout(cb_deadline, fut).await {
+                            Ok(Ok(())) => supervisor_finalized += 1,
+                            Ok(Err(_)) => {
+                                supervisor_finalized += 1;
+                                callback_failed += 1;
+                            }
+                            Err(_) => {
+                                supervisor_finalized += 1;
+                                callback_aborted += 1;
+                            }
+                        }
+                    } else {
+                        normally_finalized += 1;
+                    }
+                }
+                Ok(Err(_)) => {
+                    invariant_failed += 1;
+                    if let Some(payload) = entry.guard.try_claim() {
+                        entry.guard.mark_callback_scheduled();
+                        let end = build_transaction_end(
+                            &payload,
+                            TransactionEndKind::RuntimeShutdown,
+                            None,
+                            EventDeliveryOutcome::Failed,
+                            0,
+                        );
+                        let fut = payload.callback.call(end);
+                        let _ = tokio::time::timeout(Duration::from_millis(100), fut).await;
+                        supervisor_finalized += 1;
+                    }
+                }
+                Err(_) => {
+                    if let Some(payload) = entry.guard.try_claim() {
+                        entry.guard.mark_callback_scheduled();
+                        let end = build_transaction_end(
+                            &payload,
+                            TransactionEndKind::RuntimeShutdown,
+                            None,
+                            EventDeliveryOutcome::Failed,
+                            entry.guard.sequencer().last_allocated(),
+                        );
+                        let fut = payload.callback.call(end);
+                        match tokio::time::timeout(Duration::from_millis(200), fut).await {
+                            Ok(Ok(())) => supervisor_finalized += 1,
+                            Ok(Err(_)) => {
+                                supervisor_finalized += 1;
+                                callback_failed += 1;
+                            }
+                            Err(_) => {
+                                supervisor_finalized += 1;
+                                callback_aborted += 1;
+                            }
+                        }
+                    } else {
+                        supervisor_finalized += 1;
+                    }
+                }
+            }
+        }
+
         if let Some(mcp) = self.inner.mcp.lock().await.take() {
             mcp.shutdown().await;
         }
 
         self.inner.state.store(STATE_STOPPED, Ordering::SeqCst);
         ShutdownDisposition {
-            normally_finalized: 0,
-            supervisor_finalized: 0,
-            callback_failed: 0,
-            callback_aborted: 0,
-            invariant_failed: 0,
+            normally_finalized,
+            supervisor_finalized,
+            callback_failed,
+            callback_aborted,
+            invariant_failed,
         }
     }
 }
@@ -242,31 +333,59 @@ async fn cleanup_partial(
 }
 
 impl TransactionRuntime for DefaultTransactionRuntime {
-    fn submit(&self, _request: TransactionRequest) -> Result<AdmissionReceipt, AdmissionError> {
+    fn submit(&self, request: TransactionRequest) -> Result<AdmissionReceipt, AdmissionError> {
         match self.state() {
-            RuntimeState::Accepting => Err(AdmissionError::new(
-                AdmissionErrorKind::InvalidConfiguration,
-                "transaction admission is not available until WP-04",
-            )),
+            RuntimeState::Accepting => {}
             RuntimeState::Starting | RuntimeState::Draining | RuntimeState::Stopped => {
-                Err(AdmissionError::new(
+                return Err(AdmissionError::new(
                     AdmissionErrorKind::RuntimeShuttingDown,
                     "runtime is not accepting submissions",
-                ))
+                ));
             }
         }
+
+        let ctx = AdmissionContext {
+            channels: Arc::clone(&self.inner.channels),
+            tools: self.inner.tools.clone(),
+            capacity: Arc::clone(&self.inner.capacity),
+            registry: Arc::clone(&self.inner.registry),
+            limits: self.inner.config.transaction_limits.clone(),
+        };
+        admit(&ctx, request)
     }
 
     fn terminate(
         &self,
-        _selector: TransactionSelector,
-        _mode: TerminationMode,
+        selector: TransactionSelector,
+        mode: TerminationMode,
     ) -> TerminationDisposition {
-        TerminationDisposition::NotFound
+        if !matches!(
+            self.state(),
+            RuntimeState::Accepting | RuntimeState::Draining
+        ) {
+            return TerminationDisposition::NotFound;
+        }
+        let reg = self.inner.registry.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = match selector {
+            TransactionSelector::Transaction(id) => reg.control_tx(&id),
+            TransactionSelector::Session(key) => reg.control_tx_by_session(&key),
+        };
+        drop(reg);
+        let Some(tx) = tx else {
+            return TerminationDisposition::NotFound;
+        };
+        let msg = match mode {
+            TerminationMode::Cancel { .. } => ControlMessage::Cancel,
+            TerminationMode::ForceTerminate { .. } => ControlMessage::ForceTerminate,
+        };
+        match tx.try_send(msg) {
+            Ok(()) => TerminationDisposition::Accepted,
+            Err(mpsc::error::TrySendError::Full(_)) => TerminationDisposition::AlreadyRequested,
+            Err(mpsc::error::TrySendError::Closed(_)) => TerminationDisposition::AlreadyTerminal,
+        }
     }
 
     fn shutdown(&self, deadline: Duration) -> Shutdown {
-        // Clone the inner Arc so the future is independent of &self lifetime.
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             let view = DefaultTransactionRuntime { inner };
@@ -274,3 +393,4 @@ impl TransactionRuntime for DefaultTransactionRuntime {
         })
     }
 }
+

@@ -1,6 +1,6 @@
 //! Immutable Channel registry and live bindings.
 
-use monoloop_connector::ConnectorFactory;
+use monoloop_connector::{ConnectorFactory, ConnectorInstance};
 use monoloop_contracts::{
     ChannelCapabilities, ChannelDefaults, ChannelDescriptor, ChannelId, ChannelKind, ChannelLimits,
     OutboundDialectEncoder, ToolExecutionMode,
@@ -85,4 +85,12 @@ impl ChannelRegistry {
     pub fn is_empty(&self) -> bool {
         self.channels.is_empty()
     }
+}
+
+/// Live Channel after connector instance realization at runtime start.
+pub struct LiveChannel {
+    /// Static binding.
+    pub binding: ChannelBinding,
+    /// Matched connector instance.
+    pub instance: ConnectorInstance,
 }

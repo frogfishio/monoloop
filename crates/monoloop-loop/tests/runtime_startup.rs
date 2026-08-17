@@ -98,11 +98,13 @@ async fn no_submit_after_draining() {
 }
 
 #[tokio::test]
-async fn submit_while_accepting_defers_admission() {
+async fn submit_while_accepting_admits() {
     let rt = start_runtime(vec![direct_llm_binding("llm")]).await;
-    let err = TransactionRuntime::submit(rt.as_ref(), dummy_request("llm")).unwrap_err();
-    assert_eq!(err.kind, AdmissionErrorKind::InvalidConfiguration);
-    assert!(err.message.contains("WP-04"));
+    let receipt = TransactionRuntime::submit(rt.as_ref(), dummy_request("llm")).unwrap();
+    assert!(receipt.session_id.is_some());
+    // Allow actor to finish.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
 #[tokio::test]
