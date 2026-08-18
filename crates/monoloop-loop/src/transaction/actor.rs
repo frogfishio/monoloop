@@ -546,11 +546,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 }
                 let claimed = key.clone();
                 let sk = Some(key);
-                guard_c.set_session_id(
-                    sk.as_ref()
-                        .map(|k| k.session_id.clone())
-                        .unwrap_or_else(SessionId::generate),
-                );
+                guard_c.set_session_id(claimed.session_id.clone());
                 // Publish SessionEstablished before any live units (D-026/D-036).
                 if !emit_unit_or_session(
                     &events_c,
@@ -842,10 +838,8 @@ async fn run_actor(spawn: ActorSpawn) {
                     {
                         return Err(TransactionEndKind::LimitExceeded);
                     }
-                    provider_input_bytes = provider_input_bytes.saturating_add(encoded.bytes.len());
-                    if provider_input_bytes > max_total_provider_input_bytes {
-                        return Err(TransactionEndKind::LimitExceeded);
-                    }
+                    // Do not pre-add here: run_encoded_exchange checks remaining budget
+                    // against max_total - provider_input_bytes (D-027; avoid double-count).
                     let live_cap2 = (max_total_provider_output_bytes / 256).clamp(8, 64);
                     let (live_tx2, mut live_rx2) = mpsc::channel::<CanonicalUnitEvent>(live_cap2);
                     let events_live2 = events.clone();
@@ -906,6 +900,8 @@ async fn run_actor(spawn: ActorSpawn) {
                     live_join2
                         .await
                         .map_err(|_| TransactionEndKind::InvariantFailed)??;
+                    provider_input_bytes =
+                        provider_input_bytes.saturating_add(outcome.encoded_request_bytes);
                     for u in &outcome.units {
                         provider_output_bytes =
                             provider_output_bytes.saturating_add(estimate_unit_bytes(u));
@@ -998,6 +994,7 @@ fn map_exchange_failure(f: ExchangeFailure) -> TransactionEndKind {
         ExchangeFailure::Terminated => TransactionEndKind::Terminated,
         ExchangeFailure::LimitExceeded => TransactionEndKind::LimitExceeded,
         ExchangeFailure::InvariantFailed => TransactionEndKind::InvariantFailed,
+        ExchangeFailure::ClaimDeadlineExceeded => TransactionEndKind::DeadlineExceeded,
     }
 }
 

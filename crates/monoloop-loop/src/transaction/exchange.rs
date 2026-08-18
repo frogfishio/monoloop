@@ -58,6 +58,8 @@ pub enum ExchangeFailure {
     LimitExceeded,
     /// Create open without authoritative session id, or claim gate failed closed (D-026).
     InvariantFailed,
+    /// Timed out waiting for claim / MCP activate before prompt send (D-026).
+    ClaimDeadlineExceeded,
 }
 
 /// Parameters for running one exchange.
@@ -264,11 +266,12 @@ async fn open_and_run(
 
     // D-026: wait for claim (+ MCP activate) before sending the prompt on create.
     // RecvError → claim task exited without ready; actor awaits claim_join for typed kind.
+    // Timeout is a deadline miss on the claim gate — not ChannelOpenFailed.
     if let Some(rx) = prompt_ready_rx {
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(ExchangeFailure::InvariantFailed),
-            Err(_) => return Err(ExchangeFailure::ChannelOpenFailed),
+            Err(_) => return Err(ExchangeFailure::ClaimDeadlineExceeded),
         }
     }
 

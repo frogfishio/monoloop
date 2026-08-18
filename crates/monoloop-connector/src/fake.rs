@@ -51,6 +51,8 @@ pub struct FakeConnectorConfig {
     pub open_delay: Duration,
     /// If true, open fails with connection_failed.
     pub fail_open: bool,
+    /// When true, create_mode open returns no external session id (D-026 tests).
+    pub omit_created_session_id: bool,
 }
 
 impl Default for FakeConnectorConfig {
@@ -60,6 +62,7 @@ impl Default for FakeConnectorConfig {
             endpoints: HashMap::new(),
             open_delay: Duration::ZERO,
             fail_open: false,
+            omit_created_session_id: false,
         }
     }
 }
@@ -216,10 +219,14 @@ async fn open_fake(
         .as_ref()
         .is_some_and(|a| a.create_mode)
     {
-        Some(ExternalSessionId::new(format!(
-            "fake-created-{}",
-            uuid::Uuid::new_v4()
-        )))
+        if config.omit_created_session_id {
+            None
+        } else {
+            Some(ExternalSessionId::new(format!(
+                "fake-created-{}",
+                uuid::Uuid::new_v4()
+            )))
+        }
     } else {
         request
             .session_attachment

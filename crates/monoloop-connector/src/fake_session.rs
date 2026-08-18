@@ -400,6 +400,18 @@ impl FakeConnectorFactory {
             connector_config: crate::fake::FakeConnectorConfig::default(),
         }
     }
+
+    /// External-agent with custom FakeConnector config (e.g. omit created session id).
+    pub fn external_agent_with_connector_config(
+        session_config: FakeSessionAdapterConfig,
+        connector_config: crate::fake::FakeConnectorConfig,
+    ) -> Self {
+        Self {
+            with_sessions: true,
+            session_config,
+            connector_config,
+        }
+    }
 }
 
 impl ConnectorFactory for FakeConnectorFactory {

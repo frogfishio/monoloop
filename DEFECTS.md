@@ -897,7 +897,7 @@ considered delivered while these remain.
 | D-031 | Fixed (residual closed) | OpenAI continuation encodes transcript only (no duplicate `results` append) |
 | D-032 | Fixed (residual closed) | Shutdown supervisor callbacks use injected `Handle` via `try_spawn` |
 | D-033 | Fixed | absolute request deadline; enqueue selects deadline; output queue from output budget |
-| D-034 | Fixed (residual closed) | Global MCP permit acquired before body buffer / service create |
+| D-034 | Fixed (known residual) | Canonical hex + permit-before-body; process-global capability service map remains a structural residual (LAW 5 smell) — not claimed closed |
 | D-035 | Fixed | estimate covers names, args JSON, tool_call_id; serialize fail closed |
 | D-036 | Fixed | OrderedEventPublisher serialize allocate+enqueue; live waits for claim |
 | D-037 | Fixed | fmt + invalid_json asserts MalformedSemanticPayload; gates re-run |
@@ -970,11 +970,13 @@ create that returns no external ID is accepted instead of failing invariant.
       (`prompt_ready` gate; activate in claim task before send)
 - [x] MCP tool context/results and all events carry the claimed `SessionKey`.
       (`TransactionToolDispatcher::rebind_session` before activate)
-- [x] Missing/mismatched provider ID fails before prompt transmission.
-      (`InvariantFailed` when open lacks external id; claim RecvError →
-      `InvariantFailed`; claim errors awaited, not remapped to Cancelled)
-- [x] Live fan-out waits for `SessionEstablished` / claim watch before publishing
-      units. (dedicated barrier e2e still desirable)
+- [x] Missing/mismatched provider ID fails before prompt transmission —
+      proven by `tests/claim_gate.rs::create_without_provider_session_id_ends_invariant_failed`
+      (`FakeConnectorConfig::omit_created_session_id` → `InvariantFailed`, not Cancelled).
+      Claim/MCP errors awaited via `claim_join` on exchange fail.
+- [x] Live fan-out waits for claim watch before publishing units
+      (`session_watch.wait_for(Some)`). Dedicated multi-event barrier e2e still
+      desirable for create ordering vs. first CanonicalUnit.
 
 ## D-027: Live exchange fan-out still retains unbounded output and incompletely accounts limits
 
