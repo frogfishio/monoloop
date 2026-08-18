@@ -1,7 +1,7 @@
 # WP-12 — Profile capability report (from tested declarations)
 
 **Status:** Generated from WP-11 ChannelBinding constructors and
-`crates/monoloop-loop/tests/profile_bindings.rs` + WP-00 worksheet evidence.  
+`crates/monoloop-testkit/tests/profile_bindings.rs` + WP-00 worksheet evidence.  
 **Not a live multi-session MCP proof.** Limitations: see `WP12_CURRENT_LIMITATIONS.md`.
 
 | Profile | Crate | Kind | Session mode | MCP config | Exchange | Continuation | Tool mode | Binding test |

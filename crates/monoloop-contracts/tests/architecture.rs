@@ -175,11 +175,24 @@ fn loop_production_does_not_depend_on_profile_or_testkit() {
             "monoloop-loop production deps must not include {forbidden}; deps={deps:?}"
         );
     }
-    // Loop may compose connector + interpreter; profiles only as dev-deps for binding tests.
+    // Loop may compose connector + interpreter. Profiles must not appear even as
+    // dev-deps: crates.io packaging resolves all declared deps from the registry,
+    // and profiles already depend on monoloop-loop (publish cycle).
     assert!(
         deps.iter().any(|d| d == "monoloop-contracts"),
         "loop must depend on contracts"
     );
+}
+
+#[test]
+fn loop_dev_deps_do_not_include_profiles() {
+    let deps = all_deps_including_dev("monoloop-loop");
+    for forbidden in PROFILE_CRATES {
+        assert!(
+            !deps.iter().any(|d| d == *forbidden),
+            "monoloop-loop must not depend on {forbidden} (incl. dev); deps={deps:?}"
+        );
+    }
 }
 
 #[test]

@@ -31,11 +31,3 @@ uuid = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
 reqwest = { workspace = true }
-
-# WP-11 profile binding qualification
-monoloop-connector-grok = { workspace = true }
-monoloop-connector-cursor = { workspace = true }
-monoloop-connector-codex = { workspace = true }
-monoloop-connector-agy = { workspace = true }
-monoloop-connector-zai = { workspace = true }
-monoloop-connector-claude = { workspace = true }

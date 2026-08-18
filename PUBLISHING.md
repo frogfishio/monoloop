@@ -66,3 +66,11 @@ without the workspace root.
 GitHub Actions writes `BUILD` from `GITHUB_RUN_NUMBER` and uploads it as an
 artifact (see `.github/workflows/ci.yml`). Local `make dist` increments `BUILD`
 by one.
+
+## Dev-dependency cycle note
+
+`monoloop-loop` must **not** list profile crates as Cargo dependencies (even
+dev-dependencies): profiles depend on `monoloop-loop`, and crates.io packaging
+resolves all declared deps from the registry. WP-11 profile binding qualification
+lives in `monoloop-testkit` (`tests/profile_bindings.rs`).
+

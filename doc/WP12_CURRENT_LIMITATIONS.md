@@ -56,7 +56,9 @@ path”; it records what is proven, partial, or out of scope.
 
 - `rmcp` / `jsonschema` push workspace MSRV to **1.88**.
 - Profile crates may depend on `monoloop-loop` for ChannelBinding construction;
-  `monoloop-loop` depends on profiles only as **dev-dependencies**.
+  `monoloop-loop` must not depend on profiles (even as dev-dependencies) so
+  crates.io packaging can publish leaf-first. WP-11 binding qualification lives
+  in `monoloop-testkit`.
 
 ## When something fails live
 
