@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! Z.ai CLI connector profile (`@guizmo-ai/zai-cli` / `zai`).
 //!
 //! **Not ACP.** Headless mode (`zai -p`) prints OpenAI-compatible chat messages

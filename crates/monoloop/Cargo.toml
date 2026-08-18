@@ -1,0 +1,39 @@
+[package]
+name = "monoloop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/monoloop"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Monoloop: Connector + Interpreter + transaction-composing Loop (AGPL-3.0-or-later; commercial at frogfish.io)"
+
+[[bin]]
+name = "monoloop"
+path = "src/bin/monoloop.rs"
+
+[dependencies]
+monoloop-contracts = { workspace = true }
+monoloop-connector = { workspace = true }
+monoloop-interpreter = { workspace = true }
+monoloop-loop = { workspace = true }
+monoloop-connector-grok = { workspace = true, optional = true }
+monoloop-connector-cursor = { workspace = true, optional = true }
+monoloop-connector-codex = { workspace = true, optional = true }
+monoloop-connector-agy = { workspace = true, optional = true }
+monoloop-connector-zai = { workspace = true, optional = true }
+monoloop-connector-claude = { workspace = true, optional = true }
+
+[features]
+default = []
+grok = ["dep:monoloop-connector-grok"]
+cursor = ["dep:monoloop-connector-cursor"]
+codex = ["dep:monoloop-connector-codex"]
+agy = ["dep:monoloop-connector-agy"]
+zai = ["dep:monoloop-connector-zai"]
+claude = ["dep:monoloop-connector-claude"]

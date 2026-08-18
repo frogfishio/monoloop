@@ -3,13 +3,19 @@ name = "monoloop-loop"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
 description = "Minimal extensible Loop: lossless canonical subscription, empty-capable tools"
 
 [dependencies]
-monoloop-contracts = { path = "../monoloop-contracts" }
-monoloop-connector = { path = "../monoloop-connector" }
-monoloop-interpreter = { path = "../monoloop-interpreter" }
+monoloop-contracts = { workspace = true }
+monoloop-connector = { workspace = true }
+monoloop-interpreter = { workspace = true }
 axum = { workspace = true }
 jsonschema = { workspace = true }
 rand = { workspace = true }
@@ -27,9 +33,9 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 reqwest = { workspace = true }
 
 # WP-11 profile binding qualification
-monoloop-connector-grok = { path = "../monoloop-connector-grok" }
-monoloop-connector-cursor = { path = "../monoloop-connector-cursor" }
-monoloop-connector-codex = { path = "../monoloop-connector-codex" }
-monoloop-connector-agy = { path = "../monoloop-connector-agy" }
-monoloop-connector-zai = { path = "../monoloop-connector-zai" }
-monoloop-connector-claude = { path = "../monoloop-connector-claude" }
+monoloop-connector-grok = { workspace = true }
+monoloop-connector-cursor = { workspace = true }
+monoloop-connector-codex = { workspace = true }
+monoloop-connector-agy = { workspace = true }
+monoloop-connector-zai = { workspace = true }
+monoloop-connector-claude = { workspace = true }

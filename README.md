@@ -134,3 +134,43 @@ let proxy = ConnectorProxy::builder()
     .build()?;
 // endpoint_ref: "grok:ws://127.0.0.1:2419" with credential_ref set
 ```
+
+## License
+
+Copyright (C) Alexander R. Croft
+
+Monoloop is licensed under the **GNU Affero General Public License v3.0 or later**
+(`AGPL-3.0-or-later`). See [`LICENSE`](LICENSE).
+
+A **commercial license** is available from [frogfish.io](https://frogfish.io).
+See [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md) and [`LICENSING.md`](LICENSING.md).
+
+External pull requests and contributed copyrightable material are **not** accepted;
+see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Versioning
+
+- `VERSION` — semver (e.g. `0.1.0`); bump with `make bump` (or edit by hand)
+- `BUILD` — monotonic build id; `make dist` increments it (CI may set `BUILD` from
+  `GITHUB_RUN_NUMBER`)
+
+```bash
+make bump          # 0.1.0 -> 0.1.1 and sync Cargo.toml
+make dist          # BUILD++, release build, cargo package dry-run, CLI checks
+cargo run -p monoloop -- --version
+cargo run -p monoloop -- --copyright
+```
+
+## crates.io
+
+Publish leaf crates first (`monoloop-contracts`, then connector/interpreter, then
+`monoloop-loop`, profile crates, `monoloop-testkit`, finally the `monoloop` façade).
+
+```bash
+make package       # dry-run for the publish order
+# then, when ready (requires crates.io token):
+# cargo publish -p monoloop-contracts
+# ...
+# cargo publish -p monoloop
+```
+

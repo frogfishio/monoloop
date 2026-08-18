@@ -3,15 +3,21 @@ name = "monoloop-connector-claude"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
 description = "Claude Code CLI connector profile (headless stream-json NDJSON on stdout)"
 
 [dependencies]
 bytes = { workspace = true }
-monoloop-connector = { path = "../monoloop-connector" }
-monoloop-contracts = { path = "../monoloop-contracts" }
-monoloop-interpreter = { path = "../monoloop-interpreter" }
-monoloop-loop = { path = "../monoloop-loop" }
+monoloop-connector = { workspace = true }
+monoloop-contracts = { workspace = true }
+monoloop-interpreter = { workspace = true }
+monoloop-loop = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! Claude Code connector profile (`claude` CLI).
 //!
 //! **Not ACP.** Headless print mode:

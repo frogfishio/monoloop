@@ -12,6 +12,7 @@ members = [
     "crates/monoloop-interpreter",
     "crates/monoloop-loop",
     "crates/monoloop-testkit",
+    "crates/monoloop",
 ]
 default-members = [
     "crates/monoloop-contracts",
@@ -25,12 +26,19 @@ default-members = [
     "crates/monoloop-interpreter",
     "crates/monoloop-loop",
     "crates/monoloop-testkit",
+    "crates/monoloop",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
+authors = ["Alexander R. Croft"]
+repository = "https://github.com/frogfishio/monoloop"
+homepage = "https://frogfish.io"
+readme = "README.md"
+keywords = ["llm", "agent", "async", "tokio", "acp"]
+categories = ["asynchronous", "api-bindings"]
 # Raised to 1.88 in WP-00 for maintained `rmcp` Streamable HTTP SDK (see DECISIONS.md).
 rust-version = "1.88"
 
@@ -61,3 +69,16 @@ jsonschema = { version = "0.49", default-features = false }
 secrecy = { version = "0.10", features = ["serde"] }
 rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
 getrandom = "0.3"
+
+# Internal crates (path + version required for crates.io publish).
+monoloop-contracts = { path = "crates/monoloop-contracts", version = "0.1.0" }
+monoloop-connector = { path = "crates/monoloop-connector", version = "0.1.0" }
+monoloop-connector-grok = { path = "crates/monoloop-connector-grok", version = "0.1.0" }
+monoloop-connector-cursor = { path = "crates/monoloop-connector-cursor", version = "0.1.0" }
+monoloop-connector-agy = { path = "crates/monoloop-connector-agy", version = "0.1.0" }
+monoloop-connector-codex = { path = "crates/monoloop-connector-codex", version = "0.1.0" }
+monoloop-connector-zai = { path = "crates/monoloop-connector-zai", version = "0.1.0" }
+monoloop-connector-claude = { path = "crates/monoloop-connector-claude", version = "0.1.0" }
+monoloop-interpreter = { path = "crates/monoloop-interpreter", version = "0.1.0" }
+monoloop-loop = { path = "crates/monoloop-loop", version = "0.1.0" }
+monoloop-testkit = { path = "crates/monoloop-testkit", version = "0.1.0" }

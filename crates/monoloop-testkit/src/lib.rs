@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! Monoloop test kit — **not a product component**.
 //!
 //! Console renderer, event distributor, and Driver composition helpers.

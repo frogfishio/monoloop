@@ -1113,6 +1113,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "monoloop"
+version = "0.1.0"
+dependencies = [
+ "monoloop-connector",
+ "monoloop-connector-agy",
+ "monoloop-connector-claude",
+ "monoloop-connector-codex",
+ "monoloop-connector-cursor",
+ "monoloop-connector-grok",
+ "monoloop-connector-zai",
+ "monoloop-contracts",
+ "monoloop-interpreter",
+ "monoloop-loop",
+]
+
+[[package]]
 name = "monoloop-connector"
 version = "0.1.0"
 dependencies = [

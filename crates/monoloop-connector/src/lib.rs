@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! Component 01 — abstract Connector, fake transport, and connector proxy.
 //!
 //! See `doc/CONNECTOR.md`. This crate does not interpret semantic model content.

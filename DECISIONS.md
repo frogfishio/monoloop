@@ -58,3 +58,17 @@ members. Passing secrets via `-k` was also possible in Z.ai (`pass_api_key_flag`
 
 **Evidence:** Law 16 text in `rules/LAWS.md`; Z.ai/Claude config docs;
 `GrokServerConfig::validate_endpoint_security`.
+
+## D-00x: AGPL-3.0-or-later + commercial dual licensing
+
+**Date:** 2026-08-18
+
+Workspace crates publish under SPDX `AGPL-3.0-or-later` (see root `LICENSE`).
+A commercial license is offered separately at https://frogfish.io
+(`LICENSE-COMMERCIAL.md`, `LICENSING.md`). Cargo.toml no longer uses
+`MIT OR Apache-2.0`. External contributions are not accepted (`CONTRIBUTING.md`)
+so ownership for commercial licensing stays clear.
+
+Versioning uses root `VERSION` + `BUILD` with `make bump` / `make dist`
+(see `LICENSING.md`, `PUBLISHING.md`).
+

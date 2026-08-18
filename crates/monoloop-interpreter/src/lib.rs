@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! Component 02 — Interpreter.
 //!
 //! Consumes ordered raw Connector bytes + dialect binding, assembles complete

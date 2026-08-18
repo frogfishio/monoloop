@@ -3,21 +3,27 @@ name = "monoloop-testkit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 rust-version.workspace = true
 description = "Test kit: console renderer, fixtures, and composition helpers (not a product component)"
 
 [dependencies]
 bytes = { workspace = true }
-monoloop-contracts = { path = "../monoloop-contracts" }
-monoloop-connector = { path = "../monoloop-connector" }
-monoloop-connector-grok = { path = "../monoloop-connector-grok" }
-monoloop-connector-cursor = { path = "../monoloop-connector-cursor" }
-monoloop-connector-agy = { path = "../monoloop-connector-agy" }
-monoloop-connector-codex = { path = "../monoloop-connector-codex" }
-monoloop-connector-zai = { path = "../monoloop-connector-zai" }
-monoloop-connector-claude = { path = "../monoloop-connector-claude" }
-monoloop-interpreter = { path = "../monoloop-interpreter" }
-monoloop-loop = { path = "../monoloop-loop" }
+monoloop-contracts = { workspace = true }
+monoloop-connector = { workspace = true }
+monoloop-connector-grok = { workspace = true }
+monoloop-connector-cursor = { workspace = true }
+monoloop-connector-agy = { workspace = true }
+monoloop-connector-codex = { workspace = true }
+monoloop-connector-zai = { workspace = true }
+monoloop-connector-claude = { workspace = true }
+monoloop-interpreter = { workspace = true }
+monoloop-loop = { workspace = true }
 pulldown-cmark = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

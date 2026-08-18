@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! Grok Build Network Connector Profile.
 //!
 //! One authenticated Grok Build server, many logical sessions correlated by

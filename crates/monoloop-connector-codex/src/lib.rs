@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! OpenAI Codex ACP connector profile.
 //!
 //! Speaks JSON-RPC 2.0 over **stdio NDJSON**, same client shape as Cursor / Agy ACP.

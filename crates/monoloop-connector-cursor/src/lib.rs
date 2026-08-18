@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! Cursor Agent ACP connector profile.
 //!
 //! Spawns `agent acp` and speaks JSON-RPC 2.0 over **stdio NDJSON**.

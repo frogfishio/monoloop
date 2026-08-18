@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) Alexander R. Croft
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Record CI build number into BUILD
+        env:
+          CI: "1"
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          echo "${GITHUB_RUN_NUMBER}" > BUILD
+          echo "BUILD=$(cat BUILD)"
+          python3 scripts/sync_version.py
+      - name: Upload BUILD artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: monoloop-build-number
+          path: BUILD
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-targets --all-features
+      - run: cargo doc --workspace --no-deps
+      - name: CLI flags
+        run: |
+          cargo build -p monoloop --bin monoloop
+          ./target/debug/monoloop --help
+          ./target/debug/monoloop --version
+          ./target/debug/monoloop --copyright
+      - name: crates.io package dry-run (contracts leaf)
+        run: cargo package -p monoloop-contracts --allow-dirty --no-verify

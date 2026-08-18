@@ -1,3 +1,6 @@
+//! SPDX-License-Identifier: AGPL-3.0-or-later
+//! Copyright (C) Alexander R. Croft
+//!
 //! Component 03 — The Loop.
 //!
 //! Inner `LoopRuntime` (complete-unit tool reaction) plus the outer
