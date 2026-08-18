@@ -7,8 +7,12 @@
 //!
 //! - [`monoloop_contracts`] — shared identities and ports
 //! - [`monoloop_connector`] — abstract Connector + FakeConnector
-//! - [`monoloop_interpreter`] — dialect → complete canonical units
+//! - [`monoloop_interpreter`] — dialect → **complete** canonical units (no token stream)
 //! - [`monoloop_loop`] — transaction runtime + inner tool loop
+//!
+//! Host assembly: see the crate README and examples `fake_echo` /
+//! `host_grok_wiring` (`--features grok`). docs.rs: <https://docs.rs/monoloop>.
+//! Normative specs: <https://github.com/frogfishio/monoloop> (`doc/`).
 //!
 //! Licensed under **AGPL-3.0-or-later**. A commercial license is available at
 //! <https://frogfish.io>. See the repository `LICENSING.md` and

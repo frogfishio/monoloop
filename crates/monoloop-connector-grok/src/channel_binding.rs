@@ -188,11 +188,45 @@ impl SessionAdapter for GrokSessionAdapter {
     }
 }
 
-/// Build a production-shaped Grok Channel binding.
+/// Build a production-shaped Grok Channel binding for `ChannelRegistry`.
 ///
-/// - `endpoint_ref`: `ws://127.0.0.1:port` (loopback by default)
-/// - `credential_ref`: secret resolver key name
-/// - Tools: empty only unless MCP gateway is composed separately (CreationOnly)
+/// # Arguments
+///
+/// * `id` — Monoloop [`ChannelId`] string (caller-chosen; e.g. `"grok"`).
+/// * `endpoint_ref` — WebSocket URL, typically loopback `ws://127.0.0.1:<port>`.
+///   Non-loopback requires `wss` + explicit opt-in (fail-closed).
+/// * `credential_ref` — **name** passed to [`SecretResolver::resolve`] (not the secret).
+/// * `secrets` — host-injected resolver (keychain / env / vault). Never log resolved values.
+/// * `encoder` — usually `AcpPromptEncoder::grok()` from `monoloop-loop` / `monoloop::loop_runtime`.
+/// * `interpreter` — usually `DefaultInterpreterFactory::new()`.
+///
+/// # Session identity
+///
+/// Grok’s `sessionId` is the correlation id. New turn: `TransactionRequest.session_id = None`.
+/// Resume: pass `SessionId::from_external(&ExternalSessionId::try_new(session_id)?)`.
+///
+/// # Example (façade)
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use monoloop::connector_grok::{grok_channel_binding, InMemorySecretResolver};
+/// use monoloop::interpreter::DefaultInterpreterFactory;
+/// use monoloop::loop_runtime::AcpPromptEncoder;
+///
+/// let secrets = Arc::new(InMemorySecretResolver::new());
+/// secrets.insert("grok-server-secret", "…");
+/// let binding = grok_channel_binding(
+///     "grok",
+///     "ws://127.0.0.1:2419",
+///     "grok-server-secret",
+///     secrets,
+///     Arc::new(AcpPromptEncoder::grok()),
+///     Arc::new(DefaultInterpreterFactory::new()),
+/// );
+/// ```
+///
+/// Runnable host wiring (no testkit):
+/// `cargo run -p monoloop --example host_grok_wiring --features grok`
 pub fn grok_channel_binding(
     id: impl AsRef<str>,
     endpoint_ref: impl Into<String>,

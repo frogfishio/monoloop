@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Ordered canonical messages for one transaction submission.
+///
+/// Monoloop does **not** own chat history. Hosts map their journal into
+/// [`CanonicalMessage`] values (typically `User` / `Assistant`, plus `System` /
+/// `Tool` when needed) and call [`CanonicalInput::try_new`]. For a single user
+/// line only, see [`user_text_input`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalInput {
     messages: Vec<CanonicalMessage>,

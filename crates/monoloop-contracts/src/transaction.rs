@@ -212,6 +212,9 @@ pub struct TransactionEvent {
 }
 
 /// Event payload variants.
+///
+/// Live assistant text arrives only as [`Self::CanonicalUnit`] (complete units).
+/// There is **no** token / delta stream on this port.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TransactionEventPayload {
     /// External session identity established.
@@ -219,7 +222,7 @@ pub enum TransactionEventPayload {
         /// Authoritative external id.
         external_session_id: crate::id::ExternalSessionId,
     },
-    /// Complete canonical unit from Interpreter composition.
+    /// Complete canonical unit from Interpreter composition (not a token delta).
     CanonicalUnit(CanonicalUnitEvent),
     /// Host tool lifecycle.
     ToolLifecycle(ToolLifecycleEvent),

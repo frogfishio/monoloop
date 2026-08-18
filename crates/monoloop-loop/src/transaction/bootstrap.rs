@@ -48,6 +48,13 @@ impl RuntimeConfig {
 }
 
 /// Only construction path for [`super::DefaultTransactionRuntime`].
+///
+/// # Host Tokio pattern
+///
+/// `executor` must be a multi-thread Tokio [`Handle`]. CLI samples may use
+/// `#[tokio::main]` + `Handle::current()`. Embedded hosts (e.g. Tauri) should
+/// start a dedicated multi-thread runtime at process setup and pass
+/// `runtime.handle().clone()` here for the process lifetime.
 pub struct RuntimeBootstrap {
     /// Limits and feature flags.
     pub config: RuntimeConfig,

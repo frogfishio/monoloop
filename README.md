@@ -138,23 +138,26 @@ let proxy = ConnectorProxy::builder()
 
 ## Crate guides (for humans and agents)
 
-Point an LLM agent at **`crates/monoloop/README.md`** first. That README has the
-assembly recipe (`ChannelBinding` → `ChannelRegistry` → `RuntimeBootstrap` →
-`submit`) and hard rules (no testkit bleed, empty-tool path, push completion).
+Point an LLM agent / product host at **`crates/monoloop/README.md`** first. That
+README has the assembly recipe, Grok wiring (no testkit), multi-turn
+`CanonicalInput`, CanonicalUnit-only live text, and the Tokio `Handle` host pattern.
 
 | Crate | Start here |
 |---|---|
-| [`monoloop`](crates/monoloop/README.md) | Product façade + `examples/fake_echo.rs` |
+| [`monoloop`](crates/monoloop/README.md) | Façade + `fake_echo` + `host_grok_wiring` |
 | [`monoloop-contracts`](crates/monoloop-contracts/README.md) | Shared types/ports |
 | [`monoloop-connector`](crates/monoloop-connector/README.md) | Component 01 |
 | [`monoloop-interpreter`](crates/monoloop-interpreter/README.md) | Component 02 |
 | [`monoloop-loop`](crates/monoloop-loop/README.md) | Component 03 + `examples/fake_echo.rs` |
-| `monoloop-connector-*` | Profile READMEs + `*_channel_binding` |
-| [`monoloop-testkit`](crates/monoloop-testkit/README.md) | Live examples only (not product) |
+| `monoloop-connector-*` | Profile READMEs + `*_channel_binding` signatures |
+| [`monoloop-testkit`](crates/monoloop-testkit/README.md) | Live Driver examples only (not product) |
 
 ```bash
 cargo run -p monoloop --example fake_echo
+cargo run -p monoloop --example host_grok_wiring --features grok
 ```
+
+Published docs: <https://docs.rs/monoloop> · Repo: <https://github.com/frogfishio/monoloop>
 
 ## License
 

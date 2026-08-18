@@ -7,6 +7,12 @@ Profile connectors (Grok, Cursor, …) are optional Cargo features.
 
 **License:** AGPL-3.0-or-later. Commercial: <https://frogfish.io>
 
+| Resource | URL |
+|---|---|
+| docs.rs | <https://docs.rs/monoloop> |
+| Repository / normative `doc/` | <https://github.com/frogfishio/monoloop> |
+| Homepage | <https://frogfish.io> |
+
 ## What this crate is / is not
 
 | Is | Is not |
@@ -15,73 +21,121 @@ Profile connectors (Grok, Cursor, …) are optional Cargo features.
 | Thin CLI (`monoloop --version` / `--copyright`) | A chat UI or agent framework |
 | Assembly entry for hosts | Test kit (see `monoloop-testkit`) |
 
-## Agent assembly recipe (copy this shape)
+## Host integration (product hosts)
 
-Monoloop is assembled, not “started with a prompt.” Wire one Channel, start the
-runtime, then `submit` push-based transactions.
-
-```text
-1. ChannelBinding {
-     connector_factory,   // FakeConnectorFactory OR profile helper
-     encoder,             // profile encoder OR TestTextEncoder (smoke only)
-     interpreter,         // DefaultInterpreterFactory (or profile-provided)
-     capabilities,        // must include option_policy + dialects
-     …                    // id, kind, tool_mode, endpoint_ref, limits
-   }
-2. ChannelRegistry::build(vec![binding])
-3. DefaultTransactionRuntime::start(RuntimeBootstrap {
-     config: RuntimeConfig { enable_mcp_listener: false, ..Default::default() },
-     channels, tools: HostToolRegistry::empty(), executor
-   })
-4. TransactionRuntime::submit(TransactionRequest {
-     channel_id, input: user_text_input(…),
-     events: FnEventSink(…), completion: FnCompletionCallback(…),
-     invocation_config, tools: vec![], …
-   })
-5. Await the one completion callback; run-owned state is destroyed at terminal
-```
-
-**Hosts with a live profile** should call that profile’s `*_channel_binding(...)`
-(see Optional Channel profiles). Do not hand-roll Grok/Cursor/… bindings from the
-smoke sample.
-
-**Offline smoke sample** (FakeConnector + `test_raw` dialect, no network, no testkit):
+### 1. Smoke assembly (FakeConnector, no network)
 
 ```bash
 cargo run -p monoloop --example fake_echo
 ```
 
-See [`examples/fake_echo.rs`](examples/fake_echo.rs). A component-level twin lives
-under `monoloop-loop` (same wiring, direct crate imports).
+Shape: `ChannelBinding` → `ChannelRegistry` → `RuntimeBootstrap` → `submit`.
 
-### `TestTextEncoder` (smoke only)
+### 2. Grok Build wiring (no testkit)
 
-`TestTextEncoder` is a **loop-owned deterministic encoder** for FakeConnector +
-`DialectDescriptor::test_raw()`. It is **not** the production host path and is
-**not** the testkit ACP/OpenAI fixture encoder family. Live Channels use the
-encoder supplied by `*_channel_binding`.
+```bash
+cargo run -p monoloop --example host_grok_wiring --features grok
+```
 
-### Module map (façade paths)
+Public binding signature (also on docs.rs / `monoloop-connector-grok`):
+
+```rust
+pub fn grok_channel_binding(
+    id: impl AsRef<str>,
+    endpoint_ref: impl Into<String>,     // "ws://127.0.0.1:2419"
+    credential_ref: impl Into<String>,   // SecretResolver key name
+    secrets: Arc<dyn SecretResolver>,    // host keychain adapter
+    encoder: Arc<dyn OutboundDialectEncoder>, // AcpPromptEncoder::grok()
+    interpreter: Arc<dyn InterpreterFactory>, // DefaultInterpreterFactory::new()
+) -> ChannelBinding
+```
+
+Façade imports with `--features grok`:
+
+- `monoloop::connector_grok::{grok_channel_binding, SecretResolver, SecretRef, …}`
+- `monoloop::loop_runtime::AcpPromptEncoder`
+- `monoloop::interpreter::DefaultInterpreterFactory`
+
+Live Driver/Console qualification stays in **`monoloop-testkit`** (`live_grok_*`).
+Product hosts must not depend on testkit.
+
+### 3. Multi-turn history (host-built)
+
+`user_text_input("…")` is a **one-line** helper. For chat journals, build
+`CanonicalInput` yourself:
+
+```rust
+use monoloop::contracts::{CanonicalInput, CanonicalMessage, InputLimits, TextPart};
+
+let limits = InputLimits::default();
+let input = CanonicalInput::try_new(
+    vec![
+        CanonicalMessage::User { content: vec![TextPart::try_new("Hi", limits.max_text_part_bytes)?], name: None },
+        CanonicalMessage::Assistant { content: vec![TextPart::try_new("Hello!", limits.max_text_part_bytes)?], tool_calls: vec![] },
+        CanonicalMessage::User { content: vec![TextPart::try_new("Continue.", limits.max_text_part_bytes)?], name: None },
+    ],
+    &limits,
+)?;
+```
+
+Monoloop does **not** own durable history. The host maps journal →
+`CanonicalMessage::{System,User,Assistant,Tool}` and submits one transaction at a time.
+Resume Grok with explicit `session_id: Some(SessionId::from_external(&ExternalSessionId::try_new(grok_session_id)?))`
+(never ambient “last session”).
+
+### 4. Live text path = complete canonical units only
+
+There is **no token / delta stream API**. UI should render from push events:
+
+`TransactionEventPayload::CanonicalUnit(CanonicalUnitEvent)` — complete sentences /
+structures / tool lifecycle units. `InterpretationEnd` / EOF alone ≠ turn success;
+wait for the completion callback / `Ended` payload.
+
+### 5. Tokio `Handle` in Tauri / desktop hosts
+
+`RuntimeBootstrap.executor` is a `tokio::runtime::Handle`. Supported pattern:
+
+1. At app startup, build a dedicated **multi-thread** Tokio runtime and keep it for process life.
+2. Pass `runtime.handle().clone()` (or `Handle::current()` inside that runtime) into `RuntimeBootstrap`.
+3. Drive `submit` / async work on that runtime.
+
+`#[tokio::main]` is fine for CLI samples; embedded hosts (Tauri) should own the runtime explicitly.
+Set `RuntimeConfig { enable_mcp_listener: false, ..Default::default() }` unless you want the MCP shell (`Default` enables it).
+
+### Hard rules
+
+- **Do not** depend on `monoloop-testkit` from product crates.
+- **Do not** invent ambient “current session”.
+- Empty tools (`HostToolRegistry::empty()`, `tools: vec![]`) → `tool_unavailable`, zero effects.
+- Canonical completeness ≠ authorization.
+
+## Agent assembly recipe (copy this shape)
+
+```text
+1. ChannelBinding { connector_factory, encoder, interpreter, capabilities, … }
+2. ChannelRegistry::build(vec![binding])
+3. DefaultTransactionRuntime::start(RuntimeBootstrap {
+     config: RuntimeConfig { enable_mcp_listener: false, ..Default::default() },
+     channels, tools: HostToolRegistry::empty(), executor
+   })
+4. TransactionRuntime::submit(TransactionRequest { … push events + completion … })
+5. Await the one completion callback
+```
+
+### Module map
 
 | Use | From |
 |---|---|
-| `monoloop::contracts::*` | identities, ports, `user_text_input`, sinks |
-| `monoloop::connector::FakeConnectorFactory` | deterministic DirectLlm transport (smoke) |
-| `monoloop::interpreter::DefaultInterpreterFactory` | bytes → complete canonical units |
-| `monoloop::loop_runtime::{ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, RuntimeBootstrap, RuntimeConfig, TestTextEncoder}` | composition |
+| `monoloop::contracts::*` | identities, ports, `CanonicalInput`, sinks |
+| `monoloop::connector::*` | FakeConnector / abstract Connector |
+| `monoloop::interpreter::*` | `DefaultInterpreterFactory` |
+| `monoloop::loop_runtime::*` | runtime, registry, encoders |
+| `monoloop::connector_grok::*` | Grok profile (`features = ["grok"]`) |
 
-### Hard rules agents must not break
+### `TestTextEncoder` (smoke only)
 
-- **Do not** depend on `monoloop-testkit` from product/host product crates.
-- **Do not** invent ambient “current session”; pass explicit IDs on the request.
-- **Empty tools** (`HostToolRegistry::empty()`, `tools: vec![]`) is required first
-  qualification: complete tool requests become `tool_unavailable` with **zero effects**.
-  (`fake_echo` does not emit tool calls; see `monoloop-loop` `tests/empty_loop.rs`.)
-- Set `RuntimeConfig.enable_mcp_listener: false` unless you intentionally start the
-  MCP shell (`Default` enables it).
-- Events and completion are **push** callbacks on `TransactionRequest`, not a pull API.
-- One in-flow transaction per `SessionKey`; duplicates are rejected, never queued.
-- Canonical completeness ≠ authorization; never treat Interpreter output as safe to execute.
+Loop-owned deterministic encoder for FakeConnector + `test_raw`. Not a production
+Channel encoder. Live hosts use profile `*_channel_binding`.
 
 ## Optional Channel profiles
 
@@ -90,16 +144,13 @@ monoloop = { version = "0.1", features = ["grok"] }
 # also: cursor, codex, agy, zai, claude
 ```
 
-Each profile crate exports a `*_channel_binding(...)` helper. Live qualification
-examples live in **`monoloop-testkit`**, not here.
-
 ## Version / license helpers
 
 ```rust
 use monoloop::{version_string, copyright_notice};
-println!("{}", version_string());   // e.g. 0.1.0+build-42
+println!("{}", version_string());
 println!("{}", copyright_notice());
 ```
 
-Normative specs: repository `doc/README.md`, `doc/MONOLOOP.md`,
-`doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md`.
+Normative specs (public repo): `doc/README.md`, `doc/MONOLOOP.md`,
+`doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md`, `doc/GROK_BUILD_CONNECTOR.md`.
