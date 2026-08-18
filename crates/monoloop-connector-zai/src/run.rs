@@ -35,13 +35,9 @@ pub async fn run_headless_prompt(
         target: "zai_agent",
         "spawn {} {:?}",
         config.command.display(),
-        // Do not log -k value if present
         args.iter()
-            .enumerate()
-            .map(|(i, a)| {
-                if i > 0 && args[i - 1] == "-k" {
-                    "***".to_string()
-                } else if a.len() > 80 {
+            .map(|a| {
+                if a.len() > 80 {
                     format!("{}…", &a[..40])
                 } else {
                     a.clone()

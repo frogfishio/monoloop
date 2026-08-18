@@ -2,15 +2,19 @@
 
 use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::{SharedToolCapacity, TransactionToolCapacity};
+use super::tool_handler::{ToolExecutionControl, ToolKillHandle};
 use super::validation::{
     validate_tool_completion, validate_tool_input, InputValidationFailure, DEFAULT_MAX_JSON_DEPTH,
 };
 use monoloop_contracts::{
     CanonicalToolError, CanonicalToolOutput, CanonicalToolResult, CanonicalToolResultOutcome,
-    ExchangeId, SessionKey, ToolActionId, ToolCall, ToolCallContext, ToolCompletion, ToolId,
-    ToolLifecycleEvent, ToolName, ToolRuntimeError, ToolStartError, TransactionId,
+    ExchangeId, SessionKey, ToolActionId, ToolCall, ToolCallContext, ToolCancellationPolicy,
+    ToolCompletion, ToolId, ToolLifecycleEvent, ToolName, ToolRuntimeError, ToolStartError,
+    TransactionId,
 };
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -304,17 +308,21 @@ impl TransactionToolDispatcher {
             }
         };
 
-        // Bounded execution: deadline + cancel.
+        // Bounded execution: deadline, then policy-based cancel → grace → kill → join (D-024).
         let deadline = spec.limits.execution_deadline;
+        let policy = spec.cancellation.clone();
         let control = handle.control.clone();
+        let kill = handle.kill.clone();
+        let wait = handle.completion.wait();
+        tokio::pin!(wait);
         let completion = tokio::select! {
             biased;
-            c = handle.completion.wait() => c,
+            c = &mut wait => c,
             _ = tokio::time::sleep(deadline) => {
-                control.cancel();
-                ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded)
+                await_tool_termination(&mut wait, &control, kill.as_ref(), &policy).await
             }
         };
+        // Capacity released only after worker joined / terminal selected.
         drop(permit);
 
         let max_output = spec.limits.max_output_bytes.min(self.max_tool_output_bytes);
@@ -392,6 +400,50 @@ impl TransactionToolDispatcher {
                     tool_id: Some(tool_id),
                     code: code.into(),
                     lifecycle,
+                }
+            }
+        }
+    }
+}
+
+/// After execution deadline: cooperative cancel, optional grace, then kill+join (D-024).
+async fn await_tool_termination(
+    wait: &mut Pin<&mut impl Future<Output = ToolCompletion>>,
+    control: &ToolExecutionControl,
+    kill: Option<&ToolKillHandle>,
+    policy: &ToolCancellationPolicy,
+) -> ToolCompletion {
+    control.cancel();
+    let join_grace = Duration::from_millis(200);
+    match policy {
+        ToolCancellationPolicy::Abortable => {
+            if let Some(k) = kill {
+                k.kill();
+            }
+            match tokio::time::timeout(join_grace, wait).await {
+                Ok(c) => c,
+                Err(_) => ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded),
+            }
+        }
+        ToolCancellationPolicy::Cooperative { grace } => {
+            match tokio::time::timeout(*grace, &mut *wait).await {
+                Ok(c) => c,
+                Err(_) => ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded),
+            }
+        }
+        ToolCancellationPolicy::IsolatedKillable { grace } => {
+            match tokio::time::timeout(*grace, &mut *wait).await {
+                Ok(c) => c,
+                Err(_) => {
+                    if let Some(k) = kill {
+                        k.kill();
+                    }
+                    match tokio::time::timeout(join_grace, wait).await {
+                        Ok(c) => c,
+                        Err(_) => {
+                            ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed)
+                        }
+                    }
                 }
             }
         }

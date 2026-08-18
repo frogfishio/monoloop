@@ -43,7 +43,8 @@ bounded resources, and zero accidental effects from incomplete tool material.
 ## Transport and Grok Build profile
 
 - Default local Grok server binds **loopback**. Non-loopback requires an explicit
-  authenticated transport-security policy; fail closed otherwise.
+  opt-in **and** `wss` (authenticated transport); plain `ws://` to non-loopback
+  fails closed even when allowed.
 - Prompts and session control travel only over authenticated ACP/JSON-RPC WebSocket —
   never via process argv or one-process-per-session spawn side effects.
 - Connector may parse only bounded framing/routing fields (e.g. JSON-RPC id,

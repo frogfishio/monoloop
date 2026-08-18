@@ -277,38 +277,70 @@ pub fn admit(
         start_gate: start_rx,
     });
 
-    let reaper = tokio::spawn(async move {
-        let _ = actor_join.await;
-        delivery_join.abort();
-    });
-
-    let entry = ActiveTransaction {
-        transaction_id,
-        session_key,
-        channel_id: request.channel_id.clone(),
-        guard,
-        control_tx,
-        actor_join: reaper,
-        release_capacity: Arc::clone(&release_capacity),
-    };
-
     // D-009 + D-010: Accepting check + session claim + insert under one lock.
+    // Defer reaper wrap until install succeeds so failure can abort owned tasks (LAW 23).
     {
         let mut reg = ctx.registry.lock().unwrap_or_else(|e| e.into_inner());
         if ctx.runtime_state.load(Ordering::SeqCst) != STATE_ACCEPTING {
             drop(reg);
             release_capacity();
-            // Do not start actor; drop start_tx (actor sees cancel).
             drop(start_tx);
+            actor_join.abort();
+            delivery_join.abort();
             return Err(AdmissionError::new(
                 AdmissionErrorKind::RuntimeShuttingDown,
                 "runtime is not accepting submissions",
             ));
         }
-        if let Err(kind) = reg.insert(entry, Some(live.binding.limits.max_distinct_sessions)) {
+        // Pre-check distinct session / collision without moving joins into a dropped entry.
+        if let Some(ref sk) = session_key {
+            if reg.session_active(sk) {
+                drop(reg);
+                release_capacity();
+                drop(start_tx);
+                actor_join.abort();
+                delivery_join.abort();
+                return Err(AdmissionError::new(
+                    AdmissionErrorKind::SessionAlreadyActive,
+                    "session already has an active transaction",
+                ));
+            }
+            let max = live.binding.limits.max_distinct_sessions;
+            if reg.distinct_sessions_on_channel(&sk.channel_id) >= max {
+                drop(reg);
+                release_capacity();
+                drop(start_tx);
+                actor_join.abort();
+                delivery_join.abort();
+                return Err(AdmissionError::new(
+                    AdmissionErrorKind::CapacityExceeded,
+                    "channel distinct session capacity exceeded",
+                ));
+            }
+        }
+
+        let reaper = tokio::spawn(async move {
+            let _ = actor_join.await;
+            delivery_join.abort();
+            let _ = delivery_join.await;
+        });
+        let entry = ActiveTransaction {
+            transaction_id,
+            session_key,
+            channel_id: request.channel_id.clone(),
+            guard,
+            control_tx,
+            actor_join: reaper,
+            release_capacity: Arc::clone(&release_capacity),
+        };
+        if let Err((kind, failed)) =
+            reg.insert(entry, Some(live.binding.limits.max_distinct_sessions))
+        {
             drop(reg);
             release_capacity();
             drop(start_tx);
+            // Abort owned reaper (covers actor + delivery) — sync admit cannot await.
+            failed.actor_join.abort();
             return Err(AdmissionError::new(kind, "registry install failed"));
         }
     }

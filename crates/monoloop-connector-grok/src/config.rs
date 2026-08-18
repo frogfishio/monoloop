@@ -105,9 +105,10 @@ impl GrokServerConfig {
                 "websocket endpoint must use ws or wss scheme",
             ));
         }
-        if !is_loopback && scheme != "wss" && !self.allow_non_loopback {
+        // SECURITY: non-loopback always requires wss, even when explicitly allowed.
+        if !is_loopback && scheme != "wss" {
             return Err(crate::error::GrokConnectorError::configuration(
-                "non-loopback requires wss",
+                "non-loopback endpoint requires wss (authenticated transport)",
             ));
         }
         Ok(())

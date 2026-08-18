@@ -36,9 +36,11 @@ path”; it records what is proven, partial, or out of scope.
 | External agent live multi-exchange | SendAndRetain against real Grok/Cursor/Codex/agy is qualification (testkit examples), not a deterministic acceptance gate |
 | MCP Refreshable | Not declared; CreationOnly only for external agents |
 | Inline continuation + MCP | Explicitly unsupported (CallerControlled only for gateway profiles) |
-| IsolatedKillable escalate | Registration validates `supports_isolated_kill`; full kill+join-after-grace suite is residual |
+| Headless CLI argv prompts | Z.ai/Claude vendor CLIs require prompt on argv; LAW 16 clarified in `DECISIONS.md` D-002; secrets must not be on argv |
+| Headless CLI in-CLI tools | Tools may run inside the spawned CLI; Monoloop EmptyToolRegistry is observational for those Channels |
+| Profile → Loop coupling | Profile crates depend on Loop/Interpreter to build `ChannelBinding` (accepted; not Connector-only packages) |
 | Provider malformed corpus | Interpreter/SSE fixtures cover fragmentation and common malformation; not an infinite fuzz corpus |
-| Profile prompt-shortcut removal | Encoders own prompt bodies; connector open/session sequencing remains profile-owned (see WP-00 PS-* inventory) |
+| Sync admit join | Install-failure path aborts owned tasks but cannot await joins (sync `admit`) |
 
 ## Out of scope (by design / plan)
 

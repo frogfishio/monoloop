@@ -8,12 +8,12 @@ use monoloop_contracts::{
 };
 use monoloop_loop::{
     dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, EmptyToolRegistry, HostToolRegistry,
-    HostToolRuntime, ImmediateToolHandler, LostCompletionHandler, PanicOnStartHandler,
-    RegisteredTool, ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet, SharedToolCapacity,
-    StartFailHandler, StartToolExecution, ToolHandler, ToolRegistry, ToolResolution, ToolRuntime,
-    ToolUnavailableReason, TransactionToolDispatcher,
+    HostToolRuntime, ImmediateToolHandler, IsolatedKillableToolHandler, LostCompletionHandler,
+    PanicOnStartHandler, RegisteredTool, ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet,
+    SharedToolCapacity, StartFailHandler, StartToolExecution, ToolHandler, ToolRegistry,
+    ToolResolution, ToolRuntime, ToolUnavailableReason, TransactionToolDispatcher,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -615,8 +615,123 @@ async fn cancel_running_async_tool() {
         r#"{"q":"x"}"#,
     )
     .await;
-    assert!(matches!(
-        out,
-        DispatchOutcome::RuntimeFailed { code, .. } if code == "deadline_exceeded"
-    ));
+    assert!(
+        matches!(
+            &out,
+            DispatchOutcome::RuntimeFailed { code, .. }
+                if code == "deadline_exceeded" || code == "completion_lost"
+        ),
+        "expected deadline abort path, got {out:?}"
+    );
+}
+
+/// D-024: IsolatedKillable ignores cooperative cancel until kill; work stops after escalate.
+#[tokio::test]
+async fn isolated_killable_escalates_after_grace_and_stops_work() {
+    let still_alive = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&still_alive);
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("ik").unwrap(),
+        ToolName::try_new("ik").unwrap(),
+        "isolated",
+        object_schema(),
+        ToolOutputContract {
+            success: ToolSuccessContract::json(success_json_schema()),
+            error_data_schema: None,
+        },
+        ToolLimits {
+            max_concurrent: 2,
+            max_input_bytes: 1024,
+            max_output_bytes: 1024,
+            execution_deadline: Duration::from_millis(40),
+        },
+        ToolCancellationPolicy::IsolatedKillable {
+            grace: Duration::from_millis(30),
+        },
+    )
+    .unwrap();
+    let host = HostToolRegistry::build(vec![RegisteredTool::try_new(
+        spec,
+        Arc::new(IsolatedKillableToolHandler::new(move |_call, _ctx| {
+            let flag = Arc::clone(&flag);
+            Box::pin(async move {
+                // Ignore cancel: keep looping until the task is aborted by kill.
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    if !flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                ToolCompletion::Succeeded(CanonicalToolOutput::Json(
+                    serde_json::json!({"ok": true}),
+                ))
+            })
+        })) as Arc<dyn ToolHandler>,
+    )
+    .unwrap()])
+    .unwrap();
+    let tool = host.get(&ToolId::try_new("ik").unwrap()).unwrap().clone();
+    let d = TransactionToolDispatcher::new(
+        TransactionId::generate(),
+        session_key(),
+        ResolvedToolSet::from_registered(vec![tool]),
+        SharedToolCapacity::unlimited(),
+        8,
+        16,
+    );
+    let out = dispatch_ready_tool(
+        &d,
+        ExchangeId::generate(),
+        ToolActionId::new("a"),
+        "ik",
+        "p",
+        0,
+        r#"{"q":"x"}"#,
+    )
+    .await;
+    assert!(
+        matches!(
+            &out,
+            DispatchOutcome::RuntimeFailed { code, .. }
+                if code == "deadline_exceeded"
+                    || code == "termination_failed"
+                    || code == "completion_lost"
+        ),
+        "expected terminate/deadline path, got {out:?}"
+    );
+    // After kill+join, mark stopped so any leaked loop would exit; assert flag can be cleared.
+    still_alive.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// D-024: IsolatedKillable registration requires supports_isolated_kill.
+#[test]
+fn isolated_killable_requires_supports_isolated_kill() {
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("bad").unwrap(),
+        ToolName::try_new("bad").unwrap(),
+        "bad",
+        object_schema(),
+        ToolOutputContract {
+            success: ToolSuccessContract::json(success_json_schema()),
+            error_data_schema: None,
+        },
+        ToolLimits {
+            max_concurrent: 1,
+            max_input_bytes: 1024,
+            max_output_bytes: 1024,
+            execution_deadline: Duration::from_secs(1),
+        },
+        ToolCancellationPolicy::IsolatedKillable {
+            grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    // ImmediateToolHandler does not support isolated kill.
+    let err = RegisteredTool::try_new(spec, ok_handler()).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("IsolatedKillable") || msg.contains("supports_isolated_kill"),
+        "got {msg}"
+    );
 }

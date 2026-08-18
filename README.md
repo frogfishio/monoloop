@@ -23,17 +23,22 @@ register](doc/REQUIREMENTS.md), [transaction design](doc/TRANSACTION_RUNTIME_DES
 Connector profile](doc/GROK_BUILD_CONNECTOR.md), and [Test Kit and
 Driver](doc/TEST_KIT.md).
 
-## Workspace (implementation in progress)
+## Workspace
 
 ```text
 crates/
-  monoloop-contracts        # identities, dialect, errors, limits, canonical events
-  monoloop-connector        # abstract Connector, FakeConnector, ConnectorProxy
-  monoloop-connector-grok   # Grok Build ACP/WebSocket profile
-  monoloop-interpreter      # reassemble raw dialect bytes → complete canonical events
-  monoloop-loop             # transaction runtime; inner tool loop; MCP/tool adapters
-  monoloop-testkit          # distributor, console, Driver (NOT a product dependency)
+  monoloop-contracts          # identities, dialect, errors, limits, canonical events
+  monoloop-connector          # abstract Connector, FakeConnector, ConnectorProxy
+  monoloop-connector-grok     # Grok Build ACP/WebSocket profile
+  monoloop-connector-*        # additional Channel profiles (Cursor, Codex, …)
+  monoloop-interpreter        # raw dialect bytes → complete canonical events
+  monoloop-loop               # transaction runtime; inner tool loop; MCP/tool adapters
+  monoloop-testkit            # distributor, console, Driver (NOT a product dependency)
 ```
+
+Fake + scripted OpenAI paths are the deterministic acceptance surface. Live
+multi-profile qualification and headless CLI exceptions are documented in
+`doc/WP12_CURRENT_LIMITATIONS.md` and `DECISIONS.md`.
 
 ```bash
 cargo test --workspace

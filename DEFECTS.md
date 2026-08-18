@@ -802,9 +802,8 @@ rejected.
 ## D-024: Declared tool cancellation policy is not enforced by handler registration or cleanup
 
 **Priority:** P2
-**Status:** Fixed (partial→stronger, 2026-08-18) — registration validates
-`supports_abort` / `supports_isolated_kill`; residual: escalate kill + join
-after grace
+**Status:** Fixed (2026-08-18) — registration validates policy; dispatcher
+cancel → grace → kill → join before capacity release
 **Affected:**
 - `crates/monoloop-loop/src/transaction/host_tools.rs`
 - `crates/monoloop-loop/src/transaction/dispatcher.rs`
@@ -828,8 +827,13 @@ effects after transaction terminalization.
 
 - [x] Unstoppable handler cannot register as Abortable
       (`abortable_requires_supports_abort_handler`).
-- [x] Handler trait exposes `supports_abort` / `supports_isolated_kill`.
-- [ ] Residual: IsolatedKillable escalate + join-after-grace proof suite.
+- [x] Handler trait exposes `supports_abort` / `supports_isolated_kill`;
+      `ToolKillHandle` on execution handles.
+- [x] IsolatedKillable registration requires kill support
+      (`isolated_killable_requires_supports_isolated_kill`).
+- [x] Escalate after grace + join
+      (`isolated_killable_escalates_after_grace_and_stops_work`,
+      `cancel_running_async_tool`).
 
 ## D-025: WP-12 does not meet its own acceptance and formatting gates
 
@@ -890,5 +894,5 @@ considered delivered while these remain.
 | D-021 | Fixed | CallbackService + panic isolation; capacity free while callback runs |
 | D-022 | Fixed | Rejected → CanonicalToolResult |
 | D-023 | Fixed | empty extension allowlist deny + admission test |
-| D-024 | Fixed (partial→stronger) | registration policy check; residual IsolatedKillable escalate suite |
+| D-024 | Fixed | registration + cancel→grace→kill→join before capacity release |
 | D-025 | Fixed (partial→stronger) | acceptance/limitations refreshed; residual = qualification/audit |

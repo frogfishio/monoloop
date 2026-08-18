@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Notify};
+use tokio::task::AbortHandle;
 
 /// Host-linked tool implementation.
 pub trait ToolHandler: Send + Sync {
@@ -94,6 +95,24 @@ impl ToolExecutionCompletion {
     }
 }
 
+/// Force-stop handle for IsolatedKillable / Abortable workers (D-024).
+#[derive(Clone, Debug)]
+pub struct ToolKillHandle {
+    abort: AbortHandle,
+}
+
+impl ToolKillHandle {
+    /// Wrap a Tokio task abort handle.
+    pub fn new(abort: AbortHandle) -> Self {
+        Self { abort }
+    }
+
+    /// Abort the isolated worker task (idempotent).
+    pub fn kill(&self) {
+        self.abort.abort();
+    }
+}
+
 /// Handle returned from [`ToolHandler::start`].
 #[derive(Debug)]
 pub struct LinkedToolExecutionHandle {
@@ -103,6 +122,8 @@ pub struct LinkedToolExecutionHandle {
     pub control: ToolExecutionControl,
     /// Exactly-once completion.
     pub completion: ToolExecutionCompletion,
+    /// Optional kill handle for escalate-after-grace (D-024).
+    pub kill: Option<ToolKillHandle>,
 }
 
 /// Handler that completes immediately from a synchronous function.
@@ -136,6 +157,7 @@ where
             execution_id: ToolExecutionId::generate(),
             control: ToolExecutionControl::new(),
             completion: ToolExecutionCompletion::new(rx),
+            kill: None,
         })
     }
 }
@@ -168,23 +190,83 @@ where
     ) -> Result<LinkedToolExecutionHandle, ToolStartError> {
         let control = ToolExecutionControl::new();
         let control_body = control.clone();
-        let fut = (self.f)(call, context, control_body);
+        let fut = (self.f)(call, context, control_body.clone());
+        let (tx, rx) = oneshot::channel();
+        // Single owned worker: select cancel vs body (no detached watcher — LAW 23).
+        let join = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = control_body.cancelled() => {
+                    let _ = tx.send(ToolCompletion::RuntimeFailed(
+                        monoloop_contracts::ToolRuntimeError::TerminationFailed,
+                    ));
+                }
+                result = fut => {
+                    let _ = tx.send(result);
+                }
+            }
+        });
+        let kill = ToolKillHandle::new(join.abort_handle());
+        Ok(LinkedToolExecutionHandle {
+            execution_id: ToolExecutionId::generate(),
+            control,
+            completion: ToolExecutionCompletion::new(rx),
+            kill: Some(kill),
+        })
+    }
+
+    fn supports_abort(&self) -> bool {
+        true
+    }
+}
+
+/// Isolated worker that ignores cooperative cancel until [`ToolKillHandle::kill`] (D-024 tests).
+pub struct IsolatedKillableToolHandler<F> {
+    f: F,
+}
+
+impl<F> IsolatedKillableToolHandler<F>
+where
+    F: Fn(ToolCall, ToolCallContext) -> BoxFut + Send + Sync,
+{
+    /// Construct from a function that returns a boxed future.
+    pub fn new(f: F) -> Self {
+        Self { f }
+    }
+}
+
+impl<F> ToolHandler for IsolatedKillableToolHandler<F>
+where
+    F: Fn(ToolCall, ToolCallContext) -> BoxFut + Send + Sync,
+{
+    fn start(
+        &self,
+        call: ToolCall,
+        context: ToolCallContext,
+    ) -> Result<LinkedToolExecutionHandle, ToolStartError> {
+        let control = ToolExecutionControl::new();
+        let fut = (self.f)(call, context);
         let (tx, rx) = oneshot::channel();
         let join = tokio::spawn(async move {
             let result = fut.await;
             let _ = tx.send(result);
         });
-        // Abort on cancel: poller task watches control.
-        let control_watch = control.clone();
-        tokio::spawn(async move {
-            control_watch.cancelled().await;
-            join.abort();
-        });
+        let kill = ToolKillHandle::new(join.abort_handle());
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
             control,
             completion: ToolExecutionCompletion::new(rx),
+            kill: Some(kill),
         })
+    }
+
+    fn supports_abort(&self) -> bool {
+        // Cooperative cancel alone does not stop this worker.
+        false
+    }
+
+    fn supports_isolated_kill(&self) -> bool {
+        true
     }
 }
 
@@ -235,6 +317,7 @@ impl ToolHandler for LostCompletionHandler {
             execution_id: ToolExecutionId::generate(),
             control: ToolExecutionControl::new(),
             completion: ToolExecutionCompletion::new(rx),
+            kill: None,
         })
     }
 }

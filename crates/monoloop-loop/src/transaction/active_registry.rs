@@ -75,23 +75,34 @@ impl ActiveTransactionRegistry {
     ///
     /// When `max_distinct_sessions` is `Some`, rejecting a new session that would
     /// exceed the channel's concurrent distinct-session bound (D-015).
+    ///
+    /// On failure the entry is returned so the caller can abort/join owned tasks (LAW 23).
     pub fn insert(
         &mut self,
         entry: ActiveTransaction,
         max_distinct_sessions: Option<usize>,
-    ) -> Result<(), monoloop_contracts::AdmissionErrorKind> {
+    ) -> Result<(), (monoloop_contracts::AdmissionErrorKind, Box<ActiveTransaction>)> {
         if let Some(ref sk) = entry.session_key {
             if self.by_session.contains_key(sk) {
-                return Err(monoloop_contracts::AdmissionErrorKind::SessionAlreadyActive);
+                return Err((
+                    monoloop_contracts::AdmissionErrorKind::SessionAlreadyActive,
+                    Box::new(entry),
+                ));
             }
             if let Some(max) = max_distinct_sessions {
                 if self.distinct_sessions_on_channel(&sk.channel_id) >= max {
-                    return Err(monoloop_contracts::AdmissionErrorKind::CapacityExceeded);
+                    return Err((
+                        monoloop_contracts::AdmissionErrorKind::CapacityExceeded,
+                        Box::new(entry),
+                    ));
                 }
             }
         }
         if self.by_tx.contains_key(&entry.transaction_id) {
-            return Err(monoloop_contracts::AdmissionErrorKind::SpawnFailed);
+            return Err((
+                monoloop_contracts::AdmissionErrorKind::SpawnFailed,
+                Box::new(entry),
+            ));
         }
         if let Some(ref sk) = entry.session_key {
             self.by_session.insert(sk.clone(), entry.transaction_id);

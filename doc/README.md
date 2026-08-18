@@ -1,6 +1,6 @@
 # Monoloop — Three-component asynchronous kernel
 
-**Status:** Architecture under construction
+**Status:** WP-12 Fake/scripted acceptance in progress; see `WP12_REQUIREMENTS_ACCEPTANCE.md`
 
 **Implementation language:** Rust
 

@@ -20,8 +20,6 @@ pub struct ZaiAgentConfig {
     pub model: Option<String>,
     /// Optional base URL (`-u` / `ZAI_BASE_URL`). Not logged.
     pub base_url: Option<String>,
-    /// When true, pass `-k` from `ZAI_API_KEY` if set. Prefer env for the CLI itself.
-    pub pass_api_key_flag: bool,
     /// Max tool rounds (`--max-tool-rounds`).
     pub max_tool_rounds: u32,
     /// Wall-clock deadline for the whole headless process.
@@ -40,7 +38,6 @@ impl Default for ZaiAgentConfig {
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             model: std::env::var("ZAI_MODEL").ok().filter(|s| !s.is_empty()),
             base_url: std::env::var("ZAI_BASE_URL").ok().filter(|s| !s.is_empty()),
-            pass_api_key_flag: false,
             max_tool_rounds: 50,
             run_deadline: Duration::from_secs(10 * 60),
             max_stdout_bytes: 8 * 1024 * 1024,
@@ -70,7 +67,11 @@ impl ZaiAgentConfig {
         self
     }
 
-    /// Build argv for one headless prompt (prompt text last via `-p`).
+    /// Build argv for one headless prompt.
+    ///
+    /// **LAW 16 note:** Z.ai CLI requires `-p <prompt>` (vendor contract). Secrets
+    /// MUST NOT appear on argv; API keys stay in the process environment only.
+    /// See `DECISIONS.md` (headless CLI prompt surface).
     pub fn argv_for_prompt(&self, prompt: &str) -> Vec<String> {
         let mut args = self.extra_args.clone();
         args.push("-d".into());
@@ -85,14 +86,6 @@ impl ZaiAgentConfig {
         if let Some(ref u) = self.base_url {
             args.push("-u".into());
             args.push(u.clone());
-        }
-        if self.pass_api_key_flag {
-            if let Ok(k) = std::env::var("ZAI_API_KEY") {
-                if !k.is_empty() {
-                    args.push("-k".into());
-                    args.push(k);
-                }
-            }
         }
         args.push("-p".into());
         args.push(prompt.to_string());

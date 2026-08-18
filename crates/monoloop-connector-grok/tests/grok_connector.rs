@@ -283,6 +283,24 @@ async fn non_loopback_without_opt_in_fails_closed() {
 }
 
 #[tokio::test]
+async fn non_loopback_opt_in_still_requires_wss() {
+    let secrets = Arc::new(InMemorySecretResolver::new());
+    secrets.insert("S", "x");
+    let connector = GrokConnector::new(secrets);
+    let mut config = GrokServerConfig::loopback(9, SecretRef::new("S")).unwrap();
+    config.websocket_endpoint = url::Url::parse("ws://example.com:2419").unwrap();
+    config.allow_non_loopback = true;
+    let err = match connector.connect(config) {
+        Err(e) => e,
+        Ok(_) => panic!("ws:// non-loopback must reject even when allowed"),
+    };
+    assert!(
+        err.to_string().contains("wss") || err.to_string().contains("authenticated"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn bad_secret_rejected() {
     let secret = "real-secret";
     let addr = common::mock_acp_server::start_mock_acp_server(secret).await;

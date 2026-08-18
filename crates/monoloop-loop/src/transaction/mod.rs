@@ -59,9 +59,9 @@ pub use runtime::{DefaultTransactionRuntime, Startup};
 pub use state::RuntimeState;
 pub use tool_capacity::{SharedToolCapacity, TransactionToolCapacity};
 pub use tool_handler::{
-    AsyncToolHandler, ImmediateToolHandler, LinkedToolExecutionHandle, LostCompletionHandler,
-    PanicOnStartHandler, StartFailHandler, ToolExecutionCompletion, ToolExecutionControl,
-    ToolHandler,
+    AsyncToolHandler, ImmediateToolHandler, IsolatedKillableToolHandler, LinkedToolExecutionHandle,
+    LostCompletionHandler, PanicOnStartHandler, StartFailHandler, ToolExecutionCompletion,
+    ToolExecutionControl, ToolHandler, ToolKillHandle,
 };
 pub use validation::{
     validate_tool_completion, validate_tool_input, InputValidationFailure, OutputValidationFailure,

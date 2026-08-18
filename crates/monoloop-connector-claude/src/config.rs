@@ -73,7 +73,9 @@ impl ClaudeAgentConfig {
 
     /// Build argv for one headless print prompt.
     ///
-    /// Prompt is the positional argument after flags (Claude CLI contract).
+    /// **LAW 16 note:** Claude Code requires the prompt as a CLI argument in
+    /// print mode (vendor contract). Secrets MUST NOT appear on argv.
+    /// See `DECISIONS.md` (headless CLI prompt surface).
     pub fn argv_for_prompt(&self, prompt: &str) -> Vec<String> {
         let mut args = self.extra_args.clone();
         args.push("-p".into());

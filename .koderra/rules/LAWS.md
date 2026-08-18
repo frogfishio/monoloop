@@ -45,8 +45,13 @@ Normative detail lives in `doc/`; this file is the short enforcement list.
     ranking, or fallback retry inside Monoloop.
 15. Connector moves dialect-labelled bytes and minimal routing envelopes only —
     no semantic interpretation of assistant text, tools, plans, or turns.
-16. Prompts never go on process argv. Grok path is authenticated ACP/JSON-RPC over
-    WebSocket to one long-lived server (not one process per session).
+16. Prompts and secrets never go on process argv for the Grok Build path
+    (authenticated ACP/JSON-RPC over WebSocket to one long-lived server; not
+    one process per session). Headless CLI profiles (Z.ai, Claude Code) that
+    require a vendor `-p`/`prompt` argument MAY place the prompt on argv only
+    when recorded in `DECISIONS.md`; they MUST NOT place credentials or secrets
+    on argv. Prefer ACP/WebSocket or stdin-only transports when the vendor
+    supports them.
 
 ## State and persistence
 
