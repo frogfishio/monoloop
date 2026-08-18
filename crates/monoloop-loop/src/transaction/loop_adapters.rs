@@ -159,7 +159,7 @@ pub async fn dispatch_ready_tool_cancellable(
     provider_tool_call_id: &str,
     request_ordinal: u32,
     arguments_json: &str,
-    cancel: Option<std::sync::Arc<tokio::sync::Notify>>,
+    cancel: Option<std::sync::Arc<super::sticky_cancel::StickyCancel>>,
 ) -> DispatchOutcome {
     let name = match ToolName::try_new(tool_name) {
         Ok(n) => n,

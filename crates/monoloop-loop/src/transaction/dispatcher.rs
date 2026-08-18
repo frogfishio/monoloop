@@ -186,7 +186,7 @@ impl TransactionToolDispatcher {
     pub async fn dispatch_with_cancel(
         self: &Arc<Self>,
         request: DispatchRequest,
-        cancel: Option<Arc<tokio::sync::Notify>>,
+        cancel: Option<Arc<super::sticky_cancel::StickyCancel>>,
     ) -> DispatchOutcome {
         let action = request.tool_action_id.clone();
 
@@ -278,6 +278,10 @@ impl TransactionToolDispatcher {
             deadline: Instant::now() + spec.limits.execution_deadline,
         };
 
+        // Bounded execution: deadline / external cancel → grace → kill → join (D-024 / D-028).
+        let deadline = spec.limits.execution_deadline;
+        let policy = spec.cancellation.clone();
+
         let start_result = catch_unwind(AssertUnwindSafe(|| handler.start(call, context)));
         let handle = match start_result {
             Ok(Ok(h)) => h,
@@ -320,9 +324,6 @@ impl TransactionToolDispatcher {
             }
         };
 
-        // Bounded execution: deadline / external cancel → grace → kill → join (D-024 / D-028).
-        let deadline = spec.limits.execution_deadline;
-        let policy = spec.cancellation.clone();
         let control = handle.control.clone();
         let kill = handle.kill.clone();
         // Structural: declared Abortable/IsolatedKillable must carry a kill handle (D-028).
@@ -333,6 +334,10 @@ impl TransactionToolDispatcher {
             ToolCancellationPolicy::Cooperative { .. } => true,
         };
         if !kill_ok {
+            // Stop already-started work before reporting missing kill (D-028 residual).
+            control.cancel();
+            let wait = handle.completion.wait();
+            let _ = tokio::time::timeout(Duration::from_millis(200), wait).await;
             drop(permit);
             lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
                 tool_action_id: action.clone(),
@@ -350,7 +355,7 @@ impl TransactionToolDispatcher {
         tokio::pin!(wait);
         let cancel_fut = async {
             if let Some(n) = cancel.as_ref() {
-                n.notified().await;
+                n.cancelled().await;
             } else {
                 std::future::pending::<()>().await;
             }

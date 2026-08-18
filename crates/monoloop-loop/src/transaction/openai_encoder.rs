@@ -146,13 +146,10 @@ impl OutboundDialectEncoder for OpenAiChatCompletionsEncoder {
         &self,
         request: ToolContinuationEncodeRequest<'_>,
     ) -> Result<EncodedExchange, EncodingError> {
-        let mut msgs = encode_messages_vec(request.context.messages())?;
-        // Append tool results in model-declared ordinal order when possible.
-        let mut results: Vec<&CanonicalToolResult> = request.results.iter().collect();
-        results.sort_by_key(|r| r.request_ordinal);
-        for result in results {
-            msgs.push(encode_tool_result_message(result)?);
-        }
+        // D-031 residual: actor already appends tool results into ContinuationContext
+        // via append_exchange_to_transcript — do not append `request.results` again.
+        let _ = request.results;
+        let msgs = encode_messages_vec(request.context.messages())?;
         self.encode_body(Value::Array(msgs), request.tools, request.config)
     }
 }
@@ -259,6 +256,7 @@ fn encode_message(msg: &CanonicalMessage) -> Result<Value, EncodingError> {
     }
 }
 
+#[allow(dead_code)] // retained for potential direct-result encoding; continuation uses transcript Tool messages
 fn encode_tool_result_message(result: &CanonicalToolResult) -> Result<Value, EncodingError> {
     let content = match &result.outcome {
         CanonicalToolResultOutcome::Succeeded(CanonicalToolOutput::Json(v)) => {

@@ -26,6 +26,7 @@ mod openai_encoder;
 mod resolved_tools;
 mod runtime;
 mod state;
+mod sticky_cancel;
 mod tool_capacity;
 mod tool_handler;
 mod validation;

@@ -345,4 +345,40 @@ mod tests {
             .unwrap();
         assert_eq!(&encoded.bytes[..], b"hi");
     }
+
+    #[test]
+    fn non_empty_tools_rejected_for_acp_prompt() {
+        use monoloop_contracts::{
+            JsonSchema, ToolCancellationPolicy, ToolId, ToolLimits, ToolName, ToolOutputContract,
+            ToolSpec, ToolSuccessContract,
+        };
+        let enc = AcpPromptEncoder::grok();
+        let input = user_text_input("hi").unwrap();
+        let tid = TransactionId::generate();
+        let eid = ExchangeId::generate();
+        let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+        let tool = ToolSpec::try_new(
+            ToolId::try_new("t").unwrap(),
+            ToolName::try_new("t").unwrap(),
+            "d",
+            schema.clone(),
+            ToolOutputContract {
+                success: ToolSuccessContract::json(schema),
+                error_data_schema: None,
+            },
+            ToolLimits::default(),
+            ToolCancellationPolicy::Abortable,
+        )
+        .unwrap();
+        let err = enc
+            .encode_initial(InitialEncodeRequest {
+                transaction_id: &tid,
+                exchange_id: &eid,
+                input: &input,
+                config: &bare_cfg(),
+                tools: &[tool],
+            })
+            .unwrap_err();
+        assert!(matches!(err, EncodingError::Unsupported(_)));
+    }
 }

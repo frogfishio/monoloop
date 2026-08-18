@@ -458,6 +458,13 @@ async fn run_actor(spawn: ActorSpawn) {
 
         // --- Provider exchanges (initial + optional inline tool continuations) ---
         let tool_specs: Vec<_> = tools.specs().into_iter().cloned().collect();
+        // ACP / external-agent encoders reject model tool arrays; MCP carries tools (D-014 residual).
+        let encode_tools: &[monoloop_contracts::ToolSpec] =
+            if tool_mode == ToolExecutionMode::McpGateway {
+                &[]
+            } else {
+                &tool_specs
+            };
         let max_exchanges = max_provider_exchanges.max(1);
         let max_inline = max_continuations;
         let mut exchanges_done = 0usize;
@@ -467,7 +474,7 @@ async fn run_actor(spawn: ActorSpawn) {
         // D-031: cumulative continuation transcript (original input + each
         // assistant tool-call group and ordered results, appended once).
         let mut continuation_messages = input.messages().to_vec();
-        let _ = max_total_provider_output_bytes;
+        let max_retained_unit_bytes = max_total_provider_output_bytes.max(256);
 
         // D-011: fan units to the event sink as they are produced (not only after EOF).
         // D-026: wait for authoritative SessionKey before publishing any unit.
@@ -507,14 +514,17 @@ async fn run_actor(spawn: ActorSpawn) {
             Err(()) => return Err(TransactionEndKind::InvariantFailed),
         };
 
-        let (session_id_tx, claim_join) = if create_mode_attach {
+        let (session_id_tx, claim_join, prompt_ready_rx) = if create_mode_attach {
             let (sess_tx, sess_rx) = oneshot::channel();
+            let (prompt_tx, prompt_rx) = oneshot::channel::<()>();
             let registry_c = Arc::clone(&registry);
             let events_c = events.clone();
             let guard_c = Arc::clone(&guard);
             let channel_c = channel_id.clone();
             let session_watch_c = session_watch_tx.clone();
             let max_distinct = max_distinct_sessions;
+            let pending_mcp_c = pending_mcp.clone();
+            let mcp_c = mcp.clone();
             let join = match try_spawn(&executor, async move {
                 let Ok(ext) = sess_rx.await else {
                     return Ok::<(), TransactionEndKind>(());
@@ -555,6 +565,15 @@ async fn run_actor(spawn: ActorSpawn) {
                     return Err(TransactionEndKind::EventDeliveryFailed);
                 }
                 let _ = session_watch_c.send(sk);
+                // Activate MCP before the prompt is sent (D-026 residual).
+                if let Some(ref pending) = pending_mcp_c {
+                    if let Some(handle) = mcp_c.as_ref() {
+                        handle
+                            .activate(&pending.token)
+                            .map_err(|_| TransactionEndKind::InvariantFailed)?;
+                    }
+                }
+                let _ = prompt_tx.send(());
                 Ok(())
             }) {
                 Ok(h) => h,
@@ -563,9 +582,9 @@ async fn run_actor(spawn: ActorSpawn) {
                     return Err(TransactionEndKind::InvariantFailed);
                 }
             };
-            (Some(sess_tx), Some(join))
+            (Some(sess_tx), Some(join), Some(prompt_rx))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let mut outcome = tokio::select! {
@@ -595,19 +614,24 @@ async fn run_actor(spawn: ActorSpawn) {
                 session_attachment: attachment.clone(),
                 input: &input,
                 config: &effective,
-                tools: &tool_specs,
+                tools: encode_tools,
                 interpretation_limits: InterpretationLimits::default(),
                 deadline,
                 cleanup_deadline,
                 max_encoded_exchange_bytes,
                 unit_tx: Some(live_tx),
                 session_id_tx,
+                prompt_ready_rx,
+                max_retained_unit_bytes,
             }) => r,
         }
         .map_err(map_exchange_failure)?;
         exchanges_done += 1;
         // D-027: count initial encoded request toward aggregate provider input.
-        // (Byte length already enforced against max_encoded_exchange_bytes in run_exchange.)
+        provider_input_bytes = provider_input_bytes.saturating_add(outcome.encoded_request_bytes);
+        if provider_input_bytes > max_total_provider_input_bytes {
+            return Err(TransactionEndKind::LimitExceeded);
+        }
         if let Some(j) = claim_join {
             j.await.map_err(|_| TransactionEndKind::InvariantFailed)??;
             let Some(ext) = outcome.external_session_id.clone() else {
@@ -618,15 +642,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 channel_id.clone(),
                 SessionId::from_external(&ext),
             ));
-            let _ = session_watch_tx.send(session_key.clone());
-            // Activate MCP only after authoritative claim (D-026).
-            if let Some(ref pending) = pending_mcp {
-                if let Some(handle) = mcp.as_ref() {
-                    handle
-                        .activate(&pending.token)
-                        .map_err(|_| TransactionEndKind::InvariantFailed)?;
-                }
-            }
+            // MCP already activated inside claim task before prompt send.
         }
         for u in &outcome.units {
             provider_output_bytes = provider_output_bytes.saturating_add(estimate_unit_bytes(u));
@@ -678,7 +694,7 @@ async fn run_actor(spawn: ActorSpawn) {
             for (ord, (action_id, name, payload, provider_id)) in ready.into_iter().enumerate() {
                 // D-028: notify cancel into dispatch so the worker is terminated+joined
                 // instead of dropping the dispatch future (which would detach work).
-                let tool_cancel = Arc::new(tokio::sync::Notify::new());
+                let tool_cancel = Arc::new(super::sticky_cancel::StickyCancel::new());
                 let tool_cancel_dispatch = Arc::clone(&tool_cancel);
                 let dispatch_fut = dispatch_ready_tool_cancellable(
                     &dispatcher,
@@ -694,7 +710,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 let dispatch_outcome = tokio::select! {
                     biased;
                     ctrl = control_rx.recv() => {
-                        tool_cancel.notify_waiters();
+                        tool_cancel.cancel();
                         // Join the in-flight dispatch (cancel path terminates worker).
                         let _ = dispatch_fut.await;
                         return Err(match ctrl {
@@ -802,7 +818,7 @@ async fn run_actor(spawn: ActorSpawn) {
                                 context: &context,
                                 results: &results,
                                 config: &effective,
-                                tools: &tool_specs,
+                                tools: encode_tools,
                             },
                         )
                         .map_err(|_| TransactionEndKind::EncodingFailed)?;
@@ -867,12 +883,20 @@ async fn run_actor(spawn: ActorSpawn) {
                             cleanup_deadline,
                             max_encoded_exchange_bytes,
                             unit_tx: Some(live_tx2),
+                            max_retained_unit_bytes,
                         }) => r,
                     }
                     .map_err(map_exchange_failure)?;
                     live_join2
                         .await
                         .map_err(|_| TransactionEndKind::InvariantFailed)??;
+                    for u in &outcome.units {
+                        provider_output_bytes =
+                            provider_output_bytes.saturating_add(estimate_unit_bytes(u));
+                    }
+                    if provider_output_bytes > max_total_provider_output_bytes {
+                        return Err(TransactionEndKind::LimitExceeded);
+                    }
                     exchanges_done += 1;
                     continuations_done += 1;
                 }

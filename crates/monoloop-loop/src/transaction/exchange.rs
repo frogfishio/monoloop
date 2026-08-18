@@ -27,6 +27,8 @@ pub struct ExchangeOutcome {
     pub interpretation_id: InterpretationId,
     /// Authoritative external session id from open (create/load), if any.
     pub external_session_id: Option<monoloop_contracts::ExternalSessionId>,
+    /// Bytes actually sent on the provider request body (D-027 aggregate input).
+    pub encoded_request_bytes: usize,
     /// Complete canonical unit events observed (not Ended).
     pub units: Vec<CanonicalUnitEvent>,
     /// Connector terminal.
@@ -92,6 +94,10 @@ pub struct ExchangeParams<'a> {
     pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
     /// Optional oneshot: authoritative external session id immediately after open (D-013).
     pub session_id_tx: Option<oneshot::Sender<monoloop_contracts::ExternalSessionId>>,
+    /// When set, wait for this signal after open (claim+MCP activate) before sending the prompt (D-026).
+    pub prompt_ready_rx: Option<oneshot::Receiver<()>>,
+    /// Max bytes retained in the in-exchange unit buffer (D-027); derived from provider output budget.
+    pub max_retained_unit_bytes: usize,
 }
 
 /// Parameters for a continuation exchange (fresh identities, pre-encoded body).
@@ -124,6 +130,8 @@ pub struct EncodedExchangeParams<'a> {
     pub max_encoded_exchange_bytes: usize,
     /// Optional live unit sink (D-011); when set, units are forwarded as produced.
     pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
+    /// Max bytes retained in the in-exchange unit buffer (D-027).
+    pub max_retained_unit_bytes: usize,
 }
 
 /// Run one SendAndFinish exchange end-to-end (no raw bytes enter actor queues).
@@ -157,6 +165,8 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
         params.cleanup_deadline,
         params.unit_tx,
         params.session_id_tx,
+        params.prompt_ready_rx,
+        params.max_retained_unit_bytes,
     )
     .await
 }
@@ -182,6 +192,8 @@ pub async fn run_encoded_exchange(
         params.cleanup_deadline,
         params.unit_tx,
         None,
+        None,
+        params.max_retained_unit_bytes,
     )
     .await
 }
@@ -201,6 +213,8 @@ async fn open_and_run(
     cleanup_deadline: Duration,
     unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
     session_id_tx: Option<oneshot::Sender<monoloop_contracts::ExternalSessionId>>,
+    prompt_ready_rx: Option<oneshot::Receiver<()>>,
+    max_retained_unit_bytes: usize,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
     let connection_id = ConnectionId::generate();
     let interpretation_id = InterpretationId::generate();
@@ -221,8 +235,13 @@ async fn open_and_run(
         Ok(Err(_)) => return Err(ExchangeFailure::ChannelOpenFailed),
         Err(_) => return Err(ExchangeFailure::ChannelOpenFailed),
     };
-    // Open succeeded; hand ownership to run_opened_exchange's ExchangeGuard.
+    // Open succeeded — keep control until ExchangeGuard takes over inside run_opened_exchange.
+    let opened_control = opened.control.clone();
     let _ = open_guard.control.take();
+    // Early opened ownership: terminate if we drop before ExchangeGuard is installed (D-028).
+    let mut early_opened = EarlyOpenedGuard {
+        control: Some(opened_control),
+    };
 
     if let Some(tx) = session_id_tx {
         if let Some(ref ext) = opened.external_session_id {
@@ -230,7 +249,16 @@ async fn open_and_run(
         }
     }
 
-    run_opened_exchange(
+    // D-026: wait for claim (+ MCP activate) before sending the prompt on create.
+    if let Some(rx) = prompt_ready_rx {
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(ExchangeFailure::Cancelled),
+            Err(_) => return Err(ExchangeFailure::ChannelOpenFailed),
+        }
+    }
+
+    let outcome = run_opened_exchange(
         executor,
         exchange_id,
         interpretation_id,
@@ -241,8 +269,13 @@ async fn open_and_run(
         deadline,
         cleanup_deadline,
         unit_tx,
+        max_retained_unit_bytes,
+        &mut early_opened,
     )
-    .await
+    .await;
+    // ExchangeGuard (or failure paths) now own termination.
+    let _ = early_opened.control.take();
+    outcome
 }
 
 /// Terminates pending open control if dropped before open completes (D-028).
@@ -251,6 +284,19 @@ struct PendingOpenGuard {
 }
 
 impl Drop for PendingOpenGuard {
+    fn drop(&mut self) {
+        if let Some(ctrl) = self.control.take() {
+            let _ = ctrl.terminate(monoloop_connector::TerminationReason::CallerForced);
+        }
+    }
+}
+
+/// Terminates an opened connection if dropped before [`ExchangeGuard`] owns it (D-028).
+struct EarlyOpenedGuard {
+    control: Option<monoloop_connector::ConnectionControlHandle>,
+}
+
+impl Drop for EarlyOpenedGuard {
     fn drop(&mut self) {
         if let Some(ctrl) = self.control.take() {
             let _ = ctrl.terminate(monoloop_connector::TerminationReason::CallerForced);
@@ -270,9 +316,20 @@ async fn run_opened_exchange(
     deadline: Duration,
     cleanup_deadline: Duration,
     unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
+    max_retained_unit_bytes: usize,
+    early_opened: &mut EarlyOpenedGuard,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
     let join_grace = cleanup_deadline.max(Duration::from_millis(50));
     let connection_id = opened.connection_id.clone();
+    let encoded_request_bytes = encoded.bytes.len();
+
+    // Install ExchangeGuard before interpreter/pump/send so cancel cannot detach (D-028).
+    let mut guard = ExchangeGuard {
+        control: early_opened.control.take(),
+        joins: Some(JoinSet::new()),
+        units_abort: None,
+    };
+
     let interpretation = interpreter
         .start(StartInterpretation {
             interpretation_id: interpretation_id.clone(),
@@ -286,50 +343,49 @@ async fn run_opened_exchange(
     // Pump raw output → interpretation (owned task on injected executor — D-032).
     let output = Arc::clone(&opened.output);
     let interp_in = interpretation.input.clone();
-    let mut joins = JoinSet::new();
-    joins.spawn_on(
-        async move {
-            loop {
-                match output.receive().await {
-                    Ok(Some(chunk)) => {
-                        if interp_in.push_bytes(chunk).await.is_err() {
+    if let Some(ref mut joins) = guard.joins {
+        joins.spawn_on(
+            async move {
+                loop {
+                    match output.receive().await {
+                        Ok(Some(chunk)) => {
+                            if interp_in.push_bytes(chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = interp_in.finish_clean().await;
+                            break;
+                        }
+                        Err(e) => {
+                            use monoloop_contracts::ConnectorErrorKind;
+                            match e.kind {
+                                ConnectorErrorKind::Cancelled => {
+                                    let _ = interp_in.cancel().await;
+                                }
+                                ConnectorErrorKind::Terminated => {
+                                    let _ = interp_in.cancel().await;
+                                }
+                                _ => {
+                                    let _ = interp_in.transport_failed().await;
+                                }
+                            }
                             break;
                         }
                     }
-                    Ok(None) => {
-                        let _ = interp_in.finish_clean().await;
-                        break;
-                    }
-                    Err(e) => {
-                        use monoloop_contracts::ConnectorErrorKind;
-                        match e.kind {
-                            ConnectorErrorKind::Cancelled => {
-                                let _ = interp_in.cancel().await;
-                            }
-                            ConnectorErrorKind::Terminated => {
-                                let _ = interp_in.cancel().await;
-                            }
-                            _ => {
-                                let _ = interp_in.transport_failed().await;
-                            }
-                        }
-                        break;
-                    }
                 }
-            }
-        },
-        executor,
-    );
+            },
+            executor,
+        );
+    }
 
     // Send encoded request body.
     if !encoded.bytes.is_empty() && opened.input.send(encoded.bytes.clone()).await.is_err() {
-        abort_joins(&mut joins).await;
         return Err(ExchangeFailure::ConnectorFailed);
     }
     match encoded.input_policy {
         ExchangeInputPolicy::SendAndFinish => {
             if opened.input.finish().await.is_err() {
-                abort_joins(&mut joins).await;
                 return Err(ExchangeFailure::ConnectorFailed);
             }
         }
@@ -337,10 +393,9 @@ async fn run_opened_exchange(
     }
 
     // Collect interpretation events; optionally fan out live (D-011).
-    // D-027: retain only bounded continuation state — enforce an in-exchange
-    // retention ceiling so a never-ending provider cannot grow memory unboundedly.
+    // D-027: retain only byte-bounded continuation state.
     let events_handle = interpretation.events;
-    let max_retained_units = 10_000usize;
+    let max_retained = max_retained_unit_bytes.max(256);
     let units = Arc::new(tokio::sync::Mutex::new(Vec::<CanonicalUnitEvent>::new()));
     let retention_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let units_task = {
@@ -348,6 +403,7 @@ async fn run_opened_exchange(
         let retention_exceeded = Arc::clone(&retention_exceeded);
         let unit_tx = unit_tx;
         try_spawn(executor, async move {
+            let mut retained_bytes = 0usize;
             while let Some(ev) = events_handle.recv().await {
                 match ev {
                     monoloop_contracts::InterpreterOutputEvent::Unit(u) => {
@@ -357,11 +413,13 @@ async fn run_opened_exchange(
                                 break;
                             }
                         }
+                        let add = estimate_retained_unit_bytes(&unit);
                         let mut guard = units.lock().await;
-                        if guard.len() >= max_retained_units {
+                        if retained_bytes.saturating_add(add) > max_retained {
                             retention_exceeded.store(true, std::sync::atomic::Ordering::SeqCst);
                             break;
                         }
+                        retained_bytes = retained_bytes.saturating_add(add);
                         guard.push(unit);
                     }
                     monoloop_contracts::InterpreterOutputEvent::Ended(_) => break,
@@ -370,14 +428,7 @@ async fn run_opened_exchange(
         })
         .map_err(|_| ExchangeFailure::ConnectorFailed)?
     };
-
-    // D-012: abort pump + units collector + terminate connector if this future is dropped
-    // (e.g. actor cancel wins select). On normal completion, take handles and join.
-    let mut guard = ExchangeGuard {
-        control: Some(opened.control.clone()),
-        joins: Some(joins),
-        units_abort: Some(units_task.abort_handle()),
-    };
+    guard.units_abort = Some(units_task.abort_handle());
 
     let completion = interpretation.completion;
     let conn_completion = opened.completion;
@@ -441,11 +492,26 @@ async fn run_opened_exchange(
         connection_id,
         interpretation_id,
         external_session_id,
+        encoded_request_bytes,
         units,
         connection_end: conn_end,
         interpretation_end: interp_end,
         failure,
     })
+}
+
+fn estimate_retained_unit_bytes(unit: &CanonicalUnitEvent) -> usize {
+    use monoloop_contracts::CanonicalUnit;
+    match &unit.snapshot().unit {
+        CanonicalUnit::Text(t) => t.content.len().saturating_add(32),
+        CanonicalUnit::Tool(t) => t
+            .request_payload
+            .as_ref()
+            .map(|p| p.len())
+            .unwrap_or(0)
+            .saturating_add(64),
+        _ => 64,
+    }
 }
 
 /// Drop guard: terminate connector and abort child tasks if exchange is cancelled (D-012).

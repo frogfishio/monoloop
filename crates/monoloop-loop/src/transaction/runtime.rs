@@ -7,6 +7,7 @@ use super::callback_service::CallbackService;
 use super::capacity::CapacityManagers;
 use super::channel_registry::{ChannelBinding, LiveChannel};
 use super::error::StartupError;
+use super::executor_spawn::try_spawn;
 use super::finalization::build_transaction_end;
 use super::host_tools::HostToolRegistry;
 use super::mcp::McpGateway;
@@ -22,6 +23,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -236,13 +238,12 @@ impl DefaultTransactionRuntime {
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            return self
-                .inner
-                .shutdown_disposition
-                .lock()
-                .await
-                .clone()
-                .unwrap_or_default();
+            // Prefer published disposition. If the leader has not published by our
+            // deadline, return zeroed counts rather than a stale Default alias (D-029).
+            if let Some(d) = self.inner.shutdown_disposition.lock().await.clone() {
+                return d;
+            }
+            return ShutdownDisposition::default();
         }
 
         let active = {
@@ -289,7 +290,14 @@ impl DefaultTransactionRuntime {
                     );
                     // D-029: no minimum pad after global deadline expiry.
                     let cb_budget = Duration::ZERO;
-                    match run_callback_isolated(payload.callback, end, cb_budget).await {
+                    match run_callback_isolated(
+                        &self.inner.executor,
+                        payload.callback,
+                        end,
+                        cb_budget,
+                    )
+                    .await
+                    {
                         CallbackRun::Ok => supervisor_finalized += 1,
                         CallbackRun::Failed => {
                             supervisor_finalized += 1;
@@ -307,7 +315,8 @@ impl DefaultTransactionRuntime {
                 continue;
             }
 
-            let per = (remaining / n as u32).max(Duration::from_millis(20));
+            // Never pad beyond remaining global budget (D-029 residual).
+            let per = remaining / n as u32;
             let mut join = entry.actor_join;
             match tokio::time::timeout(per, &mut join).await {
                 Ok(Ok(())) => {
@@ -325,7 +334,14 @@ impl DefaultTransactionRuntime {
                         let cb_budget = cb_cfg.min(
                             deadline_at.saturating_duration_since(tokio::time::Instant::now()),
                         );
-                        match run_callback_isolated(payload.callback, end, cb_budget).await {
+                        match run_callback_isolated(
+                            &self.inner.executor,
+                            payload.callback,
+                            end,
+                            cb_budget,
+                        )
+                        .await
+                        {
                             CallbackRun::Ok => supervisor_finalized += 1,
                             CallbackRun::Failed => {
                                 supervisor_finalized += 1;
@@ -354,7 +370,13 @@ impl DefaultTransactionRuntime {
                         let cb_budget = deadline_at
                             .saturating_duration_since(tokio::time::Instant::now())
                             .min(cb_cfg);
-                        let _ = run_callback_isolated(payload.callback, end, cb_budget).await;
+                        let _ = run_callback_isolated(
+                            &self.inner.executor,
+                            payload.callback,
+                            end,
+                            cb_budget,
+                        )
+                        .await;
                         supervisor_finalized += 1;
                     }
                 }
@@ -380,7 +402,14 @@ impl DefaultTransactionRuntime {
                         let cb_budget = cb_cfg.min(
                             deadline_at.saturating_duration_since(tokio::time::Instant::now()),
                         );
-                        match run_callback_isolated(payload.callback, end, cb_budget).await {
+                        match run_callback_isolated(
+                            &self.inner.executor,
+                            payload.callback,
+                            end,
+                            cb_budget,
+                        )
+                        .await
+                        {
                             CallbackRun::Ok => supervisor_finalized += 1,
                             CallbackRun::Failed => {
                                 supervisor_finalized += 1;
@@ -433,8 +462,9 @@ enum CallbackRun {
     Aborted,
 }
 
-/// Invoke + await host callback with panic isolation on a child task (D-021).
+/// Invoke + await host callback with panic isolation on the injected executor (D-021 / D-032).
 async fn run_callback_isolated(
+    executor: &Handle,
     callback: Box<dyn monoloop_contracts::CompletionCallback>,
     end: monoloop_contracts::TransactionEnd,
     deadline: Duration,
@@ -442,14 +472,18 @@ async fn run_callback_isolated(
     let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
     match call {
         Ok(fut) => {
-            let handle = tokio::spawn(fut);
+            let mut handle = match try_spawn(executor, fut) {
+                Ok(h) => h,
+                Err(()) => return CallbackRun::Failed,
+            };
             let abort = handle.abort_handle();
-            match tokio::time::timeout(deadline, handle).await {
+            match tokio::time::timeout(deadline, &mut handle).await {
                 Ok(Ok(Ok(()))) => CallbackRun::Ok,
                 Ok(Ok(Err(_))) => CallbackRun::Failed,
                 Ok(Err(_)) => CallbackRun::Failed, // join error = panic in future
                 Err(_) => {
                     abort.abort();
+                    let _ = handle.await;
                     CallbackRun::Aborted
                 }
             }

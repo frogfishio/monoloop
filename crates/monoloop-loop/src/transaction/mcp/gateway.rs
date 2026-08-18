@@ -256,7 +256,15 @@ async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) 
             .unwrap_or_else(|_| Response::new(Body::empty()));
     };
 
-    // Bound body size before protocol dispatch (D-018).
+    // D-034 residual: acquire concurrency permits before body buffering / service create.
+    let Ok(_global) = global_mcp_permits().try_acquire_owned() else {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(Body::from("mcp global concurrency exceeded"))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    };
+
+    // Bound body size before protocol dispatch (D-018), after global permit.
     let (parts, body) = req.into_parts();
     let collected = match axum::body::to_bytes(body, 1024 * 1024).await {
         Ok(b) => b,
@@ -297,13 +305,6 @@ async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) 
             .clone()
     };
 
-    // D-034: global + per-capability concurrency, plus request duration bound.
-    let Ok(_global) = global_mcp_permits().try_acquire_owned() else {
-        return Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .body(Body::from("mcp global concurrency exceeded"))
-            .unwrap_or_else(|_| Response::new(Body::empty()));
-    };
     let Ok(_local) = service.permits.clone().try_acquire_owned() else {
         return Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)

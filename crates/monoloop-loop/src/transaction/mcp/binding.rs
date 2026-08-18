@@ -158,6 +158,7 @@ impl fmt::Debug for McpBinding {
 }
 
 /// Handle returned when a pending binding is created.
+#[derive(Clone)]
 pub struct PendingMcpBinding {
     /// Capability token (for activation/revoke; never log).
     pub token: CapabilityToken,

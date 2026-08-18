@@ -8,13 +8,14 @@
 use super::executor_spawn::try_spawn;
 use monoloop_contracts::{CompletionCallback, TransactionEnd};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
 
 type CallbackJoin = (AbortHandle, JoinHandle<()>);
+/// Std mutex so schedule can always register joins without async/try_lock drop (D-029).
 type CallbackJoinSet = Arc<Mutex<Vec<CallbackJoin>>>;
 
 /// Bounded, runtime-owned completion callback executor.
@@ -127,7 +128,7 @@ impl CallbackService {
             let call =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
             if let Ok(fut) = call {
-                let handle = match try_spawn(&executor, fut) {
+                let mut handle = match try_spawn(&executor, fut) {
                     Ok(h) => h,
                     Err(()) => {
                         drop(permit);
@@ -136,10 +137,11 @@ impl CallbackService {
                     }
                 };
                 let abort = handle.abort_handle();
-                match tokio::time::timeout(budget, handle).await {
+                match tokio::time::timeout(budget, &mut handle).await {
                     Ok(Ok(_)) | Ok(Err(_)) => {}
                     Err(_) => {
                         abort.abort();
+                        let _ = handle.await;
                     }
                 }
             }
@@ -154,10 +156,11 @@ impl CallbackService {
             }
         };
         let abort = handle.abort_handle();
-        // Best-effort register for shutdown join; ignore contention.
-        if let Ok(mut g) = joins.try_lock() {
-            g.push((abort, handle));
-        };
+        // Always own the join for shutdown (D-029 residual).
+        joins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((abort, handle));
     }
 
     /// Schedule a host callback on an owned task (does not block the caller).
@@ -191,7 +194,7 @@ impl CallbackService {
         }
         let remaining = deadline.saturating_sub(start.elapsed());
         let mut handles = {
-            let mut g = self.joins.lock().await;
+            let mut g = self.joins.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *g)
         };
         for (abort, join) in handles.drain(..) {

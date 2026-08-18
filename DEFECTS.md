@@ -889,15 +889,15 @@ considered delivered while these remain.
 
 | ID | Status | Notes |
 |---|---|---|
-| D-026 | Fixed | Loop claim/activate order + session watch; Grok/Cursor/Codex/Agy `initial_mcp`→`mcpServers` |
-| D-027 | Fixed | cancel-safe byte reserve + retention ceiling + live channel capacity from output budget |
-| D-028 | Fixed | PendingOpenGuard + units join + dispatch cancel notify + structural kill check; capability defaults fail-closed |
-| D-029 | Fixed | admission callback reserve + drain abort + shared shutdown disposition + join-on-timeout |
+| D-026 | Fixed (residual closed) | Create: claim+`SessionEstablished`+MCP activate **before** prompt send (`prompt_ready` gate); ACP encode uses empty tools for `McpGateway` |
+| D-027 | Fixed (residual closed) | `encoded_request_bytes` counted; continuation units counted into provider output; retention is **byte**-bounded |
+| D-028 | Fixed (residual closed) | `EarlyOpenedGuard` before interpreter/send; `StickyCancel`; missing kill aborts started work |
+| D-029 | Fixed (residual closed) | Callback joins always registered (std `Mutex`); shutdown per-actor slice never pads past global remaining |
 | D-030 | Fixed | ExchangeId-scoped ToolActionId; empty allowlist → rejection Completed; CallerControlled after observe |
-| D-031 | Fixed | cumulative continuation transcript + cumulative context byte check |
-| D-032 | Fixed | injected Handle stored and used for runtime-owned spawns |
+| D-031 | Fixed (residual closed) | OpenAI continuation encodes transcript only (no duplicate `results` append) |
+| D-032 | Fixed (residual closed) | Shutdown supervisor callbacks use injected `Handle` via `try_spawn` |
 | D-033 | Fixed | absolute request deadline; enqueue selects deadline; output queue from output budget |
-| D-034 | Fixed | canonicalize token hex + global/per-capability concurrency + request duration bound |
+| D-034 | Fixed (residual closed) | Global MCP permit acquired before body buffer / service create |
 | D-035 | Fixed | estimate covers names, args JSON, tool_call_id; serialize fail closed |
 | D-036 | Fixed | OrderedEventPublisher serialize allocate+enqueue; live waits for claim |
 | D-037 | Fixed | fmt + invalid_json asserts MalformedSemanticPayload; gates re-run |
