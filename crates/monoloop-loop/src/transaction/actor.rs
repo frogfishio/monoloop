@@ -589,7 +589,7 @@ async fn run_actor(spawn: ActorSpawn) {
             (None, None, None)
         };
 
-        let mut outcome = tokio::select! {
+        let exchange_result = tokio::select! {
             biased;
             ctrl = control_rx.recv() => {
                 // Drop exchange future → ExchangeGuard terminates connector + aborts units (D-012).
@@ -625,26 +625,38 @@ async fn run_actor(spawn: ActorSpawn) {
                 session_id_tx,
                 prompt_ready_rx,
                 max_retained_unit_bytes,
+                max_remaining_provider_input_bytes: max_total_provider_input_bytes
+                    .saturating_sub(provider_input_bytes),
             }) => r,
-        }
-        .map_err(map_exchange_failure)?;
+        };
+        let mut outcome = match exchange_result {
+            Ok(o) => o,
+            Err(e) => {
+                // Join claim so typed claim/MCP errors are not lost / remapped (D-026).
+                live_join.abort();
+                let _ = tokio::time::timeout(cleanup_deadline, live_join).await;
+                if let Some(j) = claim_join {
+                    match tokio::time::timeout(cleanup_deadline, j).await {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(kind))) => return Err(kind),
+                        Ok(Err(_)) | Err(_) => return Err(TransactionEndKind::InvariantFailed),
+                    }
+                }
+                return Err(map_exchange_failure(e));
+            }
+        };
         exchanges_done += 1;
-        // D-027: count initial encoded request toward aggregate provider input.
+        // D-027: body already checked against remaining budget before send.
         provider_input_bytes = provider_input_bytes.saturating_add(outcome.encoded_request_bytes);
-        if provider_input_bytes > max_total_provider_input_bytes {
-            return Err(TransactionEndKind::LimitExceeded);
-        }
         if let Some(j) = claim_join {
             j.await.map_err(|_| TransactionEndKind::InvariantFailed)??;
             let Some(ext) = outcome.external_session_id.clone() else {
-                // D-026: successful create without authoritative ID is invariant failure.
                 return Err(TransactionEndKind::InvariantFailed);
             };
             session_key = Some(SessionKey::new(
                 channel_id.clone(),
                 SessionId::from_external(&ext),
             ));
-            // MCP already activated inside claim task before prompt send.
         }
         for u in &outcome.units {
             provider_output_bytes = provider_output_bytes.saturating_add(estimate_unit_bytes(u));
@@ -886,6 +898,8 @@ async fn run_actor(spawn: ActorSpawn) {
                             max_encoded_exchange_bytes,
                             unit_tx: Some(live_tx2),
                             max_retained_unit_bytes,
+                            max_remaining_provider_input_bytes: max_total_provider_input_bytes
+                                .saturating_sub(provider_input_bytes),
                         }) => r,
                     }
                     .map_err(map_exchange_failure)?;
@@ -983,6 +997,7 @@ fn map_exchange_failure(f: ExchangeFailure) -> TransactionEndKind {
         ExchangeFailure::Cancelled => TransactionEndKind::Cancelled,
         ExchangeFailure::Terminated => TransactionEndKind::Terminated,
         ExchangeFailure::LimitExceeded => TransactionEndKind::LimitExceeded,
+        ExchangeFailure::InvariantFailed => TransactionEndKind::InvariantFailed,
     }
 }
 

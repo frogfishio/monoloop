@@ -56,6 +56,8 @@ pub enum ExchangeFailure {
     Terminated,
     /// Exchange retained-output / aggregate limit exceeded (D-027).
     LimitExceeded,
+    /// Create open without authoritative session id, or claim gate failed closed (D-026).
+    InvariantFailed,
 }
 
 /// Parameters for running one exchange.
@@ -98,6 +100,8 @@ pub struct ExchangeParams<'a> {
     pub prompt_ready_rx: Option<oneshot::Receiver<()>>,
     /// Max bytes retained in the in-exchange unit buffer (D-027); derived from provider output budget.
     pub max_retained_unit_bytes: usize,
+    /// Remaining aggregate provider-input budget; checked after encode, before open/send (D-027).
+    pub max_remaining_provider_input_bytes: usize,
 }
 
 /// Parameters for a continuation exchange (fresh identities, pre-encoded body).
@@ -132,6 +136,8 @@ pub struct EncodedExchangeParams<'a> {
     pub unit_tx: Option<mpsc::Sender<CanonicalUnitEvent>>,
     /// Max bytes retained in the in-exchange unit buffer (D-027).
     pub max_retained_unit_bytes: usize,
+    /// Remaining aggregate provider-input budget (D-027).
+    pub max_remaining_provider_input_bytes: usize,
 }
 
 /// Run one SendAndFinish exchange end-to-end (no raw bytes enter actor queues).
@@ -149,6 +155,9 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
         .map_err(|_| ExchangeFailure::EncodingFailed)?;
     if encoded.bytes.len() > params.max_encoded_exchange_bytes {
         return Err(ExchangeFailure::EncodingFailed);
+    }
+    if encoded.bytes.len() > params.max_remaining_provider_input_bytes {
+        return Err(ExchangeFailure::LimitExceeded);
     }
 
     open_and_run(
@@ -177,6 +186,9 @@ pub async fn run_encoded_exchange(
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
     if params.encoded.bytes.len() > params.max_encoded_exchange_bytes {
         return Err(ExchangeFailure::EncodingFailed);
+    }
+    if params.encoded.bytes.len() > params.max_remaining_provider_input_bytes {
+        return Err(ExchangeFailure::LimitExceeded);
     }
     open_and_run(
         params.executor,
@@ -244,16 +256,18 @@ async fn open_and_run(
     };
 
     if let Some(tx) = session_id_tx {
-        if let Some(ref ext) = opened.external_session_id {
-            let _ = tx.send(ext.clone());
-        }
+        let Some(ref ext) = opened.external_session_id else {
+            return Err(ExchangeFailure::InvariantFailed);
+        };
+        let _ = tx.send(ext.clone());
     }
 
     // D-026: wait for claim (+ MCP activate) before sending the prompt on create.
+    // RecvError → claim task exited without ready; actor awaits claim_join for typed kind.
     if let Some(rx) = prompt_ready_rx {
         match tokio::time::timeout(deadline, rx).await {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(ExchangeFailure::Cancelled),
+            Ok(Err(_)) => return Err(ExchangeFailure::InvariantFailed),
             Err(_) => return Err(ExchangeFailure::ChannelOpenFailed),
         }
     }
