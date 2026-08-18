@@ -22,6 +22,11 @@ use tokio::sync::Notify;
 
 fn caps(session: SessionMode, exchange: ExchangeMode) -> ChannelCapabilities {
     let d = DialectDescriptor::test_raw();
+    let option_policy = if session == SessionMode::External {
+        monoloop_contracts::OptionPolicy::external_agent()
+    } else {
+        monoloop_contracts::OptionPolicy::direct_llm()
+    };
     ChannelCapabilities {
         session_mode: session,
         mcp_configuration: McpConfigurationCapability::None,
@@ -31,6 +36,7 @@ fn caps(session: SessionMode, exchange: ExchangeMode) -> ChannelCapabilities {
         supports_distinct_session_concurrency: true,
         input_dialect: d.clone(),
         output_dialect: d,
+        option_policy,
     }
 }
 

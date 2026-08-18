@@ -34,6 +34,7 @@ fn caps() -> ChannelCapabilities {
         supports_distinct_session_concurrency: true,
         input_dialect: d.clone(),
         output_dialect: d,
+        option_policy: monoloop_contracts::OptionPolicy::direct_llm(),
     }
 }
 
@@ -799,6 +800,78 @@ async fn unknown_extension_rejected_at_admission() {
     let err = TransactionRuntime::submit(rt.as_ref(), req).unwrap_err();
     assert_eq!(err.kind, AdmissionErrorKind::InvalidConfiguration);
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-023: DirectLlm and ExternalAgent declare distinct option matrices.
+#[test]
+fn channel_option_policy_matrices_differ() {
+    use monoloop_contracts::ConfigOption;
+    let direct = monoloop_contracts::OptionPolicy::direct_llm();
+    let external = monoloop_contracts::OptionPolicy::external_agent();
+    assert!(direct
+        .supported_invocation
+        .contains(&ConfigOption::Temperature));
+    assert!(!external
+        .supported_invocation
+        .contains(&ConfigOption::Temperature));
+    assert!(external
+        .supported_invocation
+        .contains(&ConfigOption::ContinuationPolicy));
+}
+
+/// D-023: allowed openai.seed extension admits; temperature rejected on external-agent policy.
+#[tokio::test]
+async fn allowed_extension_admits_and_external_rejects_temperature() {
+    use monoloop_contracts::{ExtensionKey, VersionedExtension};
+
+    let mut binding = llm_binding("llm", 4);
+    let key = ExtensionKey::try_new("openai.seed", 64).unwrap();
+    binding.capabilities.option_policy = binding
+        .capabilities
+        .option_policy
+        .with_extension_keys([key.clone()]);
+    let rt = start_with_limits(vec![binding], limits_cap(4, 4)).await;
+    let mut req = free_request(
+        "llm",
+        None,
+        Arc::new(FnEventSink(|_| {
+            Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+        })),
+        counting_completion(Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new())),
+    );
+    req.invocation_config.extensions.insert(
+        key,
+        VersionedExtension {
+            version: 1,
+            value: serde_json::json!(7),
+        },
+    );
+    TransactionRuntime::submit(rt.as_ref(), req).expect("allowed extension admits");
+    for _ in 0..50 {
+        if rt.active_count() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // External-agent option matrix rejects Temperature (policy-only check on a
+    // DirectLlm binding so we do not need a SessionAdapter for this admission gate).
+    let mut strict = llm_binding("strict", 4);
+    strict.capabilities.option_policy = monoloop_contracts::OptionPolicy::external_agent();
+    let rt2 = start_with_limits(vec![strict], limits_cap(4, 4)).await;
+    let mut bad = free_request(
+        "strict",
+        None,
+        Arc::new(FnEventSink(|_| {
+            Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+        })),
+        counting_completion(Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new())),
+    );
+    bad.invocation_config.temperature = Some(0.9);
+    let err = TransactionRuntime::submit(rt2.as_ref(), bad).unwrap_err();
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidConfiguration);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+    TransactionRuntime::shutdown(rt2.as_ref(), Duration::from_secs(1)).await;
 }
 
 /// D-024: Abortable tool cannot register a handler that refuses abort support.

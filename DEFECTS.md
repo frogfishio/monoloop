@@ -301,7 +301,7 @@ closes MCP.
 ## D-011: Canonical events are buffered until exchange completion instead of streamed
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-027 and D-036
+**Status:** Fixed (via D-027/D-036)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/exchange.rs:262-316`
 - `crates/monoloop-loop/src/transaction/actor.rs:328-343`
@@ -335,7 +335,7 @@ for the entire response with no transaction byte/item bound.
 ## D-012: Cancellation drops exchange futures without terminating and joining their children
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-028
+**Status:** Fixed (via D-028)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - `crates/monoloop-loop/src/transaction/exchange.rs`
@@ -376,7 +376,7 @@ concurrent child cancellation/join.
 ## D-013: External session create and reuse do not attach authoritative provider sessions
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-026
+**Status:** Fixed (via D-026)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - profile SessionAdapter / FakeSessionAdapter paths
@@ -416,7 +416,7 @@ claims the provider's authoritative created session ID.
 ## D-014: CreationOnly MCP capabilities are installed through the unsupported refresh path
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-026
+**Status:** Fixed (via D-026)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - `crates/monoloop-loop/src/transaction/admission.rs`
@@ -455,7 +455,7 @@ incompatible.
 ## D-015: Most configured transaction and Channel limits are inert
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-027, D-031, and D-035
+**Status:** Fixed (via D-027/D-031/D-035)
 **Affected:**
 - `crates/monoloop-contracts/src/limits.rs`
 - `crates/monoloop-loop/src/transaction/admission.rs`
@@ -507,7 +507,7 @@ runtime configuration. Event queues are item-bounded only.
 ## D-016: OpenAI tool calls can execute before the provider finishes declaring them
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-030
+**Status:** Fixed (via D-030)
 **Affected:**
 - `crates/monoloop-interpreter/src/openai_chat.rs:224-324`
 - `crates/monoloop-loop/src/transaction/actor.rs:544-570`
@@ -571,7 +571,7 @@ identities.
 ## D-018: The MCP HTTP endpoint recreates protocol session state for every request
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-034
+**Status:** Fixed (via D-034)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/mcp/gateway.rs`
 - `crates/monoloop-loop/tests/mcp_gateway.rs`
@@ -611,7 +611,7 @@ per-route concurrency limit, or global in-flight request bound.
 ## D-019: HTTP failure and backpressure paths bypass resource and cancellation bounds
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-033
+**Status:** Fixed (via D-033)
 **Affected:**
 - `crates/monoloop-connector/src/http.rs:469-478`
 - `crates/monoloop-connector/src/http.rs:481-574`
@@ -649,7 +649,7 @@ the advertised overall request timeout can be consumed twice.
 ## D-020: Shutdown does not obey its global deadline or join aborted actors
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-029
+**Status:** Fixed (via D-029)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/runtime.rs:201-320`
 
@@ -684,7 +684,7 @@ state and independently drain/stop services.
 ## D-021: Event-sink and completion-callback panics escape their runtime boundaries
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-029
+**Status:** Fixed (via D-029)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/events.rs`
 - `crates/monoloop-loop/src/transaction/actor.rs`
@@ -723,7 +723,7 @@ bounded callback executor/reservation.
 ## D-022: Rejected direct-model tool calls produce no canonical result
 
 **Priority:** P1
-**Status:** Reopened (2026-08-18 re-review) — see D-030
+**Status:** Fixed (via D-030)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/dispatcher.rs:118-181`
 - `crates/monoloop-loop/src/transaction/actor.rs:373-417`
@@ -759,8 +759,7 @@ tool outcomes rather than transaction failures.
 ## D-023: Admission accepts a liberal configuration policy and encoders drop extensions
 
 **Priority:** P2
-**Status:** Reopened (2026-08-18 re-review) — Channel-specific option policy
-and accepted-extension encoding remain absent
+**Status:** Fixed (2026-08-18) — ChannelCapabilities.option_policy + encoder round-trip
 **Affected:**
 - `crates/monoloop-contracts/src/config.rs`
 - `crates/monoloop-loop/src/transaction/admission.rs`
@@ -787,13 +786,13 @@ rejected.
       (`empty_extension_allowlist_denies`,
       `unknown_extension_rejected_at_admission`).
 - [x] Channel defaults seed `allowed_extension_keys` at admission.
-- [ ] Residual: per-Channel distinct option matrices + encoder round-trip for
-      every accepted extension key (profiles currently declare empty extensions).
+- [x] Per-Channel distinct option matrices (`direct_llm` vs `external_agent`)
+      and OpenAI/ACP encoder round-trip / fail-closed for extensions.
 
 ## D-024: Declared tool cancellation policy is not enforced by handler registration or cleanup
 
 **Priority:** P2
-**Status:** Reopened (2026-08-18 re-review) — see D-028
+**Status:** Fixed (via D-028)
 **Affected:**
 - `crates/monoloop-loop/src/transaction/host_tools.rs`
 - `crates/monoloop-loop/src/transaction/dispatcher.rs`
@@ -828,7 +827,7 @@ effects after transaction terminalization.
 ## D-025: WP-12 does not meet its own acceptance and formatting gates
 
 **Priority:** P2
-**Status:** Reopened (2026-08-18 re-review) — mandatory formatting and test
+**Status:** Fixed (via D-037) — mandatory formatting and test
 gates fail; see D-037
 **Affected:**
 - `doc/WP12_REQUIREMENTS_ACCEPTANCE.md`
@@ -882,7 +881,7 @@ considered delivered while these remain.
 | D-020 | Fixed (via D-029) | shared shutdown disposition + abort-then-join under remaining budget |
 | D-021 | Fixed (via D-029) | callback reservation at admission + drain abort/join |
 | D-022 | Fixed (via D-030) | empty allowlist rejects; rejection Completed published |
-| D-023 | Reopened | Channel policy and extension encoding remain undelivered |
+| D-023 | Fixed | ChannelCapabilities.option_policy; openai.*/acp.meta.* encode or fail closed |
 | D-024 | Fixed (via D-028) | actor cancel notifies dispatch; worker terminate+join; fail-closed capability defaults |
 | D-025 | Fixed (via D-037) | fmt + invalid_json test + gates |
 

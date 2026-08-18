@@ -222,6 +222,7 @@ pub fn grok_channel_binding(
             supports_distinct_session_concurrency: true,
             input_dialect: d.clone(),
             output_dialect: d,
+            option_policy: monoloop_contracts::OptionPolicy::external_agent(),
         },
         limits: ChannelLimits {
             max_active_transactions: 32,
@@ -258,6 +259,7 @@ mod tests {
                 supports_distinct_session_concurrency: true,
                 input_dialect: d.clone(),
                 output_dialect: d,
+                option_policy: monoloop_contracts::OptionPolicy::external_agent(),
             },
             limits: ChannelLimits::default(),
         };

@@ -153,7 +153,7 @@ pub struct ChannelDefaults {
 }
 
 /// Which options a Channel accepts and which are immutable once a session exists.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OptionPolicy {
     /// Options callers may set on invocation.
     pub supported_invocation: BTreeSet<ConfigOption>,
@@ -164,8 +164,44 @@ pub struct OptionPolicy {
     pub allowed_extension_keys: BTreeSet<ExtensionKey>,
 }
 
+impl OptionPolicy {
+    /// Direct-LLM Channel: typed invocation options open; no extensions by default.
+    pub fn direct_llm() -> Self {
+        let mut p = Self::default();
+        p.supported_invocation.extend([
+            ConfigOption::Model,
+            ConfigOption::Temperature,
+            ConfigOption::ReasoningEffort,
+            ConfigOption::MaxOutputTokens,
+            ConfigOption::Stop,
+            ConfigOption::ResponseFormat,
+            ConfigOption::ContinuationPolicy,
+            ConfigOption::Deadline,
+            ConfigOption::Extensions,
+        ]);
+        p
+    }
+
+    /// External-agent Channel: session/continuation focused; no model temperature by default.
+    pub fn external_agent() -> Self {
+        let mut p = Self::default();
+        p.supported_invocation.extend([
+            ConfigOption::ContinuationPolicy,
+            ConfigOption::Deadline,
+            ConfigOption::Extensions,
+        ]);
+        p
+    }
+
+    /// Permit exact extension keys (still requires [`ConfigOption::Extensions`] supported).
+    pub fn with_extension_keys(mut self, keys: impl IntoIterator<Item = ExtensionKey>) -> Self {
+        self.allowed_extension_keys.extend(keys);
+        self
+    }
+}
+
 /// Named configuration option for policy checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ConfigOption {
     /// Model id.
     Model,

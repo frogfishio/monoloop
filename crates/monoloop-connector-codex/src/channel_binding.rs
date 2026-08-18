@@ -182,6 +182,7 @@ pub fn codex_channel_binding(
             supports_distinct_session_concurrency: true,
             input_dialect: d.clone(),
             output_dialect: d,
+            option_policy: monoloop_contracts::OptionPolicy::external_agent(),
         },
         limits: ChannelLimits::default(),
     }

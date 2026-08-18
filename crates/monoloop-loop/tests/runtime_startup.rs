@@ -21,6 +21,11 @@ use std::time::Duration;
 
 fn test_caps(session: SessionMode, exchange: ExchangeMode) -> ChannelCapabilities {
     let d = DialectDescriptor::test_raw();
+    let option_policy = if session == SessionMode::External {
+        monoloop_contracts::OptionPolicy::external_agent()
+    } else {
+        monoloop_contracts::OptionPolicy::direct_llm()
+    };
     ChannelCapabilities {
         session_mode: session,
         mcp_configuration: McpConfigurationCapability::None,
@@ -30,6 +35,7 @@ fn test_caps(session: SessionMode, exchange: ExchangeMode) -> ChannelCapabilitie
         supports_distinct_session_concurrency: true,
         input_dialect: d.clone(),
         output_dialect: d,
+        option_policy,
     }
 }
 

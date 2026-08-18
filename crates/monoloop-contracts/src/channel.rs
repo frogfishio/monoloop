@@ -1,6 +1,6 @@
 //! Channel capability data contracts (no live factory arcs).
 
-use crate::config::ContinuationPolicy;
+use crate::config::{ContinuationPolicy, OptionPolicy};
 use crate::dialect::DialectDescriptor;
 use crate::limits::ChannelLimits;
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,8 @@ pub struct ChannelCapabilities {
     pub input_dialect: DialectDescriptor,
     /// Output dialect declaration.
     pub output_dialect: DialectDescriptor,
+    /// Immutable option/extension policy for this Channel (D-023).
+    pub option_policy: OptionPolicy,
 }
 
 /// Data-only Channel descriptor used before live binding construction.
@@ -229,6 +231,7 @@ mod tests {
             supports_distinct_session_concurrency: true,
             input_dialect: d.clone(),
             output_dialect: d,
+            option_policy: crate::config::OptionPolicy::direct_llm(),
         }
     }
 

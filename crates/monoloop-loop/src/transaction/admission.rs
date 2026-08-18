@@ -16,8 +16,8 @@ use super::mcp::McpGatewayHandle;
 use super::resolved_tools::ResolvedToolSet;
 use monoloop_contracts::{
     merge_effective_config, AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId,
-    ChannelKind, ConfigOption, ExtensionLimits, McpConfigurationCapability, OptionPolicy,
-    SessionId, SessionKey, ToolExecutionMode, TransactionId, TransactionLimits, TransactionRequest,
+    ChannelKind, ExtensionLimits, McpConfigurationCapability, OptionPolicy, SessionId, SessionKey,
+    ToolExecutionMode, TransactionId, TransactionLimits, TransactionRequest,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -143,7 +143,8 @@ pub fn admit(
         ));
     }
 
-    let policy = channel_option_policy(&live.binding.defaults);
+    // D-023: Channel-declared option policy is authoritative (not a liberal hard-code).
+    let policy = channel_option_policy(&live.binding);
     let effective = merge_effective_config(
         &live.binding.defaults,
         request.session_config.as_ref(),
@@ -454,21 +455,11 @@ fn allocate_session(
     }
 }
 
-fn channel_option_policy(defaults: &monoloop_contracts::ChannelDefaults) -> OptionPolicy {
-    let mut p = OptionPolicy::default();
-    p.supported_invocation.extend([
-        ConfigOption::Model,
-        ConfigOption::Temperature,
-        ConfigOption::ReasoningEffort,
-        ConfigOption::MaxOutputTokens,
-        ConfigOption::Stop,
-        ConfigOption::ResponseFormat,
-        ConfigOption::ContinuationPolicy,
-        ConfigOption::Deadline,
-        ConfigOption::Extensions,
-    ]);
-    // D-023: only Channel-declared default extension keys are allowed (if any).
-    p.allowed_extension_keys = defaults.extensions.keys().cloned().collect();
+fn channel_option_policy(binding: &super::channel_registry::ChannelBinding) -> OptionPolicy {
+    let mut p = binding.capabilities.option_policy.clone();
+    // Default extension keys declared on the Channel are always permitted.
+    p.allowed_extension_keys
+        .extend(binding.defaults.extensions.keys().cloned());
     p
 }
 

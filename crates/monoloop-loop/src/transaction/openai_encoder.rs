@@ -100,6 +100,9 @@ impl OpenAiChatCompletionsEncoder {
             body.insert("reasoning_effort".into(), Value::String(label.into()));
         }
 
+        // D-023: encode admitted openai.* extensions; never silently drop.
+        encode_openai_extensions(&mut body, &config.extensions)?;
+
         if !tools.is_empty() {
             let tool_defs: Vec<Value> = tools
                 .iter()
@@ -152,6 +155,34 @@ impl OutboundDialectEncoder for OpenAiChatCompletionsEncoder {
         }
         self.encode_body(Value::Array(msgs), request.tools, request.config)
     }
+}
+
+/// Map admitted `openai.*` extensions into Chat Completions body fields (D-023).
+///
+/// Any extension that cannot be represented fails closed — never silently dropped.
+fn encode_openai_extensions(
+    body: &mut Map<String, Value>,
+    extensions: &std::collections::BTreeMap<
+        monoloop_contracts::ExtensionKey,
+        monoloop_contracts::VersionedExtension,
+    >,
+) -> Result<(), EncodingError> {
+    for (key, ext) in extensions {
+        let Some(field) = key.as_str().strip_prefix("openai.") else {
+            return Err(EncodingError::Unsupported("non-openai extension"));
+        };
+        match field {
+            "seed" | "user" | "top_p" | "n" | "frequency_penalty" | "presence_penalty"
+            | "logit_bias" | "logprobs" | "top_logprobs" | "metadata" => {
+                if body.contains_key(field) {
+                    return Err(EncodingError::Unsupported("extension overrides body field"));
+                }
+                body.insert(field.to_string(), ext.value.clone());
+            }
+            _ => return Err(EncodingError::Unsupported("openai extension field")),
+        }
+    }
+    Ok(())
 }
 
 fn encode_messages(messages: &[CanonicalMessage]) -> Result<Value, EncodingError> {
@@ -427,5 +458,89 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EncodingError::InvalidConfiguration));
         let _ = CanonicalInput::try_new(vec![], &Default::default());
+    }
+
+    #[test]
+    fn openai_seed_extension_round_trip() {
+        use monoloop_contracts::{ExtensionKey, VersionedExtension};
+        let enc = OpenAiChatCompletionsEncoder::default();
+        let input = user_text_input("Hi").unwrap();
+        let tid = TransactionId::generate();
+        let eid = ExchangeId::generate();
+        let mut cfg = effective("gpt-test");
+        let key = ExtensionKey::try_new("openai.seed", 64).unwrap();
+        cfg.extensions.insert(
+            key,
+            VersionedExtension {
+                version: 1,
+                value: serde_json::json!(42),
+            },
+        );
+        let encoded = enc
+            .encode_initial(InitialEncodeRequest {
+                transaction_id: &tid,
+                exchange_id: &eid,
+                input: &input,
+                config: &cfg,
+                tools: &[],
+            })
+            .unwrap();
+        let v: Value = serde_json::from_slice(&encoded.bytes).unwrap();
+        assert_eq!(v["seed"], 42);
+    }
+
+    #[test]
+    fn unknown_openai_extension_fails_encode() {
+        use monoloop_contracts::{ExtensionKey, VersionedExtension};
+        let enc = OpenAiChatCompletionsEncoder::default();
+        let input = user_text_input("Hi").unwrap();
+        let tid = TransactionId::generate();
+        let eid = ExchangeId::generate();
+        let mut cfg = effective("gpt-test");
+        let key = ExtensionKey::try_new("openai.not_a_real_field", 64).unwrap();
+        cfg.extensions.insert(
+            key,
+            VersionedExtension {
+                version: 1,
+                value: serde_json::json!(1),
+            },
+        );
+        let err = enc
+            .encode_initial(InitialEncodeRequest {
+                transaction_id: &tid,
+                exchange_id: &eid,
+                input: &input,
+                config: &cfg,
+                tools: &[],
+            })
+            .unwrap_err();
+        assert!(matches!(err, EncodingError::Unsupported(_)));
+    }
+
+    #[test]
+    fn non_openai_extension_fails_encode() {
+        use monoloop_contracts::{ExtensionKey, VersionedExtension};
+        let enc = OpenAiChatCompletionsEncoder::default();
+        let input = user_text_input("Hi").unwrap();
+        let tid = TransactionId::generate();
+        let eid = ExchangeId::generate();
+        let mut cfg = effective("gpt-test");
+        let key = ExtensionKey::try_new("other.vendor", 64).unwrap();
+        cfg.extensions.insert(
+            key,
+            VersionedExtension {
+                version: 1,
+                value: serde_json::json!(true),
+            },
+        );
+        assert!(enc
+            .encode_initial(InitialEncodeRequest {
+                transaction_id: &tid,
+                exchange_id: &eid,
+                input: &input,
+                config: &cfg,
+                tools: &[],
+            })
+            .is_err());
     }
 }

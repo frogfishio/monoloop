@@ -199,6 +199,8 @@ async fn mcp_dispatch_rest(
 struct CapabilityHttpService {
     service: StreamableHttpService<TransactionMcpHandler, LocalSessionManager>,
     cancel: CancellationToken,
+    /// Per-capability concurrent request bound (D-034).
+    permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// Process-wide map: capability token hex → durable MCP session manager (D-018).
@@ -206,23 +208,48 @@ static CAPABILITY_SERVICES: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Arc<CapabilityHttpService>>>,
 > = std::sync::OnceLock::new();
 
+/// Global MCP request concurrency across all capability tokens (D-034).
+static GLOBAL_MCP_PERMITS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+const MAX_GLOBAL_MCP_REQUESTS: usize = 64;
+const MAX_PER_CAPABILITY_MCP_REQUESTS: usize = 8;
+const MCP_REQUEST_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn capability_services(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<CapabilityHttpService>>> {
     CAPABILITY_SERVICES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+fn global_mcp_permits() -> Arc<tokio::sync::Semaphore> {
+    GLOBAL_MCP_PERMITS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_MCP_REQUESTS)))
+        .clone()
+}
+
 /// Drop and cancel the per-token Streamable HTTP service (D-018 session cleanup).
 fn drop_capability_service(token_hex: &str) {
+    let key = CapabilityToken::from_hex(token_hex)
+        .map(|t| t.to_hex())
+        .unwrap_or_else(|| token_hex.to_ascii_lowercase());
     if let Ok(mut map) = capability_services().lock() {
-        if let Some(svc) = map.remove(token_hex) {
+        if let Some(svc) = map.remove(&key) {
             svc.cancel.cancel();
         }
     }
 }
 
 async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) -> Response<Body> {
-    let Some(binding) = routes.get_by_hex(token_hex) else {
-        drop_capability_service(token_hex);
+    // D-034: canonicalize hex spelling before route/service-map access so
+    // uppercase/lowercase equivalents share one service and revoke key.
+    let Some(canonical) = CapabilityToken::from_hex(token_hex).map(|t| t.to_hex()) else {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("unknown capability"))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    };
+    let Some(binding) = routes.get_by_hex(&canonical) else {
+        drop_capability_service(&canonical);
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("unknown capability"))
@@ -246,7 +273,7 @@ async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) 
         let mut map = capability_services()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        map.entry(token_hex.to_string())
+        map.entry(canonical.clone())
             .or_insert_with(|| {
                 let handler = binding.handler.clone();
                 let cancel = CancellationToken::new();
@@ -264,14 +291,34 @@ async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) 
                         config,
                     ),
                     cancel,
+                    permits: Arc::new(tokio::sync::Semaphore::new(MAX_PER_CAPABILITY_MCP_REQUESTS)),
                 })
             })
             .clone()
     };
 
-    let req = rewrite_path(req, token_hex);
-    let response = service.service.handle(req).await;
-    response.map(Body::new)
+    // D-034: global + per-capability concurrency, plus request duration bound.
+    let Ok(_global) = global_mcp_permits().try_acquire_owned() else {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(Body::from("mcp global concurrency exceeded"))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    };
+    let Ok(_local) = service.permits.clone().try_acquire_owned() else {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .body(Body::from("mcp capability concurrency exceeded"))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    };
+
+    let req = rewrite_path(req, &canonical);
+    match tokio::time::timeout(MCP_REQUEST_DURATION, service.service.handle(req)).await {
+        Ok(response) => response.map(Body::new),
+        Err(_) => Response::builder()
+            .status(StatusCode::GATEWAY_TIMEOUT)
+            .body(Body::from("mcp request deadline exceeded"))
+            .unwrap_or_else(|_| Response::new(Body::empty())),
+    }
 }
 
 fn rewrite_path(req: Request, token_hex: &str) -> Request {

@@ -5,10 +5,11 @@
 
 use monoloop_contracts::{
     Bytes, CanonicalMessage, DialectDescriptor, EncodedExchange, EncodingError,
-    ExchangeInputPolicy, InitialEncodeRequest, OutboundDialectEncoder,
-    ToolContinuationEncodeRequest,
+    ExchangeInputPolicy, ExtensionKey, InitialEncodeRequest, OutboundDialectEncoder,
+    ToolContinuationEncodeRequest, VersionedExtension,
 };
-use serde_json::json;
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 
 /// How ACP prompt bytes are shaped for the Connector input path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -130,22 +131,44 @@ impl OutboundDialectEncoder for AcpPromptEncoder {
                 "non-empty tools require MCP gateway for external-agent ACP profiles",
             ));
         }
+        // D-023: admitted extensions must be encoded or rejected — never dropped.
+        let meta = encode_acp_extension_meta(&request.config.extensions)?;
         let bytes = match self.shape {
-            AcpPromptWireShape::PlainText => Bytes::from(text.into_bytes()),
+            AcpPromptWireShape::PlainText => {
+                if meta.is_some() {
+                    return Err(EncodingError::Unsupported(
+                        "plain-text ACP shape cannot encode extensions",
+                    ));
+                }
+                Bytes::from(text.into_bytes())
+            }
             AcpPromptWireShape::ParamsObject => {
-                let v = json!({
+                let mut params = json!({
                     "prompt": [{ "type": "text", "text": text }]
                 });
+                if let Some(m) = meta {
+                    params
+                        .as_object_mut()
+                        .ok_or(EncodingError::UnrepresentableInput)?
+                        .insert("_meta".into(), m);
+                }
                 Bytes::from(
-                    serde_json::to_vec(&v).map_err(|_| EncodingError::UnrepresentableInput)?,
+                    serde_json::to_vec(&params).map_err(|_| EncodingError::UnrepresentableInput)?,
                 )
             }
             AcpPromptWireShape::MethodEnvelope => {
+                let mut params = json!({
+                    "prompt": [{ "type": "text", "text": text }]
+                });
+                if let Some(m) = meta {
+                    params
+                        .as_object_mut()
+                        .ok_or(EncodingError::UnrepresentableInput)?
+                        .insert("_meta".into(), m);
+                }
                 let v = json!({
                     "method": "session/prompt",
-                    "params": {
-                        "prompt": [{ "type": "text", "text": text }]
-                    }
+                    "params": params
                 });
                 Bytes::from(
                     serde_json::to_vec(&v).map_err(|_| EncodingError::UnrepresentableInput)?,
@@ -171,6 +194,30 @@ impl OutboundDialectEncoder for AcpPromptEncoder {
             "ACP external agents do not encode model tool continuations",
         ))
     }
+}
+
+/// Encode admitted ACP / x.ai extensions into `_meta` (D-023).
+///
+/// Returns `None` when empty. Unknown namespaces fail closed.
+fn encode_acp_extension_meta(
+    extensions: &BTreeMap<ExtensionKey, VersionedExtension>,
+) -> Result<Option<Value>, EncodingError> {
+    if extensions.is_empty() {
+        return Ok(None);
+    }
+    let mut meta = Map::new();
+    for (key, ext) in extensions {
+        let field = key
+            .as_str()
+            .strip_prefix("acp.meta.")
+            .or_else(|| key.as_str().strip_prefix("x.ai."))
+            .ok_or(EncodingError::Unsupported("non-acp extension"))?;
+        if meta.contains_key(field) {
+            return Err(EncodingError::Unsupported("duplicate extension meta key"));
+        }
+        meta.insert(field.to_string(), ext.value.clone());
+    }
+    Ok(Some(Value::Object(meta)))
 }
 
 /// Headless CLI encoder: plain text prompt body for Z.ai / Claude print mode.
@@ -211,6 +258,12 @@ impl OutboundDialectEncoder for HeadlessPromptEncoder {
         if !request.tools.is_empty() {
             return Err(EncodingError::Unsupported(
                 "headless CLI profiles reject Monoloop-linked tools (MCP None)",
+            ));
+        }
+        // D-023: plain argv/text body cannot carry extensions — fail closed.
+        if !request.config.extensions.is_empty() {
+            return Err(EncodingError::Unsupported(
+                "headless CLI encoder cannot encode extensions",
             ));
         }
         let text = AcpPromptEncoder::collect_user_text(request.input.messages())?;
