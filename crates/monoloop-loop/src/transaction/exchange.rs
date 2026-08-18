@@ -413,7 +413,8 @@ async fn run_opened_exchange(
     // Collect interpretation events; optionally fan out live (D-011).
     // D-027: retain only byte-bounded continuation state; enforce limits before live publish.
     let events_handle = interpretation.events;
-    let max_retained = max_retained_unit_bytes.max(256);
+    // Caller passes the *remaining* aggregate output budget; do not raise it.
+    let max_retained = max_retained_unit_bytes;
     let units = Arc::new(tokio::sync::Mutex::new(Vec::<CanonicalUnitEvent>::new()));
     let (limit_tx, limit_rx) = oneshot::channel::<()>();
     let units_task = {

@@ -198,11 +198,11 @@ impl CallbackService {
             std::mem::take(&mut *g)
         };
         for (abort, join) in handles.drain(..) {
+            abort.abort();
             if remaining.is_zero() {
-                abort.abort();
-                let _ = join.await;
+                // Shutdown budget exhausted — do not await a non-yielding callback.
+                drop(join);
             } else {
-                abort.abort();
                 let _ = tokio::time::timeout(remaining, join).await;
             }
         }

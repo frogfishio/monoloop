@@ -277,158 +277,90 @@ impl DefaultTransactionRuntime {
 
         for (entry, abort) in handles {
             let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                // Global deadline exhausted: abort and do not await unboundedly.
-                // Host code that never yields can otherwise keep shutdown past
-                // the supplied deadline (D-029 residual).
-                abort.abort();
-                drop(entry.actor_join);
-                if let Some(payload) = entry.guard.try_claim() {
-                    entry.guard.mark_callback_scheduled();
-                    let end = build_transaction_end(
-                        &payload,
-                        TransactionEndKind::RuntimeShutdown,
-                        None,
-                        EventDeliveryOutcome::Failed,
-                        entry.guard.sequencer().last_allocated(),
-                    );
-                    // D-029: no minimum pad after global deadline expiry.
-                    let cb_budget = Duration::ZERO;
-                    match run_callback_isolated(
-                        &self.inner.executor,
-                        payload.callback,
-                        end,
-                        cb_budget,
-                    )
-                    .await
-                    {
-                        CallbackRun::Ok => supervisor_finalized += 1,
-                        CallbackRun::Failed => {
-                            supervisor_finalized += 1;
-                            callback_failed += 1;
-                        }
-                        CallbackRun::Aborted => {
-                            supervisor_finalized += 1;
-                            callback_aborted += 1;
-                        }
-                    }
-                } else {
-                    supervisor_finalized += 1;
-                }
-                (entry.release_capacity)();
-                continue;
-            }
-
-            // Never pad beyond remaining global budget (D-029 residual).
-            let per = remaining / n as u32;
             let mut join = entry.actor_join;
-            match tokio::time::timeout(per, &mut join).await {
-                Ok(Ok(())) => {
-                    if entry.guard.callback_was_scheduled() {
-                        normally_finalized += 1;
-                    } else if let Some(payload) = entry.guard.try_claim() {
-                        entry.guard.mark_callback_scheduled();
-                        let end = build_transaction_end(
-                            &payload,
-                            TransactionEndKind::RuntimeShutdown,
-                            None,
-                            EventDeliveryOutcome::Failed,
-                            entry.guard.sequencer().last_allocated(),
-                        );
-                        let cb_budget = cb_cfg.min(
-                            deadline_at.saturating_duration_since(tokio::time::Instant::now()),
-                        );
-                        match run_callback_isolated(
-                            &self.inner.executor,
-                            payload.callback,
-                            end,
-                            cb_budget,
-                        )
-                        .await
-                        {
-                            CallbackRun::Ok => supervisor_finalized += 1,
-                            CallbackRun::Failed => {
-                                supervisor_finalized += 1;
-                                callback_failed += 1;
-                            }
-                            CallbackRun::Aborted => {
-                                supervisor_finalized += 1;
-                                callback_aborted += 1;
+            let actor_abort = entry.actor_abort.clone();
+            let delivery_abort = entry.delivery_abort.clone();
+
+            // Result of joining the reaper within the global budget.
+            // `None` means still pending after abort — do not finalize (D-029).
+            const ABORT_SETTLE: Duration = Duration::from_millis(50);
+            // Abort actor+delivery so the reaper can observe child completion.
+            // Reaper abort alone would drop those JoinHandles without stopping work.
+            let stop_children = || {
+                actor_abort.abort();
+                delivery_abort.abort();
+            };
+            let join_result: Option<Result<(), tokio::task::JoinError>> = if remaining.is_zero() {
+                stop_children();
+                match tokio::time::timeout(ABORT_SETTLE, &mut join).await {
+                    Ok(r) => Some(r),
+                    Err(_) => {
+                        abort.abort();
+                        tokio::time::timeout(ABORT_SETTLE, &mut join).await.ok()
+                    }
+                }
+            } else {
+                let per = remaining / n as u32;
+                match tokio::time::timeout(per, &mut join).await {
+                    Ok(r) => Some(r),
+                    Err(_) => {
+                        stop_children();
+                        let join_budget =
+                            deadline_at.saturating_duration_since(tokio::time::Instant::now());
+                        let settle = if join_budget.is_zero() {
+                            ABORT_SETTLE
+                        } else {
+                            join_budget.max(ABORT_SETTLE)
+                        };
+                        match tokio::time::timeout(settle, &mut join).await {
+                            Ok(r) => Some(r),
+                            Err(_) => {
+                                abort.abort();
+                                tokio::time::timeout(ABORT_SETTLE, &mut join).await.ok()
                             }
                         }
-                    } else {
-                        normally_finalized += 1;
                     }
                 }
-                Ok(Err(_)) => {
-                    invariant_failed += 1;
-                    if let Some(payload) = entry.guard.try_claim() {
-                        entry.guard.mark_callback_scheduled();
-                        let end = build_transaction_end(
-                            &payload,
-                            TransactionEndKind::RuntimeShutdown,
-                            None,
-                            EventDeliveryOutcome::Failed,
-                            0,
-                        );
-                        let cb_budget = deadline_at
-                            .saturating_duration_since(tokio::time::Instant::now())
-                            .min(cb_cfg);
-                        let _ = run_callback_isolated(
-                            &self.inner.executor,
-                            payload.callback,
-                            end,
-                            cb_budget,
-                        )
-                        .await;
+            };
+
+            let Some(join_result) = join_result else {
+                // Still running after abort+budget — do not claim terminal or release.
+                std::mem::forget(join);
+                invariant_failed += 1;
+                continue;
+            };
+
+            // Join observed (Ok or abort-cancelled). Finalize if the actor did not.
+            if entry.guard.callback_was_scheduled() {
+                normally_finalized += 1;
+            } else if let Some(payload) = entry.guard.try_claim() {
+                entry.guard.mark_callback_scheduled();
+                let end = build_transaction_end(
+                    &payload,
+                    TransactionEndKind::RuntimeShutdown,
+                    None,
+                    EventDeliveryOutcome::Failed,
+                    entry.guard.sequencer().last_allocated(),
+                );
+                let cb_budget =
+                    cb_cfg.min(deadline_at.saturating_duration_since(tokio::time::Instant::now()));
+                match run_callback_isolated(&self.inner.executor, payload.callback, end, cb_budget)
+                    .await
+                {
+                    CallbackRun::Ok => supervisor_finalized += 1,
+                    CallbackRun::Failed => {
                         supervisor_finalized += 1;
+                        callback_failed += 1;
                     }
-                }
-                Err(_) => {
-                    // D-029: abort then join only within remaining global budget.
-                    abort.abort();
-                    let join_budget =
-                        deadline_at.saturating_duration_since(tokio::time::Instant::now());
-                    if join_budget.is_zero() {
-                        // Deadline exhausted — do not await non-yielding host code.
-                        drop(join);
-                    } else {
-                        let _ = tokio::time::timeout(join_budget, join).await;
-                    }
-                    if let Some(payload) = entry.guard.try_claim() {
-                        entry.guard.mark_callback_scheduled();
-                        let end = build_transaction_end(
-                            &payload,
-                            TransactionEndKind::RuntimeShutdown,
-                            None,
-                            EventDeliveryOutcome::Failed,
-                            entry.guard.sequencer().last_allocated(),
-                        );
-                        let cb_budget = cb_cfg.min(
-                            deadline_at.saturating_duration_since(tokio::time::Instant::now()),
-                        );
-                        match run_callback_isolated(
-                            &self.inner.executor,
-                            payload.callback,
-                            end,
-                            cb_budget,
-                        )
-                        .await
-                        {
-                            CallbackRun::Ok => supervisor_finalized += 1,
-                            CallbackRun::Failed => {
-                                supervisor_finalized += 1;
-                                callback_failed += 1;
-                            }
-                            CallbackRun::Aborted => {
-                                supervisor_finalized += 1;
-                                callback_aborted += 1;
-                            }
-                        }
-                    } else {
+                    CallbackRun::Aborted => {
                         supervisor_finalized += 1;
+                        callback_aborted += 1;
                     }
                 }
+            } else if join_result.is_err() {
+                invariant_failed += 1;
+            } else {
+                normally_finalized += 1;
             }
             (entry.release_capacity)();
         }
@@ -487,8 +419,9 @@ async fn run_callback_isolated(
                 Ok(Ok(Err(_))) => CallbackRun::Failed,
                 Ok(Err(_)) => CallbackRun::Failed, // join error = panic in future
                 Err(_) => {
+                    // Deadline already consumed — abort and do not await unboundedly.
                     abort.abort();
-                    let _ = handle.await;
+                    drop(handle);
                     CallbackRun::Aborted
                 }
             }

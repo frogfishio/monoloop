@@ -479,7 +479,6 @@ async fn run_actor(spawn: ActorSpawn) {
         // D-031: cumulative continuation transcript (original input + each
         // assistant tool-call group and ordered results, appended once).
         let mut continuation_messages = input.messages().to_vec();
-        let max_retained_unit_bytes = max_total_provider_output_bytes.max(256);
 
         // D-011: fan units to the event sink as they are produced (not only after EOF).
         // D-026: wait for authoritative SessionKey before publishing any unit.
@@ -625,7 +624,9 @@ async fn run_actor(spawn: ActorSpawn) {
                 unit_tx: Some(live_tx),
                 session_id_tx,
                 prompt_ready_rx,
-                max_retained_unit_bytes,
+                // Remaining aggregate output budget for this exchange (D-027).
+                max_retained_unit_bytes: max_total_provider_output_bytes
+                    .saturating_sub(provider_output_bytes),
                 max_remaining_provider_input_bytes: max_total_provider_input_bytes
                     .saturating_sub(provider_input_bytes),
             }) => r,
@@ -906,7 +907,9 @@ async fn run_actor(spawn: ActorSpawn) {
                             cleanup_deadline,
                             max_encoded_exchange_bytes,
                             unit_tx: Some(live_tx2),
-                            max_retained_unit_bytes,
+                            // Remaining aggregate output budget for this continuation (D-027).
+                            max_retained_unit_bytes: max_total_provider_output_bytes
+                                .saturating_sub(provider_output_bytes),
                             max_remaining_provider_input_bytes: max_total_provider_input_bytes
                                 .saturating_sub(provider_input_bytes),
                         }) => r,
@@ -963,9 +966,19 @@ async fn run_actor(spawn: ActorSpawn) {
         };
         if cancelled {
             tools_cancel.cancel();
-            // Join within the configured cleanup budget only; never pad or wait forever.
-            if !cleanup_deadline.is_zero() {
-                let _ = tokio::time::timeout(cleanup_deadline, work.as_mut()).await;
+            // Prefer joining within cleanup_deadline, but never detach an in-flight
+            // tool worker by dropping `work` while termination is incomplete (D-028).
+            // Sticky cancel triggers kill+join inside dispatch; keep awaiting until
+            // that path finishes even if the cleanup budget elapses.
+            if cleanup_deadline.is_zero() {
+                let _ = work.as_mut().await;
+            } else {
+                match tokio::time::timeout(cleanup_deadline, work.as_mut()).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        let _ = work.as_mut().await;
+                    }
+                }
             }
         }
     }
@@ -1314,16 +1327,22 @@ async fn finalize_and_cleanup(
     let seq_preview = events.sequencer().peek_next();
     let end_preview = build_transaction_end(&payload, kind, prior, delivery, seq_preview);
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let send_ok = events
-        .publish_terminal(
-            payload.transaction_id,
-            channel_id.clone(),
-            session_for_event,
-            TransactionEventPayload::Ended(end_preview),
-            ack_tx,
+    // Bound enqueue+ack by the terminal delivery deadline so a stuck sink cannot
+    // hold a claimed finalization forever (blocks shutdown supervisor claim).
+    let send_ok = matches!(
+        tokio::time::timeout(
+            terminal_event_delivery_deadline,
+            events.publish_terminal(
+                payload.transaction_id,
+                channel_id.clone(),
+                session_for_event,
+                TransactionEventPayload::Ended(end_preview),
+                ack_tx,
+            ),
         )
-        .await
-        .is_ok();
+        .await,
+        Ok(Ok(_))
+    );
     let seq = if send_ok {
         events.sequencer().last_allocated()
     } else {

@@ -386,6 +386,8 @@ pub fn admit(
             guard,
             control_tx,
             actor_join: reaper,
+            actor_abort,
+            delivery_abort,
             release_capacity: Arc::clone(&release_capacity),
         };
         if let Err((kind, failed)) =

@@ -28,8 +28,12 @@ pub struct ActiveTransaction {
     pub guard: Arc<FinalizationGuard>,
     /// Control sender (capacity 1).
     pub control_tx: mpsc::Sender<ControlMessage>,
-    /// Join handle for actor (+ delivery reaper).
+    /// Join handle for the reaper that owns actor + delivery joins.
     pub actor_join: tokio::task::JoinHandle<()>,
+    /// Abort the transaction actor task directly (reaper abort alone detaches it).
+    pub actor_abort: tokio::task::AbortHandle,
+    /// Abort the event-delivery task directly.
+    pub delivery_abort: tokio::task::AbortHandle,
     /// Once-only capacity release (actor finalize and/or shutdown supervisor).
     pub release_capacity: Arc<dyn Fn() + Send + Sync>,
 }

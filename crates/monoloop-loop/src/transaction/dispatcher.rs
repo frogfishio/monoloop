@@ -365,10 +365,11 @@ impl TransactionToolDispatcher {
             ToolCancellationPolicy::Cooperative { .. } => true,
         };
         if !kill_ok {
-            // Handler lied about supports_*; stop best-effort then fail closed.
+            // Handler lied about supports_*: cooperative cancel then *join* before
+            // returning. A timed detach would leave the worker running after the
+            // transaction observes RuntimeFailed (D-028 structural requirement).
             control.cancel();
-            let wait = handle.completion.wait();
-            let _ = tokio::time::timeout(Duration::from_millis(200), wait).await;
+            let _ = handle.completion.wait().await;
             drop(permit);
             lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
                 tool_action_id: action.clone(),
