@@ -74,3 +74,10 @@ dev-dependencies): profiles depend on `monoloop-loop`, and crates.io packaging
 resolves all declared deps from the registry. WP-11 profile binding qualification
 lives in `monoloop-testkit` (`tests/profile_bindings.rs`).
 
+## crates.io rate limits
+
+Publishing many **new** crate names in one burst trips crates.io’s new-crate
+rate limit (HTTP 429 with a `try again after … GMT` timestamp). Space first-time
+uploads (~10 minutes apart after a 429) or wait for the stated retry time.
+Version bumps of already-published crates are less restricted.
+
