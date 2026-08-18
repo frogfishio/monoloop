@@ -614,9 +614,8 @@ mod tests {
                 value: serde_json::json!(2),
             },
         );
-        let mut policy = open_policy();
-        policy.allowed_extension_keys.clear(); // empty means unrestricted in our validate when empty
-                                               // With empty allowed set we currently allow all — re-check validate_extensions
+        let policy = open_policy();
+        // max_keys=1 fires before empty-allowlist deny when two keys present.
         let err = merge_effective_config(
             &ChannelDefaults::default(),
             None,
@@ -627,5 +626,37 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ConfigError::TooManyExtensions { .. }));
+    }
+
+    /// D-023: empty allowed_extension_keys denies any extension.
+    #[test]
+    fn empty_extension_allowlist_denies() {
+        let limits = ExtensionLimits {
+            max_keys: 8,
+            max_key_bytes: 32,
+            max_value_depth: 2,
+            max_serialized_bytes: 256,
+        };
+        let k = ExtensionKey::try_new("ns.secret", limits.max_key_bytes).unwrap();
+        let mut inv = InvocationConfig::default();
+        inv.extensions.insert(
+            k,
+            VersionedExtension {
+                version: 1,
+                value: serde_json::json!({"x": 1}),
+            },
+        );
+        let mut policy = open_policy();
+        policy.allowed_extension_keys.clear();
+        let err = merge_effective_config(
+            &ChannelDefaults::default(),
+            None,
+            None,
+            &inv,
+            &policy,
+            &limits,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownExtension(_)));
     }
 }

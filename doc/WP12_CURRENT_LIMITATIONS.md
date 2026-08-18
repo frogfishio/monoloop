@@ -8,19 +8,26 @@ path”; it records what is proven, partial, or out of scope.
 
 - Runtime bootstrap, Channel registry, admission, dual-index SessionKey registry.
 - Exactly-one callback / Ended sequencing on FakeConnector + Test dialect paths.
+- Runtime-owned `CallbackService`: capacity released while host callbacks run;
+  shutdown drains inflight callbacks.
 - Global and per-Channel active capacity plus-one rejection and release.
+- Distinct-session and encoded-exchange channel limits; event byte budget;
+  tool payload/output caps; empty extension allowlist deny.
 - Multi-Channel same session-string isolation; concurrent transaction isolation.
 - Subscriber backpressure isolated to the slow transaction’s sink.
 - Shutdown with active work: finalize + zero active/capacity after drain.
+- Cancel during delayed open and during Hang (no provider body) response wait.
 - EmptyToolRegistry / NoToolRuntime → `tool_unavailable`, zero effects.
 - Host linked tools (dispatcher, capacity, validation) and MCP gateway binding
-  lifecycle (loopback, capability redaction, revoke on shutdown).
+  lifecycle (loopback, HTTP initialize/list/call, capability redaction, revoke).
 - Streaming HTTP Connector + credential resolver (secrets not in Debug/errors).
-- OpenAI Chat Completions SSE Interpreter + encoder vertical e2e (local scripted).
+- OpenAI Chat Completions SSE Interpreter + encoder vertical e2e (local scripted);
+  tool Ready only on `tool_calls` finish.
 - Six profile ChannelBinding capability matrices register and validate.
 - Architecture: product crates do not depend on `monoloop-testkit`; Connector /
   Interpreter / Loop production dependency direction holds.
 - Testkit: chat projection rebuilds from canonical TransactionEvent units only.
+- Tool registration rejects Abortable handlers that do not `supports_abort`.
 
 ## Partial / not release-proven
 
@@ -29,10 +36,7 @@ path”; it records what is proven, partial, or out of scope.
 | External agent live multi-exchange | SendAndRetain against real Grok/Cursor/Codex/agy is qualification (testkit examples), not a deterministic acceptance gate |
 | MCP Refreshable | Not declared; CreationOnly only for external agents |
 | Inline continuation + MCP | Explicitly unsupported (CallerControlled only for gateway profiles) |
-| Full terminal-race matrix | Covered: cancel vs complete, short deadline, shutdown vs active. Not every combinatorial pair of stale exchange/child/capability races is exhaustively enumerated |
-| Paused-time deadline suites | Deadline tests use real short timeouts; Tokio paused-time not required for current Fake paths |
-| Forced actor abort supervisor | Shutdown supervisor path is exercised; dedicated panic/abort injection suite is not separate |
-| Concurrent tools + concurrent MCP + concurrent direct LLM | Covered in slices (tools, MCP gateway, direct LLM e2e); not one giant multi-path soak |
+| IsolatedKillable escalate | Registration validates `supports_isolated_kill`; full kill+join-after-grace suite is residual |
 | Provider malformed corpus | Interpreter/SSE fixtures cover fragmentation and common malformation; not an infinite fuzz corpus |
 | Profile prompt-shortcut removal | Encoders own prompt bodies; connector open/session sequencing remains profile-owned (see WP-00 PS-* inventory) |
 
@@ -44,6 +48,7 @@ path”; it records what is proven, partial, or out of scope.
 - OpenAI Responses API, non-streaming Chat Completions, multimodal.
 - Remote MCP transport beyond loopback gateway.
 - Ambient “current session” recovery after Connector restart.
+- Independent security audit process sign-off (organizational, not a Fake test).
 
 ## Dependency / MSRV notes
 

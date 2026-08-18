@@ -774,6 +774,85 @@ async fn submit_after_shutdown_rejects_without_active_leak() {
     assert_eq!(err.kind, AdmissionErrorKind::RuntimeShuttingDown);
 }
 
+/// D-023: unknown invocation extension rejected when Channel allowlist is empty.
+#[tokio::test]
+async fn unknown_extension_rejected_at_admission() {
+    use monoloop_contracts::{ExtensionKey, VersionedExtension};
+
+    let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
+    let mut req = free_request(
+        "llm",
+        None,
+        Arc::new(FnEventSink(|_| {
+            Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+        })),
+        counting_completion(Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new())),
+    );
+    let key = ExtensionKey::try_new("ns.not-allowed", 64).unwrap();
+    req.invocation_config.extensions.insert(
+        key,
+        VersionedExtension {
+            version: 1,
+            value: serde_json::json!({"v": true}),
+        },
+    );
+    let err = TransactionRuntime::submit(rt.as_ref(), req).unwrap_err();
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidConfiguration);
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+}
+
+/// D-024: Abortable tool cannot register a handler that refuses abort support.
+#[test]
+fn abortable_requires_supports_abort_handler() {
+    use monoloop_contracts::{
+        JsonSchema, ToolCall, ToolCallContext, ToolCancellationPolicy, ToolCompletion, ToolId,
+        ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolStartError, ToolSuccessContract,
+    };
+    use monoloop_loop::{RegisteredTool, ToolHandler};
+
+    struct Unstoppable;
+    impl ToolHandler for Unstoppable {
+        fn start(
+            &self,
+            _call: ToolCall,
+            _ctx: ToolCallContext,
+        ) -> Result<monoloop_loop::LinkedToolExecutionHandle, ToolStartError> {
+            Err(ToolStartError::Rejected("unstoppable"))
+        }
+        fn supports_abort(&self) -> bool {
+            false
+        }
+    }
+
+    let schema = JsonSchema::try_new(serde_json::json!({
+        "type": "object",
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("u").unwrap(),
+        ToolName::try_new("u").unwrap(),
+        "unstoppable",
+        schema.clone(),
+        ToolOutputContract {
+            success: ToolSuccessContract::json(schema),
+            error_data_schema: None,
+        },
+        ToolLimits::default(),
+        ToolCancellationPolicy::Abortable,
+    )
+    .unwrap();
+    let err = RegisteredTool::try_new(spec, Arc::new(Unstoppable)).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("supports_abort") || msg.contains("Abortable"),
+        "expected policy mismatch, got {msg}"
+    );
+    let _ = ToolCompletion::Succeeded(monoloop_contracts::CanonicalToolOutput::Json(
+        serde_json::json!({}),
+    ));
+}
+
 /// D-015: max_tools_per_transaction plus-one rejects at admission.
 #[tokio::test]
 async fn tools_per_transaction_plus_one_rejected() {
