@@ -80,6 +80,7 @@ const PRODUCT_CRATES: &[&str] = &[
     "monoloop-connector-claude",
     "monoloop-interpreter",
     "monoloop-loop",
+    "monoloop", // product façade (not a fourth component; still must not depend on testkit)
 ];
 
 const PROFILE_CRATES: &[&str] = &[
@@ -95,6 +96,7 @@ const PROFILE_CRATES: &[&str] = &[
 fn contracts_do_not_depend_on_product_or_testkit() {
     let deps = all_deps_including_dev("monoloop-contracts");
     for forbidden in [
+        "monoloop",
         "monoloop-connector",
         "monoloop-interpreter",
         "monoloop-loop",
@@ -206,4 +208,25 @@ fn testkit_may_depend_on_product_but_not_reverse() {
     );
     // Reverse already enforced by product_crates_do_not_depend_on_testkit.
     let _ = testkit;
+}
+
+#[test]
+fn facade_reexports_three_components_without_testkit() {
+    let prod = production_deps("monoloop");
+    for required in [
+        "monoloop-contracts",
+        "monoloop-connector",
+        "monoloop-interpreter",
+        "monoloop-loop",
+    ] {
+        assert!(
+            prod.iter().any(|d| d == required),
+            "façade must depend on {required}; prod={prod:?}"
+        );
+    }
+    let all = all_deps_including_dev("monoloop");
+    assert!(
+        !all.iter().any(|d| d == "monoloop-testkit"),
+        "façade must not depend on monoloop-testkit; deps={all:?}"
+    );
 }

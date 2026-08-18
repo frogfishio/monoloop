@@ -1126,6 +1126,7 @@ dependencies = [
  "monoloop-contracts",
  "monoloop-interpreter",
  "monoloop-loop",
+ "tokio",
 ]
 
 [[package]]

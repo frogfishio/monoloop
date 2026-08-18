@@ -53,9 +53,13 @@ or use `--no-verify` only after registry deps resolve.
 
 ```bash
 make bump          # optional semver bump
-make dist          # BUILD++, release build, package dry-run for contracts, CLI checks
+make dist          # BUILD++, sync VERSION + copy BUILD into crates/monoloop/, release build, package dry-run, CLI checks
 make test
 ```
+
+The façade embeds `crates/monoloop/BUILD` (kept in sync from the workspace `BUILD`
+by `make sync-version` / `make dist`) so published crates.io sources compile
+without the workspace root.
 
 ## CI build numbers
 

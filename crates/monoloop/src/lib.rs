@@ -37,8 +37,11 @@ pub use monoloop_connector_zai as connector_zai;
 /// Crate version from Cargo (`MAJOR.MINOR.PATCH`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Build number from the repository `BUILD` file (embedded at compile time).
-pub const BUILD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../BUILD"));
+/// Build number from this crate’s `BUILD` file (synced from the workspace root).
+///
+/// Packaged with the crate so `cargo publish` / crates.io builds resolve without
+/// needing the workspace root.
+pub const BUILD: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/BUILD"));
 
 /// `{version}+build-{build}` as required by `LICENSING.md`.
 pub fn version_string() -> String {

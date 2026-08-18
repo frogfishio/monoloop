@@ -31,6 +31,8 @@ help:
 sync-version:
 	@test -f $(VERSION_FILE) || (echo "missing $(VERSION_FILE)" && exit 1)
 	@python3 scripts/sync_version.py "$(VERSION)"
+	@# Façade embeds BUILD for crates.io; keep crate copy aligned with workspace.
+	@cp "$(BUILD_FILE)" crates/monoloop/BUILD
 
 bump:
 	@python3 scripts/bump_version.py
@@ -49,6 +51,7 @@ endif
 else
 	@n=$$(($$(cat $(BUILD_FILE)) + 1)); echo $$n > $(BUILD_FILE); echo "BUILD -> $$n"
 endif
+	@cp "$(BUILD_FILE)" crates/monoloop/BUILD
 	@$(MAKE) sync-version
 	cargo build --workspace --release
 	@$(MAKE) package

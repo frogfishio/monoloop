@@ -135,6 +135,27 @@ let proxy = ConnectorProxy::builder()
 // endpoint_ref: "grok:ws://127.0.0.1:2419" with credential_ref set
 ```
 
+
+## Crate guides (for humans and agents)
+
+Point an LLM agent at **`crates/monoloop/README.md`** first. That README has the
+assembly recipe (`ChannelBinding` → `ChannelRegistry` → `RuntimeBootstrap` →
+`submit`) and hard rules (no testkit bleed, empty-tool path, push completion).
+
+| Crate | Start here |
+|---|---|
+| [`monoloop`](crates/monoloop/README.md) | Product façade + `examples/fake_echo.rs` |
+| [`monoloop-contracts`](crates/monoloop-contracts/README.md) | Shared types/ports |
+| [`monoloop-connector`](crates/monoloop-connector/README.md) | Component 01 |
+| [`monoloop-interpreter`](crates/monoloop-interpreter/README.md) | Component 02 |
+| [`monoloop-loop`](crates/monoloop-loop/README.md) | Component 03 + `examples/fake_echo.rs` |
+| `monoloop-connector-*` | Profile READMEs + `*_channel_binding` |
+| [`monoloop-testkit`](crates/monoloop-testkit/README.md) | Live examples only (not product) |
+
+```bash
+cargo run -p monoloop --example fake_echo
+```
+
 ## License
 
 Copyright (C) Alexander R. Croft

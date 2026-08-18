@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/monoloop"
-readme.workspace = true
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -37,3 +37,6 @@ codex = ["dep:monoloop-connector-codex"]
 agy = ["dep:monoloop-connector-agy"]
 zai = ["dep:monoloop-connector-zai"]
 claude = ["dep:monoloop-connector-claude"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

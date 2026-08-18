@@ -64,9 +64,11 @@ impl OutboundDialectEncoder for EmptyBytesEncoder {
     }
 }
 
-/// Encodes canonical text messages as UTF-8 for the Test dialect (FakeConnector echo).
+/// Loop-owned **smoke** encoder for FakeConnector + [`DialectDescriptor::test_raw`].
 ///
-/// Joins text parts and ensures a trailing sentence terminator so the segmenter emits.
+/// Joins text parts as UTF-8 and ensures a trailing sentence terminator so the
+/// segmenter emits. Not a production Channel encoder and not a testkit fixture
+/// encoder — live hosts must use profile `*_channel_binding` encoders instead.
 #[derive(Debug, Default)]
 pub struct TestTextEncoder;
 
