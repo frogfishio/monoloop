@@ -544,6 +544,7 @@ async fn run_actor(spawn: ActorSpawn) {
                         Err(_) => return Err(TransactionEndKind::InvariantFailed),
                     }
                 }
+                let claimed = key.clone();
                 let sk = Some(key);
                 guard_c.set_session_id(
                     sk.as_ref()
@@ -565,8 +566,9 @@ async fn run_actor(spawn: ActorSpawn) {
                     return Err(TransactionEndKind::EventDeliveryFailed);
                 }
                 let _ = session_watch_c.send(sk);
-                // Activate MCP before the prompt is sent (D-026 residual).
+                // Rebind MCP dispatcher to claimed key, then activate before prompt (D-026).
                 if let Some(ref pending) = pending_mcp_c {
+                    pending.dispatcher.rebind_session(claimed);
                     if let Some(handle) = mcp_c.as_ref() {
                         handle
                             .activate(&pending.token)

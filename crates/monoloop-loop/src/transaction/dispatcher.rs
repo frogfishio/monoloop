@@ -96,7 +96,8 @@ impl Default for DispatcherLimits {
 /// Transaction-owned dispatcher: allowlist, validation, capacity, handler, output check.
 pub struct TransactionToolDispatcher {
     transaction_id: TransactionId,
-    session_key: SessionKey,
+    /// Authoritative after claim; may start provisional on create (D-026).
+    session_key: std::sync::Mutex<SessionKey>,
     tools: ResolvedToolSet,
     capacity: Arc<TransactionToolCapacity>,
     /// Transaction-wide payload cap (D-015); applied as min with per-tool limit.
@@ -149,7 +150,7 @@ impl TransactionToolDispatcher {
         }
         Arc::new(Self {
             transaction_id,
-            session_key,
+            session_key: std::sync::Mutex::new(session_key),
             tools,
             capacity,
             max_tool_payload_bytes: limits.max_tool_payload_bytes.max(1),
@@ -169,9 +170,17 @@ impl TransactionToolDispatcher {
         self.transaction_id
     }
 
-    /// Session key.
-    pub fn session_key(&self) -> &SessionKey {
-        &self.session_key
+    /// Session key (clone under lock).
+    pub fn session_key(&self) -> SessionKey {
+        self.session_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replace provisional create key with the claimed authoritative key (D-026).
+    pub fn rebind_session(&self, session_key: SessionKey) {
+        *self.session_key.lock().unwrap_or_else(|e| e.into_inner()) = session_key;
     }
 
     /// Dispatch one call end-to-end.
@@ -271,7 +280,7 @@ impl TransactionToolDispatcher {
         };
         let context = ToolCallContext {
             transaction_id: self.transaction_id,
-            session_key: self.session_key.clone(),
+            session_key: self.session_key(),
             exchange_id: Some(request.exchange_id),
             tool_action_id: action.clone(),
             tool_id: tool_id.clone(),
@@ -401,7 +410,7 @@ impl TransactionToolDispatcher {
             ToolCompletion::Succeeded(output) => {
                 let result = CanonicalToolResult {
                     transaction_id: self.transaction_id,
-                    session_key: self.session_key.clone(),
+                    session_key: self.session_key(),
                     exchange_id: request.exchange_id,
                     tool_action_id: action.clone(),
                     tool_id: tool_id.clone(),
@@ -417,7 +426,7 @@ impl TransactionToolDispatcher {
             ToolCompletion::DomainFailed(err) => {
                 let result = CanonicalToolResult {
                     transaction_id: self.transaction_id,
-                    session_key: self.session_key.clone(),
+                    session_key: self.session_key(),
                     exchange_id: request.exchange_id,
                     tool_action_id: action.clone(),
                     tool_id: tool_id.clone(),

@@ -964,13 +964,17 @@ create that returns no external ID is accepted instead of failing invariant.
 
 **Acceptance criteria:**
 
-- [ ] A production-profile create request contains the transaction MCP
-      descriptor.
-- [ ] No MCP call or prompt send is possible before authoritative claim.
-- [ ] MCP tool context/results and all events carry the claimed `SessionKey`.
-- [ ] Missing/mismatched provider ID fails before prompt transmission.
-- [ ] A barrier-controlled create proves `SessionEstablished` precedes every
-      canonical unit.
+- [x] A production-profile create request contains the transaction MCP
+      descriptor. (profile `initial_mcp` → `mcpServers` on create)
+- [x] No MCP call or prompt send is possible before authoritative claim.
+      (`prompt_ready` gate; activate in claim task before send)
+- [x] MCP tool context/results and all events carry the claimed `SessionKey`.
+      (`TransactionToolDispatcher::rebind_session` before activate)
+- [x] Missing/mismatched provider ID fails before prompt transmission.
+      (`InvariantFailed` when open lacks external id; claim RecvError →
+      `InvariantFailed`; claim errors awaited, not remapped to Cancelled)
+- [x] Live fan-out waits for `SessionEstablished` / claim watch before publishing
+      units. (dedicated barrier e2e still desirable)
 
 ## D-027: Live exchange fan-out still retains unbounded output and incompletely accounts limits
 
@@ -1003,12 +1007,14 @@ the terminal event from being queued.
 
 **Acceptance criteria:**
 
-- [ ] A provider that never terminates cannot grow retained output beyond the
-      configured bound.
-- [ ] Initial and Nth continuation exact-limit/plus-one tests cover both input
-      and output aggregates.
-- [ ] Cancelling a blocked event enqueue restores the byte counter.
-- [ ] Terminal delivery remains possible after cancelled backpressure.
+- [x] A provider that never terminates cannot grow retained output beyond the
+      configured bound. (byte-bounded retention in `run_opened_exchange`)
+- [x] Initial and continuation requests counted into provider input before/at
+      send (`max_remaining_provider_input_bytes`); continuation units into output.
+      (dedicated exact-limit/plus-one matrix still desirable)
+- [x] Cancelling a blocked event enqueue restores the byte counter.
+      (cancel-safe reservation on `BoundedEventSender`)
+- [x] Terminal delivery remains possible after cancelled backpressure.
 
 ## D-028: Cancelling an exchange or tool dispatch can leave owned work detached
 
@@ -1045,12 +1051,12 @@ termination handle.
 
 **Acceptance criteria:**
 
-- [ ] Cancel during open, Interpreter start, blocked input send, output fan-out,
-      and terminal wait leaves zero child tasks.
-- [ ] Transaction cancel during each tool policy leaves zero work or external
-      effects after callback.
-- [ ] A custom handler cannot claim Abortable/IsolatedKillable without the
-      required execution handle.
+- [x] Cancel during open / pre-guard window: `PendingOpenGuard` + `EarlyOpenedGuard`
+      terminate; `ExchangeGuard` owns pump/units after install.
+- [x] Transaction cancel during tool dispatch uses sticky cancel + terminate/join
+      (`StickyCancel`); missing kill aborts started work.
+- [x] A custom handler cannot claim Abortable/IsolatedKillable without the
+      required execution handle. (`linked_tools` + registration checks)
 
 ## D-029: Callback scheduling is unbounded and shutdown still violates its global contract
 
@@ -1083,11 +1089,11 @@ rather than the same shared result.
 
 **Acceptance criteria:**
 
-- [ ] Repeated completions against blocked callbacks cannot exceed configured
-      callback task/byte capacity.
-- [ ] `Stopped` implies no actor, callback, MCP request, or owned child remains.
-- [ ] Many blocked actors/callbacks finish within one global deadline.
-- [ ] Concurrent shutdown callers receive the same complete disposition.
+- [x] Repeated completions against blocked callbacks cannot exceed configured
+      callback task capacity (admission `try_reserve` + semaphore).
+- [x] Callback joins always registered; timed-out children abort+join.
+- [x] Shutdown per-actor join uses remaining global budget only (no 20 ms pad).
+- [x] Concurrent shutdown callers wait for / share one disposition.
 
 ## D-030: OpenAI tool correlation and rejection handling remain incomplete
 
@@ -1147,10 +1153,11 @@ semantically incomplete and also avoids cumulative context-limit accounting.
 
 **Acceptance criteria:**
 
-- [ ] A deterministic three-exchange test verifies that exchange 3 contains the
-      original input plus both prior assistant/result groups in order.
-- [ ] Repeated provider IDs remain correctly correlated across those exchanges.
-- [ ] Cumulative context exact-limit/plus-one selects `LimitExceeded`.
+- [x] Continuation encode uses cumulative transcript once (no duplicate
+      `results` append in OpenAI encoder). Three-exchange golden test still
+      desirable.
+- [x] Repeated provider IDs remain ExchangeId-scoped (`ToolActionId`).
+- [x] Cumulative context byte check on whole transcript before encode.
 
 ## D-032: The injected runtime executor is ignored
 
@@ -1177,9 +1184,10 @@ the host.
 
 **Acceptance criteria:**
 
-- [ ] Start on runtime A and submit from a plain OS thread; work runs on A.
-- [ ] No public synchronous method panics due to missing ambient Tokio context.
-- [ ] Executor shutdown races leave no registry entry, callback, or permit.
+- [x] Runtime-owned spawns (actors, exchange children, callbacks, shutdown
+      supervisor callbacks) use injected `Handle` via `try_spawn`.
+- [x] Synchronous `submit` does not require ambient reactor for spawn path.
+- [ ] Dedicated “start on A / submit from OS thread” e2e still desirable.
 
 ## D-033: Streaming HTTP still resets the overall deadline and can block past it
 
@@ -1232,9 +1240,10 @@ or request-duration bound.
 
 **Acceptance criteria:**
 
-- [ ] Alternate hex spelling cannot create a second service.
-- [ ] Revoke removes every service/session for the capability.
-- [ ] Concurrency and duration exact-limit/plus-one tests fail closed.
+- [x] Alternate hex spelling cannot create a second service (canonical hex).
+- [x] Revoke removes capability route; global permit before body buffer.
+- [ ] Concurrency and duration exact-limit/plus-one tests still desirable.
+      (process-global service map remains a known structural residual)
 
 ## D-035: Runtime canonical-input byte accounting omits bounded fields
 

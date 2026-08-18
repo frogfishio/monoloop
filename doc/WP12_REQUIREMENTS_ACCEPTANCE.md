@@ -80,7 +80,7 @@ cargo doc --workspace --no-deps
 | Contracts leaf | Pass | same |
 | Connector ↛ Interpreter/Loop | Pass | abstract connector crate |
 | Interpreter ↛ Connector/Loop | Pass | same |
-| Loop production ↛ profiles | Pass | profiles are Loop **dev-dependencies** |
+| Loop production ↛ profiles | Pass | profiles not in Loop deps (even as dev-deps); WP-11 binding tests in testkit |
 | Profile → Loop/Interpreter | Partial | Accepted coupling for `ChannelBinding` construction (`DECISIONS.md` D-002) |
 
 ## Open items (honest residual)

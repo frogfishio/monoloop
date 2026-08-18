@@ -166,6 +166,8 @@ pub struct PendingMcpBinding {
     pub descriptor: McpServerDescriptor,
     /// Transaction id.
     pub transaction_id: TransactionId,
+    /// Dispatcher to rebind after authoritative session claim (D-026).
+    pub dispatcher: Arc<TransactionToolDispatcher>,
 }
 
 impl fmt::Debug for PendingMcpBinding {
@@ -174,6 +176,7 @@ impl fmt::Debug for PendingMcpBinding {
             .field("token", &self.token)
             .field("descriptor", &self.descriptor)
             .field("transaction_id", &self.transaction_id)
+            .field("dispatcher_session", &self.dispatcher.session_key())
             .finish()
     }
 }
@@ -226,7 +229,7 @@ impl McpRouteTable {
             transaction_id,
             state,
             handler,
-            dispatcher,
+            dispatcher: Arc::clone(&dispatcher),
             tools,
         });
 
@@ -246,6 +249,7 @@ impl McpRouteTable {
             token,
             descriptor,
             transaction_id,
+            dispatcher,
         })
     }
 
