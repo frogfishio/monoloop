@@ -527,7 +527,7 @@ async fn run_actor(spawn: ActorSpawn) {
             let mcp_c = mcp.clone();
             let join = match try_spawn(&executor, async move {
                 let Ok(ext) = sess_rx.await else {
-                    return Ok::<(), TransactionEndKind>(());
+                    return Err(TransactionEndKind::InvariantFailed);
                 };
                 let sid = SessionId::from_external(&ext);
                 let key = SessionKey::new(channel_c.clone(), sid);

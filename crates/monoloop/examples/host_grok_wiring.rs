@@ -92,8 +92,8 @@ async fn main() {
     //     interpreter: Arc<dyn InterpreterFactory>,
     // ) -> ChannelBinding
     //
-    let endpoint = std::env::var("MONOLOOP_GROK_ENDPOINT")
-        .unwrap_or_else(|_| "ws://127.0.0.1:2419".into());
+    let endpoint =
+        std::env::var("MONOLOOP_GROK_ENDPOINT").unwrap_or_else(|_| "ws://127.0.0.1:2419".into());
 
     let binding = monoloop::connector_grok::grok_channel_binding(
         "grok",
@@ -142,9 +142,7 @@ async fn main() {
 
     // Live text path: TransactionEventPayload::CanonicalUnit only (complete units).
     // There is no token / delta stream API.
-    println!(
-        "events: match TransactionEventPayload::CanonicalUnit(_); no token stream"
-    );
+    println!("events: match TransactionEventPayload::CanonicalUnit(_); no token stream");
 
     if std::env::var("MONOLOOP_GROK_SUBMIT").ok().as_deref() != Some("1") {
         println!(
