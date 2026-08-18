@@ -9,6 +9,7 @@ use super::callback_service::CallbackService;
 use super::capacity::CapacityManagers;
 use super::channel_registry::LiveChannel;
 use super::events::{spawn_delivery_task, BoundedEventSender};
+use super::executor_spawn::try_spawn;
 use super::finalization::{EventSequencer, FinalizationGuard};
 use super::host_tools::HostToolRegistry;
 use super::mcp::McpGatewayHandle;
@@ -21,6 +22,7 @@ use monoloop_contracts::{
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 /// Runtime state constants (must match `runtime.rs`).
@@ -44,6 +46,8 @@ pub struct AdmissionContext {
     pub runtime_state: Arc<AtomicU8>,
     /// Runtime-owned completion callbacks (D-021).
     pub callbacks: CallbackService,
+    /// Injected Tokio handle for all runtime-owned spawns (D-032).
+    pub executor: Handle,
 }
 
 /// Perform synchronous admission (no network/tool I/O).
@@ -188,6 +192,18 @@ pub fn admit(
         ));
     }
 
+    // D-029: reserve callback capacity at admission; retain through callback terminal.
+    let callback_reservation = match ctx.callbacks.try_reserve() {
+        Some(r) => r,
+        None => {
+            ctx.capacity.release(&request.channel_id);
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::CapacityExceeded,
+                "callback capacity exceeded",
+            ));
+        }
+    };
+
     let channel_for_release = request.channel_id.clone();
     let capacity = Arc::clone(&ctx.capacity);
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -218,15 +234,27 @@ pub fn admit(
         Arc::clone(&sequencer),
     );
 
-    let delivery_join = spawn_delivery_task(
+    let delivery_join = match spawn_delivery_task(
+        &ctx.executor,
         event_rx,
         request.events,
         fail_tx,
         byte_counter,
         ctx.limits.terminal_event_delivery_deadline,
-    );
+    ) {
+        Ok(h) => h,
+        Err(()) => {
+            release_capacity();
+            drop(callback_reservation);
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::RuntimeShuttingDown,
+                "executor unavailable for delivery task",
+            ));
+        }
+    };
 
-    let actor_join = spawn_actor(ActorSpawn {
+    let actor_join = match spawn_actor(ActorSpawn {
+        executor: ctx.executor.clone(),
         transaction_id,
         channel_id: request.channel_id.clone(),
         channel_kind: live.binding.kind,
@@ -274,8 +302,19 @@ pub fn admit(
         max_diagnostic_count: ctx.limits.max_diagnostic_count,
         max_diagnostic_bytes: ctx.limits.max_diagnostic_bytes,
         callbacks: ctx.callbacks.clone(),
+        callback_reservation,
         start_gate: start_rx,
-    });
+    }) {
+        Ok(h) => h,
+        Err(()) => {
+            delivery_join.abort();
+            release_capacity();
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::RuntimeShuttingDown,
+                "executor unavailable for actor task",
+            ));
+        }
+    };
 
     // D-009 + D-010: Accepting check + session claim + insert under one lock.
     // Defer reaper wrap until install succeeds so failure can abort owned tasks (LAW 23).
@@ -319,11 +358,26 @@ pub fn admit(
             }
         }
 
-        let reaper = tokio::spawn(async move {
+        let actor_abort = actor_join.abort_handle();
+        let delivery_abort = delivery_join.abort_handle();
+        let reaper = match try_spawn(&ctx.executor, async move {
             let _ = actor_join.await;
             delivery_join.abort();
             let _ = delivery_join.await;
-        });
+        }) {
+            Ok(h) => h,
+            Err(()) => {
+                drop(reg);
+                release_capacity();
+                drop(start_tx);
+                actor_abort.abort();
+                delivery_abort.abort();
+                return Err(AdmissionError::new(
+                    AdmissionErrorKind::RuntimeShuttingDown,
+                    "executor unavailable for reaper task",
+                ));
+            }
+        };
         let entry = ActiveTransaction {
             transaction_id,
             session_key,
@@ -418,29 +472,48 @@ fn channel_option_policy(defaults: &monoloop_contracts::ChannelDefaults) -> Opti
     p
 }
 
-fn estimate_input_bytes(input: &monoloop_contracts::CanonicalInput) -> usize {
-    input
-        .messages()
-        .iter()
-        .map(|m| match m {
-            monoloop_contracts::CanonicalMessage::System { content, .. }
-            | monoloop_contracts::CanonicalMessage::User { content, .. } => {
-                content.iter().map(|p| p.text().len()).sum()
-            }
-            monoloop_contracts::CanonicalMessage::Assistant {
-                content,
-                tool_calls,
-                ..
-            } => {
-                content.iter().map(|p| p.text().len()).sum::<usize>()
-                    + tool_calls
-                        .iter()
-                        .map(|c| c.tool_call_id.len() + c.tool_name.as_str().len())
-                        .sum::<usize>()
-            }
-            monoloop_contracts::CanonicalMessage::Tool { content, .. } => {
-                content.iter().map(|p| p.text().len()).sum()
-            }
-        })
-        .sum()
+/// Deterministic canonical-input byte estimate covering every counted field (D-035).
+///
+/// Counts text parts, optional message names, tool-call IDs/names/arguments JSON,
+/// and Tool-message correlation IDs. Serialization failure for arguments fails closed
+/// by counting the configured argument as oversized rather than zero.
+pub(crate) fn estimate_input_bytes(input: &monoloop_contracts::CanonicalInput) -> usize {
+    input.messages().iter().map(estimate_message_bytes).sum()
+}
+
+fn estimate_message_bytes(m: &monoloop_contracts::CanonicalMessage) -> usize {
+    match m {
+        monoloop_contracts::CanonicalMessage::System { content, name }
+        | monoloop_contracts::CanonicalMessage::User { content, name } => {
+            content.iter().map(|p| p.text().len()).sum::<usize>()
+                + name.as_ref().map(|n| n.len()).unwrap_or(0)
+        }
+        monoloop_contracts::CanonicalMessage::Assistant {
+            content,
+            tool_calls,
+        } => {
+            content.iter().map(|p| p.text().len()).sum::<usize>()
+                + tool_calls
+                    .iter()
+                    .map(estimate_tool_call_bytes)
+                    .sum::<usize>()
+        }
+        monoloop_contracts::CanonicalMessage::Tool {
+            tool_call_id,
+            content,
+        } => tool_call_id.len() + content.iter().map(|p| p.text().len()).sum::<usize>(),
+    }
+}
+
+fn estimate_tool_call_bytes(c: &monoloop_contracts::CanonicalAssistantToolCall) -> usize {
+    let args_bytes = match serde_json::to_vec(&c.arguments) {
+        Ok(b) => b.len(),
+        // Fail closed: treat unserializable args as at least one byte so they
+        // cannot bypass max_input_bytes via a zero fallback (D-035).
+        Err(_) => usize::MAX / 4,
+    };
+    c.tool_call_id
+        .len()
+        .saturating_add(c.tool_name.as_str().len())
+        .saturating_add(args_bytes)
 }

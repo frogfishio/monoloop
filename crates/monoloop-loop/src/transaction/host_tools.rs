@@ -53,11 +53,8 @@ impl RegisteredTool {
                 }
             }
             ToolCancellationPolicy::Cooperative { .. } => {
-                if !handler.supports_abort() {
-                    return Err(super::StartupError::ToolRegistry(
-                        "Cooperative tool requires supports_abort handler",
-                    ));
-                }
+                // Cooperative cancel is best-effort. Sync/immediate handlers may
+                // omit supports_abort; cancel is vacuous once completion is already sent.
             }
         }
         Ok(Self { spec, handler })

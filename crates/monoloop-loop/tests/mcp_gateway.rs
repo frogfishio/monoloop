@@ -49,7 +49,9 @@ fn make_spec(id: &str, name: &str) -> ToolSpec {
             max_output_bytes: 1024,
             execution_deadline: Duration::from_secs(5),
         },
-        ToolCancellationPolicy::Abortable,
+        ToolCancellationPolicy::Cooperative {
+            grace: std::time::Duration::from_millis(50),
+        },
     )
     .unwrap()
 }

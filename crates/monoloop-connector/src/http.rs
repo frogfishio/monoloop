@@ -293,8 +293,16 @@ async fn open_http(
         return Err(err.with_connection_id(request.connection_id.as_str()));
     }
 
-    let buf = request.limits.buffers.max_queued_input_bytes.max(1);
-    let capacity = (buf / request.limits.buffers.max_chunk_bytes.max(1)).max(1);
+    let in_buf = request.limits.buffers.max_queued_input_bytes.max(1);
+    let in_capacity = (in_buf / request.limits.buffers.max_chunk_bytes.max(1)).max(1);
+    // D-033: output queue capacity from output-byte budget, not input buffers.
+    let out_buf = request
+        .limits
+        .buffers
+        .max_queued_output_bytes
+        .min(config.max_response_bytes)
+        .max(1);
+    let out_capacity = (out_buf / request.limits.buffers.max_chunk_bytes.max(1)).max(1);
     let max_chunk = request
         .limits
         .buffers
@@ -302,8 +310,8 @@ async fn open_http(
         .min(config.max_chunk_bytes)
         .max(1);
 
-    let (in_tx, in_rx) = mpsc::channel::<RawInputMessage>(capacity);
-    let (out_tx, out_rx) = mpsc::channel::<Bytes>(capacity);
+    let (in_tx, in_rx) = mpsc::channel::<RawInputMessage>(in_capacity);
+    let (out_tx, out_rx) = mpsc::channel::<Bytes>(out_capacity);
     let (end_tx, end_rx) = oneshot::channel();
 
     let connection_id = request.connection_id.clone();
@@ -420,6 +428,8 @@ async fn run_http_owner(
     }
 
     // Phase 2: POST body and stream response.
+    // D-033: one absolute request deadline covering send+headers+body; never reset.
+    let deadline = Instant::now() + config.request_timeout;
     let mut builder = client.request(config.method.as_reqwest(), url);
     for (name, value) in &config.headers {
         builder = builder.header(name.as_str(), value.as_str());
@@ -430,6 +440,17 @@ async fn run_http_owner(
     builder = builder.body(body);
 
     let send_fut = builder.send();
+    let send_budget = deadline
+        .saturating_duration_since(Instant::now())
+        .min(connect_deadline);
+    if send_budget.is_zero() {
+        owner.finish(
+            ConnectionEndKind::TransportFailure,
+            EndInitiator::LocalTransport,
+            Some("http request deadline exceeded".into()),
+        );
+        return;
+    }
     let response = tokio::select! {
         biased;
         _ = wait_control(&control) => {
@@ -441,8 +462,7 @@ async fn run_http_owner(
             owner.finish(kind, EndInitiator::LocalControl, None);
             return;
         }
-        // D-019: use the shorter of connect and overall request bounds, not max.
-        r = timeout(connect_deadline.min(config.request_timeout), send_fut) => {
+        r = timeout(send_budget, send_fut) => {
             match r {
                 Ok(Ok(resp)) => resp,
                 Ok(Err(_)) => {
@@ -479,8 +499,6 @@ async fn run_http_owner(
 
     let mut stream = response.bytes_stream();
     let mut total_response: usize = 0;
-    // D-019: one absolute overall deadline from response start.
-    let deadline = Instant::now() + config.request_timeout;
 
     loop {
         if Instant::now() >= deadline {
@@ -535,7 +553,16 @@ async fn run_http_owner(
                         }
                         total_response += chunk.len();
                         let len = chunk.len() as u64;
-                        // D-019: enqueue must not ignore cancel while blocked on full queue.
+                        // D-033: blocked enqueue selects cancel, idle, and overall deadline.
+                        let enqueue_budget = deadline.saturating_duration_since(Instant::now());
+                        if enqueue_budget.is_zero() {
+                            owner.finish(
+                                ConnectionEndKind::TransportFailure,
+                                EndInitiator::LocalTransport,
+                                Some("http overall response deadline exceeded".into()),
+                            );
+                            return;
+                        }
                         tokio::select! {
                             biased;
                             _ = wait_control(&control) => {
@@ -545,6 +572,14 @@ async fn run_http_owner(
                                     ConnectionEndKind::Cancelled
                                 };
                                 owner.finish(kind, EndInitiator::LocalControl, None);
+                                return;
+                            }
+                            _ = tokio::time::sleep(enqueue_budget) => {
+                                owner.finish(
+                                    ConnectionEndKind::TransportFailure,
+                                    EndInitiator::LocalTransport,
+                                    Some("http overall response deadline exceeded".into()),
+                                );
                                 return;
                             }
                             send_res = out_tx.send(chunk) => {

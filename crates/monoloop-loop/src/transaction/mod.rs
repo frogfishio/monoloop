@@ -16,6 +16,7 @@ mod dispatcher;
 mod error;
 mod events;
 mod exchange;
+mod executor_spawn;
 mod fake_support;
 mod finalization;
 mod host_tools;

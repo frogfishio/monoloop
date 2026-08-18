@@ -176,6 +176,18 @@ impl TransactionToolDispatcher {
 
     /// Dispatch one call end-to-end.
     pub async fn dispatch(self: &Arc<Self>, request: DispatchRequest) -> DispatchOutcome {
+        self.dispatch_with_cancel(request, None).await
+    }
+
+    /// Dispatch with an optional external cancel signal (D-028).
+    ///
+    /// When `cancel` is notified, the dispatcher runs the same termination path as
+    /// an execution deadline so the worker is cancel/kill/joined instead of detached.
+    pub async fn dispatch_with_cancel(
+        self: &Arc<Self>,
+        request: DispatchRequest,
+        cancel: Option<Arc<tokio::sync::Notify>>,
+    ) -> DispatchOutcome {
         let action = request.tool_action_id.clone();
 
         // Allowlist by public name.
@@ -308,16 +320,47 @@ impl TransactionToolDispatcher {
             }
         };
 
-        // Bounded execution: deadline, then policy-based cancel → grace → kill → join (D-024).
+        // Bounded execution: deadline / external cancel → grace → kill → join (D-024 / D-028).
         let deadline = spec.limits.execution_deadline;
         let policy = spec.cancellation.clone();
         let control = handle.control.clone();
         let kill = handle.kill.clone();
+        // Structural: declared Abortable/IsolatedKillable must carry a kill handle (D-028).
+        let kill_ok = match &policy {
+            ToolCancellationPolicy::Abortable | ToolCancellationPolicy::IsolatedKillable { .. } => {
+                kill.is_some()
+            }
+            ToolCancellationPolicy::Cooperative { .. } => true,
+        };
+        if !kill_ok {
+            drop(permit);
+            lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
+                tool_action_id: action.clone(),
+                tool_id: tool_id.clone(),
+                code: "missing_kill_handle".into(),
+            });
+            return DispatchOutcome::RuntimeFailed {
+                tool_action_id: action,
+                tool_id: Some(tool_id),
+                code: "missing_kill_handle".into(),
+                lifecycle,
+            };
+        }
         let wait = handle.completion.wait();
         tokio::pin!(wait);
+        let cancel_fut = async {
+            if let Some(n) = cancel.as_ref() {
+                n.notified().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let completion = tokio::select! {
             biased;
             c = &mut wait => c,
+            _ = cancel_fut => {
+                await_tool_termination(&mut wait, &control, kill.as_ref(), &policy).await
+            }
             _ = tokio::time::sleep(deadline) => {
                 await_tool_termination(&mut wait, &control, kill.as_ref(), &policy).await
             }

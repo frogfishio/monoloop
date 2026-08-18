@@ -398,7 +398,6 @@ mod tests {
         let mut s = st();
         let c = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"x","arguments":"{not-json"}}]},"finish_reason":"tool_calls"}]}"#;
         let fr = s.push_bytes(c).unwrap();
-        s.push_bytes(b"\n\n").unwrap();
         assert!(!fr.iter().any(|f| matches!(
             f,
             AcpFragment::Tool {
@@ -406,6 +405,14 @@ mod tests {
                 ..
             }
         )));
+        let err = s
+            .push_bytes(b"\n\n")
+            .expect_err("invalid tool JSON must fail closed at finish");
+        assert_eq!(err.kind, InterpreterErrorKind::MalformedSemanticPayload);
+        assert!(
+            !s.saw_done(),
+            "malformed tool args must not reach a successful done state"
+        );
     }
 
     #[test]

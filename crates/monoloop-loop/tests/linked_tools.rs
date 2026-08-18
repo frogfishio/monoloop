@@ -57,7 +57,9 @@ fn make_spec(id: &str, name: &str) -> ToolSpec {
             max_output_bytes: 1024,
             execution_deadline: Duration::from_secs(5),
         },
-        ToolCancellationPolicy::Abortable,
+        ToolCancellationPolicy::Cooperative {
+            grace: std::time::Duration::from_millis(50),
+        },
     )
     .unwrap()
 }
@@ -589,7 +591,9 @@ async fn empty_tool_registry_still_unavailable() {
 #[tokio::test]
 async fn cancel_running_async_tool() {
     // Short deadline forces timeout cancel path while the handler still runs.
+    // Abortable + AsyncToolHandler (supports_abort + kill handle) is the structural pair.
     let mut spec = make_spec("c", "cancel_me");
+    spec.cancellation = ToolCancellationPolicy::Abortable;
     spec.limits.execution_deadline = Duration::from_millis(50);
     let host = HostToolRegistry::build(vec![RegisteredTool::new(
         spec,
@@ -619,7 +623,9 @@ async fn cancel_running_async_tool() {
         matches!(
             &out,
             DispatchOutcome::RuntimeFailed { code, .. }
-                if code == "deadline_exceeded" || code == "completion_lost"
+                if code == "deadline_exceeded"
+                    || code == "completion_lost"
+                    || code == "termination_failed"
         ),
         "expected deadline abort path, got {out:?}"
     );

@@ -136,6 +136,31 @@ pub async fn dispatch_ready_tool(
     request_ordinal: u32,
     arguments_json: &str,
 ) -> DispatchOutcome {
+    dispatch_ready_tool_cancellable(
+        dispatcher,
+        exchange_id,
+        tool_action_id,
+        tool_name,
+        provider_tool_call_id,
+        request_ordinal,
+        arguments_json,
+        None,
+    )
+    .await
+}
+
+/// Dispatch with an actor-owned cancel signal so mid-dispatch cancel joins the worker (D-028).
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_ready_tool_cancellable(
+    dispatcher: &Arc<TransactionToolDispatcher>,
+    exchange_id: ExchangeId,
+    tool_action_id: ToolActionId,
+    tool_name: &str,
+    provider_tool_call_id: &str,
+    request_ordinal: u32,
+    arguments_json: &str,
+    cancel: Option<std::sync::Arc<tokio::sync::Notify>>,
+) -> DispatchOutcome {
     let name = match ToolName::try_new(tool_name) {
         Ok(n) => n,
         Err(_) => {
@@ -148,13 +173,16 @@ pub async fn dispatch_ready_tool(
         }
     };
     dispatcher
-        .dispatch(DispatchRequest {
-            exchange_id,
-            tool_action_id,
-            tool_name: name,
-            provider_tool_call_id: provider_tool_call_id.into(),
-            request_ordinal,
-            arguments_json: arguments_json.into(),
-        })
+        .dispatch_with_cancel(
+            DispatchRequest {
+                exchange_id,
+                tool_action_id,
+                tool_name: name,
+                provider_tool_call_id: provider_tool_call_id.into(),
+                request_ordinal,
+                arguments_json: arguments_json.into(),
+            },
+            cancel,
+        )
         .await
 }

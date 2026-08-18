@@ -13,13 +13,14 @@ use monoloop_connector::{
     AnonymousCredentialResolver, StreamingHttpConfig, StreamingHttpConnectorFactory,
 };
 use monoloop_contracts::{
-    user_text_input, CanonicalToolOutput, ChannelCapabilities, ChannelDefaults, ChannelId,
-    ChannelKind, ChannelLimits, ContinuationPolicy, DialectBinding, DialectDescriptor,
-    ExchangeMode, FnCompletionCallback, FnEventSink, InvocationConfig, JsonSchema,
-    McpConfigurationCapability, McpReachability, SessionMode, ToolCancellationPolicy,
-    ToolCompletion, ToolExecutionMode, ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec,
-    ToolSuccessContract, TransactionEnd, TransactionEndKind, TransactionEvent,
-    TransactionEventPayload, TransactionRequest, TransactionRuntime,
+    user_text_input, CanonicalToolOutput, CanonicalToolResultOutcome, ChannelCapabilities,
+    ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy, DialectBinding,
+    DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink, InvocationConfig,
+    JsonSchema, McpConfigurationCapability, McpReachability, SessionMode, ToolActionId,
+    ToolCancellationPolicy, ToolCompletion, ToolExecutionMode, ToolId, ToolLifecycleEvent,
+    ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEnd,
+    TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionRequest,
+    TransactionRuntime,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
@@ -162,7 +163,9 @@ fn echo_tool() -> RegisteredTool {
             error_data_schema: None,
         },
         ToolLimits::default(),
-        ToolCancellationPolicy::Abortable,
+        ToolCancellationPolicy::Cooperative {
+            grace: std::time::Duration::from_millis(50),
+        },
     )
     .unwrap();
     RegisteredTool::new(
@@ -534,6 +537,208 @@ async fn concurrent_direct_llm_isolated() {
     tokio::time::timeout(Duration::from_secs(15), wait(f2, n2))
         .await
         .unwrap();
+
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+    join.abort();
+}
+
+fn completed_tool_results(
+    evs: &[TransactionEvent],
+) -> Vec<monoloop_contracts::CanonicalToolResult> {
+    evs.iter()
+        .filter_map(|e| match &e.payload {
+            TransactionEventPayload::ToolLifecycle(ToolLifecycleEvent::Completed { result }) => {
+                Some(result.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// D-030: empty allowlist must not report a model tool request as plain Completed.
+#[tokio::test]
+async fn empty_allowlist_tool_request_is_continuation_required() {
+    let script = Arc::new(|n: usize, _body: String| {
+        if n == 0 {
+            tool_call_sse()
+        } else {
+            panic!("empty allowlist must not open a continuation exchange under CallerControlled");
+        }
+    });
+    let (addr, join) = bind_sse_server(script).await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+
+    let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            enable_mcp_listener: false,
+            ..Default::default()
+        },
+        channels: ChannelRegistry::build(vec![openai_channel(
+            "openai-empty-allow",
+            endpoint,
+            BTreeSet::from([ContinuationPolicy::CallerControlled]),
+            "gpt-test",
+        )])
+        .unwrap(),
+        tools: HostToolRegistry::empty(),
+        executor: tokio::runtime::Handle::current(),
+    })
+    .await
+    .unwrap();
+
+    let (kind, evs) = run_tx(
+        rt.as_ref(),
+        "openai-empty-allow",
+        "Use echo.",
+        vec![],
+        ContinuationPolicy::CallerControlled,
+    )
+    .await;
+    assert_eq!(kind, TransactionEndKind::ContinuationRequired);
+    let results = completed_tool_results(&evs);
+    assert_eq!(results.len(), 1, "expected one Completed rejection result");
+    assert_eq!(results[0].provider_tool_call_id, "call_1");
+    assert!(matches!(
+        results[0].outcome,
+        CanonicalToolResultOutcome::DomainFailed(_)
+    ));
+    // Internal action id must be exchange-scoped, not the bare provider id.
+    assert_ne!(results[0].tool_action_id, ToolActionId::new("call_1"));
+    assert!(results[0].tool_action_id.as_str().ends_with(":call_1"));
+
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+    join.abort();
+}
+
+/// D-030: rejection results reach inline continuation with the original provider call id.
+#[tokio::test]
+async fn empty_allowlist_inline_preserves_provider_call_id() {
+    let script = Arc::new(|n: usize, body: String| match n {
+        0 => tool_call_sse(),
+        1 => {
+            assert!(
+                body.contains("call_1"),
+                "inline rejection continuation must keep provider id: {body}"
+            );
+            assert!(
+                body.contains("\"role\":\"tool\"")
+                    || body.contains("tool_not_allowed")
+                    || body.contains("error"),
+                "continuation should carry a tool error result: {body}"
+            );
+            text_sse("Acknowledged missing tool.")
+        }
+        _ => panic!("too many exchanges"),
+    });
+    let (addr, join) = bind_sse_server(script).await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+
+    let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            enable_mcp_listener: false,
+            ..Default::default()
+        },
+        channels: ChannelRegistry::build(vec![openai_channel(
+            "openai-empty-inline",
+            endpoint,
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+            "gpt-test",
+        )])
+        .unwrap(),
+        tools: HostToolRegistry::empty(),
+        executor: tokio::runtime::Handle::current(),
+    })
+    .await
+    .unwrap();
+
+    let (kind, evs) = run_tx(
+        rt.as_ref(),
+        "openai-empty-inline",
+        "Use echo.",
+        vec![],
+        ContinuationPolicy::InlineToolContinuation,
+    )
+    .await;
+    assert_eq!(kind, TransactionEndKind::Completed);
+    let results = completed_tool_results(&evs);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].provider_tool_call_id, "call_1");
+    assert!(matches!(
+        results[0].outcome,
+        CanonicalToolResultOutcome::DomainFailed(_)
+    ));
+
+    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+    join.abort();
+}
+
+/// D-030: the same provider call id in two exchanges yields distinct internal action ids.
+#[tokio::test]
+async fn reused_provider_call_id_gets_distinct_internal_action_ids() {
+    let script = Arc::new(|n: usize, body: String| match n {
+        0 => tool_call_sse(),
+        1 => {
+            assert!(body.contains("call_1"));
+            tool_call_sse() // same provider id "call_1" again
+        }
+        2 => {
+            assert!(body.contains("call_1"));
+            text_sse("Done after two tool rounds.")
+        }
+        _ => panic!("too many exchanges"),
+    });
+    let (addr, join) = bind_sse_server(script).await;
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+
+    let tools = HostToolRegistry::build(vec![echo_tool()]).unwrap();
+    let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            enable_mcp_listener: false,
+            ..Default::default()
+        },
+        channels: ChannelRegistry::build(vec![openai_channel(
+            "openai-reuse-id",
+            endpoint,
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+            "gpt-test",
+        )])
+        .unwrap(),
+        tools,
+        executor: tokio::runtime::Handle::current(),
+    })
+    .await
+    .unwrap();
+
+    let (kind, evs) = run_tx(
+        rt.as_ref(),
+        "openai-reuse-id",
+        "Use echo twice.",
+        vec![ToolId::try_new("echo").unwrap()],
+        ContinuationPolicy::InlineToolContinuation,
+    )
+    .await;
+    assert_eq!(kind, TransactionEndKind::Completed);
+    let results = completed_tool_results(&evs);
+    assert_eq!(
+        results.len(),
+        2,
+        "expected one Completed per exchange tool call"
+    );
+    assert_eq!(results[0].provider_tool_call_id, "call_1");
+    assert_eq!(results[1].provider_tool_call_id, "call_1");
+    assert_ne!(
+        results[0].tool_action_id, results[1].tool_action_id,
+        "reused provider id must map to distinct internal action ids"
+    );
+    assert!(results[0].tool_action_id.as_str().ends_with(":call_1"));
+    assert!(results[1].tool_action_id.as_str().ends_with(":call_1"));
+    assert_ne!(results[0].exchange_id, results[1].exchange_id);
 
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
     join.abort();

@@ -171,9 +171,22 @@ async fn open_as_raw_connection(
             })?
             .map_err(|e| e.into_connector())?
     } else {
+        // D-026: serialize CreationOnly MCP descriptor into provider session/new.
+        let mut session_cfg = GrokSessionConfig::default();
+        if let Some(mcp) = request
+            .session_attachment
+            .as_ref()
+            .and_then(|a| a.initial_mcp.as_ref())
+        {
+            session_cfg.mcp_servers.push(serde_json::json!({
+                "name": mcp.server_name,
+                "type": "http",
+                "url": mcp.expose_capability_url(),
+            }));
+        }
         let pending = server
             .sessions
-            .begin_new(GrokSessionConfig::default())
+            .begin_new(session_cfg)
             .map_err(|e| e.into_connector())?;
         timeout(request.limits.connect_deadline, pending.opened)
             .await

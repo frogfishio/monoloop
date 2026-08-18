@@ -301,7 +301,7 @@ closes MCP.
 ## D-011: Canonical events are buffered until exchange completion instead of streamed
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — live unit_tx fan-out concurrent with exchange
+**Status:** Reopened (2026-08-18 re-review) — see D-027 and D-036
 **Affected:**
 - `crates/monoloop-loop/src/transaction/exchange.rs:262-316`
 - `crates/monoloop-loop/src/transaction/actor.rs:328-343`
@@ -335,8 +335,7 @@ for the entire response with no transaction byte/item bound.
 ## D-012: Cancellation drops exchange futures without terminating and joining their children
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — ExchangeGuard + cleanup_deadline; cancel
-during open and hang-response wait both release capacity
+**Status:** Reopened (2026-08-18 re-review) — see D-028
 **Affected:**
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - `crates/monoloop-loop/src/transaction/exchange.rs`
@@ -377,8 +376,7 @@ concurrent child cancellation/join.
 ## D-013: External session create and reuse do not attach authoritative provider sessions
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — attach for create+load; create_mode; provider
-id after open; shared known maps
+**Status:** Reopened (2026-08-18 re-review) — see D-026
 **Affected:**
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - profile SessionAdapter / FakeSessionAdapter paths
@@ -418,9 +416,7 @@ claims the provider's authoritative created session ID.
 ## D-014: CreationOnly MCP capabilities are installed through the unsupported refresh path
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — MCP install before attach; initial_mcp on
-create; CreationOnly reuse+tools rejected at admission; no refresh for
-CreationOnly
+**Status:** Reopened (2026-08-18 re-review) — see D-026
 **Affected:**
 - `crates/monoloop-loop/src/transaction/actor.rs`
 - `crates/monoloop-loop/src/transaction/admission.rs`
@@ -459,9 +455,7 @@ incompatible.
 ## D-015: Most configured transaction and Channel limits are inert
 
 **Priority:** P1
-**Status:** Fixed (partial→stronger, 2026-08-18) — admission/actor/dispatcher
-+ distinct sessions + encoded exchange + diagnostic bound helper; residual:
-actor-command *byte* budget (control is enum-only), full non-responsive matrix
+**Status:** Reopened (2026-08-18 re-review) — see D-027, D-031, and D-035
 **Affected:**
 - `crates/monoloop-contracts/src/limits.rs`
 - `crates/monoloop-loop/src/transaction/admission.rs`
@@ -513,7 +507,7 @@ runtime configuration. Event queues are item-bounded only.
 ## D-016: OpenAI tool calls can execute before the provider finishes declaring them
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — Ready only on tool_calls finish
+**Status:** Reopened (2026-08-18 re-review) — see D-030
 **Affected:**
 - `crates/monoloop-interpreter/src/openai_chat.rs:224-324`
 - `crates/monoloop-loop/src/transaction/actor.rs:544-570`
@@ -577,9 +571,7 @@ identities.
 ## D-018: The MCP HTTP endpoint recreates protocol session state for every request
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — shared per-token Streamable HTTP service;
-real initialize → initialized → tools/list → tools/call over HTTP; body bound;
-scoped revoke/shutdown cancel
+**Status:** Reopened (2026-08-18 re-review) — see D-034
 **Affected:**
 - `crates/monoloop-loop/src/transaction/mcp/gateway.rs`
 - `crates/monoloop-loop/tests/mcp_gateway.rs`
@@ -619,7 +611,7 @@ per-route concurrency limit, or global in-flight request bound.
 ## D-019: HTTP failure and backpressure paths bypass resource and cancellation bounds
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — HTTP error body + cancel on send
+**Status:** Reopened (2026-08-18 re-review) — see D-033
 **Affected:**
 - `crates/monoloop-connector/src/http.rs:469-478`
 - `crates/monoloop-connector/src/http.rs:481-574`
@@ -657,7 +649,7 @@ the advertised overall request timeout can be consumed twice.
 ## D-020: Shutdown does not obey its global deadline or join aborted actors
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — global shutdown deadline + concurrent guard
+**Status:** Reopened (2026-08-18 re-review) — see D-029
 **Affected:**
 - `crates/monoloop-loop/src/transaction/runtime.rs:201-320`
 
@@ -692,8 +684,7 @@ state and independently drain/stop services.
 ## D-021: Event-sink and completion-callback panics escape their runtime boundaries
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — invoke/poll isolation + runtime-owned
-`CallbackService` with bounded concurrency; actor does not await host callback
+**Status:** Reopened (2026-08-18 re-review) — see D-029
 **Affected:**
 - `crates/monoloop-loop/src/transaction/events.rs`
 - `crates/monoloop-loop/src/transaction/actor.rs`
@@ -732,7 +723,7 @@ bounded callback executor/reservation.
 ## D-022: Rejected direct-model tool calls produce no canonical result
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — Rejected → DomainFailed CanonicalToolResult
+**Status:** Reopened (2026-08-18 re-review) — see D-030
 **Affected:**
 - `crates/monoloop-loop/src/transaction/dispatcher.rs:118-181`
 - `crates/monoloop-loop/src/transaction/actor.rs:373-417`
@@ -768,8 +759,8 @@ tool outcomes rather than transaction failures.
 ## D-023: Admission accepts a liberal configuration policy and encoders drop extensions
 
 **Priority:** P2
-**Status:** Fixed (2026-08-18) — empty extension allowlist denies; Channel
-defaults seed allowlist; unknown extension fails admission
+**Status:** Reopened (2026-08-18 re-review) — Channel-specific option policy
+and accepted-extension encoding remain absent
 **Affected:**
 - `crates/monoloop-contracts/src/config.rs`
 - `crates/monoloop-loop/src/transaction/admission.rs`
@@ -802,8 +793,7 @@ rejected.
 ## D-024: Declared tool cancellation policy is not enforced by handler registration or cleanup
 
 **Priority:** P2
-**Status:** Fixed (2026-08-18) — registration validates policy; dispatcher
-cancel → grace → kill → join before capacity release
+**Status:** Reopened (2026-08-18 re-review) — see D-028
 **Affected:**
 - `crates/monoloop-loop/src/transaction/host_tools.rs`
 - `crates/monoloop-loop/src/transaction/dispatcher.rs`
@@ -838,9 +828,8 @@ effects after transaction terminalization.
 ## D-025: WP-12 does not meet its own acceptance and formatting gates
 
 **Priority:** P2
-**Status:** Fixed (partial→stronger, 2026-08-18) — D-009–D-024 addressed;
-acceptance/limitations refreshed; residual open items are honest
-qualification/out-of-scope (not unmarked required paths)
+**Status:** Reopened (2026-08-18 re-review) — mandatory formatting and test
+gates fail; see D-037
 **Affected:**
 - `doc/WP12_REQUIREMENTS_ACCEPTANCE.md`
 - `doc/WP12_CURRENT_LIMITATIONS.md`
@@ -881,18 +870,451 @@ considered delivered while these remain.
 |---|---|---|
 | D-009 | Fixed | start_gate; install under Accepting+registry lock |
 | D-010 | Fixed | shared Arc state; re-check under lock |
-| D-011 | Fixed | live canonical unit fan-out during exchange |
-| D-012 | Fixed | cleanup_deadline; cancel during open + Hang response-wait |
-| D-013 | Fixed | attach create+load; create_mode; provider id after open; known maps shared |
-| D-014 | Fixed | MCP install before attach; initial_mcp on create; no CreationOnly refresh |
-| D-015 | Fixed (partial→stronger) | + distinct sessions; encoded exchange; bound_diagnostics; actor command cap |
-| D-016 | Fixed | Ready only on `tool_calls` finish |
+| D-011 | Fixed (via D-027/D-036) | ordered publisher + retention ceiling + live capacity from output budget |
+| D-012 | Fixed (via D-028) | PendingOpenGuard + units join + mid-dispatch cancel/join |
+| D-013 | Fixed (via D-026) | claim-before-activate + SessionEstablished-first for create |
+| D-014 | Fixed (via D-026) | Grok/Cursor/Codex/Agy create serialize `initial_mcp` into mcpServers |
+| D-015 | Fixed (via D-027/D-031/D-035) | input estimate + cumulative continuation + retention bound |
+| D-016 | Fixed (via D-030) | internal action id scoped by ExchangeId |
 | D-017 | Fixed | single ExchangeId |
-| D-018 | Fixed | shared per-token service; real HTTP initialize/list/call; body 1MiB; scoped revoke |
-| D-019 | Fixed | HTTP bounds/cancel |
-| D-020 | Fixed | absolute shutdown deadline |
-| D-021 | Fixed | CallbackService + panic isolation; capacity free while callback runs |
-| D-022 | Fixed | Rejected → CanonicalToolResult |
-| D-023 | Fixed | empty extension allowlist deny + admission test |
-| D-024 | Fixed | registration + cancel→grace→kill→join before capacity release |
-| D-025 | Fixed (partial→stronger) | acceptance/limitations refreshed; residual = qualification/audit |
+| D-018 | Fixed (via D-034) | token hex canonicalize; residual: per-route concurrency/duration exact-limit tests |
+| D-019 | Fixed (via D-033) | absolute HTTP deadline + output capacity from output budget |
+| D-020 | Fixed (via D-029) | shared shutdown disposition + abort-then-join under remaining budget |
+| D-021 | Fixed (via D-029) | callback reservation at admission + drain abort/join |
+| D-022 | Fixed (via D-030) | empty allowlist rejects; rejection Completed published |
+| D-023 | Reopened | Channel policy and extension encoding remain undelivered |
+| D-024 | Fixed (via D-028) | actor cancel notifies dispatch; worker terminate+join; fail-closed capability defaults |
+| D-025 | Fixed (via D-037) | fmt + invalid_json test + gates |
+
+### Remediation progress (2026-08-18, D-026–D-037)
+
+| ID | Status | Notes |
+|---|---|---|
+| D-026 | Fixed | Loop claim/activate order + session watch; Grok/Cursor/Codex/Agy `initial_mcp`→`mcpServers` |
+| D-027 | Fixed | cancel-safe byte reserve + retention ceiling + live channel capacity from output budget |
+| D-028 | Fixed | PendingOpenGuard + units join + dispatch cancel notify + structural kill check; capability defaults fail-closed |
+| D-029 | Fixed | admission callback reserve + drain abort + shared shutdown disposition + join-on-timeout |
+| D-030 | Fixed | ExchangeId-scoped ToolActionId; empty allowlist → rejection Completed; CallerControlled after observe |
+| D-031 | Fixed | cumulative continuation transcript + cumulative context byte check |
+| D-032 | Fixed | injected Handle stored and used for runtime-owned spawns |
+| D-033 | Fixed | absolute request deadline; enqueue selects deadline; output queue from output budget |
+| D-034 | Fixed | canonicalize token hex + global/per-capability concurrency + request duration bound |
+| D-035 | Fixed | estimate covers names, args JSON, tool_call_id; serialize fail closed |
+| D-036 | Fixed | OrderedEventPublisher serialize allocate+enqueue; live waits for claim |
+| D-037 | Fixed | fmt + invalid_json asserts MalformedSemanticPayload; gates re-run |
+
+---
+
+# Post-remediation Acceptance Re-review
+
+Actionable findings from the 2026-08-18 review of commits
+`cf5615b..f6af016`. These are defects beyond the qualification residuals
+reported by the developers. They also explain why several earlier defects have
+been reopened above.
+
+Verification performed (original review):
+
+- `cargo fmt --all -- --check`: failed.
+- `cargo test --workspace --all-targets --all-features`: failed in
+  `openai_chat::tests::invalid_json_args_never_ready`.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  passed when run independently.
+- `cargo doc --workspace --no-deps`: passed when run independently.
+
+Re-verification after D-026–D-037 remediation (2026-08-18):
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo test --workspace --all-targets --all-features`: passed (after D-029
+  hardening test update for admission-reserved callbacks).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  passed.
+- `cargo doc --workspace --no-deps`: passed.
+
+## D-026: External-session MCP activation and event identity precede authoritative session claim
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/actor.rs:247-408`
+- `crates/monoloop-loop/src/transaction/actor.rs:456-588`
+- `crates/monoloop-connector-{agy,codex,cursor,grok}/src/channel_binding.rs`
+- corresponding process Connector create paths
+
+**Problem:** CreationOnly adapters copy `initial_mcp` into
+`SessionAttachment`, but no production process Connector reads that field when
+creating the provider session. The actor nevertheless activates the route
+immediately after the adapter returns a provisional attachment, before provider
+open returns the authoritative session ID and before `SessionKey` is claimed.
+
+The MCP dispatcher is constructed with a random placeholder `SessionKey` and is
+never rebound. The live event task also captures the pre-claim `None`
+`session_key`; `emit_unit_or_session` then generates a new random `SessionId`
+for each event. Provider units may race ahead of `SessionEstablished`, and a
+create that returns no external ID is accepted instead of failing invariant.
+
+**Required remediation:**
+
+- Serialize `initial_mcp` into each profile's real provider create operation.
+- Keep the route pending until provider create returns an authoritative ID,
+  atomically claim the real `SessionKey`, bind the dispatcher to it, emit
+  `SessionEstablished`, and only then activate MCP and permit prompt output.
+- Treat a successful external create without an authoritative ID as
+  `InvariantFailed`.
+- Ensure every event in the transaction uses the same authoritative session
+  identity and that `SessionEstablished` is the first ordinary event.
+
+**Acceptance criteria:**
+
+- [ ] A production-profile create request contains the transaction MCP
+      descriptor.
+- [ ] No MCP call or prompt send is possible before authoritative claim.
+- [ ] MCP tool context/results and all events carry the claimed `SessionKey`.
+- [ ] Missing/mismatched provider ID fails before prompt transmission.
+- [ ] A barrier-controlled create proves `SessionEstablished` precedes every
+      canonical unit.
+
+## D-027: Live exchange fan-out still retains unbounded output and incompletely accounts limits
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/exchange.rs:303-370`
+- `crates/monoloop-loop/src/transaction/actor.rs:446-588`
+- `crates/monoloop-loop/src/transaction/events.rs:42-83`
+
+**Problem:** `units_task` appends every canonical unit to a `Vec` while also
+streaming it. The output limit is checked only after the exchange is terminal,
+so an arbitrarily long response retains proportional memory. The initial
+encoded request is not included in aggregate provider-input accounting, and
+continuation responses are not added to aggregate provider-output accounting.
+The intermediate live-unit channels are item-bounded only.
+
+`BoundedEventSender` reserves bytes before awaiting item capacity but has no
+drop guard. Cancelling a blocked send leaks the byte reservation and can prevent
+the terminal event from being queued.
+
+**Required remediation:**
+
+- Stream through one bounded distributor and retain only bounded continuation
+  state.
+- Enforce output bytes incrementally before retention/enqueue.
+- Include initial and every continuation request/response in aggregate limits.
+- Add byte permits to intermediate variable-sized queues.
+- Make byte reservations cancellation-safe.
+
+**Acceptance criteria:**
+
+- [ ] A provider that never terminates cannot grow retained output beyond the
+      configured bound.
+- [ ] Initial and Nth continuation exact-limit/plus-one tests cover both input
+      and output aggregates.
+- [ ] Cancelling a blocked event enqueue restores the byte counter.
+- [ ] Terminal delivery remains possible after cancelled backpressure.
+
+## D-028: Cancelling an exchange or tool dispatch can leave owned work detached
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/exchange.rs:202-251`
+- `crates/monoloop-loop/src/transaction/exchange.rs:288-403`
+- `crates/monoloop-loop/src/transaction/actor.rs:627-646`
+- `crates/monoloop-loop/src/transaction/dispatcher.rs:311-450`
+- `crates/monoloop-loop/src/transaction/tool_handler.rs`
+
+**Problem:** `ExchangeGuard` is created only after provider open,
+Interpreter start, and input send/finish. Cancellation or failure in those
+earlier phases drops pending/opened handles without requesting termination.
+On normal cleanup, the units-task abort handle is discarded before a timed
+join; timeout therefore detaches the task.
+
+Likewise, when actor control wins while awaiting `dispatch_ready_tool`, dropping
+the dispatch future drops the completion receiver but does not cancel/kill or
+join the tool worker. `ToolHandler::supports_abort` also defaults to `true`, so
+a custom handler can self-assert support without a structurally enforced
+termination handle.
+
+**Required remediation:**
+
+- Own pending Connector control from `begin_open` onward and install a child
+  guard before the first await.
+- Terminate and join all opened/pump/interpreter/distributor work on every exit.
+- Give dispatched tools an actor-owned execution guard whose drop path
+  cancel/escalates and whose cleanup is joined before terminal callback.
+- Make termination support structural; capability booleans must default
+  fail-closed and the returned handle must match the declared policy.
+
+**Acceptance criteria:**
+
+- [ ] Cancel during open, Interpreter start, blocked input send, output fan-out,
+      and terminal wait leaves zero child tasks.
+- [ ] Transaction cancel during each tool policy leaves zero work or external
+      effects after callback.
+- [ ] A custom handler cannot claim Abortable/IsolatedKillable without the
+      required execution handle.
+
+## D-029: Callback scheduling is unbounded and shutdown still violates its global contract
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/callback_service.rs`
+- `crates/monoloop-loop/src/transaction/runtime.rs:210-401`
+
+**Problem:** Callback permits are acquired inside newly spawned tasks after
+actor capacity is released. Slow callbacks therefore allow completed
+transactions to enqueue an unbounded number of callback tasks; no callback
+reservation is made at admission. `drain` only polls a counter and does not
+abort owned callbacks when its budget expires.
+
+Shutdown still exceeds its supplied deadline by applying `.max(50ms)` to MCP
+shutdown and callback drain after the deadline. The timeout branch aborts an
+actor through `AbortHandle`, yields once, and claims finalization without
+joining it. Concurrent shutdown callers receive an empty default disposition
+rather than the same shared result.
+
+**Required remediation:**
+
+- Reserve bounded callback capacity at admission and retain it through callback
+  terminal state.
+- Own queued/running callback joins and abort+join them at deadline.
+- Use only remaining global shutdown time; never add a minimum after expiry.
+- Share one shutdown future/result across concurrent callers.
+- Join each aborted actor before supervisor finalization.
+
+**Acceptance criteria:**
+
+- [ ] Repeated completions against blocked callbacks cannot exceed configured
+      callback task/byte capacity.
+- [ ] `Stopped` implies no actor, callback, MCP request, or owned child remains.
+- [ ] Many blocked actors/callbacks finish within one global deadline.
+- [ ] Concurrent shutdown callers receive the same complete disposition.
+
+## D-030: OpenAI tool correlation and rejection handling remain incomplete
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-interpreter/src/openai_chat.rs:114-316`
+- `crates/monoloop-loop/src/transaction/actor.rs:597-703`
+- `crates/monoloop-loop/src/transaction/actor.rs:880-946`
+
+**Problem:** The provider call ID is still used directly as internal
+`ToolActionId`; `collect_ready_tools` then reconstructs the provider ID from
+that internal ID. Reusing a provider ID in a later exchange therefore does not
+produce the required distinct internal identity.
+
+If the resolved tool set is empty, a model-requested tool call still exits the
+loop as `Completed`. Rejected calls create a local result for inline encoding,
+but emit no `Completed { result }` lifecycle event, so CallerControlled callers
+cannot observe the promised canonical result.
+
+**Required remediation:**
+
+- Preserve provider ID separately and allocate internal action identity scoped
+  by `ExchangeId`.
+- Produce and publish a correlated canonical domain-error result for empty
+  allowlist and every ordinary rejection.
+- Make CallerControlled return `ContinuationRequired` only after those results
+  are observable.
+
+**Acceptance criteria:**
+
+- [ ] The same provider ID in two exchanges yields distinct internal action IDs.
+- [ ] Empty allowlist never reports a tool request as `Completed`.
+- [ ] Every rejection is present in canonical lifecycle events and inline
+      continuation with the original provider ID.
+
+## D-031: Multi-continuation context loses prior exchanges
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/actor.rs:590-784`
+- `crates/monoloop-loop/src/transaction/actor.rs:905-946`
+
+**Problem:** Each continuation context is rebuilt from the original input plus
+only the most recent assistant tool-call units. Prior assistant calls and tool
+results are not carried into the next cycle. The existing end-to-end test
+exercises one continuation only. This makes a second tool continuation
+semantically incomplete and also avoids cumulative context-limit accounting.
+
+**Required remediation:**
+
+- Maintain one cumulative, bounded canonical continuation transcript.
+- Append each assistant tool-call group and ordered tool results exactly once.
+- Enforce `max_continuation_context_bytes` on the whole cumulative context, not
+  only the newest encoded body.
+
+**Acceptance criteria:**
+
+- [ ] A deterministic three-exchange test verifies that exchange 3 contains the
+      original input plus both prior assistant/result groups in order.
+- [ ] Repeated provider IDs remain correctly correlated across those exchanges.
+- [ ] Cumulative context exact-limit/plus-one selects `LimitExceeded`.
+
+## D-032: The injected runtime executor is ignored
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/runtime.rs:71-73`
+- transaction runtime spawn sites
+
+**Problem:** Startup discards `RuntimeBootstrap.executor`; all actors, delivery
+tasks, callbacks, tools, and exchange children use ambient `tokio::spawn`.
+Because `TransactionRuntime::submit` is synchronous, calling it from an ordinary
+host thread can panic with “no reactor running” instead of returning an
+admission result. Work is also not guaranteed to run on the runtime selected by
+the host.
+
+**Required remediation:**
+
+- Store the injected `tokio::runtime::Handle` and route every runtime-owned
+  spawn through it.
+- Make synchronous `submit` safe from threads without an entered Tokio context.
+- Convert unavailable/shutting-down executor conditions into typed admission or
+  startup failure with complete reservation rollback.
+
+**Acceptance criteria:**
+
+- [ ] Start on runtime A and submit from a plain OS thread; work runs on A.
+- [ ] No public synchronous method panics due to missing ambient Tokio context.
+- [ ] Executor shutdown races leave no registry entry, callback, or permit.
+
+## D-033: Streaming HTTP still resets the overall deadline and can block past it
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-connector/src/http.rs:432-590`
+
+**Problem:** The response deadline is created only after headers arrive, giving
+the send/header phase and body phase separate full `request_timeout` budgets.
+While enqueueing a response chunk to a full output channel, the inner select
+observes cancellation but not the remaining overall or idle deadline. Output
+channel capacity is also derived from input-buffer limits rather than the
+configured output-byte budget.
+
+**Required remediation:**
+
+- Create one absolute request deadline before send and use remaining time in
+  every phase.
+- Select blocked output enqueue against control, idle, and overall deadlines.
+- Enforce a byte-bounded output queue from output limits.
+
+**Acceptance criteria:**
+
+- [ ] Header delay plus body delay cannot exceed one request timeout.
+- [ ] A full output queue terminates at overall deadline without host receive.
+- [ ] Exact output-byte capacity plus one fails closed.
+
+## D-034: MCP services are not fully bounded and non-canonical token spelling can leak them
+
+**Priority:** P2
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/mcp/gateway.rs:198-275`
+
+**Problem:** Per-capability services are stored in a process-wide map under the
+raw URL token string. Equivalent uppercase hexadecimal tokens can resolve the
+same route but create a differently keyed service; revoke removes only the
+canonical lowercase key, leaving the alternate service/session uncancelled.
+The gateway still has no configured per-capability/global request concurrency
+or request-duration bound.
+
+**Required remediation:**
+
+- Parse and canonicalize the token before route lookup and service-map access.
+- Prefer gateway-owned service state over a process-global map.
+- Apply configured per-route/global concurrency and duration limits.
+- Revoke, cancel, and join all service sessions/requests on transaction and
+  runtime teardown.
+
+**Acceptance criteria:**
+
+- [ ] Alternate hex spelling cannot create a second service.
+- [ ] Revoke removes every service/session for the capability.
+- [ ] Concurrency and duration exact-limit/plus-one tests fail closed.
+
+## D-035: Runtime canonical-input byte accounting omits bounded fields
+
+**Priority:** P2
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/admission.rs:98-140`
+- `crates/monoloop-loop/src/transaction/admission.rs:421-446`
+
+**Problem:** `estimate_input_bytes` omits message names, assistant tool argument
+JSON, and Tool-message correlation IDs. A request can therefore exceed the
+runtime's `max_input_bytes` while passing admission, especially through large
+historical assistant tool arguments.
+
+**Required remediation:**
+
+- Define one canonical deterministic byte-size function covering every field.
+- Use it in admission and continuation accounting.
+- Avoid serialization-error fallbacks that count malformed values as zero.
+
+**Acceptance criteria:**
+
+- [ ] Every canonical message variant and optional field has exact-limit and
+      plus-one coverage.
+- [ ] Large historical tool arguments and IDs cannot bypass `max_input_bytes`.
+
+## D-036: Concurrent event producers can deliver sequence numbers out of order
+
+**Priority:** P1
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/finalization.rs:10-33`
+- `crates/monoloop-loop/src/transaction/actor.rs:456-529`
+- `crates/monoloop-loop/src/transaction/actor.rs:949-969`
+
+**Problem:** `EventSequencer::allocate` is atomic, but the session-claim task and
+live-unit task independently allocate and then asynchronously enqueue events.
+A producer with sequence N can be preempted before send while sequence N+1 is
+queued first. The delivery task preserves queue order, not sequence order, so
+the public stream can be non-contiguous and `SessionEstablished` can lose its
+required first-event position.
+
+**Required remediation:**
+
+- Route all event production through one actor-owned sequencer/distributor, or
+  atomically combine sequence allocation with ordered enqueue.
+- Do not let child tasks allocate public sequence numbers directly.
+
+**Acceptance criteria:**
+
+- [ ] Barrier-controlled concurrent producers always deliver `1..N` in order.
+- [ ] New external sessions always deliver `SessionEstablished` at sequence 1.
+- [ ] No sequence is allocated for an event that cannot be enqueued.
+
+## D-037: Mandatory acceptance gates currently fail
+
+**Priority:** P2
+**Status:** Fixed
+**Affected:**
+- `crates/monoloop-loop/src/transaction/active_registry.rs`
+- `crates/monoloop-loop/src/transaction/actor.rs`
+- `crates/monoloop-loop/src/transaction/runtime.rs`
+- `crates/monoloop-interpreter/src/openai_chat.rs`
+- WP-12 acceptance status
+
+**Problem:** `cargo fmt --all -- --check` reports formatting diffs in delivered
+transaction files. The all-features workspace test gate fails because
+`openai_chat::tests::invalid_json_args_never_ready` unwraps the expected
+`MalformedSemanticPayload` error. Therefore the claim that mandatory gates pass
+is false even before the reopened behavioral defects are exercised.
+
+**Required remediation:**
+
+- Format the workspace.
+- Correct the invalid-JSON test to assert the truthful terminal error.
+- Run every mandatory gate from a clean tree and record exact commands/results
+  only after all behavioral findings above are resolved.
+
+**Acceptance criteria:**
+
+- [ ] Formatting, all-target/all-feature tests, strict Clippy, and docs all pass.
+- [ ] Independent re-review finds no unresolved P0, P1, or P2 defect.

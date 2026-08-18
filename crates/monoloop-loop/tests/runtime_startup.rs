@@ -164,7 +164,9 @@ fn duplicate_tool_ids_rejected() {
                 error_data_schema: None,
             },
             ToolLimits::default(),
-            ToolCancellationPolicy::Abortable,
+            ToolCancellationPolicy::Cooperative {
+                grace: std::time::Duration::from_millis(50),
+            },
         )
         .unwrap();
         RegisteredTool::new(
@@ -196,7 +198,9 @@ fn duplicate_tool_names_rejected() {
                 error_data_schema: None,
             },
             ToolLimits::default(),
-            ToolCancellationPolicy::Abortable,
+            ToolCancellationPolicy::Cooperative {
+                grace: std::time::Duration::from_millis(50),
+            },
         )
         .unwrap();
         RegisteredTool::new(

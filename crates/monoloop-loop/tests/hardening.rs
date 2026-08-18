@@ -880,7 +880,9 @@ async fn tools_per_transaction_plus_one_rejected() {
                     error_data_schema: None,
                 },
                 ToolLimits::default(),
-                ToolCancellationPolicy::Abortable,
+                ToolCancellationPolicy::Cooperative {
+                    grace: std::time::Duration::from_millis(50),
+                },
             )
             .unwrap(),
             Arc::new(ImmediateToolHandler::new(|_, _| {
@@ -1042,7 +1044,9 @@ async fn tool_payload_transaction_cap_rejects() {
                 max_output_bytes: 1024,
                 execution_deadline: Duration::from_secs(5),
             },
-            ToolCancellationPolicy::Abortable,
+            ToolCancellationPolicy::Cooperative {
+                grace: std::time::Duration::from_millis(50),
+            },
         )
         .unwrap(),
         Arc::new(ImmediateToolHandler::new(|_, _| {
@@ -1264,10 +1268,9 @@ async fn slow_callback_does_not_block_capacity_release() {
     }
     assert_eq!(rt.active_count(), 0);
     assert_eq!(rt.capacity().global_active(), 0);
-    // Subsequent admit succeeds while prior callbacks still run.
-    let done = Arc::new(Notify::new());
-    let ends = Arc::new(AtomicUsize::new(0));
-    TransactionRuntime::submit(
+    // D-029: callback slots reserved at admission are retained through callback
+    // terminal, so a third admit fails closed while both slow callbacks hold slots.
+    let after_err = TransactionRuntime::submit(
         rt.as_ref(),
         free_request(
             "llm",
@@ -1275,14 +1278,47 @@ async fn slow_callback_does_not_block_capacity_release() {
             Arc::new(FnEventSink(|_| {
                 Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
             })),
-            counting_completion(Arc::clone(&ends), Arc::clone(&done)),
+            Box::new(FnCompletionCallback(|_end: TransactionEnd| {
+                Box::pin(async { Ok(()) }) as monoloop_contracts::CompletionDelivery
+            })),
         ),
     )
-    .unwrap();
+    .expect_err("callback capacity must fail closed while slow callbacks hold slots");
+    assert_eq!(
+        after_err.kind,
+        monoloop_contracts::AdmissionErrorKind::CapacityExceeded
+    );
+    hold.notify_waiters();
+    // After callbacks complete, admission succeeds again.
+    let done = Arc::new(Notify::new());
+    let ends = Arc::new(AtomicUsize::new(0));
+    let mut admitted = false;
+    for _ in 0..100 {
+        match TransactionRuntime::submit(
+            rt.as_ref(),
+            free_request(
+                "llm",
+                Some(SessionId::try_new("after-slow-cb-released").unwrap()),
+                Arc::new(FnEventSink(|_| {
+                    Box::pin(async { Ok(()) }) as monoloop_contracts::EventDelivery
+                })),
+                counting_completion(Arc::clone(&ends), Arc::clone(&done)),
+            ),
+        ) {
+            Ok(_) => {
+                admitted = true;
+                break;
+            }
+            Err(e) if e.kind == monoloop_contracts::AdmissionErrorKind::CapacityExceeded => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("unexpected admit error after callback release: {e:?}"),
+        }
+    }
+    assert!(admitted, "admit after slow callbacks release");
     tokio::time::timeout(Duration::from_secs(5), done.notified())
         .await
-        .expect("admit after slow callbacks");
-    hold.notify_waiters();
+        .expect("third transaction completes");
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(2)).await;
 }
 

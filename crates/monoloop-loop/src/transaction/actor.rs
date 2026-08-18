@@ -1,14 +1,15 @@
 //! Transaction actor: session establish + one provider exchange + finalization.
 
 use super::active_registry::{ActiveTransactionRegistry, ClaimSessionError, ControlMessage};
-use super::callback_service::CallbackService;
+use super::callback_service::{CallbackReservation, CallbackService};
 use super::dispatcher::{DispatchOutcome, DispatcherLimits, TransactionToolDispatcher};
-use super::events::{BoundedEventSender, QueuedEvent};
+use super::events::{BoundedEventSender, OrderedEventPublisher};
 use super::exchange::{
     run_encoded_exchange, run_exchange, EncodedExchangeParams, ExchangeFailure, ExchangeParams,
 };
+use super::executor_spawn::try_spawn;
 use super::finalization::{build_transaction_end, FinalizationGuard};
-use super::loop_adapters::dispatch_ready_tool;
+use super::loop_adapters::dispatch_ready_tool_cancellable;
 use super::mcp::{CapabilityToken, McpGatewayHandle, PendingMcpBinding};
 use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::SharedToolCapacity;
@@ -16,20 +17,23 @@ use monoloop_connector::{Connector, SessionAdapter};
 use monoloop_contracts::{
     CanonicalAssistantToolCall, CanonicalMessage, CanonicalToolError, CanonicalToolResult,
     CanonicalUnit, CanonicalUnitEvent, ChannelId, ChannelKind, ContinuationContext,
-    ContinuationPolicy, EffectiveConfig, EventDeliveryOutcome, ExternalSessionId,
+    ContinuationPolicy, EffectiveConfig, EventDeliveryOutcome, ExchangeId, ExternalSessionId,
     InterpretationLimits, McpConfigurationCapability, McpReachability, OutboundDialectEncoder,
-    SessionId, SessionKey, TextChannel, TextPart, ToolExecutionMode, ToolId, ToolLifecycleEvent,
-    ToolName, ToolRequestState, TransactionEndKind, TransactionEvent, TransactionEventPayload,
+    SessionId, SessionKey, TextChannel, TextPart, ToolActionId, ToolExecutionMode, ToolId,
+    ToolLifecycleEvent, ToolName, ToolRequestState, TransactionEndKind, TransactionEventPayload,
     TransactionId,
 };
 use monoloop_interpreter::InterpreterFactory;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot, watch};
 // oneshot used for start_gate and create-session claim.
 
 /// Inputs for the transaction actor.
 pub struct ActorSpawn {
+    /// Injected Tokio handle for runtime-owned child tasks (D-032).
+    pub executor: Handle,
     /// Transaction id.
     pub transaction_id: TransactionId,
     /// Channel id.
@@ -119,13 +123,16 @@ pub struct ActorSpawn {
     pub max_diagnostic_bytes: usize,
     /// Runtime-owned completion callback service (D-021).
     pub callbacks: CallbackService,
+    /// Admission-reserved callback capacity retained through terminal (D-029).
+    pub callback_reservation: CallbackReservation,
     /// Closed only after registry install succeeds (D-009).
     pub start_gate: oneshot::Receiver<()>,
 }
 
-/// Spawn the actor task.
-pub fn spawn_actor(spawn: ActorSpawn) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+/// Spawn the actor task on the injected executor (D-032).
+pub fn spawn_actor(spawn: ActorSpawn) -> Result<tokio::task::JoinHandle<()>, ()> {
+    let executor = spawn.executor.clone();
+    try_spawn(&executor, async move {
         run_actor(spawn).await;
     })
 }
@@ -139,6 +146,7 @@ struct ActorResult {
 
 async fn run_actor(spawn: ActorSpawn) {
     let ActorSpawn {
+        executor,
         transaction_id,
         channel_id,
         channel_kind: _,
@@ -183,14 +191,21 @@ async fn run_actor(spawn: ActorSpawn) {
         max_diagnostic_count,
         max_diagnostic_bytes,
         callbacks,
+        callback_reservation,
         start_gate,
     } = spawn;
     let _ = (max_diagnostic_count, max_diagnostic_bytes);
+    // D-036: sole ordinary event allocator/publisher for this transaction.
+    let events = OrderedEventPublisher::new(event_tx.clone(), Arc::clone(guard.sequencer()));
+    // D-026: live fan-out waits for authoritative SessionKey before publishing.
+    let (session_watch_tx, session_watch_rx) = watch::channel(session_key.clone());
 
     // D-009: do not perform I/O or callbacks until admission installs us.
     match start_gate.await {
         Ok(()) => {}
         Err(_) => {
+            // Drop reservation via Drop; release capacity/registry.
+            drop(callback_reservation);
             release_capacity();
             let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
             let _ = reg.remove(&transaction_id);
@@ -219,13 +234,14 @@ async fn run_actor(spawn: ActorSpawn) {
                 transaction_id,
                 channel_id,
                 guard,
-                event_tx,
+                events,
                 registry,
                 release_capacity,
                 result,
                 terminal_event_delivery_deadline,
                 callback_deadline,
                 &callbacks,
+                callback_reservation,
             )
             .await;
             return;
@@ -354,8 +370,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 }
                 session_key = Some(key);
                 if !emit_unit_or_session(
-                    &event_tx,
-                    &guard,
+                    &events,
                     transaction_id,
                     &channel_id,
                     &session_key,
@@ -367,45 +382,43 @@ async fn run_actor(spawn: ActorSpawn) {
                 {
                     return Err(TransactionEndKind::EventDeliveryFailed);
                 }
-            }
-            // Create: claim after first open returns the provider id (below).
-            attachment = Some(att);
-
-            // D-014: activate MCP route after attach; CreationOnly uses initial_mcp only
-            // (never begin_refresh_mcp). Refreshable may still refresh after claim.
-            if let Some(ref pending) = pending_mcp {
-                if mcp_configuration == McpConfigurationCapability::Refreshable {
-                    if let (Some(att_ref), Some(adapter)) = (attachment.as_ref(), sessions.as_ref())
-                    {
-                        if let Ok(pending_cfg) = adapter.begin_refresh_mcp(
-                            Arc::clone(att_ref),
-                            Some(pending.descriptor.clone()),
-                        ) {
-                            tokio::select! {
-                                biased;
-                                ctrl = control_rx.recv() => {
-                                    let _ = pending_cfg.control.cancel();
-                                    return Err(match ctrl {
-                                        Some(ControlMessage::ForceTerminate) => {
-                                            TransactionEndKind::Terminated
-                                        }
-                                        _ => TransactionEndKind::Cancelled,
-                                    });
-                                }
-                                r = pending_cfg.completion => {
-                                    r.map_err(|_| TransactionEndKind::InvariantFailed)?;
+                let _ = session_watch_tx.send(session_key.clone());
+                // Load path: activate MCP only after authoritative claim (D-026).
+                if let Some(ref pending) = pending_mcp {
+                    if mcp_configuration == McpConfigurationCapability::Refreshable {
+                        if let (Some(att_ref), Some(adapter)) =
+                            (Some(Arc::clone(&att)), sessions.as_ref())
+                        {
+                            if let Ok(pending_cfg) =
+                                adapter.begin_refresh_mcp(att_ref, Some(pending.descriptor.clone()))
+                            {
+                                tokio::select! {
+                                    biased;
+                                    ctrl = control_rx.recv() => {
+                                        let _ = pending_cfg.control.cancel();
+                                        return Err(match ctrl {
+                                            Some(ControlMessage::ForceTerminate) => {
+                                                TransactionEndKind::Terminated
+                                            }
+                                            _ => TransactionEndKind::Cancelled,
+                                        });
+                                    }
+                                    r = pending_cfg.completion => {
+                                        r.map_err(|_| TransactionEndKind::InvariantFailed)?;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                // CreationOnly: descriptor already passed via initial_mcp; activate route.
-                if let Some(handle) = mcp.as_ref() {
-                    handle
-                        .activate(&pending.token)
-                        .map_err(|_| TransactionEndKind::InvariantFailed)?;
+                    if let Some(handle) = mcp.as_ref() {
+                        handle
+                            .activate(&pending.token)
+                            .map_err(|_| TransactionEndKind::InvariantFailed)?;
+                    }
                 }
             }
+            // Create: claim + MCP activate after first open returns the provider id (below).
+            attachment = Some(att);
         } else if provisional_external {
             // No SessionAdapter: synthetic DirectLlm-style claim only.
             let sid = SessionId::generate();
@@ -424,11 +437,11 @@ async fn run_actor(spawn: ActorSpawn) {
                 }
             }
             session_key = Some(key);
+            let _ = session_watch_tx.send(session_key.clone());
             let ext = ExternalSessionId::try_new(sid.as_str())
                 .map_err(|_| TransactionEndKind::InvariantFailed)?;
             if !emit_unit_or_session(
-                &event_tx,
-                &guard,
+                &events,
                 transaction_id,
                 &channel_id,
                 &session_key,
@@ -451,20 +464,33 @@ async fn run_actor(spawn: ActorSpawn) {
         let mut continuations_done = 0usize;
         let mut provider_input_bytes = 0usize;
         let mut provider_output_bytes = 0usize;
+        // D-031: cumulative continuation transcript (original input + each
+        // assistant tool-call group and ordered results, appended once).
+        let mut continuation_messages = input.messages().to_vec();
         let _ = max_total_provider_output_bytes;
 
         // D-011: fan units to the event sink as they are produced (not only after EOF).
-        let (live_tx, mut live_rx) =
-            mpsc::channel::<CanonicalUnitEvent>(max_provider_exchanges.saturating_mul(64).max(64));
-        let event_tx_live = event_tx.clone();
-        let guard_live = Arc::clone(&guard);
+        // D-026: wait for authoritative SessionKey before publishing any unit.
+        // D-027: item capacity derived from provider-output byte budget (byte-aware bound).
+        let live_cap = (max_total_provider_output_bytes / 256)
+            .clamp(8, max_provider_exchanges.saturating_mul(64).max(64));
+        let (live_tx, mut live_rx) = mpsc::channel::<CanonicalUnitEvent>(live_cap);
+        let events_live = events.clone();
         let channel_live = channel_id.clone();
-        let session_live = session_key.clone();
-        let live_join = tokio::spawn(async move {
+        let mut session_watch_live = session_watch_rx.clone();
+        let live_join = match try_spawn(&executor, async move {
+            // Block until claim publishes a SessionKey (already Some for load/DirectLlm).
+            if session_watch_live
+                .wait_for(|sk| sk.is_some())
+                .await
+                .is_err()
+            {
+                return Err(TransactionEndKind::EventDeliveryFailed);
+            }
             while let Some(unit) = live_rx.recv().await {
+                let session_live = session_watch_live.borrow().clone();
                 if !emit_canonical_unit(
-                    &event_tx_live,
-                    &guard_live,
+                    &events_live,
                     transaction_id,
                     &channel_live,
                     &session_live,
@@ -476,16 +502,20 @@ async fn run_actor(spawn: ActorSpawn) {
                 }
             }
             Ok(())
-        });
+        }) {
+            Ok(h) => h,
+            Err(()) => return Err(TransactionEndKind::InvariantFailed),
+        };
 
         let (session_id_tx, claim_join) = if create_mode_attach {
             let (sess_tx, sess_rx) = oneshot::channel();
             let registry_c = Arc::clone(&registry);
-            let event_tx_c = event_tx.clone();
+            let events_c = events.clone();
             let guard_c = Arc::clone(&guard);
             let channel_c = channel_id.clone();
+            let session_watch_c = session_watch_tx.clone();
             let max_distinct = max_distinct_sessions;
-            let join = tokio::spawn(async move {
+            let join = match try_spawn(&executor, async move {
                 let Ok(ext) = sess_rx.await else {
                     return Ok::<(), TransactionEndKind>(());
                 };
@@ -510,9 +540,9 @@ async fn run_actor(spawn: ActorSpawn) {
                         .map(|k| k.session_id.clone())
                         .unwrap_or_else(SessionId::generate),
                 );
+                // Publish SessionEstablished before any live units (D-026/D-036).
                 if !emit_unit_or_session(
-                    &event_tx_c,
-                    &guard_c,
+                    &events_c,
                     transaction_id,
                     &channel_c,
                     &sk,
@@ -524,8 +554,15 @@ async fn run_actor(spawn: ActorSpawn) {
                 {
                     return Err(TransactionEndKind::EventDeliveryFailed);
                 }
+                let _ = session_watch_c.send(sk);
                 Ok(())
-            });
+            }) {
+                Ok(h) => h,
+                Err(()) => {
+                    live_join.abort();
+                    return Err(TransactionEndKind::InvariantFailed);
+                }
+            };
             (Some(sess_tx), Some(join))
         } else {
             (None, None)
@@ -548,6 +585,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 });
             }
             r = run_exchange(ExchangeParams {
+                executor: &executor,
                 transaction_id,
                 connector: connector.as_ref(),
                 encoder: encoder.as_ref(),
@@ -568,20 +606,33 @@ async fn run_actor(spawn: ActorSpawn) {
         }
         .map_err(map_exchange_failure)?;
         exchanges_done += 1;
+        // D-027: count initial encoded request toward aggregate provider input.
+        // (Byte length already enforced against max_encoded_exchange_bytes in run_exchange.)
+        if let Some(j) = claim_join {
+            j.await.map_err(|_| TransactionEndKind::InvariantFailed)??;
+            let Some(ext) = outcome.external_session_id.clone() else {
+                // D-026: successful create without authoritative ID is invariant failure.
+                return Err(TransactionEndKind::InvariantFailed);
+            };
+            session_key = Some(SessionKey::new(
+                channel_id.clone(),
+                SessionId::from_external(&ext),
+            ));
+            let _ = session_watch_tx.send(session_key.clone());
+            // Activate MCP only after authoritative claim (D-026).
+            if let Some(ref pending) = pending_mcp {
+                if let Some(handle) = mcp.as_ref() {
+                    handle
+                        .activate(&pending.token)
+                        .map_err(|_| TransactionEndKind::InvariantFailed)?;
+                }
+            }
+        }
         for u in &outcome.units {
             provider_output_bytes = provider_output_bytes.saturating_add(estimate_unit_bytes(u));
         }
         if provider_output_bytes > max_total_provider_output_bytes {
             return Err(TransactionEndKind::LimitExceeded);
-        }
-        if let Some(j) = claim_join {
-            j.await.map_err(|_| TransactionEndKind::InvariantFailed)??;
-            if let Some(ext) = outcome.external_session_id.clone() {
-                session_key = Some(SessionKey::new(
-                    channel_id.clone(),
-                    SessionId::from_external(&ext),
-                ));
-            }
         }
         live_join
             .await
@@ -599,9 +650,9 @@ async fn run_actor(spawn: ActorSpawn) {
                 break;
             }
 
-            let ready = collect_ready_tools(&outcome.units);
-            if ready.is_empty() || tools.is_empty() {
-                // No tool requests, or empty admitted set (zero external effects).
+            // Interpreter units keep provider call IDs; allocate internal action IDs here.
+            let ready = collect_ready_tools(outcome.exchange_id, &outcome.units);
+            if ready.is_empty() {
                 break;
             }
 
@@ -609,6 +660,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 .clone()
                 .ok_or(TransactionEndKind::InvariantFailed)?;
 
+            // Empty allowlist still dispatches so each request gets a correlated rejection.
             let dispatcher = TransactionToolDispatcher::with_limits(
                 transaction_id,
                 sk.clone(),
@@ -624,9 +676,27 @@ async fn run_actor(spawn: ActorSpawn) {
 
             let mut results: Vec<CanonicalToolResult> = Vec::with_capacity(ready.len());
             for (ord, (action_id, name, payload, provider_id)) in ready.into_iter().enumerate() {
+                // D-028: notify cancel into dispatch so the worker is terminated+joined
+                // instead of dropping the dispatch future (which would detach work).
+                let tool_cancel = Arc::new(tokio::sync::Notify::new());
+                let tool_cancel_dispatch = Arc::clone(&tool_cancel);
+                let dispatch_fut = dispatch_ready_tool_cancellable(
+                    &dispatcher,
+                    outcome.exchange_id,
+                    action_id,
+                    &name,
+                    &provider_id,
+                    ord as u32,
+                    &payload,
+                    Some(tool_cancel_dispatch),
+                );
+                tokio::pin!(dispatch_fut);
                 let dispatch_outcome = tokio::select! {
                     biased;
                     ctrl = control_rx.recv() => {
+                        tool_cancel.notify_waiters();
+                        // Join the in-flight dispatch (cancel path terminates worker).
+                        let _ = dispatch_fut.await;
                         return Err(match ctrl {
                             Some(ControlMessage::ForceTerminate) => {
                                 TransactionEndKind::Terminated
@@ -634,16 +704,9 @@ async fn run_actor(spawn: ActorSpawn) {
                             _ => TransactionEndKind::Cancelled,
                         });
                     }
-                    r = dispatch_ready_tool(
-                        &dispatcher,
-                        outcome.exchange_id,
-                        action_id,
-                        &name,
-                        &provider_id,
-                        ord as u32,
-                        &payload,
-                    ) => r,
+                    r = &mut dispatch_fut => r,
                 };
+                let mut rejection_result: Option<CanonicalToolResult> = None;
                 match &dispatch_outcome {
                     DispatchOutcome::Canonical { result, .. } => {
                         results.push(result.clone());
@@ -654,13 +717,13 @@ async fn run_actor(spawn: ActorSpawn) {
                         message,
                         ..
                     } => {
-                        // D-022: ordinary rejections are correlated tool outcomes.
+                        // Ordinary rejections are correlated domain-error results (D-022/D-030).
                         let err = CanonicalToolError::try_new(*code, message.as_str(), None, 256)
                             .unwrap_or_else(|_| {
                                 CanonicalToolError::try_new("tool_rejected", "rejected", None, 256)
                                     .expect("static")
                             });
-                        results.push(CanonicalToolResult {
+                        let result = CanonicalToolResult {
                             transaction_id,
                             session_key: sk.clone(),
                             exchange_id: outcome.exchange_id,
@@ -672,36 +735,64 @@ async fn run_actor(spawn: ActorSpawn) {
                             outcome: monoloop_contracts::CanonicalToolResultOutcome::DomainFailed(
                                 err,
                             ),
-                        });
+                        };
+                        results.push(result.clone());
+                        rejection_result = Some(result);
                     }
                     DispatchOutcome::RuntimeFailed { .. } => {}
                 }
                 emit_dispatch_outcome(
-                    &event_tx,
-                    &guard,
+                    &events,
                     transaction_id,
                     &channel_id,
                     &session_key,
                     dispatch_outcome,
                 )
                 .await?;
+                // Rejected dispatcher paths omit Completed; publish before continuation decision.
+                if let Some(result) = rejection_result {
+                    if !emit_tool_lifecycle(
+                        &events,
+                        transaction_id,
+                        &channel_id,
+                        &session_key,
+                        ToolLifecycleEvent::Completed { result },
+                    )
+                    .await
+                    {
+                        return Err(TransactionEndKind::EventDeliveryFailed);
+                    }
+                }
             }
 
             if results.is_empty() {
-                // All rejected/runtime-failed handled by emit_dispatch_outcome.
+                // All runtime-failed (ToolExchangeFailed already returned) or no products.
                 break;
             }
 
             match effective.continuation_policy {
                 ContinuationPolicy::CallerControlled => {
+                    // Results are already on the event stream (Canonical Completed / rejection Completed).
                     return Err(TransactionEndKind::ContinuationRequired);
                 }
                 ContinuationPolicy::InlineToolContinuation => {
                     if continuations_done >= max_inline || exchanges_done >= max_exchanges {
                         return Err(TransactionEndKind::LimitExceeded);
                     }
-                    let context = build_continuation_context(&input, &outcome.units)
+                    // Append this exchange's assistant tool-calls + results once (D-031).
+                    append_exchange_to_transcript(
+                        &mut continuation_messages,
+                        &outcome.units,
+                        &results,
+                    )
+                    .map_err(|_| TransactionEndKind::EncodingFailed)?;
+                    let context = ContinuationContext::try_new(continuation_messages.clone())
                         .map_err(|_| TransactionEndKind::EncodingFailed)?;
+                    // Enforce cumulative context size, not only the newest body.
+                    let context_bytes = estimate_input_bytes_from_messages(&continuation_messages);
+                    if context_bytes > max_continuation_context_bytes {
+                        return Err(TransactionEndKind::LimitExceeded);
+                    }
                     let exchange_id = monoloop_contracts::ExchangeId::generate();
                     let encoded = encoder
                         .encode_tool_continuation(
@@ -725,16 +816,15 @@ async fn run_actor(spawn: ActorSpawn) {
                     if provider_input_bytes > max_total_provider_input_bytes {
                         return Err(TransactionEndKind::LimitExceeded);
                     }
-                    let (live_tx2, mut live_rx2) = mpsc::channel::<CanonicalUnitEvent>(64);
-                    let event_tx_live = event_tx.clone();
-                    let guard_live = Arc::clone(&guard);
+                    let live_cap2 = (max_total_provider_output_bytes / 256).clamp(8, 64);
+                    let (live_tx2, mut live_rx2) = mpsc::channel::<CanonicalUnitEvent>(live_cap2);
+                    let events_live2 = events.clone();
                     let channel_live = channel_id.clone();
                     let session_live = session_key.clone();
-                    let live_join2 = tokio::spawn(async move {
+                    let live_join2 = match try_spawn(&executor, async move {
                         while let Some(unit) = live_rx2.recv().await {
                             if !emit_canonical_unit(
-                                &event_tx_live,
-                                &guard_live,
+                                &events_live2,
                                 transaction_id,
                                 &channel_live,
                                 &session_live,
@@ -746,7 +836,10 @@ async fn run_actor(spawn: ActorSpawn) {
                             }
                         }
                         Ok(())
-                    });
+                    }) {
+                        Ok(h) => h,
+                        Err(()) => return Err(TransactionEndKind::InvariantFailed),
+                    };
                     outcome = tokio::select! {
                         biased;
                         ctrl = control_rx.recv() => {
@@ -760,6 +853,7 @@ async fn run_actor(spawn: ActorSpawn) {
                             });
                         }
                         r = run_encoded_exchange(EncodedExchangeParams {
+                            executor: &executor,
                             transaction_id,
                             exchange_id,
                             connector: connector.as_ref(),
@@ -842,13 +936,14 @@ async fn run_actor(spawn: ActorSpawn) {
         transaction_id,
         channel_id,
         guard,
-        event_tx,
+        events,
         registry,
         release_capacity,
         result,
         terminal_event_delivery_deadline,
         callback_deadline,
         &callbacks,
+        callback_reservation,
     )
     .await;
 }
@@ -861,6 +956,7 @@ fn map_exchange_failure(f: ExchangeFailure) -> TransactionEndKind {
         ExchangeFailure::InterpretationFailed => TransactionEndKind::InterpretationFailed,
         ExchangeFailure::Cancelled => TransactionEndKind::Cancelled,
         ExchangeFailure::Terminated => TransactionEndKind::Terminated,
+        ExchangeFailure::LimitExceeded => TransactionEndKind::LimitExceeded,
     }
 }
 
@@ -877,10 +973,19 @@ fn estimate_unit_bytes(unit: &CanonicalUnitEvent) -> usize {
     }
 }
 
-/// Ready tool requests: (action_id, name, payload_json, provider_call_id).
+/// Internal action id scoped by exchange so reused provider IDs stay distinct.
+fn internal_tool_action_id(exchange_id: ExchangeId, provider_call_id: &str) -> ToolActionId {
+    ToolActionId::new(format!("{}:{provider_call_id}", exchange_id.as_uuid()))
+}
+
+/// Ready tool requests: (internal_action_id, name, payload_json, provider_call_id).
+///
+/// Interpreter fragments keep the provider call ID on `ToolActionEvent.tool_action_id`;
+/// the Loop allocates a distinct internal id for dispatch/lifecycle correlation.
 fn collect_ready_tools(
+    exchange_id: ExchangeId,
     units: &[CanonicalUnitEvent],
-) -> Vec<(monoloop_contracts::ToolActionId, String, String, String)> {
+) -> Vec<(ToolActionId, String, String, String)> {
     let mut out = Vec::new();
     for unit in units {
         let snap = unit.snapshot();
@@ -897,16 +1002,18 @@ fn collect_ready_tools(
             continue;
         };
         let provider_id = tool.tool_action_id.as_str().to_string();
-        out.push((tool.tool_action_id.clone(), name, payload, provider_id));
+        let action_id = internal_tool_action_id(exchange_id, &provider_id);
+        out.push((action_id, name, payload, provider_id));
     }
     out
 }
 
-/// Build continuation context: original input + assistant message with tool calls.
-fn build_continuation_context(
-    input: &monoloop_contracts::CanonicalInput,
+/// Append one exchange's assistant tool-call group and ordered tool results (D-031).
+fn append_exchange_to_transcript(
+    messages: &mut Vec<CanonicalMessage>,
     units: &[CanonicalUnitEvent],
-) -> Result<ContinuationContext, ()> {
+    results: &[CanonicalToolResult],
+) -> Result<(), ()> {
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     for unit in units {
@@ -921,6 +1028,7 @@ fn build_continuation_context(
                 let payload = tool.request_payload.as_deref().unwrap_or("{}");
                 let args: serde_json::Value =
                     serde_json::from_str(payload).unwrap_or_else(|_| serde_json::json!({}));
+                // Provider call ID stays on the wire for correlation (D-030/D-031).
                 tool_calls.push(CanonicalAssistantToolCall {
                     tool_call_id: tool.tool_action_id.as_str().to_string(),
                     tool_name: ToolName::try_new(name).map_err(|_| ())?,
@@ -930,7 +1038,6 @@ fn build_continuation_context(
             _ => {}
         }
     }
-    let mut messages = input.messages().to_vec();
     let content = if text.trim().is_empty() {
         Vec::new()
     } else {
@@ -943,43 +1050,89 @@ fn build_continuation_context(
         content,
         tool_calls,
     });
-    ContinuationContext::try_new(messages).map_err(|_| ())
+    for result in results {
+        let body = match &result.outcome {
+            monoloop_contracts::CanonicalToolResultOutcome::Succeeded(out) => match out {
+                monoloop_contracts::CanonicalToolOutput::Text(t) => t.clone(),
+                monoloop_contracts::CanonicalToolOutput::Json(v) => v.to_string(),
+            },
+            monoloop_contracts::CanonicalToolResultOutcome::DomainFailed(err) => {
+                err.message.clone()
+            }
+        };
+        let part = TextPart::try_new(if body.is_empty() { "ok" } else { &body }, 256 * 1024)
+            .map_err(|_| ())?;
+        messages.push(CanonicalMessage::Tool {
+            tool_call_id: result.provider_tool_call_id.clone(),
+            content: vec![part],
+        });
+    }
+    Ok(())
+}
+
+fn estimate_input_bytes_from_messages(messages: &[CanonicalMessage]) -> usize {
+    // Mirror admission `estimate_input_bytes` without re-validating CanonicalInput.
+    messages
+        .iter()
+        .map(|m| match m {
+            CanonicalMessage::System { content, name }
+            | CanonicalMessage::User { content, name } => {
+                content.iter().map(|p| p.text().len()).sum::<usize>()
+                    + name.as_ref().map(|n| n.len()).unwrap_or(0)
+            }
+            CanonicalMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                content.iter().map(|p| p.text().len()).sum::<usize>()
+                    + tool_calls
+                        .iter()
+                        .map(|c| {
+                            let args = serde_json::to_vec(&c.arguments)
+                                .map(|b| b.len())
+                                .unwrap_or(usize::MAX / 4);
+                            c.tool_call_id
+                                .len()
+                                .saturating_add(c.tool_name.as_str().len())
+                                .saturating_add(args)
+                        })
+                        .sum::<usize>()
+            }
+            CanonicalMessage::Tool {
+                tool_call_id,
+                content,
+            } => tool_call_id.len() + content.iter().map(|p| p.text().len()).sum::<usize>(),
+        })
+        .sum()
 }
 
 async fn emit_unit_or_session(
-    event_tx: &BoundedEventSender,
-    guard: &FinalizationGuard,
+    events: &OrderedEventPublisher,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
     session_key: &Option<SessionKey>,
     payload: TransactionEventPayload,
 ) -> bool {
-    let seq = guard.sequencer().allocate();
-    let session_id = session_key
-        .as_ref()
-        .map(|k| k.session_id.clone())
-        .unwrap_or_else(SessionId::generate);
-    let event = TransactionEvent {
-        transaction_id,
-        channel_id: channel_id.clone(),
-        session_id,
-        sequence: seq,
-        payload,
+    // D-026: never invent a random SessionId for ordinary events. Unclaimed
+    // create paths must claim before publishing (SessionEstablished first).
+    let Some(session_id) = session_key.as_ref().map(|k| k.session_id.clone()) else {
+        return false;
     };
-    event_tx.send(QueuedEvent::new(event, None)).await.is_ok()
+    events
+        .publish(transaction_id, channel_id.clone(), session_id, payload)
+        .await
+        .is_ok()
 }
 
 async fn emit_canonical_unit(
-    event_tx: &BoundedEventSender,
-    guard: &FinalizationGuard,
+    events: &OrderedEventPublisher,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
     session_key: &Option<SessionKey>,
     unit: CanonicalUnitEvent,
 ) -> bool {
     emit_unit_or_session(
-        event_tx,
-        guard,
+        events,
         transaction_id,
         channel_id,
         session_key,
@@ -989,8 +1142,7 @@ async fn emit_canonical_unit(
 }
 
 async fn emit_dispatch_outcome(
-    event_tx: &BoundedEventSender,
-    guard: &FinalizationGuard,
+    events: &OrderedEventPublisher,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
     session_key: &Option<SessionKey>,
@@ -999,16 +1151,7 @@ async fn emit_dispatch_outcome(
     match outcome {
         DispatchOutcome::Canonical { lifecycle, .. } => {
             for ev in lifecycle {
-                if !emit_tool_lifecycle(
-                    event_tx,
-                    guard,
-                    transaction_id,
-                    channel_id,
-                    session_key,
-                    ev,
-                )
-                .await
-                {
+                if !emit_tool_lifecycle(events, transaction_id, channel_id, session_key, ev).await {
                     return Err(TransactionEndKind::EventDeliveryFailed);
                 }
             }
@@ -1016,16 +1159,7 @@ async fn emit_dispatch_outcome(
         }
         DispatchOutcome::Rejected { lifecycle, .. } => {
             for ev in lifecycle {
-                if !emit_tool_lifecycle(
-                    event_tx,
-                    guard,
-                    transaction_id,
-                    channel_id,
-                    session_key,
-                    ev,
-                )
-                .await
-                {
+                if !emit_tool_lifecycle(events, transaction_id, channel_id, session_key, ev).await {
                     return Err(TransactionEndKind::EventDeliveryFailed);
                 }
             }
@@ -1034,16 +1168,7 @@ async fn emit_dispatch_outcome(
         }
         DispatchOutcome::RuntimeFailed { lifecycle, .. } => {
             for ev in lifecycle {
-                if !emit_tool_lifecycle(
-                    event_tx,
-                    guard,
-                    transaction_id,
-                    channel_id,
-                    session_key,
-                    ev,
-                )
-                .await
-                {
+                if !emit_tool_lifecycle(events, transaction_id, channel_id, session_key, ev).await {
                     return Err(TransactionEndKind::EventDeliveryFailed);
                 }
             }
@@ -1053,16 +1178,14 @@ async fn emit_dispatch_outcome(
 }
 
 async fn emit_tool_lifecycle(
-    event_tx: &BoundedEventSender,
-    guard: &FinalizationGuard,
+    events: &OrderedEventPublisher,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
     session_key: &Option<SessionKey>,
     lifecycle: ToolLifecycleEvent,
 ) -> bool {
     emit_unit_or_session(
-        event_tx,
-        guard,
+        events,
         transaction_id,
         channel_id,
         session_key,
@@ -1076,15 +1199,17 @@ async fn finalize_and_cleanup(
     transaction_id: TransactionId,
     channel_id: ChannelId,
     guard: Arc<FinalizationGuard>,
-    event_tx: BoundedEventSender,
+    events: OrderedEventPublisher,
     registry: Arc<Mutex<ActiveTransactionRegistry>>,
     release_capacity: Arc<dyn Fn() + Send + Sync>,
     result: ActorResult,
     terminal_event_delivery_deadline: Duration,
     callback_deadline: Duration,
     callbacks: &CallbackService,
+    callback_reservation: CallbackReservation,
 ) {
     let Some(payload) = guard.try_claim() else {
+        drop(callback_reservation);
         release_capacity();
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let _ = reg.remove(&transaction_id);
@@ -1097,25 +1222,28 @@ async fn finalize_and_cleanup(
         .or_else(|| result.session_key.as_ref().map(|k| k.session_id.clone()))
         .unwrap_or_else(SessionId::generate);
 
-    let seq = guard.sequencer().allocate();
     let mut kind = result.kind;
     let mut prior = result.prior;
     let mut delivery = result.delivery;
 
-    let end_preview = build_transaction_end(&payload, kind, prior, delivery, seq);
-    let event = TransactionEvent {
-        transaction_id: payload.transaction_id,
-        channel_id: channel_id.clone(),
-        session_id: session_for_event,
-        sequence: seq,
-        payload: TransactionEventPayload::Ended(end_preview),
-    };
-
+    let seq_preview = events.sequencer().peek_next();
+    let end_preview = build_transaction_end(&payload, kind, prior, delivery, seq_preview);
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    let send_ok = event_tx
-        .send(QueuedEvent::new(event, Some(ack_tx)))
+    let send_ok = events
+        .publish_terminal(
+            payload.transaction_id,
+            channel_id.clone(),
+            session_for_event,
+            TransactionEventPayload::Ended(end_preview),
+            ack_tx,
+        )
         .await
         .is_ok();
+    let seq = if send_ok {
+        events.sequencer().last_allocated()
+    } else {
+        seq_preview
+    };
 
     if !send_ok {
         delivery = EventDeliveryOutcome::Failed;
@@ -1133,7 +1261,7 @@ async fn finalize_and_cleanup(
     }
 
     let end = build_transaction_end(&payload, kind, prior, delivery, seq);
-    drop(event_tx);
+    drop(events);
 
     {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -1142,6 +1270,11 @@ async fn finalize_and_cleanup(
     release_capacity();
 
     guard.mark_callback_scheduled();
-    // D-021: schedule on runtime-owned service; actor does not await host callback.
-    callbacks.schedule(payload.callback, end, Some(callback_deadline));
+    // D-021 / D-029: schedule with admission-reserved capacity; actor does not await.
+    callbacks.schedule_reserved(
+        callback_reservation,
+        payload.callback,
+        end,
+        Some(callback_deadline),
+    );
 }

@@ -81,7 +81,13 @@ impl ActiveTransactionRegistry {
         &mut self,
         entry: ActiveTransaction,
         max_distinct_sessions: Option<usize>,
-    ) -> Result<(), (monoloop_contracts::AdmissionErrorKind, Box<ActiveTransaction>)> {
+    ) -> Result<
+        (),
+        (
+            monoloop_contracts::AdmissionErrorKind,
+            Box<ActiveTransaction>,
+        ),
+    > {
         if let Some(ref sk) = entry.session_key {
             if self.by_session.contains_key(sk) {
                 return Err((

@@ -21,6 +21,11 @@ impl EventSequencer {
         }
     }
 
+    /// Next sequence that [`Self::allocate`] will return (D-036 peek-before-enqueue).
+    pub fn peek_next(&self) -> u64 {
+        self.next.load(Ordering::SeqCst)
+    }
+
     /// Allocate the next contiguous sequence number.
     pub fn allocate(&self) -> u64 {
         self.next.fetch_add(1, Ordering::SeqCst)

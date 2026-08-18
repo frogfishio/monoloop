@@ -55,6 +55,10 @@ struct RuntimeInner {
     mcp_handle: Option<super::mcp::McpGatewayHandle>,
     /// Runtime-owned completion callbacks (D-021).
     callbacks: CallbackService,
+    /// Injected Tokio handle for all runtime-owned spawns (D-032).
+    executor: tokio::runtime::Handle,
+    /// Shared shutdown result for concurrent callers (D-029).
+    shutdown_disposition: AsyncMutex<Option<ShutdownDisposition>>,
 }
 
 /// Production transaction runtime.
@@ -70,7 +74,8 @@ impl DefaultTransactionRuntime {
 
     async fn start_inner(bootstrap: RuntimeBootstrap) -> Result<Arc<Self>, StartupError> {
         bootstrap.config.validate()?;
-        let _ = bootstrap.executor.id();
+        let executor = bootstrap.executor.clone();
+        let _ = executor.id();
 
         let mut realized: Vec<(ChannelId, LiveChannel)> = Vec::new();
         let mut capacity_pairs: Vec<(ChannelId, usize)> = Vec::new();
@@ -150,6 +155,7 @@ impl DefaultTransactionRuntime {
                 .max_active_transactions
                 .max(1),
             bootstrap.config.transaction_limits.callback_deadline,
+            executor.clone(),
         );
 
         let mut channels = HashMap::with_capacity(realized.len());
@@ -168,6 +174,8 @@ impl DefaultTransactionRuntime {
                 mcp: AsyncMutex::new(mcp),
                 mcp_handle,
                 callbacks,
+                executor,
+                shutdown_disposition: AsyncMutex::new(None),
             }),
         }))
     }
@@ -218,18 +226,23 @@ impl DefaultTransactionRuntime {
 
         let prev = self.inner.state.swap(STATE_DRAINING, Ordering::SeqCst);
         if prev == STATE_STOPPED || prev == STATE_DRAINING {
-            // Concurrent shutdown: second caller does not re-drain.
-            if prev == STATE_STOPPED {
-                return ShutdownDisposition::default();
-            }
-            // Wait until stopped or deadline.
+            // D-029: concurrent callers wait for and share the same disposition.
             while self.inner.state.load(Ordering::SeqCst) != STATE_STOPPED {
                 if tokio::time::Instant::now() >= deadline_at {
                     break;
                 }
+                if let Some(d) = self.inner.shutdown_disposition.lock().await.clone() {
+                    return d;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            return ShutdownDisposition::default();
+            return self
+                .inner
+                .shutdown_disposition
+                .lock()
+                .await
+                .clone()
+                .unwrap_or_default();
         }
 
         let active = {
@@ -274,7 +287,8 @@ impl DefaultTransactionRuntime {
                         EventDeliveryOutcome::Failed,
                         entry.guard.sequencer().last_allocated(),
                     );
-                    let cb_budget = cb_cfg.min(Duration::from_millis(50));
+                    // D-029: no minimum pad after global deadline expiry.
+                    let cb_budget = Duration::ZERO;
                     match run_callback_isolated(payload.callback, end, cb_budget).await {
                         CallbackRun::Ok => supervisor_finalized += 1,
                         CallbackRun::Failed => {
@@ -294,8 +308,8 @@ impl DefaultTransactionRuntime {
             }
 
             let per = (remaining / n as u32).max(Duration::from_millis(20));
-            let join = entry.actor_join;
-            match tokio::time::timeout(per, join).await {
+            let mut join = entry.actor_join;
+            match tokio::time::timeout(per, &mut join).await {
                 Ok(Ok(())) => {
                     if entry.guard.callback_was_scheduled() {
                         normally_finalized += 1;
@@ -337,17 +351,23 @@ impl DefaultTransactionRuntime {
                             EventDeliveryOutcome::Failed,
                             0,
                         );
-                        let _ =
-                            run_callback_isolated(payload.callback, end, Duration::from_millis(50))
-                                .await;
+                        let cb_budget = deadline_at
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .min(cb_cfg);
+                        let _ = run_callback_isolated(payload.callback, end, cb_budget).await;
                         supervisor_finalized += 1;
                     }
                 }
                 Err(_) => {
-                    // D-020: abort then brief poll for join terminal before supervisor claim.
-                    // (timeout drops JoinHandle which detaches; AbortHandle stops the task.)
+                    // D-029: abort then join with remaining budget (never detach JoinHandle).
                     abort.abort();
-                    tokio::task::yield_now().await;
+                    let join_budget =
+                        deadline_at.saturating_duration_since(tokio::time::Instant::now());
+                    if join_budget.is_zero() {
+                        let _ = join.await;
+                    } else {
+                        let _ = tokio::time::timeout(join_budget, join).await;
+                    }
                     if let Some(payload) = entry.guard.try_claim() {
                         entry.guard.mark_callback_scheduled();
                         let end = build_transaction_end(
@@ -357,9 +377,9 @@ impl DefaultTransactionRuntime {
                             EventDeliveryOutcome::Failed,
                             entry.guard.sequencer().last_allocated(),
                         );
-                        let cb_budget = cb_cfg
-                            .min(deadline_at.saturating_duration_since(tokio::time::Instant::now()))
-                            .min(Duration::from_millis(200));
+                        let cb_budget = cb_cfg.min(
+                            deadline_at.saturating_duration_since(tokio::time::Instant::now()),
+                        );
                         match run_callback_isolated(payload.callback, end, cb_budget).await {
                             CallbackRun::Ok => supervisor_finalized += 1,
                             CallbackRun::Failed => {
@@ -379,26 +399,30 @@ impl DefaultTransactionRuntime {
             (entry.release_capacity)();
         }
 
+        // D-029: use only remaining global shutdown time; never pad after expiry.
         let mcp_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
         if let Some(mcp) = self.inner.mcp.lock().await.take() {
-            let _ = tokio::time::timeout(mcp_budget.max(Duration::from_millis(50)), mcp.shutdown())
-                .await;
+            if !mcp_budget.is_zero() {
+                let _ = tokio::time::timeout(mcp_budget, mcp.shutdown()).await;
+            }
         }
 
-        // Drain runtime-owned host callbacks (D-021).
-        let cb_drain = deadline_at
-            .saturating_duration_since(tokio::time::Instant::now())
-            .max(Duration::from_millis(50));
-        self.inner.callbacks.drain(cb_drain).await;
+        // Drain runtime-owned host callbacks (D-021 / D-029).
+        let cb_drain = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        if !cb_drain.is_zero() {
+            self.inner.callbacks.drain(cb_drain).await;
+        }
 
-        self.inner.state.store(STATE_STOPPED, Ordering::SeqCst);
-        ShutdownDisposition {
+        let disposition = ShutdownDisposition {
             normally_finalized,
             supervisor_finalized,
             callback_failed,
             callback_aborted,
             invariant_failed,
-        }
+        };
+        *self.inner.shutdown_disposition.lock().await = Some(disposition.clone());
+        self.inner.state.store(STATE_STOPPED, Ordering::SeqCst);
+        disposition
     }
 }
 
@@ -478,6 +502,7 @@ impl TransactionRuntime for DefaultTransactionRuntime {
             mcp: self.inner.mcp_handle.clone(),
             runtime_state: Arc::clone(&self.inner.state),
             callbacks: self.inner.callbacks.clone(),
+            executor: self.inner.executor.clone(),
         };
         admit(&ctx, request)
     }

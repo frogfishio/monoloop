@@ -124,8 +124,21 @@ async fn open_raw(
             .await
             .map_err(|e| e.into_connector_error())?
     } else {
+        // D-026: CreationOnly MCP descriptor must reach provider session/new.
+        let mut session_cfg = AgySessionConfig::new(&config.cwd);
+        if let Some(mcp) = request
+            .session_attachment
+            .as_ref()
+            .and_then(|a| a.initial_mcp.as_ref())
+        {
+            session_cfg.mcp_servers = serde_json::json!([{
+                "name": mcp.server_name,
+                "type": "http",
+                "url": mcp.expose_capability_url(),
+            }]);
+        }
         agent
-            .session_new(AgySessionConfig::new(&config.cwd))
+            .session_new(session_cfg)
             .await
             .map_err(|e| e.into_connector_error())?
     };
