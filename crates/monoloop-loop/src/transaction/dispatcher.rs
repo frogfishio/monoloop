@@ -291,6 +291,28 @@ impl TransactionToolDispatcher {
         let deadline = spec.limits.execution_deadline;
         let policy = spec.cancellation.clone();
 
+        // Structural termination support must be confirmed *before* start so a
+        // missing kill capability cannot leave an ignoring worker running (D-028).
+        let supports_required_termination = match &policy {
+            ToolCancellationPolicy::Abortable => handler.supports_abort(),
+            ToolCancellationPolicy::IsolatedKillable { .. } => handler.supports_isolated_kill(),
+            ToolCancellationPolicy::Cooperative { .. } => true,
+        };
+        if !supports_required_termination {
+            drop(permit);
+            lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
+                tool_action_id: action.clone(),
+                tool_id: tool_id.clone(),
+                code: "missing_kill_handle".into(),
+            });
+            return DispatchOutcome::RuntimeFailed {
+                tool_action_id: action,
+                tool_id: Some(tool_id),
+                code: "missing_kill_handle".into(),
+                lifecycle,
+            };
+        }
+
         let start_result = catch_unwind(AssertUnwindSafe(|| handler.start(call, context)));
         let handle = match start_result {
             Ok(Ok(h)) => h,
@@ -335,7 +357,7 @@ impl TransactionToolDispatcher {
 
         let control = handle.control.clone();
         let kill = handle.kill.clone();
-        // Structural: declared Abortable/IsolatedKillable must carry a kill handle (D-028).
+        // Post-start invariant: claimed Abortable/IsolatedKillable must return a kill handle.
         let kill_ok = match &policy {
             ToolCancellationPolicy::Abortable | ToolCancellationPolicy::IsolatedKillable { .. } => {
                 kill.is_some()
@@ -343,7 +365,7 @@ impl TransactionToolDispatcher {
             ToolCancellationPolicy::Cooperative { .. } => true,
         };
         if !kill_ok {
-            // Stop already-started work before reporting missing kill (D-028 residual).
+            // Handler lied about supports_*; stop best-effort then fail closed.
             control.cancel();
             let wait = handle.completion.wait();
             let _ = tokio::time::timeout(Duration::from_millis(200), wait).await;

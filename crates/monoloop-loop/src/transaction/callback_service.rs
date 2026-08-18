@@ -156,11 +156,11 @@ impl CallbackService {
             }
         };
         let abort = handle.abort_handle();
-        // Always own the join for shutdown (D-029 residual).
-        joins
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((abort, handle));
+        // Always own the join for shutdown (D-029 residual). Reap completed
+        // joins so normal completions do not grow `joins` for the runtime lifetime.
+        let mut g = joins.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|(_, join)| !join.is_finished());
+        g.push((abort, handle));
     }
 
     /// Schedule a host callback on an owned task (does not block the caller).

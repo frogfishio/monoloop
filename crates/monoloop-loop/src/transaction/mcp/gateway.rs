@@ -256,26 +256,14 @@ async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) 
             .unwrap_or_else(|_| Response::new(Body::empty()));
     };
 
-    // D-034 residual: acquire concurrency permits before body buffering / service create.
+    // Acquire global + per-capability permits before body buffering so a slow
+    // upload cannot bypass concurrency / duration bounds (D-034 residual).
     let Ok(_global) = global_mcp_permits().try_acquire_owned() else {
         return Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
             .body(Body::from("mcp global concurrency exceeded"))
             .unwrap_or_else(|_| Response::new(Body::empty()));
     };
-
-    // Bound body size before protocol dispatch (D-018), after global permit.
-    let (parts, body) = req.into_parts();
-    let collected = match axum::body::to_bytes(body, 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .body(Body::from("request body exceeds bound"))
-                .unwrap_or_else(|_| Response::new(Body::empty()));
-        }
-    };
-    let req = Request::from_parts(parts, Body::from(collected));
 
     let service = {
         let mut map = capability_services()
@@ -312,8 +300,37 @@ async fn forward_mcp(routes: Arc<McpRouteTable>, token_hex: &str, req: Request) 
             .unwrap_or_else(|_| Response::new(Body::empty()));
     };
 
-    let req = rewrite_path(req, &canonical);
-    match tokio::time::timeout(MCP_REQUEST_DURATION, service.service.handle(req)).await {
+    let deadline_at = tokio::time::Instant::now() + MCP_REQUEST_DURATION;
+    let (parts, body) = req.into_parts();
+    let body_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+    let collected =
+        match tokio::time::timeout(body_budget, axum::body::to_bytes(body, 1024 * 1024)).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(_)) => {
+                return Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Body::from("request body exceeds bound"))
+                    .unwrap_or_else(|_| Response::new(Body::empty()));
+            }
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::GATEWAY_TIMEOUT)
+                    .body(Body::from("mcp request deadline exceeded"))
+                    .unwrap_or_else(|_| Response::new(Body::empty()));
+            }
+        };
+    let req = rewrite_path(
+        Request::from_parts(parts, Body::from(collected)),
+        &canonical,
+    );
+    let handle_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+    if handle_budget.is_zero() {
+        return Response::builder()
+            .status(StatusCode::GATEWAY_TIMEOUT)
+            .body(Body::from("mcp request deadline exceeded"))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+    match tokio::time::timeout(handle_budget, service.service.handle(req)).await {
         Ok(response) => response.map(Body::new),
         Err(_) => Response::builder()
             .status(StatusCode::GATEWAY_TIMEOUT)

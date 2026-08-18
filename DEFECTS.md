@@ -890,14 +890,14 @@ considered delivered while these remain.
 | ID | Status | Notes |
 |---|---|---|
 | D-026 | Fixed (residual closed) | Create: claim+`SessionEstablished`+MCP activate **before** prompt send (`prompt_ready` gate); ACP encode uses empty tools for `McpGateway` |
-| D-027 | Fixed (residual closed) | `encoded_request_bytes` counted; continuation units counted into provider output; retention is **byte**-bounded |
-| D-028 | Fixed (residual closed) | `EarlyOpenedGuard` before interpreter/send; `StickyCancel`; missing kill aborts started work |
-| D-029 | Fixed (residual closed) | Callback joins always registered (std `Mutex`); shutdown per-actor slice never pads past global remaining |
+| D-027 | Fixed (residual closed) | Limits before live publish; retention exceed → immediate `LimitExceeded`; estimator covers structure/diagnostics/tool names/results/ids |
+| D-028 | Fixed (residual closed) | Shared `StickyCancel` on deadline/delivery + join; kill capability checked before `handler.start` |
+| D-029 | Fixed (residual closed) | Shared shutdown disposition (no fabricated default); no unbounded joins past deadline; callback joins reaped; no 50ms cleanup floor |
 | D-030 | Fixed | ExchangeId-scoped ToolActionId; empty allowlist → rejection Completed; CallerControlled after observe |
 | D-031 | Fixed (residual closed) | OpenAI continuation encodes transcript only (no duplicate `results` append) |
-| D-032 | Fixed (residual closed) | Shutdown supervisor callbacks use injected `Handle` via `try_spawn` |
+| D-032 | Fixed (residual closed) | `try_spawn` fails closed on shut-down Handle (start-flag / cancelled join), not only spawn panics |
 | D-033 | Fixed | absolute request deadline; enqueue selects deadline; output queue from output budget |
-| D-034 | Fixed (known residual) | Canonical hex + permit-before-body; process-global capability service map remains a structural residual (LAW 5 smell) — not claimed closed |
+| D-034 | Fixed (known residual) | Canonical hex + global/per-cap permits before body; body+dispatch share duration budget; process-global service map remains |
 | D-035 | Fixed | estimate covers names, args JSON, tool_call_id; serialize fail closed |
 | D-036 | Fixed | OrderedEventPublisher serialize allocate+enqueue; live waits for claim |
 | D-037 | Fixed | fmt + invalid_json asserts MalformedSemanticPayload; gates re-run |
@@ -1017,6 +1017,10 @@ the terminal event from being queued.
 - [x] Cancelling a blocked event enqueue restores the byte counter.
       (cancel-safe reservation on `BoundedEventSender`)
 - [x] Terminal delivery remains possible after cancelled backpressure.
+- [x] Unit size checked before live publish; retention exceed returns
+      `LimitExceeded` immediately (does not wait for provider terminal).
+- [x] Estimator includes structure, diagnostics, tool names/results, and
+      envelope identifiers (not text/request-payload only).
 
 ## D-028: Cancelling an exchange or tool dispatch can leave owned work detached
 
@@ -1059,6 +1063,9 @@ termination handle.
       (`StickyCancel`); missing kill aborts started work.
 - [x] A custom handler cannot claim Abortable/IsolatedKillable without the
       required execution handle. (`linked_tools` + registration checks)
+- [x] Deadline / event-delivery failure cancels shared `StickyCancel` and joins
+      in-flight dispatch within `cleanup_deadline` (does not drop mid-dispatch).
+- [x] `supports_abort` / `supports_isolated_kill` checked before `handler.start`.
 
 ## D-029: Callback scheduling is unbounded and shutdown still violates its global contract
 
@@ -1095,7 +1102,12 @@ rather than the same shared result.
       callback task capacity (admission `try_reserve` + semaphore).
 - [x] Callback joins always registered; timed-out children abort+join.
 - [x] Shutdown per-actor join uses remaining global budget only (no 20 ms pad).
-- [x] Concurrent shutdown callers wait for / share one disposition.
+- [x] Concurrent shutdown callers wait for / share one disposition
+      (never return fabricated `Default` when local wait expires early).
+- [x] After global deadline reaches zero, aborted actor joins are not awaited
+      unboundedly (deadline wins over non-yielding host code).
+- [x] Completed callback joins are reaped (no runtime-lifetime `joins` growth).
+- [x] Configured `cleanup_deadline` honored exactly (no silent 50 ms floor).
 
 ## D-030: OpenAI tool correlation and rejection handling remain incomplete
 
@@ -1189,6 +1201,8 @@ the host.
 - [x] Runtime-owned spawns (actors, exchange children, callbacks, shutdown
       supervisor callbacks) use injected `Handle` via `try_spawn`.
 - [x] Synchronous `submit` does not require ambient reactor for spawn path.
+- [x] Spawn on an already shut-down Handle fails closed (cancelled join /
+      never-started task), not only when `spawn` panics.
 - [ ] Dedicated “start on A / submit from OS thread” e2e still desirable.
 
 ## D-033: Streaming HTTP still resets the overall deadline and can block past it
@@ -1243,7 +1257,8 @@ or request-duration bound.
 **Acceptance criteria:**
 
 - [x] Alternate hex spelling cannot create a second service (canonical hex).
-- [x] Revoke removes capability route; global permit before body buffer.
+- [x] Revoke removes capability route; global + per-capability permits acquired
+      before body buffering; body read and dispatch share one duration budget.
 - [ ] Concurrency and duration exact-limit/plus-one tests still desirable.
       (process-global service map remains a known structural residual)
 

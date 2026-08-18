@@ -336,7 +336,8 @@ async fn run_opened_exchange(
     max_retained_unit_bytes: usize,
     early_opened: &mut EarlyOpenedGuard,
 ) -> Result<ExchangeOutcome, ExchangeFailure> {
-    let join_grace = cleanup_deadline.max(Duration::from_millis(50));
+    // Honor configured cleanup_deadline exactly (no silent floor).
+    let join_grace = cleanup_deadline;
     let connection_id = opened.connection_id.clone();
     let encoded_request_bytes = encoded.bytes.len();
 
@@ -410,34 +411,36 @@ async fn run_opened_exchange(
     }
 
     // Collect interpretation events; optionally fan out live (D-011).
-    // D-027: retain only byte-bounded continuation state.
+    // D-027: retain only byte-bounded continuation state; enforce limits before live publish.
     let events_handle = interpretation.events;
     let max_retained = max_retained_unit_bytes.max(256);
     let units = Arc::new(tokio::sync::Mutex::new(Vec::<CanonicalUnitEvent>::new()));
-    let retention_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (limit_tx, limit_rx) = oneshot::channel::<()>();
     let units_task = {
         let units = Arc::clone(&units);
-        let retention_exceeded = Arc::clone(&retention_exceeded);
         let unit_tx = unit_tx;
         try_spawn(executor, async move {
             let mut retained_bytes = 0usize;
+            let mut limit_tx = Some(limit_tx);
             while let Some(ev) = events_handle.recv().await {
                 match ev {
                     monoloop_contracts::InterpreterOutputEvent::Unit(u) => {
                         let unit = *u;
+                        let add = estimate_retained_unit_bytes(&unit);
+                        if retained_bytes.saturating_add(add) > max_retained {
+                            // Fail closed before live publish or retention growth.
+                            if let Some(tx) = limit_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            break;
+                        }
                         if let Some(ref tx) = unit_tx {
                             if tx.send(unit.clone()).await.is_err() {
                                 break;
                             }
                         }
-                        let add = estimate_retained_unit_bytes(&unit);
-                        let mut guard = units.lock().await;
-                        if retained_bytes.saturating_add(add) > max_retained {
-                            retention_exceeded.store(true, std::sync::atomic::Ordering::SeqCst);
-                            break;
-                        }
                         retained_bytes = retained_bytes.saturating_add(add);
-                        guard.push(unit);
+                        units.lock().await.push(unit);
                     }
                     monoloop_contracts::InterpreterOutputEvent::Ended(_) => break,
                 }
@@ -452,18 +455,64 @@ async fn run_opened_exchange(
     let external_session_id = opened.external_session_id.clone();
     let open_control = opened.control.clone();
 
+    async fn cleanup_exchange_children(
+        guard: &mut ExchangeGuard,
+        units_task: tokio::task::JoinHandle<()>,
+        join_grace: Duration,
+    ) {
+        if let Some(mut joins) = guard.joins.take() {
+            if join_grace.is_zero() {
+                abort_joins(&mut joins).await;
+            } else {
+                let _ = tokio::time::timeout(join_grace, async {
+                    while joins.join_next().await.is_some() {}
+                })
+                .await;
+                abort_joins(&mut joins).await;
+            }
+        }
+        let mut units_task = units_task;
+        if let Some(abort) = guard.units_abort.take() {
+            if join_grace.is_zero() {
+                abort.abort();
+                let _ = units_task.await;
+            } else {
+                match tokio::time::timeout(join_grace, &mut units_task).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        abort.abort();
+                        let _ = tokio::time::timeout(join_grace, units_task).await;
+                    }
+                }
+            }
+        } else if join_grace.is_zero() {
+            let _ = units_task.await;
+        } else {
+            let _ = tokio::time::timeout(join_grace, units_task).await;
+        }
+        let _ = guard.control.take();
+    }
+
     let (interp_end, conn_end) = tokio::select! {
+        biased;
+        // Only Ok(()) is a real retention exceed. Sender-drop on normal units-task
+        // completion must not select this arm (would mis-report LimitExceeded).
+        Ok(()) = limit_rx => {
+            let _ = open_control
+                .terminate(monoloop_connector::TerminationReason::CallerForced);
+            if let Some(abort) = guard.units_abort.as_ref() {
+                abort.abort();
+            }
+            cleanup_exchange_children(&mut guard, units_task, join_grace).await;
+            return Err(ExchangeFailure::LimitExceeded);
+        }
         _ = tokio::time::sleep(deadline) => {
             let _ = open_control
                 .terminate(monoloop_connector::TerminationReason::CallerForced);
-            if let Some(abort) = guard.units_abort.take() {
+            if let Some(abort) = guard.units_abort.as_ref() {
                 abort.abort();
             }
-            let _ = tokio::time::timeout(join_grace, units_task).await;
-            if let Some(mut joins) = guard.joins.take() {
-                abort_joins(&mut joins).await;
-            }
-            let _ = guard.control.take();
+            cleanup_exchange_children(&mut guard, units_task, join_grace).await;
             return Err(ExchangeFailure::ConnectorFailed);
         }
         ends = async {
@@ -474,32 +523,7 @@ async fn run_opened_exchange(
     };
 
     // Normal path: join children within cleanup_deadline (D-012).
-    if let Some(mut joins) = guard.joins.take() {
-        let _ = tokio::time::timeout(join_grace, async {
-            while joins.join_next().await.is_some() {}
-        })
-        .await;
-        abort_joins(&mut joins).await;
-    }
-    // D-028: keep abort handle until join settles; abort again if join times out
-    // so the task is never silently detached.
-    let mut units_task = units_task;
-    if let Some(abort) = guard.units_abort.take() {
-        match tokio::time::timeout(join_grace, &mut units_task).await {
-            Ok(_) => {}
-            Err(_) => {
-                abort.abort();
-                let _ = tokio::time::timeout(join_grace, units_task).await;
-            }
-        }
-    } else {
-        let _ = tokio::time::timeout(join_grace, units_task).await;
-    }
-    let _ = guard.control.take();
-
-    if retention_exceeded.load(std::sync::atomic::Ordering::SeqCst) {
-        return Err(ExchangeFailure::LimitExceeded);
-    }
+    cleanup_exchange_children(&mut guard, units_task, join_grace).await;
 
     let units = units.lock().await.clone();
     let failure = reconcile_terminals(&conn_end, &interp_end);
@@ -519,16 +543,51 @@ async fn run_opened_exchange(
 
 fn estimate_retained_unit_bytes(unit: &CanonicalUnitEvent) -> usize {
     use monoloop_contracts::CanonicalUnit;
-    match &unit.snapshot().unit {
-        CanonicalUnit::Text(t) => t.content.len().saturating_add(32),
-        CanonicalUnit::Tool(t) => t
-            .request_payload
+    let snap = unit.snapshot();
+    let id_bytes = snap.unit_id.as_str().len()
+        + snap.interpretation_id.as_str().len()
+        + snap.connection_id.as_str().len()
+        + snap
+            .external_session_id
             .as_ref()
-            .map(|p| p.len())
+            .map(|s| s.as_str().len())
             .unwrap_or(0)
-            .saturating_add(64),
-        _ => 64,
-    }
+        + snap.flow_id.as_str().len()
+        + snap.lane_id.as_str().len()
+        + snap
+            .causal_parent_id
+            .as_ref()
+            .map(|p| p.as_str().len())
+            .unwrap_or(0);
+    let content = match &snap.unit {
+        CanonicalUnit::Text(t) => t
+            .content
+            .len()
+            .saturating_add(t.sentence_id.as_str().len())
+            .saturating_add(
+                t.paragraph_id
+                    .as_ref()
+                    .map(|p| p.as_str().len())
+                    .unwrap_or(0),
+            ),
+        CanonicalUnit::Structure(s) => s
+            .content
+            .len()
+            .saturating_add(s.structure_id.as_str().len()),
+        CanonicalUnit::Paragraph(p) => p.paragraph_id.as_str().len().saturating_add(16),
+        CanonicalUnit::Tool(t) => t
+            .tool_action_id
+            .as_str()
+            .len()
+            .saturating_add(t.tool_name.as_ref().map(|n| n.len()).unwrap_or(0))
+            .saturating_add(t.request_payload.as_ref().map(|p| p.len()).unwrap_or(0))
+            .saturating_add(t.result_payload.as_ref().map(|p| p.len()).unwrap_or(0))
+            .saturating_add(t.waiting_for.as_ref().map(|w| w.len()).unwrap_or(0)),
+        CanonicalUnit::Usage(_) => 32,
+        CanonicalUnit::Diagnostic(d) => d.message.len().saturating_add(32),
+        CanonicalUnit::Boundary(_) => 16,
+    };
+    id_bytes.saturating_add(content).saturating_add(64)
 }
 
 /// Drop guard: terminate connector and abort child tasks if exchange is cancelled (D-012).

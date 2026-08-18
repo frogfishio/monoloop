@@ -248,14 +248,19 @@ async fn run_actor(spawn: ActorSpawn) {
         }
     }
     // Join/abort grace for exchange children after cancel or terminal (D-012).
-    let cleanup_deadline = cleanup_deadline.max(Duration::from_millis(50));
+    // Honor the configured cleanup_deadline exactly (no silent minimum floor).
 
     let mut terminal_kind = TransactionEndKind::Completed;
     let mut attachment: Option<Arc<monoloop_connector::SessionAttachment>> = None;
     let mcp_token: Arc<Mutex<Option<CapabilityToken>>> = Arc::new(Mutex::new(None));
     let mcp_token_work = Arc::clone(&mcp_token);
+    // Shared cancel so deadline / delivery-failure can terminate+join in-flight tools
+    // instead of dropping the work future mid-dispatch (D-028 residual).
+    let tools_cancel = Arc::new(super::sticky_cancel::StickyCancel::new());
+    let tools_cancel_work = Arc::clone(&tools_cancel);
 
     let work = async {
+        let tools_cancel = tools_cancel_work;
         // --- EstablishingSession (D-013): attach for create *and* explicit load ---
         let mut pending_mcp: Option<PendingMcpBinding> = None;
         let mut create_mode_attach = false;
@@ -702,10 +707,12 @@ async fn run_actor(spawn: ActorSpawn) {
 
             let mut results: Vec<CanonicalToolResult> = Vec::with_capacity(ready.len());
             for (ord, (action_id, name, payload, provider_id)) in ready.into_iter().enumerate() {
+                if tools_cancel.is_cancelled() {
+                    return Err(TransactionEndKind::Cancelled);
+                }
                 // D-028: notify cancel into dispatch so the worker is terminated+joined
                 // instead of dropping the dispatch future (which would detach work).
-                let tool_cancel = Arc::new(super::sticky_cancel::StickyCancel::new());
-                let tool_cancel_dispatch = Arc::clone(&tool_cancel);
+                let tool_cancel_dispatch = Arc::clone(&tools_cancel);
                 let dispatch_fut = dispatch_ready_tool_cancellable(
                     &dispatcher,
                     outcome.exchange_id,
@@ -720,7 +727,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 let dispatch_outcome = tokio::select! {
                     biased;
                     ctrl = control_rx.recv() => {
-                        tool_cancel.cancel();
+                        tools_cancel.cancel();
                         // Join the in-flight dispatch (cancel path terminates worker).
                         let _ = dispatch_fut.await;
                         return Err(match ctrl {
@@ -730,8 +737,16 @@ async fn run_actor(spawn: ActorSpawn) {
                             _ => TransactionEndKind::Cancelled,
                         });
                     }
+                    _ = tools_cancel.cancelled() => {
+                        // Outer deadline / delivery failure: join then exit.
+                        let _ = dispatch_fut.await;
+                        return Err(TransactionEndKind::Cancelled);
+                    }
                     r = &mut dispatch_fut => r,
                 };
+                if tools_cancel.is_cancelled() {
+                    return Err(TransactionEndKind::Cancelled);
+                }
                 let mut rejection_result: Option<CanonicalToolResult> = None;
                 match &dispatch_outcome {
                     DispatchOutcome::Canonical { result, .. } => {
@@ -919,29 +934,41 @@ async fn run_actor(spawn: ActorSpawn) {
     };
 
     // Race work against deadline / delivery failure only (control is selected inside work).
-    let cancelled = tokio::select! {
-        biased;
-        fail = delivery_fail_rx.recv() => {
-            if fail.is_some() {
-                terminal_kind = TransactionEndKind::EventDeliveryFailed;
-            }
-            true
-        }
-        _ = tokio::time::sleep(deadline) => {
-            terminal_kind = TransactionEndKind::DeadlineExceeded;
-            true
-        }
-        work_res = work => {
-            match work_res {
-                Ok(()) => {
-                    terminal_kind = TransactionEndKind::Completed;
+    // On forced terminal, cancel in-flight tools and join within cleanup_deadline so
+    // workers are not detached by dropping `work` mid-dispatch (D-028 residual).
+    // Scoped so the pinned future's borrows end before finalization moves locals.
+    {
+        tokio::pin!(work);
+        let cancelled = tokio::select! {
+            biased;
+            fail = delivery_fail_rx.recv() => {
+                if fail.is_some() {
+                    terminal_kind = TransactionEndKind::EventDeliveryFailed;
                 }
-                Err(k) => terminal_kind = k,
+                true
             }
-            false
+            _ = tokio::time::sleep(deadline) => {
+                terminal_kind = TransactionEndKind::DeadlineExceeded;
+                true
+            }
+            work_res = &mut work => {
+                match work_res {
+                    Ok(()) => {
+                        terminal_kind = TransactionEndKind::Completed;
+                    }
+                    Err(k) => terminal_kind = k,
+                }
+                false
+            }
+        };
+        if cancelled {
+            tools_cancel.cancel();
+            // Join within the configured cleanup budget only; never pad or wait forever.
+            if !cleanup_deadline.is_zero() {
+                let _ = tokio::time::timeout(cleanup_deadline, work.as_mut()).await;
+            }
         }
-    };
-    let _ = cancelled;
+    }
 
     // Local revocation before terminal publication / external descriptor removal.
     let revoked_token = {
@@ -999,16 +1026,36 @@ fn map_exchange_failure(f: ExchangeFailure) -> TransactionEndKind {
 }
 
 fn estimate_unit_bytes(unit: &CanonicalUnitEvent) -> usize {
-    match unit.snapshot().unit {
-        CanonicalUnit::Text(ref t) => t.content.len().saturating_add(32),
-        CanonicalUnit::Tool(ref t) => t
-            .request_payload
+    // Keep aggregate output accounting aligned with retained-unit estimation
+    // (structure, diagnostics, tool names/results, and envelope identifiers).
+    let snap = unit.snapshot();
+    let id_bytes = snap.unit_id.as_str().len()
+        + snap.interpretation_id.as_str().len()
+        + snap.connection_id.as_str().len()
+        + snap
+            .external_session_id
             .as_ref()
-            .map(|p| p.len())
+            .map(|s| s.as_str().len())
             .unwrap_or(0)
-            .saturating_add(64),
-        _ => 64,
-    }
+        + snap.flow_id.as_str().len()
+        + snap.lane_id.as_str().len();
+    let content = match &snap.unit {
+        CanonicalUnit::Text(t) => t.content.len(),
+        CanonicalUnit::Structure(s) => s.content.len(),
+        CanonicalUnit::Paragraph(_) => 16,
+        CanonicalUnit::Tool(t) => t
+            .tool_name
+            .as_ref()
+            .map(|n| n.len())
+            .unwrap_or(0)
+            .saturating_add(t.request_payload.as_ref().map(|p| p.len()).unwrap_or(0))
+            .saturating_add(t.result_payload.as_ref().map(|p| p.len()).unwrap_or(0))
+            .saturating_add(t.tool_action_id.as_str().len()),
+        CanonicalUnit::Usage(_) => 32,
+        CanonicalUnit::Diagnostic(d) => d.message.len().saturating_add(16),
+        CanonicalUnit::Boundary(_) => 16,
+    };
+    id_bytes.saturating_add(content).saturating_add(64)
 }
 
 /// Internal action id scoped by exchange so reused provider IDs stay distinct.

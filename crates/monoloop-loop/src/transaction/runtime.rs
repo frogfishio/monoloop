@@ -228,22 +228,23 @@ impl DefaultTransactionRuntime {
 
         let prev = self.inner.state.swap(STATE_DRAINING, Ordering::SeqCst);
         if prev == STATE_STOPPED || prev == STATE_DRAINING {
-            // D-029: concurrent callers wait for and share the same disposition.
-            while self.inner.state.load(Ordering::SeqCst) != STATE_STOPPED {
-                if tokio::time::Instant::now() >= deadline_at {
-                    break;
-                }
+            // D-029: concurrent callers must share the same complete disposition.
+            // Wait for the leader to publish — never fabricate zeroed counts when
+            // a local deadline expires before the leader finishes.
+            loop {
                 if let Some(d) = self.inner.shutdown_disposition.lock().await.clone() {
                     return d;
                 }
+                if self.inner.state.load(Ordering::SeqCst) == STATE_STOPPED {
+                    // Leader stores disposition before STOPPED; re-read once.
+                    if let Some(d) = self.inner.shutdown_disposition.lock().await.clone() {
+                        return d;
+                    }
+                    // Ordering violated only under severe fault; still one shared value.
+                    return ShutdownDisposition::default();
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // Prefer published disposition. If the leader has not published by our
-            // deadline, return zeroed counts rather than a stale Default alias (D-029).
-            if let Some(d) = self.inner.shutdown_disposition.lock().await.clone() {
-                return d;
-            }
-            return ShutdownDisposition::default();
         }
 
         let active = {
@@ -277,8 +278,11 @@ impl DefaultTransactionRuntime {
         for (entry, abort) in handles {
             let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
+                // Global deadline exhausted: abort and do not await unboundedly.
+                // Host code that never yields can otherwise keep shutdown past
+                // the supplied deadline (D-029 residual).
                 abort.abort();
-                let _ = entry.actor_join.await;
+                drop(entry.actor_join);
                 if let Some(payload) = entry.guard.try_claim() {
                     entry.guard.mark_callback_scheduled();
                     let end = build_transaction_end(
@@ -381,12 +385,13 @@ impl DefaultTransactionRuntime {
                     }
                 }
                 Err(_) => {
-                    // D-029: abort then join with remaining budget (never detach JoinHandle).
+                    // D-029: abort then join only within remaining global budget.
                     abort.abort();
                     let join_budget =
                         deadline_at.saturating_duration_since(tokio::time::Instant::now());
                     if join_budget.is_zero() {
-                        let _ = join.await;
+                        // Deadline exhausted — do not await non-yielding host code.
+                        drop(join);
                     } else {
                         let _ = tokio::time::timeout(join_budget, join).await;
                     }
