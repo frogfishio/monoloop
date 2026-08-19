@@ -8,7 +8,7 @@ use super::exchange::{
     run_encoded_exchange, run_exchange, EncodedExchangeParams, ExchangeFailure, ExchangeParams,
 };
 use super::executor_spawn::try_spawn;
-use super::finalization::{build_transaction_end, FinalizationGuard};
+use super::finalization::{build_transaction_end, ClaimedFinalization, FinalizationGuard};
 use super::loop_adapters::dispatch_ready_tool_cancellable;
 use super::mcp::{CapabilityToken, McpGatewayHandle, PendingMcpBinding};
 use super::resolved_tools::ResolvedToolSet;
@@ -34,6 +34,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 pub struct ActorSpawn {
     /// Injected Tokio handle for runtime-owned child tasks (D-032).
     pub executor: Handle,
+    /// Spawn gate closed at shutdown start (D-032).
+    pub spawn_gate: super::spawn_gate::SpawnGate,
     /// Transaction id.
     pub transaction_id: TransactionId,
     /// Channel id.
@@ -132,7 +134,8 @@ pub struct ActorSpawn {
 /// Spawn the actor task on the injected executor (D-032).
 pub fn spawn_actor(spawn: ActorSpawn) -> Result<tokio::task::JoinHandle<()>, ()> {
     let executor = spawn.executor.clone();
-    try_spawn(&executor, async move {
+    let gate = spawn.spawn_gate.clone();
+    try_spawn(&executor, &gate, async move {
         run_actor(spawn).await;
     })
 }
@@ -147,6 +150,7 @@ struct ActorResult {
 async fn run_actor(spawn: ActorSpawn) {
     let ActorSpawn {
         executor,
+        spawn_gate,
         transaction_id,
         channel_id,
         channel_kind: _,
@@ -489,7 +493,7 @@ async fn run_actor(spawn: ActorSpawn) {
         let events_live = events.clone();
         let channel_live = channel_id.clone();
         let mut session_watch_live = session_watch_rx.clone();
-        let live_join = match try_spawn(&executor, async move {
+        let live_join = match try_spawn(&executor, &spawn_gate, async move {
             // Block until claim publishes a SessionKey (already Some for load/DirectLlm).
             if session_watch_live
                 .wait_for(|sk| sk.is_some())
@@ -529,7 +533,7 @@ async fn run_actor(spawn: ActorSpawn) {
             let max_distinct = max_distinct_sessions;
             let pending_mcp_c = pending_mcp.clone();
             let mcp_c = mcp.clone();
-            let join = match try_spawn(&executor, async move {
+            let join = match try_spawn(&executor, &spawn_gate, async move {
                 let Ok(ext) = sess_rx.await else {
                     return Err(TransactionEndKind::InvariantFailed);
                 };
@@ -607,6 +611,7 @@ async fn run_actor(spawn: ActorSpawn) {
             }
             r = run_exchange(ExchangeParams {
                 executor: &executor,
+                spawn_gate: &spawn_gate,
                 transaction_id,
                 connector: connector.as_ref(),
                 encoder: encoder.as_ref(),
@@ -861,7 +866,7 @@ async fn run_actor(spawn: ActorSpawn) {
                     let events_live2 = events.clone();
                     let channel_live = channel_id.clone();
                     let session_live = session_key.clone();
-                    let live_join2 = match try_spawn(&executor, async move {
+                    let live_join2 = match try_spawn(&executor, &spawn_gate, async move {
                         while let Some(unit) = live_rx2.recv().await {
                             if !emit_canonical_unit(
                                 &events_live2,
@@ -894,6 +899,7 @@ async fn run_actor(spawn: ActorSpawn) {
                         }
                         r = run_encoded_exchange(EncodedExchangeParams {
                             executor: &executor,
+                            spawn_gate: &spawn_gate,
                             transaction_id,
                             exchange_id,
                             connector: connector.as_ref(),
@@ -966,20 +972,13 @@ async fn run_actor(spawn: ActorSpawn) {
         };
         if cancelled {
             tools_cancel.cancel();
-            // Prefer joining within cleanup_deadline, but never detach an in-flight
-            // tool worker by dropping `work` while termination is incomplete (D-028).
-            // Sticky cancel triggers kill+join inside dispatch; keep awaiting until
-            // that path finishes even if the cleanup budget elapses.
-            if cleanup_deadline.is_zero() {
-                let _ = work.as_mut().await;
-            } else {
-                match tokio::time::timeout(cleanup_deadline, work.as_mut()).await {
-                    Ok(_) => {}
-                    Err(_) => {
-                        let _ = work.as_mut().await;
-                    }
-                }
+            // Join within cleanup_deadline only. Sticky cancel drives kill+join
+            // inside dispatch; do not await unboundedly past the budget (would
+            // stall terminal events and callbacks).
+            if !cleanup_deadline.is_zero() {
+                let _ = tokio::time::timeout(cleanup_deadline, work.as_mut()).await;
             }
+            // Dropping `work` after the budget ends any remaining wait.
         }
     }
 
@@ -1313,8 +1312,11 @@ async fn finalize_and_cleanup(
         let _ = reg.remove(&transaction_id);
         return;
     };
+    // If this future is aborted mid-finalize, restore payload for the supervisor.
+    let claimed = ClaimedFinalization::new(Arc::clone(&guard), payload);
 
-    let session_for_event = payload
+    let session_for_event = claimed
+        .payload()
         .session_id
         .clone()
         .or_else(|| result.session_key.as_ref().map(|k| k.session_id.clone()))
@@ -1325,7 +1327,7 @@ async fn finalize_and_cleanup(
     let mut delivery = result.delivery;
 
     let seq_preview = events.sequencer().peek_next();
-    let end_preview = build_transaction_end(&payload, kind, prior, delivery, seq_preview);
+    let end_preview = build_transaction_end(claimed.payload(), kind, prior, delivery, seq_preview);
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     // Bound enqueue+ack by the terminal delivery deadline so a stuck sink cannot
     // hold a claimed finalization forever (blocks shutdown supervisor claim).
@@ -1333,7 +1335,7 @@ async fn finalize_and_cleanup(
         tokio::time::timeout(
             terminal_event_delivery_deadline,
             events.publish_terminal(
-                payload.transaction_id,
+                claimed.payload().transaction_id,
                 channel_id.clone(),
                 session_for_event,
                 TransactionEventPayload::Ended(end_preview),
@@ -1364,7 +1366,7 @@ async fn finalize_and_cleanup(
         }
     }
 
-    let end = build_transaction_end(&payload, kind, prior, delivery, seq);
+    let end = build_transaction_end(claimed.payload(), kind, prior, delivery, seq);
     drop(events);
 
     {
@@ -1373,6 +1375,7 @@ async fn finalize_and_cleanup(
     }
     release_capacity();
 
+    let payload = claimed.take();
     guard.mark_callback_scheduled();
     // D-021 / D-029: schedule with admission-reserved capacity; actor does not await.
     callbacks.schedule_reserved(

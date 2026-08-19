@@ -11,6 +11,7 @@ use super::executor_spawn::try_spawn;
 use super::finalization::build_transaction_end;
 use super::host_tools::HostToolRegistry;
 use super::mcp::McpGateway;
+use super::spawn_gate::SpawnGate;
 use super::state::RuntimeState;
 use monoloop_contracts::{
     AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId, ChannelKind,
@@ -59,6 +60,8 @@ struct RuntimeInner {
     callbacks: CallbackService,
     /// Injected Tokio handle for all runtime-owned spawns (D-032).
     executor: tokio::runtime::Handle,
+    /// Closed at shutdown start so try_spawn fails closed (D-032).
+    spawn_gate: SpawnGate,
     /// Shared shutdown result for concurrent callers (D-029).
     shutdown_disposition: AsyncMutex<Option<ShutdownDisposition>>,
 }
@@ -149,6 +152,7 @@ impl DefaultTransactionRuntime {
             capacity_pairs,
         ));
 
+        let spawn_gate = SpawnGate::open();
         // One concurrent callback slot per active-transaction budget (D-021).
         let callbacks = CallbackService::new(
             bootstrap
@@ -158,6 +162,7 @@ impl DefaultTransactionRuntime {
                 .max(1),
             bootstrap.config.transaction_limits.callback_deadline,
             executor.clone(),
+            spawn_gate.clone(),
         );
 
         let mut channels = HashMap::with_capacity(realized.len());
@@ -177,6 +182,7 @@ impl DefaultTransactionRuntime {
                 mcp_handle,
                 callbacks,
                 executor,
+                spawn_gate,
                 shutdown_disposition: AsyncMutex::new(None),
             }),
         }))
@@ -225,6 +231,9 @@ impl DefaultTransactionRuntime {
             deadline
         };
         let deadline_at = tokio::time::Instant::now() + global;
+
+        // D-032: reject new spawns before draining so try_spawn fails closed.
+        self.inner.spawn_gate.close();
 
         let prev = self.inner.state.swap(STATE_DRAINING, Ordering::SeqCst);
         if prev == STATE_STOPPED || prev == STATE_DRAINING {
@@ -281,59 +290,49 @@ impl DefaultTransactionRuntime {
             let actor_abort = entry.actor_abort.clone();
             let delivery_abort = entry.delivery_abort.clone();
 
-            // Result of joining the reaper within the global budget.
-            // `None` means still pending after abort — do not finalize (D-029).
-            const ABORT_SETTLE: Duration = Duration::from_millis(50);
-            // Abort actor+delivery so the reaper can observe child completion.
-            // Reaper abort alone would drop those JoinHandles without stopping work.
-            let stop_children = || {
-                actor_abort.abort();
-                delivery_abort.abort();
-            };
+            // Abort actor+delivery first so the reaper can observe child completion.
+            // Then join the reaper within the absolute deadline (no yield padding).
+            actor_abort.abort();
+            delivery_abort.abort();
+
             let join_result: Option<Result<(), tokio::task::JoinError>> = if remaining.is_zero() {
-                stop_children();
-                match tokio::time::timeout(ABORT_SETTLE, &mut join).await {
-                    Ok(r) => Some(r),
-                    Err(_) => {
-                        abort.abort();
-                        tokio::time::timeout(ABORT_SETTLE, &mut join).await.ok()
-                    }
-                }
+                abort.abort();
+                drop(join);
+                None
             } else {
                 let per = remaining / n as u32;
                 match tokio::time::timeout(per, &mut join).await {
                     Ok(r) => Some(r),
                     Err(_) => {
-                        stop_children();
+                        abort.abort();
                         let join_budget =
                             deadline_at.saturating_duration_since(tokio::time::Instant::now());
-                        let settle = if join_budget.is_zero() {
-                            ABORT_SETTLE
+                        if join_budget.is_zero() {
+                            drop(join);
+                            None
                         } else {
-                            join_budget.max(ABORT_SETTLE)
-                        };
-                        match tokio::time::timeout(settle, &mut join).await {
-                            Ok(r) => Some(r),
-                            Err(_) => {
-                                abort.abort();
-                                tokio::time::timeout(ABORT_SETTLE, &mut join).await.ok()
+                            match tokio::time::timeout(join_budget, &mut join).await {
+                                Ok(r) => Some(r),
+                                Err(_) => {
+                                    drop(join);
+                                    None
+                                }
                             }
                         }
                     }
                 }
             };
 
-            let Some(join_result) = join_result else {
-                // Still running after abort+budget — do not claim terminal or release.
-                std::mem::forget(join);
+            if join_result.is_none() {
                 invariant_failed += 1;
-                continue;
-            };
+            }
 
-            // Join observed (Ok or abort-cancelled). Finalize if the actor did not.
+            // Claim after join (or with deadline-bounded restore wait) so
+            // ClaimedFinalization Drop cannot race past an empty try_claim.
+            let claim_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
             if entry.guard.callback_was_scheduled() {
                 normally_finalized += 1;
-            } else if let Some(payload) = entry.guard.try_claim() {
+            } else if let Some(payload) = entry.guard.claim_for_shutdown(claim_budget).await {
                 entry.guard.mark_callback_scheduled();
                 let end = build_transaction_end(
                     &payload,
@@ -344,8 +343,14 @@ impl DefaultTransactionRuntime {
                 );
                 let cb_budget =
                     cb_cfg.min(deadline_at.saturating_duration_since(tokio::time::Instant::now()));
-                match run_callback_isolated(&self.inner.executor, payload.callback, end, cb_budget)
-                    .await
+                match run_callback_isolated(
+                    &self.inner.executor,
+                    &self.inner.spawn_gate,
+                    payload.callback,
+                    end,
+                    cb_budget,
+                )
+                .await
                 {
                     CallbackRun::Ok => supervisor_finalized += 1,
                     CallbackRun::Failed => {
@@ -357,9 +362,9 @@ impl DefaultTransactionRuntime {
                         callback_aborted += 1;
                     }
                 }
-            } else if join_result.is_err() {
+            } else if matches!(join_result, Some(Err(_))) {
                 invariant_failed += 1;
-            } else {
+            } else if join_result.is_some() {
                 normally_finalized += 1;
             }
             (entry.release_capacity)();
@@ -402,6 +407,7 @@ enum CallbackRun {
 /// Invoke + await host callback with panic isolation on the injected executor (D-021 / D-032).
 async fn run_callback_isolated(
     executor: &Handle,
+    gate: &SpawnGate,
     callback: Box<dyn monoloop_contracts::CompletionCallback>,
     end: monoloop_contracts::TransactionEnd,
     deadline: Duration,
@@ -409,7 +415,7 @@ async fn run_callback_isolated(
     let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
     match call {
         Ok(fut) => {
-            let mut handle = match try_spawn(executor, fut) {
+            let mut handle = match try_spawn(executor, gate, fut) {
                 Ok(h) => h,
                 Err(()) => return CallbackRun::Failed,
             };
@@ -419,9 +425,10 @@ async fn run_callback_isolated(
                 Ok(Ok(Err(_))) => CallbackRun::Failed,
                 Ok(Err(_)) => CallbackRun::Failed, // join error = panic in future
                 Err(_) => {
-                    // Deadline already consumed — abort and do not await unboundedly.
+                    // Abort; keep awaiting within no extra pad — put-back style:
+                    // after abort, join should complete for async work.
                     abort.abort();
-                    drop(handle);
+                    let _ = handle.await;
                     CallbackRun::Aborted
                 }
             }
@@ -475,6 +482,7 @@ impl TransactionRuntime for DefaultTransactionRuntime {
             runtime_state: Arc::clone(&self.inner.state),
             callbacks: self.inner.callbacks.clone(),
             executor: self.inner.executor.clone(),
+            spawn_gate: self.inner.spawn_gate.clone(),
         };
         admit(&ctx, request)
     }

@@ -6,6 +6,8 @@ use monoloop_contracts::{
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// Sole allocator of transaction event sequence numbers (starts at 1).
 #[derive(Debug)]
@@ -62,6 +64,8 @@ pub struct FinalizationGuard {
     sequencer: Arc<EventSequencer>,
     /// Whether the callback was scheduled (tests / shutdown accounting).
     callback_scheduled: AtomicBool,
+    /// Wakes supervisor waiting for a mid-finalize restore after actor abort.
+    restore_notify: Notify,
 }
 
 impl FinalizationGuard {
@@ -83,6 +87,7 @@ impl FinalizationGuard {
             })),
             sequencer,
             callback_scheduled: AtomicBool::new(false),
+            restore_notify: Notify::new(),
         })
     }
 
@@ -112,6 +117,19 @@ impl FinalizationGuard {
         self.payload.lock().ok().and_then(|mut g| g.take())
     }
 
+    /// Restore a claimed-but-not-scheduled payload so the supervisor can reclaim
+    /// after an aborted mid-finalize actor (D-029).
+    pub fn restore_unscheduled(&self, payload: FinalizationPayload) {
+        if self.callback_scheduled.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut g) = self.payload.lock() {
+            *g = Some(payload);
+        }
+        self.claimed.store(false, Ordering::SeqCst);
+        self.restore_notify.notify_waiters();
+    }
+
     /// Whether already claimed.
     pub fn is_claimed(&self) -> bool {
         self.claimed.load(Ordering::SeqCst)
@@ -120,11 +138,78 @@ impl FinalizationGuard {
     /// Mark that a callback was scheduled (accounting).
     pub fn mark_callback_scheduled(&self) {
         self.callback_scheduled.store(true, Ordering::SeqCst);
+        self.restore_notify.notify_waiters();
     }
 
     /// Whether callback was scheduled.
     pub fn callback_was_scheduled(&self) -> bool {
         self.callback_scheduled.load(Ordering::SeqCst)
+    }
+
+    /// Claim for shutdown after actor abort: wait (within `budget`) for a possible
+    /// restore from [`ClaimedFinalization`] Drop, without racing a bare try_claim.
+    pub(crate) async fn claim_for_shutdown(&self, budget: Duration) -> Option<FinalizationPayload> {
+        if let Some(p) = self.try_claim() {
+            return Some(p);
+        }
+        if self.callback_was_scheduled() {
+            return None;
+        }
+        if budget.is_zero() {
+            return self.try_claim();
+        }
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(p) = self.try_claim() {
+                return Some(p);
+            }
+            if self.callback_was_scheduled() {
+                return None;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return self.try_claim();
+            }
+            tokio::select! {
+                biased;
+                _ = self.restore_notify.notified() => {}
+                _ = tokio::time::sleep(left) => {
+                    return self.try_claim();
+                }
+            }
+        }
+    }
+}
+
+/// Holds a claimed payload; restores it on drop unless consumed for schedule.
+pub(crate) struct ClaimedFinalization {
+    guard: Arc<FinalizationGuard>,
+    payload: Option<FinalizationPayload>,
+}
+
+impl ClaimedFinalization {
+    pub(crate) fn new(guard: Arc<FinalizationGuard>, payload: FinalizationPayload) -> Self {
+        Self {
+            guard,
+            payload: Some(payload),
+        }
+    }
+
+    pub(crate) fn payload(&self) -> &FinalizationPayload {
+        self.payload.as_ref().expect("claimed payload present")
+    }
+
+    /// Take the payload for callback scheduling (disarms restore-on-drop).
+    pub(crate) fn take(mut self) -> FinalizationPayload {
+        self.payload.take().expect("claimed payload present")
+    }
+}
+
+impl Drop for ClaimedFinalization {
+    fn drop(&mut self) {
+        if let Some(p) = self.payload.take() {
+            self.guard.restore_unscheduled(p);
+        }
     }
 }
 

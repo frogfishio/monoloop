@@ -48,6 +48,8 @@ pub struct AdmissionContext {
     pub callbacks: CallbackService,
     /// Injected Tokio handle for all runtime-owned spawns (D-032).
     pub executor: Handle,
+    /// Spawn gate closed at shutdown start (D-032).
+    pub spawn_gate: super::spawn_gate::SpawnGate,
 }
 
 /// Perform synchronous admission (no network/tool I/O).
@@ -237,6 +239,7 @@ pub fn admit(
 
     let delivery_join = match spawn_delivery_task(
         &ctx.executor,
+        &ctx.spawn_gate,
         event_rx,
         request.events,
         fail_tx,
@@ -256,6 +259,7 @@ pub fn admit(
 
     let actor_join = match spawn_actor(ActorSpawn {
         executor: ctx.executor.clone(),
+        spawn_gate: ctx.spawn_gate.clone(),
         transaction_id,
         channel_id: request.channel_id.clone(),
         channel_kind: live.binding.kind,
@@ -361,7 +365,7 @@ pub fn admit(
 
         let actor_abort = actor_join.abort_handle();
         let delivery_abort = delivery_join.abort_handle();
-        let reaper = match try_spawn(&ctx.executor, async move {
+        let reaper = match try_spawn(&ctx.executor, &ctx.spawn_gate, async move {
             let _ = actor_join.await;
             delivery_join.abort();
             let _ = delivery_join.await;

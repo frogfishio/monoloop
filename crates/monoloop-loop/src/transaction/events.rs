@@ -217,6 +217,7 @@ impl Drop for ByteReservation<'_> {
 /// Spawn the sequential delivery task for one transaction on `executor` (D-032).
 pub fn spawn_delivery_task(
     executor: &Handle,
+    spawn_gate: &super::spawn_gate::SpawnGate,
     mut rx: mpsc::Receiver<QueuedEvent>,
     sink: Arc<dyn TransactionEventSink>,
     on_fail: mpsc::Sender<()>,
@@ -224,12 +225,19 @@ pub fn spawn_delivery_task(
     deliver_deadline: Duration,
 ) -> Result<tokio::task::JoinHandle<()>, ()> {
     let executor_child = executor.clone();
-    try_spawn(executor, async move {
+    let gate_child = spawn_gate.clone();
+    try_spawn(executor, spawn_gate, async move {
         while let Some(item) = rx.recv().await {
             let bytes = item.approx_bytes;
             // D-021: host sink panics (invoke or poll) must not kill delivery.
-            let result =
-                deliver_isolated(&executor_child, &sink, item.event, deliver_deadline).await;
+            let result = deliver_isolated(
+                &executor_child,
+                &gate_child,
+                &sink,
+                item.event,
+                deliver_deadline,
+            )
+            .await;
             byte_counter.fetch_sub(
                 bytes.min(byte_counter.load(Ordering::SeqCst)),
                 Ordering::SeqCst,
@@ -262,6 +270,7 @@ pub fn spawn_delivery_task(
 /// Invoke sink.deliver and await its future with panic + deadline isolation (D-021).
 async fn deliver_isolated(
     executor: &Handle,
+    spawn_gate: &super::spawn_gate::SpawnGate,
     sink: &Arc<dyn TransactionEventSink>,
     event: TransactionEvent,
     deadline: Duration,
@@ -272,16 +281,17 @@ async fn deliver_isolated(
         Err(_) => return Err(EventDeliveryError::Failed),
     };
     // Owned child task: Future::poll panics become JoinError, not delivery-task death.
-    let handle = match try_spawn(executor, fut) {
+    let mut handle = match try_spawn(executor, spawn_gate, fut) {
         Ok(h) => h,
         Err(()) => return Err(EventDeliveryError::Failed),
     };
     let abort = handle.abort_handle();
-    match tokio::time::timeout(deadline, handle).await {
+    match tokio::time::timeout(deadline, &mut handle).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => Err(EventDeliveryError::Failed),
         Err(_) => {
             abort.abort();
+            let _ = handle.await;
             Err(EventDeliveryError::Failed)
         }
     }

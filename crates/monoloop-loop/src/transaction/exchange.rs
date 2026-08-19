@@ -66,6 +66,8 @@ pub enum ExchangeFailure {
 pub struct ExchangeParams<'a> {
     /// Injected Tokio handle for owned exchange children (D-032).
     pub executor: &'a Handle,
+    /// Spawn gate closed at shutdown start (D-032).
+    pub spawn_gate: &'a super::spawn_gate::SpawnGate,
     /// Transaction id.
     pub transaction_id: TransactionId,
     /// Connector instance.
@@ -110,6 +112,8 @@ pub struct ExchangeParams<'a> {
 pub struct EncodedExchangeParams<'a> {
     /// Injected Tokio handle for owned exchange children (D-032).
     pub executor: &'a Handle,
+    /// Spawn gate closed at shutdown start (D-032).
+    pub spawn_gate: &'a super::spawn_gate::SpawnGate,
     /// Transaction id.
     pub transaction_id: TransactionId,
     /// Single exchange identity shared with encoder (D-017).
@@ -164,6 +168,7 @@ pub async fn run_exchange(params: ExchangeParams<'_>) -> Result<ExchangeOutcome,
 
     open_and_run(
         params.executor,
+        params.spawn_gate,
         exchange_id,
         params.connector,
         params.endpoint_ref,
@@ -194,6 +199,7 @@ pub async fn run_encoded_exchange(
     }
     open_and_run(
         params.executor,
+        params.spawn_gate,
         params.exchange_id,
         params.connector,
         params.endpoint_ref,
@@ -215,6 +221,7 @@ pub async fn run_encoded_exchange(
 #[allow(clippy::too_many_arguments)]
 async fn open_and_run(
     executor: &Handle,
+    spawn_gate: &super::spawn_gate::SpawnGate,
     exchange_id: ExchangeId,
     connector: &dyn Connector,
     endpoint_ref: &str,
@@ -277,6 +284,7 @@ async fn open_and_run(
 
     let outcome = run_opened_exchange(
         executor,
+        spawn_gate,
         exchange_id,
         interpretation_id,
         opened,
@@ -324,6 +332,7 @@ impl Drop for EarlyOpenedGuard {
 #[allow(clippy::too_many_arguments)]
 async fn run_opened_exchange(
     executor: &Handle,
+    spawn_gate: &super::spawn_gate::SpawnGate,
     exchange_id: ExchangeId,
     interpretation_id: InterpretationId,
     opened: OpenedRawConnection,
@@ -420,7 +429,7 @@ async fn run_opened_exchange(
     let units_task = {
         let units = Arc::clone(&units);
         let unit_tx = unit_tx;
-        try_spawn(executor, async move {
+        try_spawn(executor, spawn_gate, async move {
             let mut retained_bytes = 0usize;
             let mut limit_tx = Some(limit_tx);
             while let Some(ev) = events_handle.recv().await {

@@ -25,6 +25,7 @@ mod mcp;
 mod openai_encoder;
 mod resolved_tools;
 mod runtime;
+mod spawn_gate;
 mod state;
 mod sticky_cancel;
 mod tool_capacity;

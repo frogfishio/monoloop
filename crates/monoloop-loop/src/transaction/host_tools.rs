@@ -76,9 +76,9 @@ impl HostToolRegistry {
 
     /// Build from registered tools; rejects duplicate ids/names.
     ///
-    /// Every entry already carries a [`ToolCancellationPolicy`] on its spec
-    /// (validated by [`ToolSpec::try_new`]); unstoppable handlers are rejected
-    /// by not offering that policy.
+    /// Every entry already carries a [`monoloop_contracts::ToolCancellationPolicy`]
+    /// on its spec (validated by [`monoloop_contracts::ToolSpec::try_new`]);
+    /// unstoppable handlers are rejected by not offering that policy.
     pub fn build(tools: Vec<RegisteredTool>) -> Result<Self, super::StartupError> {
         let mut by_id = HashMap::with_capacity(tools.len());
         let mut by_name = HashMap::with_capacity(tools.len());

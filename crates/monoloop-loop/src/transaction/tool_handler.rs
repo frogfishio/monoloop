@@ -6,7 +6,7 @@ use monoloop_contracts::{
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Notify};
 use tokio::task::AbortHandle;
 
@@ -96,21 +96,55 @@ impl ToolExecutionCompletion {
     }
 }
 
-/// Force-stop handle for IsolatedKillable / Abortable workers (D-024).
+/// Force-stop + join handle for IsolatedKillable / Abortable workers (D-024).
+///
+/// Owns the worker `tokio::task::JoinHandle` so kill can be followed by a real
+/// join. Timed waits must not drop the handle on timeout (put-back) or the
+/// worker would detach while capacity is released.
 #[derive(Clone, Debug)]
 pub struct ToolKillHandle {
     abort: AbortHandle,
+    join: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ToolKillHandle {
-    /// Wrap a Tokio task abort handle.
-    pub fn new(abort: AbortHandle) -> Self {
-        Self { abort }
+    /// Take ownership of a worker task (abort + join).
+    pub fn new(join: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            abort: join.abort_handle(),
+            join: Arc::new(Mutex::new(Some(join))),
+        }
     }
 
     /// Abort the isolated worker task (idempotent).
     pub fn kill(&self) {
         self.abort.abort();
+    }
+
+    /// Await worker teardown. On timeout, restores the join handle so the
+    /// worker is not detached; caller must keep capacity until a later join.
+    pub async fn join_timeout(&self, budget: std::time::Duration) -> Result<(), ()> {
+        let handle = self.join.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(mut handle) = handle else {
+            return Ok(()); // already joined
+        };
+        match tokio::time::timeout(budget, &mut handle).await {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                // Put back — do not detach on timeout.
+                *self.join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                Err(())
+            }
+        }
+    }
+
+    /// Await worker teardown after kill (unbounded). Prefer after abort so the
+    /// join completes when the task is cancelled; keeps ownership until Ready.
+    pub async fn join(&self) {
+        let handle = self.join.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = handle {
+            let _ = h.await;
+        }
     }
 }
 
@@ -207,7 +241,7 @@ where
                 }
             }
         });
-        let kill = ToolKillHandle::new(join.abort_handle());
+        let kill = ToolKillHandle::new(join);
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
             control,
@@ -252,7 +286,7 @@ where
             let result = fut.await;
             let _ = tx.send(result);
         });
-        let kill = ToolKillHandle::new(join.abort_handle());
+        let kill = ToolKillHandle::new(join);
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
             control,

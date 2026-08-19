@@ -1,11 +1,11 @@
 //! Runtime-owned completion-callback service (D-021 / D-029).
 //!
-//! Callbacks run on owned child tasks under a bounded concurrency permit so
-//! host panics/timeouts cannot kill actors, and outstanding work can be drained
-//! at shutdown independent of actor liveness. Capacity is reserved at admission
-//! (try_reserve) and retained through callback terminal state.
+//! Callbacks run on owned child tasks under a bounded concurrency permit.
+//! On deadline abort the join handle and permit are retained until the join
+//! finishes so non-yielding callbacks cannot detach while freeing capacity.
 
 use super::executor_spawn::try_spawn;
+use super::spawn_gate::SpawnGate;
 use monoloop_contracts::{CompletionCallback, TransactionEnd};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,21 +15,26 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
 
 type CallbackJoin = (AbortHandle, JoinHandle<()>);
-/// Std mutex so schedule can always register joins without async/try_lock drop (D-029).
 type CallbackJoinSet = Arc<Mutex<Vec<CallbackJoin>>>;
+
+/// Timed-out callback still holding its permit until the join finishes.
+struct RetainedCallback {
+    abort: AbortHandle,
+    join: JoinHandle<()>,
+    permit: OwnedSemaphorePermit,
+}
 
 /// Bounded, runtime-owned completion callback executor.
 #[derive(Clone)]
 pub struct CallbackService {
     permits: Arc<Semaphore>,
-    /// Admission reservations + scheduled/running callbacks (D-029).
     reserved: Arc<AtomicUsize>,
     inflight: Arc<AtomicUsize>,
     default_deadline: Duration,
-    /// Injected Tokio handle for owned callback tasks (D-032).
     executor: Handle,
-    /// Owned callback joins for shutdown abort+join (D-029).
+    spawn_gate: SpawnGate,
     joins: CallbackJoinSet,
+    retained: Arc<Mutex<Vec<RetainedCallback>>>,
 }
 
 /// Admission-time callback capacity reservation (D-029).
@@ -70,7 +75,12 @@ impl Drop for CallbackReservation {
 
 impl CallbackService {
     /// Create with a maximum number of concurrent callback tasks.
-    pub fn new(max_concurrent: usize, default_deadline: Duration, executor: Handle) -> Self {
+    pub fn new(
+        max_concurrent: usize,
+        default_deadline: Duration,
+        executor: Handle,
+        spawn_gate: SpawnGate,
+    ) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent.max(1))),
             reserved: Arc::new(AtomicUsize::new(0)),
@@ -81,11 +91,13 @@ impl CallbackService {
                 default_deadline
             },
             executor,
+            spawn_gate,
             joins: Arc::new(Mutex::new(Vec::new())),
+            retained: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Number of callbacks currently executing.
+    /// Number of callbacks currently executing (including retained).
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::SeqCst)
     }
@@ -106,10 +118,22 @@ impl CallbackService {
         })
     }
 
+    fn reap_retained(retained: &Mutex<Vec<RetainedCallback>>, inflight: &AtomicUsize) {
+        let mut g = retained.lock().unwrap_or_else(|e| e.into_inner());
+        let mut keep = Vec::new();
+        for r in g.drain(..) {
+            if r.join.is_finished() {
+                drop(r.join);
+                drop(r.permit);
+                inflight.fetch_sub(1, Ordering::SeqCst);
+            } else {
+                keep.push(r);
+            }
+        }
+        *g = keep;
+    }
+
     /// Schedule a host callback using an admission reservation (D-029).
-    ///
-    /// If the executor rejects the spawn, the reservation permit is dropped and
-    /// inflight is not left elevated (D-032).
     pub fn schedule_reserved(
         &self,
         reservation: CallbackReservation,
@@ -120,53 +144,67 @@ impl CallbackService {
         let (_permits, _reserved_counter, permit) = reservation.into_parts();
         let inflight = Arc::clone(&self.inflight);
         let joins = Arc::clone(&self.joins);
+        let retained = Arc::clone(&self.retained);
         let executor = self.executor.clone();
+        let gate = self.spawn_gate.clone();
+        let gate_inner = gate.clone();
         let budget = deadline.unwrap_or(self.default_deadline);
         inflight.fetch_add(1, Ordering::SeqCst);
         let inflight_child = Arc::clone(&inflight);
-        let handle = match try_spawn(&self.executor, async move {
+        Self::reap_retained(&retained, &inflight);
+        let handle = match try_spawn(&self.executor, &gate, async move {
             let call =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
-            if let Ok(fut) = call {
-                let mut handle = match try_spawn(&executor, fut) {
-                    Ok(h) => h,
-                    Err(()) => {
-                        drop(permit);
-                        inflight_child.fetch_sub(1, Ordering::SeqCst);
-                        return;
-                    }
-                };
-                let abort = handle.abort_handle();
-                match tokio::time::timeout(budget, &mut handle).await {
-                    Ok(Ok(_)) | Ok(Err(_)) => {}
-                    Err(_) => {
-                        abort.abort();
-                        let _ = handle.await;
+            match call {
+                Ok(fut) => {
+                    let mut handle = match try_spawn(&executor, &gate_inner, async move {
+                        let _ = fut.await;
+                    }) {
+                        Ok(h) => h,
+                        Err(()) => {
+                            drop(permit);
+                            inflight_child.fetch_sub(1, Ordering::SeqCst);
+                            return;
+                        }
+                    };
+                    let abort = handle.abort_handle();
+                    match tokio::time::timeout(budget, &mut handle).await {
+                        Ok(Ok(_)) | Ok(Err(_)) => {
+                            drop(permit);
+                            inflight_child.fetch_sub(1, Ordering::SeqCst);
+                        }
+                        Err(_) => {
+                            abort.abort();
+                            // Retain join + permit until observed finished.
+                            retained.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                RetainedCallback {
+                                    abort,
+                                    join: handle,
+                                    permit,
+                                },
+                            );
+                        }
                     }
                 }
+                Err(_) => {
+                    drop(permit);
+                    inflight_child.fetch_sub(1, Ordering::SeqCst);
+                }
             }
-            drop(permit);
-            inflight_child.fetch_sub(1, Ordering::SeqCst);
         }) {
             Ok(h) => h,
             Err(()) => {
-                // Future (and permit) dropped with failed spawn; clear inflight only.
                 inflight.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
         };
         let abort = handle.abort_handle();
-        // Always own the join for shutdown (D-029 residual). Reap completed
-        // joins so normal completions do not grow `joins` for the runtime lifetime.
         let mut g = joins.lock().unwrap_or_else(|e| e.into_inner());
         g.retain(|(_, join)| !join.is_finished());
         g.push((abort, handle));
     }
 
     /// Schedule a host callback on an owned task (does not block the caller).
-    ///
-    /// Prefer [`schedule_reserved`] after admission. This path still acquires a
-    /// permit before work; if none are available the callback is dropped fail-closed.
     pub fn schedule(
         &self,
         callback: Box<dyn CompletionCallback>,
@@ -180,17 +218,14 @@ impl CallbackService {
     }
 
     /// Wait until no callbacks are inflight, or until `deadline` elapses.
-    /// On expiry, abort owned callback tasks and join briefly (D-029).
     pub async fn drain(&self, deadline: Duration) {
         let start = tokio::time::Instant::now();
         while self.inflight() > 0 {
+            Self::reap_retained(&self.retained, &self.inflight);
             if start.elapsed() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        if self.inflight() == 0 {
-            return;
         }
         let remaining = deadline.saturating_sub(start.elapsed());
         let mut handles = {
@@ -200,11 +235,34 @@ impl CallbackService {
         for (abort, join) in handles.drain(..) {
             abort.abort();
             if remaining.is_zero() {
-                // Shutdown budget exhausted — do not await a non-yielding callback.
                 drop(join);
             } else {
                 let _ = tokio::time::timeout(remaining, join).await;
             }
+        }
+        // Retained: abort and join within remaining budget; unfinished keep permits.
+        let mut retained = {
+            let mut g = self.retained.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *g)
+        };
+        let rem = deadline.saturating_sub(start.elapsed());
+        let mut still = Vec::new();
+        for mut r in retained.drain(..) {
+            r.abort.abort();
+            if rem.is_zero() {
+                still.push(r);
+                continue;
+            }
+            match tokio::time::timeout(rem, &mut r.join).await {
+                Ok(_) => {
+                    drop(r.permit);
+                    self.inflight.fetch_sub(1, Ordering::SeqCst);
+                }
+                Err(_) => still.push(r),
+            }
+        }
+        if !still.is_empty() {
+            *self.retained.lock().unwrap_or_else(|e| e.into_inner()) = still;
         }
     }
 }

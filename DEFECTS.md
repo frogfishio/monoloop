@@ -891,11 +891,11 @@ considered delivered while these remain.
 |---|---|---|
 | D-026 | Fixed (residual closed) | Create: claim+`SessionEstablished`+MCP activate **before** prompt send (`prompt_ready` gate); ACP encode uses empty tools for `McpGateway` |
 | D-027 | Fixed (residual closed) | Per-exchange remaining output budget; limits before live publish; immediate `LimitExceeded` on retention exceed |
-| D-028 | Fixed (residual closed) | Shared `StickyCancel` always joined (no detach after cleanup); missing kill joins to completion; kill capability checked before start |
-| D-029 | Fixed (residual closed) | Shutdown aborts actor+delivery (not only reaper); finalize only after join; callback abort never unbounded; disposition counts callback outcomes |
+| D-028 | Fixed (residual closed) | `ToolKillHandle::join_timeout` puts handle back on timeout then `join()`; missing-kill holds permit until completion |
+| D-029 | Fixed (residual closed) | Shutdown joins reaper within deadline (no yield pad); `claim_for_shutdown` waits on restore notify; callback retains join+permit on timeout |
 | D-030 | Fixed | ExchangeId-scoped ToolActionId; empty allowlist → rejection Completed; CallerControlled after observe |
 | D-031 | Fixed (residual closed) | OpenAI continuation encodes transcript only (no duplicate `results` append) |
-| D-032 | Fixed (residual closed) | `try_spawn` confirms start on multi-thread (mpsc rendezvous); rejects cancelled-never-started; current-thread sync admit keeps immediate check only |
+| D-032 | Fixed (residual closed) | `SpawnGate` closed at shutdown start; `try_spawn` rejects closed gate / cancelled-never-started; body parks if gate closed before start |
 | D-033 | Fixed | absolute request deadline; enqueue selects deadline; output queue from output budget |
 | D-034 | Fixed (known residual) | Canonical hex + global/per-cap permits before body; body+dispatch share duration budget; process-global service map remains |
 | D-035 | Fixed | estimate covers names, args JSON, tool_call_id; serialize fail closed |

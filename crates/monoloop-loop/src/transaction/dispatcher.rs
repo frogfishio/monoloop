@@ -365,9 +365,9 @@ impl TransactionToolDispatcher {
             ToolCancellationPolicy::Cooperative { .. } => true,
         };
         if !kill_ok {
-            // Handler lied about supports_*: cooperative cancel then *join* before
-            // returning. A timed detach would leave the worker running after the
-            // transaction observes RuntimeFailed (D-028 structural requirement).
+            // Handler lied about supports_*: without a kill handle we cannot
+            // escalate. Hold the concurrency permit until completion so capacity
+            // cannot be reused while the worker may still be active (D-024).
             control.cancel();
             let _ = handle.completion.wait().await;
             drop(permit);
@@ -499,6 +499,12 @@ async fn await_tool_termination(
         ToolCancellationPolicy::Abortable => {
             if let Some(k) = kill {
                 k.kill();
+                // Join the worker; on timeout keep ownership and wait for abort
+                // teardown so the permit is not released while work is detached.
+                if k.join_timeout(join_grace).await.is_err() {
+                    k.join().await;
+                    return ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed);
+                }
             }
             match tokio::time::timeout(join_grace, wait).await {
                 Ok(c) => c,
@@ -517,6 +523,12 @@ async fn await_tool_termination(
                 Err(_) => {
                     if let Some(k) = kill {
                         k.kill();
+                        if k.join_timeout(join_grace).await.is_err() {
+                            k.join().await;
+                            return ToolCompletion::RuntimeFailed(
+                                ToolRuntimeError::TerminationFailed,
+                            );
+                        }
                     }
                     match tokio::time::timeout(join_grace, wait).await {
                         Ok(c) => c,
