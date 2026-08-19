@@ -1,19 +1,21 @@
-//! Per-transaction coordinator (v2 §11) — supervised DirectLlm exchange (M4).
+//! Per-transaction coordinator (v2 §11) — supervised DirectLlm exchange + empty tools (M5).
 
+use super::empty_tools::{has_ready_tool_units, run_empty_tool_pass, EmptyToolPassError};
 use super::event_publisher::EventPublisherCommand;
 use super::exchange::run_direct_llm_exchange;
 use super::task_spawner::TransactionTaskSpawner;
+use super::task_supervisor::TaskClass;
 use super::terminal::TerminalProposal;
 use crate::transaction::channel_registry::LiveChannel;
 use monoloop_contracts::{
     merge_effective_config, CanonicalInput, ChannelId, ChannelKind, ExtensionLimits,
-    InvocationConfig, SessionConfig, SessionId, TransactionEndKind, TransactionEventPayload,
-    TransactionId,
+    InvocationConfig, SessionConfig, SessionId, ToolExecutionId, TransactionEndKind,
+    TransactionEventPayload, TransactionId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// Message from coordinator workers to the supervisor.
 #[derive(Debug)]
@@ -35,8 +37,7 @@ pub struct CoordinatorParams {
     pub cancel: Arc<Notify>,
     /// Channel id.
     pub channel_id: ChannelId,
-    /// Session id when known (reserved for SessionEstablished ordering).
-    #[allow(dead_code)]
+    /// Session id when known.
     pub session_id: Option<SessionId>,
     /// Canonical input.
     pub input: CanonicalInput,
@@ -76,7 +77,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         transaction_id,
         cancel,
         channel_id,
-        session_id: _,
+        session_id,
         input,
         invocation_config,
         session_config,
@@ -110,7 +111,6 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
     };
 
     let max_encoded = live.binding.limits.max_encoded_exchange_bytes;
-    // Retain budget: channel output-oriented bound (fallback to encoded max).
     let max_retained = live
         .binding
         .limits
@@ -137,8 +137,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
     )
     .await;
 
-    // Publish complete units without silent drop (LAW 24). Publisher closure or
-    // cancel during publish fails closed as EventDeliveryFailed.
+    // Publish complete units without silent drop (LAW 24).
     let mut terminal = outcome.terminal;
     for unit in &outcome.units {
         let send = publish_tx.send(EventPublisherCommand::Publish(Box::new(
@@ -155,6 +154,59 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
                     terminal = TransactionEndKind::EventDeliveryFailed;
                     break;
                 }
+            }
+        }
+    }
+
+    if matches!(
+        terminal,
+        TransactionEndKind::Completed | TransactionEndKind::ContinuationRequired
+    ) && has_ready_tool_units(&outcome.units)
+    {
+        // M5: EmptyToolRegistry pass. Prefer TaskSupervisor ToolWorker; if the
+        // spawn mailbox rejects, await the returned future on this coordinator
+        // (already supervised) — never drop the work or invent a second machine.
+        let (done_tx, done_rx) = oneshot::channel();
+        let exec_id = ToolExecutionId::generate();
+        let units = outcome.units.clone();
+        let publish_tools = publish_tx.clone();
+        let cancel_tools = Arc::clone(&cancel);
+        let channel_tools = channel_id.clone();
+        let session_tools = session_id.clone();
+        let exchange_id = outcome.exchange_id;
+        let worker = async move {
+            let report = run_empty_tool_pass(
+                transaction_id,
+                channel_tools,
+                session_tools,
+                exchange_id,
+                &units,
+                publish_tools,
+                cancel_tools,
+            )
+            .await;
+            let _ = done_tx.send(report);
+        };
+        match tasks
+            .spawn(TaskClass::ToolWorker(transaction_id, exec_id), worker)
+            .await
+        {
+            Ok(_) => {}
+            Err((_err, returned)) => {
+                // Busy/Closed: drive the same future on the coordinator task.
+                returned.await;
+            }
+        }
+        match done_rx.await {
+            Ok(Ok(_report)) => {}
+            Ok(Err(EmptyToolPassError::Cancelled)) => {
+                terminal = TransactionEndKind::Cancelled;
+            }
+            Ok(Err(EmptyToolPassError::PublishFailed)) => {
+                terminal = TransactionEndKind::EventDeliveryFailed;
+            }
+            Ok(Err(_)) | Err(_) => {
+                terminal = TransactionEndKind::InvariantFailed;
             }
         }
     }

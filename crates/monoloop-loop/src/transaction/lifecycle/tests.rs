@@ -362,3 +362,104 @@ fn short_wait_may_timeout_while_quiescing_then_complete() {
         "expected Stopped, got {outcome:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_tool_pass_unavailable_zero_effects() {
+    use super::empty_tools::run_empty_tool_pass;
+    use super::event_publisher::EventPublisherCommand;
+    use monoloop_contracts::{
+        CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, ConnectionId, ExchangeId, FlowId,
+        InterpretationId, LaneId, ToolActionEvent, ToolActionId, ToolExecutionState,
+        ToolLifecycleEvent, ToolRequestState, ToolResultState, TransactionEventPayload,
+        TransactionId, UnitId, UnitState,
+    };
+    use tokio::sync::{mpsc, Notify};
+
+    let (tx, mut rx) = mpsc::channel::<EventPublisherCommand>(8);
+    let cancel = Arc::new(Notify::new());
+    let ready = CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
+        unit_id: UnitId::new("tool-1"),
+        unit_generation: 1,
+        unit_state: UnitState::Waiting,
+        interpretation_id: InterpretationId::generate(),
+        connection_id: ConnectionId::generate(),
+        external_session_id: None,
+        flow_id: FlowId::main(),
+        lane_id: LaneId::tool(),
+        lane_ordinal: 1,
+        causal_parent_id: None,
+        source_time: None,
+        source_step: None,
+        unit: CanonicalUnit::Tool(ToolActionEvent {
+            tool_action_id: ToolActionId::new("a1"),
+            tool_name: Some("bash".into()),
+            request_state: ToolRequestState::Ready,
+            execution_state: ToolExecutionState::Waiting,
+            result_state: ToolResultState::Absent,
+            request_payload: Some(r#"{"cmd":"ls"}"#.into()),
+            result_payload: None,
+            terminal_outcome: None,
+            waiting_for: Some("external".into()),
+        }),
+    });
+    let waiting = CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
+        unit_id: UnitId::new("tool-2"),
+        unit_generation: 1,
+        unit_state: UnitState::Waiting,
+        interpretation_id: InterpretationId::generate(),
+        connection_id: ConnectionId::generate(),
+        external_session_id: None,
+        flow_id: FlowId::main(),
+        lane_id: LaneId::tool(),
+        lane_ordinal: 2,
+        causal_parent_id: None,
+        source_time: None,
+        source_step: None,
+        unit: CanonicalUnit::Tool(ToolActionEvent {
+            tool_action_id: ToolActionId::new("a2"),
+            tool_name: Some("bash".into()),
+            request_state: ToolRequestState::Assembling,
+            execution_state: ToolExecutionState::Waiting,
+            result_state: ToolResultState::Absent,
+            request_payload: None,
+            result_payload: None,
+            terminal_outcome: None,
+            waiting_for: Some("args".into()),
+        }),
+    });
+
+    let report = run_empty_tool_pass(
+        TransactionId::generate(),
+        ChannelId::try_new("llm").unwrap(),
+        Some(SessionId::try_new("s1").unwrap()),
+        ExchangeId::generate(),
+        &[ready, waiting],
+        tx,
+        cancel,
+    )
+    .await
+    .expect("empty tool pass");
+    assert_eq!(report.ready_seen, 1);
+    assert_eq!(report.unavailable_published, 1);
+    assert_eq!(report.non_ready_ignored, 1);
+
+    let mut saw_unavailable = false;
+    while let Ok(cmd) = rx.try_recv() {
+        if let EventPublisherCommand::Publish(payload) = cmd {
+            if let TransactionEventPayload::ToolLifecycle(ToolLifecycleEvent::Completed {
+                result,
+            }) = *payload
+            {
+                assert!(matches!(
+                    result.outcome,
+                    monoloop_contracts::CanonicalToolResultOutcome::DomainFailed(_)
+                ));
+                saw_unavailable = true;
+            }
+        }
+    }
+    assert!(
+        saw_unavailable,
+        "expected ToolLifecycle Completed unavailable"
+    );
+}

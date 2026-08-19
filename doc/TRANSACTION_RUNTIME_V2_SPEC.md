@@ -1,12 +1,11 @@
 # Transaction Runtime v2 Specification
 
 **Status:** Normative replacement specification; M0–M4 landed (D-003; D-042
-Fixed). All product connectors return joinable `ConnectionOwnerWork` on
-`OpenedRawConnection`. Lifecycle exchange uses `TransactionTaskSpawner` with
-fail-closed cleanup. ACP process pumps use `Weak`+JoinSet (joined on
-shutdown/Drop). Grok pending connect/session/exchange workers abort on Drop;
-`GrokServerHandle::shutdown` joins `run_connection`. Optional shared ACP
-process-core helper remains a non-blocking cleanup. Next: M5 tools/MCP.
+Fixed); **M5 first slice** landed — EmptyToolRegistry pass under
+`TaskSupervisor` (`ToolWorker`) after exchange, truthful `tool_unavailable`
+lifecycle events, `NoToolRuntime` never started. Remaining M5: execution
+classes, process isolation, MCP TaskSupervisor registration, remove join
+vaults / ambient `DefaultLoopRuntime` spawn.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

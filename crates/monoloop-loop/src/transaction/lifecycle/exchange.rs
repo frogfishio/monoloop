@@ -27,8 +27,7 @@ pub struct DirectExchangeOutcome {
     pub units: Vec<CanonicalUnitEvent>,
     /// Mapped terminal proposal kind.
     pub terminal: TransactionEndKind,
-    /// Exchange identity (for diagnostics / later Loop wiring).
-    #[allow(dead_code)]
+    /// Exchange identity (empty-tool / Loop correlation).
     pub exchange_id: ExchangeId,
 }
 
