@@ -33,6 +33,7 @@ pub enum OutputValidationFailure {
 }
 
 /// Maximum JSON nesting depth accepted for tool arguments/results.
+#[allow(dead_code)] // used by deferred dispatcher until M5
 pub const DEFAULT_MAX_JSON_DEPTH: u32 = 16;
 
 /// Validate raw argument JSON string against size, depth, and schema.

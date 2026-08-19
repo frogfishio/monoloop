@@ -138,12 +138,14 @@ impl ToolKillHandle {
         }
     }
 
-    /// Take the join handle if still present (for vaulting on dispatch drop).
+    /// Take the join handle if still present (for TaskSupervisor registration — M5).
+    #[allow(dead_code)] // dispatcher deferred until M5
     pub(crate) fn take_join(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.join.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Whether a join handle is still owned (not yet completed/taken).
+    #[allow(dead_code)] // dispatcher deferred until M5
     pub(crate) fn has_join(&self) -> bool {
         self.join
             .lock()

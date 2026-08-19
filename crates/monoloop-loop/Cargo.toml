@@ -11,6 +11,10 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 description = "Minimal extensible Loop: lossless canonical subscription, empty-capable tools"
+# Disable autodiscovery so legacy v1 integration tests are not built unless
+# explicitly listed (and gated) below during Runtime v2 migration.
+autotests = false
+autoexamples = false
 
 [dependencies]
 monoloop-contracts = { workspace = true }
@@ -28,6 +32,65 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+default = []
+# Integration tests that still expect the deleted v1 `DefaultTransactionRuntime`
+# (and related modules). Disabled until Runtime v2 cutover (M7).
+legacy_runtime_tests = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
 reqwest = { workspace = true }
+
+[[test]]
+name = "empty_loop"
+path = "tests/empty_loop.rs"
+
+[[test]]
+name = "rmcp_loopback_spike"
+path = "tests/rmcp_loopback_spike.rs"
+
+[[test]]
+name = "admission_lifecycle"
+path = "tests/admission_lifecycle.rs"
+required-features = ["legacy_runtime_tests"]
+
+[[test]]
+name = "claim_gate"
+path = "tests/claim_gate.rs"
+required-features = ["legacy_runtime_tests"]
+
+[[test]]
+name = "direct_llm_e2e"
+path = "tests/direct_llm_e2e.rs"
+required-features = ["legacy_runtime_tests"]
+
+[[test]]
+name = "exchange_e2e"
+path = "tests/exchange_e2e.rs"
+required-features = ["legacy_runtime_tests"]
+
+[[test]]
+name = "hardening"
+path = "tests/hardening.rs"
+required-features = ["legacy_runtime_tests"]
+
+[[test]]
+name = "linked_tools"
+path = "tests/linked_tools.rs"
+required-features = ["legacy_runtime_tests"]
+
+[[test]]
+name = "mcp_gateway"
+path = "tests/mcp_gateway.rs"
+required-features = ["legacy_runtime_tests"]
+
+[[test]]
+name = "runtime_startup"
+path = "tests/runtime_startup.rs"
+required-features = ["legacy_runtime_tests"]
+
+[[example]]
+name = "fake_echo"
+path = "examples/fake_echo.rs"
+required-features = ["legacy_runtime_tests"]

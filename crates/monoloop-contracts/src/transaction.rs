@@ -59,6 +59,10 @@ where
 }
 
 /// Transaction submission request (synchronous admission; async progress).
+///
+/// **v1 fields** `events` / `completion` remain until Runtime v2 cutover (M7).
+/// New code SHOULD construct [`crate::delivery::TransactionDelivery`] ports and
+/// will migrate onto a delivery-based request shape during M2–M3.
 pub struct TransactionRequest {
     /// Explicit Channel selection.
     pub channel_id: ChannelId,
@@ -72,9 +76,9 @@ pub struct TransactionRequest {
     pub invocation_config: InvocationConfig,
     /// Selected host tool ids (deduplicated at admission).
     pub tools: Vec<ToolId>,
-    /// Required event sink.
+    /// Required event sink (v1; retired from the core at v2 cutover).
     pub events: Arc<dyn TransactionEventSink>,
-    /// Required completion callback.
+    /// Required completion callback (v1; retired from the core at v2 cutover).
     pub completion: Box<dyn CompletionCallback>,
 }
 
@@ -240,6 +244,10 @@ pub struct TransactionDiagnostic {
 }
 
 /// Terminal transaction result.
+///
+/// **Legacy (v1):** embeds `event_delivery` inside the terminal event itself.
+/// Runtime v2 publishes [`TransactionEndEvent`] on the event stream and reports
+/// delivery/cleanup on [`TransactionCompletion`] instead.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionEnd {
     /// Transaction id.
@@ -260,6 +268,122 @@ pub struct TransactionEnd {
     pub usage: TransactionUsage,
     /// Safe diagnostics.
     pub diagnostics: Vec<TransactionDiagnostic>,
+}
+
+/// Terminal event body for the v2 event stream (no self-referential delivery).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionEndEvent {
+    /// Transaction id.
+    pub transaction_id: TransactionId,
+    /// Session when established.
+    pub session_id: Option<SessionId>,
+    /// Channel.
+    pub channel_id: ChannelId,
+    /// Terminal kind.
+    pub kind: TransactionEndKind,
+    /// Number of events emitted including this terminal event.
+    pub emitted_events: u64,
+    /// Bounded usage facts.
+    pub usage: TransactionUsage,
+    /// Safe diagnostics.
+    pub diagnostics: Vec<TransactionDiagnostic>,
+}
+
+/// Outcome of attempting to enqueue the terminal `Ended` event (v2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TerminalEventDelivery {
+    /// Terminal event was accepted by the event mailbox.
+    Published,
+    /// Event receiver was dropped / channel closed.
+    QueueClosed,
+    /// Terminal-event budget elapsed before enqueue.
+    DeadlineExceeded,
+    /// Item or byte capacity rejected the terminal event.
+    LimitExceeded,
+}
+
+/// Status of owned cleanup after completion publication (v2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CleanupStatus {
+    /// All owned tasks/processes have been observed finished.
+    Complete,
+    /// Completion was published while owned work remains.
+    Pending {
+        /// Owned Tokio tasks still registered.
+        owned_tasks: u32,
+        /// Owned child processes still registered.
+        owned_processes: u32,
+        /// Cooperative in-process tools still outstanding.
+        cooperative_tools: u32,
+    },
+    /// Cleanup failed with a closed code.
+    Failed {
+        /// Stable cleanup failure code.
+        code: CleanupFailureCode,
+    },
+}
+
+/// Closed cleanup failure codes (v2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CleanupFailureCode {
+    /// Join observed a panic.
+    TaskPanicked,
+    /// Process reap failed.
+    ProcessReapFailed,
+    /// Internal ownership invariant broken.
+    InvariantFailed,
+}
+
+/// One-shot completion mailbox payload (v2).
+///
+/// Separates terminal event data from terminal-event delivery and cleanup.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionCompletion {
+    /// Terminal event body (also published on the event stream when possible).
+    pub end: TransactionEndEvent,
+    /// Result of the terminal event enqueue attempt.
+    pub terminal_event_delivery: TerminalEventDelivery,
+    /// Whether owned cleanup is complete.
+    pub cleanup: CleanupStatus,
+}
+
+/// Wait outcome for [`crate`] runtime owner shutdown (v2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShutdownWaitOutcome {
+    /// Stopped invariants hold; shutdown generation is complete.
+    Stopped(ShutdownReport),
+    /// Wait deadline elapsed; runtime remains `Quiescing` and retains ownership.
+    TimedOut(ShutdownSnapshot),
+}
+
+/// Final shutdown report when the runtime reaches `Stopped` (v2).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ShutdownReport {
+    /// Admitted transactions that received a completion publication attempt.
+    pub completions_published: u64,
+    /// Completions where the host had dropped its receiver.
+    pub completions_receiver_dropped: u64,
+    /// Completions that hit an invariant on the sender.
+    pub completions_invariant_failed: u64,
+    /// Transactions terminated because of runtime shutdown.
+    pub runtime_shutdown_terminals: u64,
+}
+
+/// Point-in-time shutdown progress while still `Quiescing` (v2).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ShutdownSnapshot {
+    /// Shutdown generation id (shared by concurrent waiters).
+    pub generation: u64,
+    /// Ledger entries still present.
+    pub ledger_entries: u32,
+    /// Owned Tokio tasks still registered.
+    pub owned_tasks: u32,
+    /// Owned child processes still registered.
+    pub owned_processes: u32,
+    /// Outstanding MCP routes.
+    pub mcp_routes: u32,
+    /// Completion publications attempted so far in this generation.
+    pub completions_published: u64,
 }
 
 /// Closed terminal kinds.

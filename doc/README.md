@@ -1,6 +1,8 @@
 # Monoloop — Three-component asynchronous kernel
 
-**Status:** WP-12 Fake/scripted acceptance in progress; see `WP12_REQUIREMENTS_ACCEPTANCE.md`
+**Status:** Transaction Runtime v2 migration in progress
+([`TRANSACTION_RUNTIME_V2_SPEC.md`](TRANSACTION_RUNTIME_V2_SPEC.md), D-003);
+WP-12 evidence remains under `WP12_*.md`
 
 **Implementation language:** Rust
 
@@ -9,6 +11,9 @@
 **Requirements register:** [REQUIREMENTS.md](REQUIREMENTS.md)
 
 **Transaction runtime design:** [TRANSACTION_RUNTIME_DESIGN.md](TRANSACTION_RUNTIME_DESIGN.md)
+
+**Transaction runtime v2 replacement specification:**
+[TRANSACTION_RUNTIME_V2_SPEC.md](TRANSACTION_RUNTIME_V2_SPEC.md)
 
 **Development specification:** [TRANSACTION_RUNTIME_IMPLEMENTATION.md](TRANSACTION_RUNTIME_IMPLEMENTATION.md)
 

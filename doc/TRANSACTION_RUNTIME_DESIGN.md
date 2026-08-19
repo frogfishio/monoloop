@@ -1,8 +1,11 @@
 # Transaction Runtime Design
 
-**Status:** Accepted architecture  
+**Status:** Accepted architecture (lifecycle sections **superseded**)  
 **Implements:** `REQUIREMENTS.md` R-000 through R-004  
-**Development contract:** `TRANSACTION_RUNTIME_IMPLEMENTATION.md`
+**Development contract:** `TRANSACTION_RUNTIME_IMPLEMENTATION.md`  
+**Lifecycle / admission / callback / shutdown / task-ownership:** superseded by
+[`TRANSACTION_RUNTIME_V2_SPEC.md`](TRANSACTION_RUNTIME_V2_SPEC.md) (D-003).
+Do not treat this document's v1 lifecycle claims as release-proven.
 
 This design turns the accepted requirements into one production architecture.
 It intentionally avoids provider-specific orchestration, dynamic tool loading,

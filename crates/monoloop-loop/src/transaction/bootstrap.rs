@@ -47,16 +47,13 @@ impl RuntimeConfig {
     }
 }
 
-/// Only construction path for [`super::DefaultTransactionRuntime`].
+/// Bootstrap inputs for Runtime v2 start (M2 will return [`super::lifecycle::StartedRuntime`]).
 ///
-/// # Host Tokio pattern
+/// # Executor ownership (v2)
 ///
-/// `executor` must be a multi-thread Tokio [`Handle`] — startup rejects
-/// current-thread handles so non-blocking admission cannot race cancel-before-start
-/// on a reactor that cannot confirm first poll. CLI samples may use
-/// `#[tokio::main]` + `Handle::current()`. Embedded hosts (e.g. Tauri) should
-/// start a dedicated multi-thread runtime at process setup and pass
-/// `runtime.handle().clone()` here for the process lifetime.
+/// Production start MUST construct and own its executor (`doc/TRANSACTION_RUNTIME_V2_SPEC.md`
+/// §7.2). The `executor` field remains temporarily for leftover callers during
+/// migration and will be removed from the production constructor in M2.
 pub struct RuntimeBootstrap {
     /// Limits and feature flags.
     pub config: RuntimeConfig,
@@ -64,6 +61,6 @@ pub struct RuntimeBootstrap {
     pub channels: ChannelRegistry,
     /// Immutable host tool shell (empty allowed).
     pub tools: HostToolRegistry,
-    /// Tokio multi-thread handle used for owned tasks.
+    /// Temporary external handle (removed from production API in M2).
     pub executor: Handle,
 }

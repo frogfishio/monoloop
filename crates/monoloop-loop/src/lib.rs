@@ -4,9 +4,12 @@
 //! Component 03 — The Loop.
 //!
 //! Inner `LoopRuntime` (complete-unit tool reaction) plus the outer
-//! `TransactionRuntime` composition layer.
+//! transaction composition layer.
 //!
-//! See `doc/THE_LOOP.md` and `doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md`.
+//! Transaction lifecycle is being replaced by Runtime v2
+//! (`doc/TRANSACTION_RUNTIME_V2_SPEC.md`). Public exports below reflect the
+//! modules that compile during migration; full `TransactionRuntime` cutover is
+//! M7.
 
 #![deny(missing_docs)]
 
@@ -32,27 +35,28 @@ pub use tools::{
     ToolRuntimeTerminal,
 };
 pub use transaction::{
-    bound_diagnostics, dispatch_ready_tool, run_encoded_exchange, run_exchange,
-    tool_definitions_from_resolved, validate_tool_completion, validate_tool_input,
-    AcpPromptEncoder, AcpPromptWireShape, AsyncToolHandler, BoundedEventSender, CallbackService,
-    CapabilityToken, CapacityManagers, ChannelBinding, ChannelRegistry, DefaultTransactionRuntime,
-    DispatchOutcome, DispatchRequest, DispatcherLimits, EmptyBytesEncoder, EncodedExchangeParams,
-    EventQueueFull, EventSequencer, ExchangeFailure, ExchangeOutcome, ExchangeParams,
-    FinalizationGuard, HeadlessPromptEncoder, HostToolRegistry, HostToolRuntime,
-    ImmediateToolHandler, InputValidationFailure, IsolatedKillableToolHandler,
-    LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler, McpBindingState, McpGateway,
-    McpGatewayHandle, McpInstallError, McpListenerShell, McpRouteTable,
+    adapt_completion_callback, adapt_event_sink, begin_shutdown_placeholder, build_completion,
+    rejecting, validate_tool_completion, validate_tool_input, AcpPromptEncoder, AcpPromptWireShape,
+    AsyncToolHandler, CapacityManagers, ChannelBinding, ChannelRegistry, EmptyBytesEncoder,
+    HeadlessPromptEncoder, HostCompletionAdapter, HostEventAdapter, HostToolRegistry,
+    ImmediateToolHandler, InputValidationFailure, IsolatedKillableToolHandler, LedgerEntry,
+    LifecycleLedger, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
     OpenAiChatCompletionsEncoder, OpenAiEncoderOptions, OutputValidationFailure,
-    PanicOnStartHandler, PendingMcpBinding, QueuedEvent, RegisteredTool, RejectEncoder,
-    ResolvedTool, ResolvedToolRegistry, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig,
-    RuntimeState, SharedToolCapacity, StartFailHandler, Startup, StartupError, TestTextEncoder,
-    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, ToolKillHandle,
-    TransactionMcpHandler, TransactionToolCapacity, TransactionToolDispatcher,
+    PanicOnStartHandler, RegisteredTool, RejectEncoder, ResolvedTool, ResolvedToolSet,
+    RuntimeBootstrap, RuntimeConfig, RuntimeOwner, RuntimeState, SharedToolCapacity,
+    ShutdownTicket, StartFailHandler, StartedRuntime, StartupError, SupervisorCommand, TaskClass,
+    TaskId, TaskSupervisor, TerminalDecision, TestTextEncoder, ToolExecutionCompletion,
+    ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionCoordinator, TransactionPhase,
+    TransactionReservations, TransactionRuntimeHandle, TransactionToolCapacity,
 };
 
 pub use monoloop_contracts::{
-    CanonicalUnit, CanonicalUnitEvent, InterpretationEnd, InterpreterOutputEvent, LoopEnd,
-    LoopEndKind, LoopError, LoopErrorKind, LoopId, LoopLimits, LoopOutputEvent, LoopScope,
-    MonoloopRunId, OutboundToolOutcome, OutboundToolResult, ToolActionId, ToolRequestState,
-    ToolUnavailableReason,
+    estimate_event_bytes, transaction_delivery, AdmissionError, AdmissionErrorKind,
+    AdmissionReceipt, BoundaryKind, CanonicalUnit, CanonicalUnitEvent, CleanupFailureCode,
+    CleanupStatus, CompletionPublishResult, DeliveryConfigError, DeliveryLimits, EventEnqueueError,
+    InterpretationEnd, InterpreterOutputEvent, LoopEnd, LoopEndKind, LoopError, LoopErrorKind,
+    LoopId, LoopLimits, LoopOutputEvent, LoopScope, MonoloopRunId, OutboundToolOutcome,
+    OutboundToolResult, ShutdownReport, ShutdownSnapshot, ShutdownWaitOutcome,
+    TerminalEventDelivery, ToolActionId, ToolRequestState, ToolUnavailableReason,
+    TransactionCompletion, TransactionDelivery, TransactionEndEvent, TransactionReceiver,
 };

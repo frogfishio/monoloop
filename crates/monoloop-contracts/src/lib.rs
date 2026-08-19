@@ -13,6 +13,7 @@
 mod canonical;
 mod channel;
 mod config;
+mod delivery;
 mod dialect;
 mod encoder;
 mod error;
@@ -41,6 +42,11 @@ pub use config::{
     merge_effective_config, ChannelDefaults, ConfigError, ConfigOption, ContinuationPolicy,
     EffectiveConfig, ExtensionKey, InvocationConfig, OptionPolicy, ReasoningEffort, ResponseFormat,
     SessionConfig, VersionedExtension,
+};
+pub use delivery::{
+    estimate_event_bytes, transaction_delivery, CompletionPublishResult, DeliveryConfigError,
+    DeliveryLimits, EventEnqueueError, TransactionCompletionReceiver, TransactionCompletionSender,
+    TransactionDelivery, TransactionEventReceiver, TransactionEventSender, TransactionReceiver,
 };
 pub use dialect::{DialectBinding, DialectDescriptor, DialectFamily, DialectNegotiation};
 pub use encoder::{
@@ -74,12 +80,14 @@ pub use tool::{
 };
 pub use transaction::{
     AdmissionError, AdmissionErrorKind, AdmissionReceipt, CancellationReason,
-    CancellationReasonCode, CompletionCallback, CompletionDelivery, CompletionDeliveryError,
-    EventDelivery, EventDeliveryError, EventDeliveryOutcome, FnCompletionCallback, FnEventSink,
-    Shutdown, ShutdownDisposition, TerminationDisposition, TerminationMode, TerminationReason,
-    TerminationReasonCode, TransactionDiagnostic, TransactionEnd, TransactionEndKind,
-    TransactionEvent, TransactionEventPayload, TransactionEventSink, TransactionRequest,
-    TransactionRuntime, TransactionSelector, TransactionUsage,
+    CancellationReasonCode, CleanupFailureCode, CleanupStatus, CompletionCallback,
+    CompletionDelivery, CompletionDeliveryError, EventDelivery, EventDeliveryError,
+    EventDeliveryOutcome, FnCompletionCallback, FnEventSink, Shutdown, ShutdownDisposition,
+    ShutdownReport, ShutdownSnapshot, ShutdownWaitOutcome, TerminalEventDelivery,
+    TerminationDisposition, TerminationMode, TerminationReason, TerminationReasonCode,
+    TransactionCompletion, TransactionDiagnostic, TransactionEnd, TransactionEndEvent,
+    TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionEventSink,
+    TransactionRequest, TransactionRuntime, TransactionSelector, TransactionUsage,
 };
 
 pub use bytes::Bytes;

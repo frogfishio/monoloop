@@ -1,65 +1,54 @@
 //! Transaction runtime composition (Component 3 outer layer).
 //!
-//! WP-03: bootstrap / registries / startup.
-//! WP-04: admission, events, finalization, callbacks, no-I/O actor.
-//! WP-06: linked tools, dispatcher, Loop adapters.
+//! Runtime v2 lifecycle lives in [`lifecycle`] (`doc/TRANSACTION_RUNTIME_V2_SPEC.md`).
+//! The deleted v1 files (`runtime`, `admission`, `actor`, `finalization`,
+//! `callback_service`, `executor_spawn`, `tool_join_vault`) are **not** restored.
+//!
+//! Modules that still depended on those files are deferred until their migration
+//! stage (see `lifecycle/mod.rs` and the v2 migration plan). They remain on disk
+//! but are not compiled, per "no additional deletions yet."
 
 mod acp_encoder;
-mod active_registry;
-mod actor;
-mod admission;
 mod bootstrap;
-mod callback_service;
 mod capacity;
 mod channel_registry;
-mod dispatcher;
 mod error;
-mod events;
-mod exchange;
-mod executor_spawn;
 mod fake_support;
-mod finalization;
 mod host_tools;
-mod loop_adapters;
-mod mcp;
+pub mod lifecycle;
 mod openai_encoder;
 mod resolved_tools;
-mod runtime;
-mod spawn_gate;
 mod state;
 mod sticky_cancel;
 mod tool_capacity;
 mod tool_handler;
-mod tool_join_vault;
 mod validation;
+
+// Deferred until migration stages that replace v1 dependencies:
+// mod active_registry;  // → lifecycle ledger (M2)
+// mod dispatcher;       // → TaskSupervisor join ownership (M5)
+// mod events;           // → lifecycle delivery + sequencing (M3)
+// mod exchange;         // → supervised Connector ownership (M4)
+// mod loop_adapters;    // → single Loop state machine (M3/M5)
+// mod mcp;              // → TaskSupervisor registration (M5)
+// mod spawn_gate;       // retired by owned executor (M2); delete at M7
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
 pub use bootstrap::{RuntimeBootstrap, RuntimeConfig};
-pub use callback_service::CallbackService;
 pub use capacity::CapacityManagers;
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
-pub use dispatcher::{
-    DispatchOutcome, DispatchRequest, DispatcherLimits, TransactionToolDispatcher,
-};
 pub use error::StartupError;
-pub use events::{BoundedEventSender, EventQueueFull, QueuedEvent};
-pub use exchange::{
-    run_encoded_exchange, run_exchange, EncodedExchangeParams, ExchangeFailure, ExchangeOutcome,
-    ExchangeParams,
-};
 pub use fake_support::{EmptyBytesEncoder, RejectEncoder, TestTextEncoder};
-pub use finalization::{bound_diagnostics, EventSequencer, FinalizationGuard};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
-pub use loop_adapters::{dispatch_ready_tool, HostToolRuntime, ResolvedToolRegistry};
-/// Back-compat alias: the MCP gateway owns the loopback listener.
-pub use mcp::McpGateway as McpListenerShell;
-pub use mcp::{
-    tool_definitions_from_resolved, CapabilityToken, McpBindingState, McpGateway, McpGatewayHandle,
-    McpInstallError, McpRouteTable, PendingMcpBinding, TransactionMcpHandler,
+pub use lifecycle::{
+    adapt_completion_callback, adapt_event_sink, begin_shutdown_placeholder, build_completion,
+    rejecting, HostCompletionAdapter, HostEventAdapter, LedgerEntry, LifecycleLedger, RuntimeOwner,
+    ShutdownTicket, StartedRuntime, SupervisorCommand, TaskClass, TaskId, TaskSupervisor,
+    TerminalDecision, TransactionCoordinator, TransactionPhase, TransactionReservations,
+    TransactionRuntimeHandle,
 };
 pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};
 pub use resolved_tools::{ResolvedTool, ResolvedToolSet};
-pub use runtime::{DefaultTransactionRuntime, Startup};
 pub use state::RuntimeState;
 pub use tool_capacity::{SharedToolCapacity, TransactionToolCapacity};
 pub use tool_handler::{

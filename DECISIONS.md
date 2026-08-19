@@ -72,3 +72,37 @@ so ownership for commercial licensing stays clear.
 Versioning uses root `VERSION` + `BUILD` with `make bump` / `make dist`
 (see `LICENSING.md`, `PUBLISHING.md`).
 
+
+## D-003 — Transaction Runtime v2 lifecycle replacement
+
+**Date:** 2026-08-19
+
+**Context:** The v1 transaction lifecycle implementation (`runtime`, `admission`,
+`actor`, `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`)
+repeatedly failed adversarial ownership review: non-blocking admission versus
+first-poll confirm, fabricated completion waiters mistaken for worker ownership,
+capacity leaks on deferred finalization, and shutdown deadlines treated as proof
+that arbitrary Rust futures had stopped. Those guarantees cannot all be satisfied
+together for in-process futures.
+
+**Decision:**
+
+1. Accept `doc/TRANSACTION_RUNTIME_V2_SPEC.md` as the normative replacement for
+   lifecycle, admission, callback, task-ownership, finalization, and shutdown.
+2. Do **not** recreate the seven deleted files individually. Replace them with
+   `transaction/lifecycle/`.
+3. Mark corresponding sections of `TRANSACTION_RUNTIME_DESIGN.md` and
+   `TRANSACTION_RUNTIME_IMPLEMENTATION.md` as superseded for those topics.
+4. Preserve Connector → Interpreter → Loop, canonical types, Channel identity,
+   bounded resources, and provider-neutral tool semantics.
+5. Migrate in stages M1–M7 from the v2 spec. Remaining on-disk modules that still
+   depend on deleted symbols are deferred (not deleted) until their stage.
+
+**Consequences:**
+
+- Core runtime publishes to concrete mailboxes; arbitrary sinks/callbacks move
+  outside the ownership boundary.
+- Production bootstrap owns its executor; bare external `Handle` is removed from
+  the production constructor (M2).
+- Shutdown timeout yields `Quiescing`, never false `Stopped`.
+- Only process-isolated work is described as hard-killable.

@@ -2,6 +2,9 @@
 //!
 //! Bare `Notify::notify_waiters()` drops the permit when nobody is waiting; the
 //! actor cancel path then awaits tool dispatch until its ordinary deadline (D-028).
+//!
+//! Temporarily unused while exchange/actor are deferred for Runtime v2 (M3–M4).
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;

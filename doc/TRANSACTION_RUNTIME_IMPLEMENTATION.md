@@ -1,14 +1,17 @@
 # Transaction Runtime Implementation Specification
 
-**Status:** Accepted for development  
+**Status:** Accepted for development (lifecycle sections **superseded**)  
 **Implements:** `REQUIREMENTS.md` R-000 through R-004  
-**Architecture:** `TRANSACTION_RUNTIME_DESIGN.md`
-**Delivery:** `TRANSACTION_RUNTIME_DELIVERY_PLAN.md`
+**Architecture:** `TRANSACTION_RUNTIME_DESIGN.md`  
+**Delivery:** `TRANSACTION_RUNTIME_DELIVERY_PLAN.md`  
+**Lifecycle / admission / callback / shutdown / task-ownership:** superseded by
+[`TRANSACTION_RUNTIME_V2_SPEC.md`](TRANSACTION_RUNTIME_V2_SPEC.md) (D-003).
+Preserve non-lifecycle contracts here until explicitly migrated; do not treat
+v1 lifecycle implementation claims as release-proven.
 
 This document fixes the contracts and implementation choices that a developer
-would otherwise have to invent. It is normative for the transaction-runtime
-work. Existing code and older descriptive text must be adapted to this
-specification, not used to silently weaken it.
+would otherwise have to invent. Lifecycle ownership is defined by Runtime v2;
+remaining sections stay normative until their migration stage.
 
 ## 1. Fixed decisions
 
