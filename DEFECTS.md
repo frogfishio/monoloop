@@ -1537,3 +1537,49 @@ These are honesty / law-22 issues, not a reason to rebuild the owner model.
 - **Accepted structural gap until M4:** realized Connector instances live on
   the cloneable handle `Arc`, not on `RuntimeOwner` (spec §7.1). Do not
   deepen this in M3.
+
+## D-042: M4 ACP owner fusion and process-core join residuals
+
+**Priority:** P1
+**Status:** Open (partial remediations applied)
+**Affected:**
+- `crates/monoloop-connector-codex/src/lib.rs` (and cursor/agy twins)
+- `crates/monoloop-connector-*/src/process.rs`, `run.rs`
+- `crates/monoloop-connector-grok/src/server.rs`, `session.rs`
+- `doc/TRANSACTION_RUNTIME_V2_SPEC.md` (M4 status wording)
+
+**Problem:** The first M4 ACP `ConnectionOwnerWork` cut fused the session
+update pump into the same `select!` as `prompt_text().await`. While the owner
+awaits the prompt RPC, it cannot drain `updates`, so the process stdout pump
+blocks on a full `update_tx` and the RPC never completes (deadlock). Finish
+under `SendAndFinish` also exited the fused loop before updates drained.
+
+Separately, long-lived ACP `ProcessInner` stdout/stderr pumps and the Grok
+multi-session `connect()` / `run_connection` tasks still use ambient
+`tokio::spawn` outside `ConnectionOwnerWork`. Marking M4 “fully landed” while
+those remain is shaped qualification (Advisor bar).
+
+**Remediation applied this turn:**
+
+- Codex/Cursor/Agy: restore a JoinSet-owned update pump concurrent with the
+  input/control loop; `agent.shutdown()` then `join_next` before `ConnectionEnd`.
+- Claude/Z.ai: observe `control.interrupted()` during input wait and run.
+- Grok Connector open path: observe cancel during pending prompt RPC; Finish
+  no longer cancels the session as a side effect of SendAndFinish.
+
+**Still open:**
+
+- Extract shared ACP process core so stdout/stderr pumps are joinable under a
+  single owner (or register with `TaskSupervisor`).
+- Grok server `connect()` / demux / session factory ambient tasks need an
+  explicit owner/join story (or remain clearly outside the Connector trait
+  open contract with deferred M4 process-core work named in the spec).
+
+**Acceptance criteria:**
+
+- [x] Codex/Cursor/Agy connection owners do not fuse update drain with
+      `prompt_text` await (JoinSet pump joined before terminal).
+- [x] Claude/Z.ai owners observe cancel/terminate during input wait.
+- [ ] Process-core pumps have no detached ambient spawn after handle drop.
+- [ ] Spec status names process-core / Grok-server residuals honestly (not
+      “M4 complete” without qualification).

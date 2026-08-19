@@ -12,10 +12,10 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use monoloop_connector::{
     CancellationReason, ConnectionCompletionHandle, ConnectionControlHandle, ConnectionEnd,
-    ConnectionEndKind, ConnectionId, ConnectionOwner, Connector, ConnectorDescriptor,
-    ControlDisposition, ControlState, DialectBinding, DialectDescriptor, EndInitiator,
-    OpenConnection, OpenedRawConnection, PendingRawConnection, RawInputHandle, RawInputMessage,
-    RawOutputHandle, TerminationReason,
+    ConnectionEndKind, ConnectionId, ConnectionOwner, ConnectionOwnerWork, Connector,
+    ConnectorDescriptor, ControlDisposition, ControlState, DialectBinding, DialectDescriptor,
+    EndInitiator, OpenConnection, OpenedRawConnection, PendingRawConnection, RawInputHandle,
+    RawInputMessage, RawOutputHandle, TerminationReason,
 };
 use monoloop_contracts::{ExternalSessionId, GrokSessionId};
 use std::collections::HashMap;
@@ -218,29 +218,10 @@ async fn open_as_raw_connection(
         request.limits.buffers.max_chunk_bytes,
     );
 
-    // Forward control cancel to session.
-    let ctrl_state = Arc::clone(&control_state);
-    let sc = session_control.clone();
-    tokio::spawn(async move {
-        loop {
-            if ctrl_state.cancel_requested() {
-                sc.cancel(CancellationReason::CallerRequested);
-                return;
-            }
-            if ctrl_state.terminate_requested() {
-                sc.terminate(TerminationReason::CallerForced);
-                return;
-            }
-            if ctrl_state.is_terminal() {
-                return;
-            }
-            ctrl_state.notify().notified().await;
-        }
-    });
-
+    // Single joinable owner: forward control to session + drive input/completion.
     let owner_control = Arc::clone(&control_state);
     let owner_cid = cid.clone();
-    tokio::spawn(async move {
+    let owner_work = ConnectionOwnerWork::new(async move {
         let mut owner = ConnectionOwner::new(owner_cid, Arc::clone(&owner_control), end_tx);
         loop {
             tokio::select! {
@@ -253,12 +234,13 @@ async fn open_as_raw_connection(
                         owner_control.notify().notified().await;
                     }
                 } => {
-                    let kind = if owner_control.terminate_requested() {
-                        ConnectionEndKind::Terminated
+                    if owner_control.terminate_requested() {
+                        session_control.terminate(TerminationReason::CallerForced);
+                        owner.finish(ConnectionEndKind::Terminated, EndInitiator::LocalControl, None);
                     } else {
-                        ConnectionEndKind::Cancelled
-                    };
-                    owner.finish(kind, EndInitiator::LocalControl, None);
+                        session_control.cancel(CancellationReason::CallerRequested);
+                        owner.finish(ConnectionEndKind::Cancelled, EndInitiator::LocalControl, None);
+                    }
                     return;
                 }
                 msg = in_rx.recv() => {
@@ -297,29 +279,69 @@ async fn open_as_raw_connection(
                                     return;
                                 }
                             };
-                            match pending.response.await {
-                                Ok(Ok(_)) => {}
-                                Ok(Err(e)) => {
-                                    owner.finish(
-                                        ConnectionEndKind::TransportFailure,
-                                        EndInitiator::LocalTransport,
-                                        Some(e.to_string()),
-                                    );
+                            // Observe cancel/terminate while awaiting the RPC so
+                            // Finish/control is not stuck behind a long prompt.
+                            tokio::select! {
+                                biased;
+                                _ = async {
+                                    loop {
+                                        if owner_control.cancel_requested()
+                                            || owner_control.terminate_requested()
+                                        {
+                                            return;
+                                        }
+                                        owner_control.notify().notified().await;
+                                    }
+                                } => {
+                                    if owner_control.terminate_requested() {
+                                        session_control.terminate(TerminationReason::CallerForced);
+                                        owner.finish(
+                                            ConnectionEndKind::Terminated,
+                                            EndInitiator::LocalControl,
+                                            None,
+                                        );
+                                    } else {
+                                        session_control.cancel(CancellationReason::CallerRequested);
+                                        owner.finish(
+                                            ConnectionEndKind::Cancelled,
+                                            EndInitiator::LocalControl,
+                                            None,
+                                        );
+                                    }
                                     return;
                                 }
-                                Err(_) => {
-                                    owner.finish(
-                                        ConnectionEndKind::TransportFailure,
-                                        EndInitiator::LocalTransport,
-                                        Some("exchange dropped".into()),
-                                    );
-                                    return;
+                                resp = pending.response => {
+                                    match resp {
+                                        Ok(Ok(_)) => {}
+                                        Ok(Err(e)) => {
+                                            owner.finish(
+                                                ConnectionEndKind::TransportFailure,
+                                                EndInitiator::LocalTransport,
+                                                Some(e.to_string()),
+                                            );
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            owner.finish(
+                                                ConnectionEndKind::TransportFailure,
+                                                EndInitiator::LocalTransport,
+                                                Some("exchange dropped".into()),
+                                            );
+                                            return;
+                                        }
+                                    }
                                 }
                             }
                         }
                         Some(RawInputMessage::Finish) | None => {
-                            session_control.cancel(CancellationReason::CallerRequested);
-                            owner.finish(ConnectionEndKind::LocalShutdown, EndInitiator::LocalTransport, None);
+                            // Input ended; do not cancel the session until the
+                            // exchange caller closes control — Finish alone is
+                            // SendAndFinish after the prompt body.
+                            owner.finish(
+                                ConnectionEndKind::LocalShutdown,
+                                EndInitiator::LocalTransport,
+                                None,
+                            );
                             return;
                         }
                     }
@@ -336,7 +358,7 @@ async fn open_as_raw_connection(
         output: out,
         control,
         completion: ConnectionCompletionHandle::new(end_rx),
-        owner_work: None,
+        owner_work: Some(owner_work),
     })
 }
 

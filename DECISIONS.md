@@ -106,7 +106,9 @@ together for in-process futures.
   the production constructor (M2).
 - Shutdown timeout yields `Quiescing`, never false `Stopped`.
 - Only process-isolated work is described as hard-killable.
-- M4 (Fake/HTTP slice): connectors return `ConnectionOwnerWork` instead of
-  ambient `tokio::spawn`; lifecycle exchange registers Connector/Interpreter
-  owners through `TransactionTaskSpawner`. ACP stdio profiles still return
-  `owner_work: None` until a later M4 slice.
+- M4 (connection-open): connectors return `ConnectionOwnerWork` instead of
+  ambient `tokio::spawn` on `Connector::begin_open` (Fake, HTTP, Claude, Z.ai,
+  Codex, Cursor, Agy, Grok). Lifecycle exchange registers Connector/Interpreter
+  owners through `TransactionTaskSpawner`. ACP session update pumps run on a
+  JoinSet owned by `ConnectionOwnerWork` and are joined before terminal (D-042).
+  Process-lifetime ACP pumps and Grok `connect()` demux remain open under D-042.

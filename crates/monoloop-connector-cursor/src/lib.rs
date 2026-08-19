@@ -29,8 +29,9 @@ pub use session::{CursorAgentHandle, CursorSession};
 
 use monoloop_connector::{
     ConnectionCompletionHandle, ConnectionControlHandle, ConnectionEnd, ConnectionEndKind,
-    Connector, ConnectorDescriptor, ControlState, EndInitiator, OpenConnection,
-    OpenedRawConnection, PendingRawConnection, RawInputHandle, RawInputMessage, RawOutputHandle,
+    ConnectionOwnerWork, Connector, ConnectorDescriptor, ControlState, EndInitiator,
+    OpenConnection, OpenedRawConnection, PendingRawConnection, RawInputHandle, RawInputMessage,
+    RawOutputHandle,
 };
 use monoloop_contracts::{DialectBinding, DialectDescriptor, ExternalSessionId};
 use std::sync::Arc;
@@ -170,20 +171,22 @@ async fn open_raw(
     let connection_id = request.connection_id.clone();
     let external_session_id = Some(ExternalSessionId::new(session.session_id.clone()));
 
-    // Pump session/update NDJSON → raw output.
+    // Update pump must run concurrently with prompt_text awaits (LAW 23 joinable
+    // via JoinSet owned by this ConnectionOwnerWork — not fused into the input
+    // select, which deadlocks when prompt RPC waits on stdout).
     let mut updates = agent.take_updates();
-    let out_pump = out_tx;
-    tokio::spawn(async move {
-        while let Some(bytes) = updates.recv().await {
-            if out_pump.send(bytes).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Input → session/prompt; honour cancel/terminate without waiting for drop.
     let control_wait = control.clone();
-    tokio::spawn(async move {
+    let owner_work = ConnectionOwnerWork::new(async move {
+        let mut joins = tokio::task::JoinSet::new();
+        let out_pump = out_tx;
+        joins.spawn(async move {
+            while let Some(bytes) = updates.recv().await {
+                if out_pump.send(bytes).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let mut bytes_accepted = 0u64;
         let (end_kind, initiated, safe_err) = loop {
             tokio::select! {
@@ -214,6 +217,8 @@ async fn open_raw(
                             }
                         }
                         Some(RawInputMessage::Finish) | None => {
+                            // Do not exit before shutdown joins the update pump —
+                            // Finish only ends input; updates may still be in flight.
                             break (
                                 ConnectionEndKind::LocalShutdown,
                                 EndInitiator::LocalControl,
@@ -226,6 +231,7 @@ async fn open_raw(
         };
 
         agent.shutdown().await;
+        while joins.join_next().await.is_some() {}
         control_state.mark_terminal();
         let _ = end_tx.send(ConnectionEnd {
             connection_id: connection_id.clone(),
@@ -245,7 +251,7 @@ async fn open_raw(
         output,
         control,
         completion,
-        owner_work: None,
+        owner_work: Some(owner_work),
     })
 }
 

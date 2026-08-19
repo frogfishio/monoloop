@@ -1,11 +1,15 @@
 # Transaction Runtime v2 Specification
 
-**Status:** Normative replacement specification; M0–M4 (Fake/HTTP slice) landed
-(D-003). Fake and StreamingHttp return joinable `ConnectionOwnerWork`; lifecycle
-exchange spawns Connector/Interpreter owners via `TransactionTaskSpawner` with
-fail-closed cleanup (terminate + concurrent child join on every early exit),
-non-blocking spawn mailbox (`try_send` + preferential drain), and no silent unit
-publish drops. ACP stdio profile migration remains a later M4 slice.
+**Status:** Normative replacement specification; M0–M4 **connection-open**
+ownership landed (D-003, D-042). All product connectors return joinable
+`ConnectionOwnerWork` on `OpenedRawConnection` (Fake, StreamingHttp, Claude,
+Z.ai, Codex, Cursor, Agy, Grok Connector bridge). Lifecycle exchange spawns
+Connector/Interpreter owners via `TransactionTaskSpawner` with fail-closed
+cleanup. ACP update pumps are JoinSet-owned inside `ConnectionOwnerWork` (not
+fused with `prompt_text` awaits). **Not closed:** process-lifetime ACP
+stdout/stderr pumps and Grok multi-session `connect()` demux still use ambient
+spawn outside `ConnectionOwnerWork` — tracked as D-042; do not treat M4 as
+Golden-complete until those joins exist.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

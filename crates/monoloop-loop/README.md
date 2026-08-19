@@ -27,14 +27,15 @@ Prefer the façade crate `monoloop` unless you need this crate as a direct depen
 
 Do not recreate the deleted v1 files (`runtime`, `admission`, `actor`,
 `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`).
-Follow the seven-stage plan in the v2 spec. **M0–M4 (Fake/HTTP) landed:** owned
-executor, task supervisor, ledger, RAII reservations, sync admission, separate
-start / control / worker / spawn queues, EventPublisher + Seal, coordinator with
-real Fake open→encode→pump→interpret under `TransactionTaskSpawner`, and
-joinable `ConnectionOwnerWork` on Fake/HTTP (no ambient Connector spawn). ACP
-profile TaskSpawner migration is still open. Deferred on-disk modules
-(`dispatcher`, legacy `exchange`, `mcp`, …) stay uncompiled until their stage.
-Legacy suites need `--features legacy_runtime_tests`.
+Follow the seven-stage plan in the v2 spec. **M0–M4 connection-open landed**
+(D-042 tracks remaining process-core joins): owned executor, task supervisor,
+ledger, RAII reservations, sync admission, separate start / control / worker /
+spawn queues, EventPublisher + Seal, Fake exchange under `TransactionTaskSpawner`,
+and joinable `ConnectionOwnerWork` on Fake/HTTP/ACP `begin_open` paths. ACP
+update pumps are JoinSet-owned inside owner work (not fused with prompt RPC).
+Process-lifetime pumps / Grok `connect()` demux remain open. Deferred on-disk
+modules stay uncompiled until their stage. Legacy suites need
+`--features legacy_runtime_tests`.
 
 ## Agent assembly recipe (v2 / M2)
 

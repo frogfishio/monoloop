@@ -28,8 +28,9 @@ pub use run::{run_claude_print, ClaudeRunOutcome};
 
 use monoloop_connector::{
     ConnectionCompletionHandle, ConnectionControlHandle, ConnectionEnd, ConnectionEndKind,
-    Connector, ConnectorDescriptor, ControlState, EndInitiator, OpenConnection,
-    OpenedRawConnection, PendingRawConnection, RawInputHandle, RawInputMessage, RawOutputHandle,
+    ConnectionOwnerWork, Connector, ConnectorDescriptor, ControlState, EndInitiator,
+    OpenConnection, OpenedRawConnection, PendingRawConnection, RawInputHandle, RawInputMessage,
+    RawOutputHandle,
 };
 use monoloop_contracts::{DialectBinding, DialectDescriptor};
 use std::sync::Arc;
@@ -143,28 +144,63 @@ async fn open_raw(
     let connection_id = request.connection_id.clone();
     let external_session_id = request.external_session_id.clone();
 
-    tokio::spawn(async move {
+    let control_wait = control.clone();
+    let owner_work = ConnectionOwnerWork::new(async move {
         let mut prompt = String::new();
         let mut bytes_accepted = 0u64;
-        while let Some(msg) = in_rx.recv().await {
-            match msg {
-                RawInputMessage::Bytes(b) => {
-                    bytes_accepted += b.len() as u64;
-                    prompt.push_str(&String::from_utf8_lossy(&b));
+        let mut end_kind = ConnectionEndKind::LocalShutdown;
+        let mut initiated = EndInitiator::LocalControl;
+        loop {
+            tokio::select! {
+                biased;
+                _ = control_wait.interrupted() => {
+                    end_kind = if control_state.terminate_requested() {
+                        ConnectionEndKind::Terminated
+                    } else {
+                        ConnectionEndKind::Cancelled
+                    };
+                    initiated = EndInitiator::LocalControl;
+                    break;
                 }
-                RawInputMessage::Finish => break,
+                msg = in_rx.recv() => {
+                    match msg {
+                        Some(RawInputMessage::Bytes(b)) => {
+                            bytes_accepted += b.len() as u64;
+                            prompt.push_str(&String::from_utf8_lossy(&b));
+                        }
+                        Some(RawInputMessage::Finish) | None => break,
+                    }
+                }
             }
         }
         let prompt = prompt.trim().to_string();
-        if !prompt.is_empty() {
-            if let Err(e) = run_claude_print(&config, &prompt, out_tx).await {
-                tracing::debug!(target: "claude_agent", "run failed: {e}");
+        if !prompt.is_empty()
+            && !matches!(
+                end_kind,
+                ConnectionEndKind::Cancelled | ConnectionEndKind::Terminated
+            )
+        {
+            tokio::select! {
+                biased;
+                _ = control_wait.interrupted() => {
+                    end_kind = if control_state.terminate_requested() {
+                        ConnectionEndKind::Terminated
+                    } else {
+                        ConnectionEndKind::Cancelled
+                    };
+                    initiated = EndInitiator::LocalControl;
+                }
+                run = run_claude_print(&config, &prompt, out_tx) => {
+                    if let Err(e) = run {
+                        tracing::debug!(target: "claude_agent", "run failed: {e}");
+                    }
+                }
             }
         }
         let _ = end_tx.send(ConnectionEnd {
             connection_id: connection_id.clone(),
-            kind: ConnectionEndKind::LocalShutdown,
-            initiated_by: EndInitiator::LocalControl,
+            kind: end_kind,
+            initiated_by: initiated,
             bytes_accepted,
             bytes_received: 0,
             safe_transport_error: None,
@@ -179,6 +215,6 @@ async fn open_raw(
         output,
         control,
         completion,
-        owner_work: None,
+        owner_work: Some(owner_work),
     })
 }
