@@ -1,13 +1,12 @@
 # Transaction Runtime v2 Specification
 
-**Status:** Normative replacement specification; M0–M4 **connection-open**
-ownership landed (D-003, D-042). All product connectors return joinable
-`ConnectionOwnerWork` on `OpenedRawConnection`. Lifecycle exchange uses
-`TransactionTaskSpawner` with fail-closed cleanup. ACP process pumps use
-`Weak`+JoinSet (joined on shutdown/Drop); Grok retains `run_connection` join
-and `GrokServerHandle::shutdown`. **Residual (D-042):** Grok session
-new/load/send oneshot workers are still ambient if the pending handle is
-dropped mid-flight — close before Golden M4.
+**Status:** Normative replacement specification; M0–M4 landed (D-003; D-042
+Fixed). All product connectors return joinable `ConnectionOwnerWork` on
+`OpenedRawConnection`. Lifecycle exchange uses `TransactionTaskSpawner` with
+fail-closed cleanup. ACP process pumps use `Weak`+JoinSet (joined on
+shutdown/Drop). Grok pending connect/session/exchange workers abort on Drop;
+`GrokServerHandle::shutdown` joins `run_connection`. Optional shared ACP
+process-core helper remains a non-blocking cleanup. Next: M5 tools/MCP.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

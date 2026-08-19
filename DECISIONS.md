@@ -106,10 +106,9 @@ together for in-process futures.
   the production constructor (M2).
 - Shutdown timeout yields `Quiescing`, never false `Stopped`.
 - Only process-isolated work is described as hard-killable.
-- M4 (connection-open): connectors return `ConnectionOwnerWork` instead of
-  ambient `tokio::spawn` on `Connector::begin_open` (Fake, HTTP, Claude, Z.ai,
-  Codex, Cursor, Agy, Grok). Lifecycle exchange registers Connector/Interpreter
-  owners through `TransactionTaskSpawner`. ACP session update pumps and
-  ProcessInner stdout/stderr use JoinSet/`Weak` and join on shutdown (D-042).
-  Grok retains `run_connection` join + `PendingGrokServer` abort-on-drop.
-  Residual under D-042: Grok session new/load/send oneshot workers.
+- M4: connectors return `ConnectionOwnerWork` on `Connector::begin_open`
+  (Fake, HTTP, Claude, Z.ai, Codex, Cursor, Agy, Grok). Lifecycle exchange
+  registers Connector/Interpreter owners through `TransactionTaskSpawner`.
+  ACP ProcessInner pumps use `Weak`+JoinSet; Grok pending
+  connect/session/exchange workers abort on Drop; `GrokServerHandle::shutdown`
+  joins `run_connection` (D-042 Fixed).

@@ -184,10 +184,9 @@ async fn run_session_with_serve(
             extension_metadata: Some(serde_json::json!({ "yoloMode": true })),
         })
         .map_err(|e| format!("session/new begin: {e}"))?;
-    let session = tokio::time::timeout(opts.connect_timeout, pending_sess.opened)
+    let session = tokio::time::timeout(opts.connect_timeout, pending_sess.wait())
         .await
         .map_err(|_| "session/new timed out".to_string())?
-        .map_err(|e| format!("session channel: {e}"))?
         .map_err(|e| format!("session/new failed: {e}"))?;
     let session_id = session.session_id.as_str().to_string();
     println!("live-grok: sessionId={session_id}");
@@ -246,13 +245,12 @@ async fn run_session_with_serve(
         .map_err(|e| format!("begin_send: {e}"))?;
 
     let (prompt_result, timed_out) = match opts.prompt_wait_ceiling {
-        Some(ceiling) => match tokio::time::timeout(ceiling, exchange.response).await {
-            Ok(Ok(Ok(v))) => {
+        Some(ceiling) => match tokio::time::timeout(ceiling, exchange.wait()).await {
+            Ok(Ok(v)) => {
                 println!("live-grok: prompt complete");
                 (format!("{v}"), false)
             }
-            Ok(Ok(Err(e))) => (format!("error:{e}"), false),
-            Ok(Err(_)) => ("channel_dropped".into(), false),
+            Ok(Err(e)) => (format!("error:{e}"), false),
             Err(_) => {
                 eprintln!(
                     "live-grok: outer ceiling {:?} hit — salvaging streamed events",
@@ -261,13 +259,12 @@ async fn run_session_with_serve(
                 ("timeout".into(), true)
             }
         },
-        None => match exchange.response.await {
-            Ok(Ok(v)) => {
+        None => match exchange.wait().await {
+            Ok(v) => {
                 println!("live-grok: prompt complete");
                 (format!("{v}"), false)
             }
-            Ok(Err(e)) => (format!("error:{e}"), false),
-            Err(_) => ("channel_dropped".into(), false),
+            Err(e) => (format!("error:{e}"), false),
         },
     };
 

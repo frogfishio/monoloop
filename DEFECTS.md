@@ -1541,7 +1541,7 @@ These are honesty / law-22 issues, not a reason to rebuild the owner model.
 ## D-042: M4 ACP owner fusion and process-core join residuals
 
 **Priority:** P1
-**Status:** Open (most remediations applied; session oneshot workers remain)
+**Status:** Fixed
 **Affected:**
 - `crates/monoloop-connector-codex/src/lib.rs` (and cursor/agy twins)
 - `crates/monoloop-connector-*/src/process.rs`, `run.rs`
@@ -1551,23 +1551,19 @@ These are honesty / law-22 issues, not a reason to rebuild the owner model.
 **Problem:** The first M4 ACP `ConnectionOwnerWork` cut fused the session
 update pump into the same `select!` as `prompt_text().await` (deadlock under
 `SendAndFinish`). ProcessInner pumps held `Arc<ProcessInner>` so
-`kill_on_drop` never ran. Grok `run_connection` / pending connect were ambient.
+`kill_on_drop` never ran. Grok `run_connection` / pending connect / session
+new/load/send workers were ambient if pending handles were dropped.
 
-**Remediation applied:**
+**Remediation:**
 
 - Connection-owner update pumps JoinSet-owned (Codex/Cursor/Agy); Claude/Z.ai
   observe control; Grok open path cancel-aware during prompt RPC.
 - ProcessInner: `Weak` pumps + JoinSet joined on shutdown; Drop aborts pumps /
   `start_kill`s child.
 - Claude/Z.ai `run_*`: JoinSet pumps joined/aborted on timeout.
-- Grok: `PendingGrokServer::wait` + Drop aborts connect join;
-  `ServerInner.connection_join` + `GrokServerHandle::shutdown`.
-
-**Still open:**
-
-- Grok `begin_session_new` / `begin_session_load` / `SessionInner::begin_send`
-  oneshot workers if the pending is dropped mid-flight.
-- Optional shared ACP process-core helper crate.
+- Grok: `PendingGrokServer` / `PendingGrokSession` / `PendingGrokExchange`
+  expose `wait()` and abort worker joins on Drop; `ServerInner.connection_join`
+  + `GrokServerHandle::shutdown`.
 
 **Acceptance criteria:**
 
@@ -1576,5 +1572,6 @@ update pump into the same `select!` as `prompt_text().await` (deadlock under
 - [x] Claude/Z.ai owners observe cancel/terminate during input wait.
 - [x] ProcessInner pumps do not pin `Arc` after handle drop.
 - [x] Grok `run_connection` join retained; pending connect abort-on-drop.
-- [ ] Grok session pending RPC/new/load spawns join-owned or fail-closed on drop.
-- [x] Spec status names remaining residuals honestly.
+- [x] Grok session pending RPC/new/load spawns join-owned or fail-closed on drop.
+- [x] Spec status matches fixed D-042 (optional shared process-core helper remains
+      a non-blocking cleanup, not a defect).

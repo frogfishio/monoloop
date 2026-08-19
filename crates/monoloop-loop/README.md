@@ -27,15 +27,15 @@ Prefer the façade crate `monoloop` unless you need this crate as a direct depen
 
 Do not recreate the deleted v1 files (`runtime`, `admission`, `actor`,
 `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`).
-Follow the seven-stage plan in the v2 spec. **M0–M4 connection-open landed**
-(D-042 tracks remaining process-core joins): owned executor, task supervisor,
-ledger, RAII reservations, sync admission, separate start / control / worker /
-spawn queues, EventPublisher + Seal, Fake exchange under `TransactionTaskSpawner`,
-and joinable `ConnectionOwnerWork` on Fake/HTTP/ACP `begin_open` paths. ACP
-update pumps are JoinSet-owned inside owner work (not fused with prompt RPC).
-Process-lifetime pumps / Grok `connect()` demux remain open. Deferred on-disk
-modules stay uncompiled until their stage. Legacy suites need
-`--features legacy_runtime_tests`.
+Follow the seven-stage plan in the v2 spec. **M0–M4 landed (D-042 Fixed):** owned
+executor, task supervisor, ledger, RAII reservations, sync admission, separate
+start / control / worker / spawn queues, EventPublisher + Seal, Fake exchange
+under `TransactionTaskSpawner`, and joinable `ConnectionOwnerWork` on
+Fake/HTTP/ACP `begin_open` paths. ACP ProcessInner pumps use `Weak`+JoinSet;
+Grok pending connect/session/exchange workers abort on Drop and join on `wait`;
+`GrokServerHandle::shutdown` / `ServerInner` Drop tear down `run_connection`.
+Deferred on-disk modules stay uncompiled until their stage. Legacy suites need
+`--features legacy_runtime_tests`. Next: M5 tools/MCP.
 
 ## Agent assembly recipe (v2 / M2)
 

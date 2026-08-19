@@ -111,10 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             extension_metadata: Some(serde_json::json!({ "yoloMode": true })),
         })
         .map_err(|e| format!("session/new begin: {e}"))?;
-    let session = tokio::time::timeout(Duration::from_secs(30), pending_sess.opened)
+    let session = tokio::time::timeout(Duration::from_secs(30), pending_sess.wait())
         .await
         .map_err(|_| "session/new timed out".to_string())?
-        .map_err(|e| format!("session channel: {e}"))?
         .map_err(|e| format!("session/new failed: {e}"))?;
 
     println!("sessionId={}", session.session_id.as_str());
@@ -191,19 +190,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Outer wait for RPC; on timeout we still salvage streamed events and exit.
     let prompt_outcome =
-        tokio::time::timeout(Duration::from_secs(prompt_timeout_secs), exchange.response).await;
+        tokio::time::timeout(Duration::from_secs(prompt_timeout_secs), exchange.wait()).await;
     let result_note = match &prompt_outcome {
-        Ok(Ok(Ok(v))) => {
+        Ok(Ok(v)) => {
             println!("prompt terminal result: {v}");
             format!("{v}")
         }
-        Ok(Ok(Err(e))) => {
+        Ok(Err(e)) => {
             eprintln!("prompt RPC error: {e} (salvaging streamed events)");
             format!("error:{e}")
-        }
-        Ok(Err(_)) => {
-            eprintln!("prompt channel dropped (salvaging streamed events)");
-            "channel_dropped".into()
         }
         Err(_) => {
             eprintln!(

@@ -94,10 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             extension_metadata: Some(serde_json::json!({ "yoloMode": true })),
         })
         .map_err(|e| format!("session/new begin: {e}"))?;
-    let session = tokio::time::timeout(Duration::from_secs(30), pending_sess.opened)
+    let session = tokio::time::timeout(Duration::from_secs(30), pending_sess.wait())
         .await
         .map_err(|_| "session/new timed out".to_string())?
-        .map_err(|e| format!("session channel: {e}"))?
         .map_err(|e| format!("session/new failed: {e}"))?;
 
     println!("sessionId={}", session.session_id.as_str());
@@ -166,12 +165,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bounded wait: real model + tools, but never hang an operator forever.
     let result =
-        match tokio::time::timeout(Duration::from_secs(prompt_timeout_secs), exchange.response)
+        match tokio::time::timeout(Duration::from_secs(prompt_timeout_secs), exchange.wait())
             .await
         {
-            Ok(Ok(Ok(v))) => v,
-            Ok(Ok(Err(e))) => return Err(format!("session/prompt failed: {e}").into()),
-            Ok(Err(_)) => return Err("prompt response channel dropped".into()),
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(format!("session/prompt failed: {e}").into()),
             Err(_) => {
                 return Err(format!(
                     "session/prompt timed out after {prompt_timeout_secs}s \

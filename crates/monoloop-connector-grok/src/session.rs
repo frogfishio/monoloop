@@ -30,10 +30,50 @@ pub struct EncodedAcpSessionMessage {
 
 /// Pending session create/load.
 pub struct PendingGrokSession {
-    /// Completes with session handle or error.
-    pub opened: tokio::sync::oneshot::Receiver<Result<GrokSessionHandle, GrokConnectorError>>,
+    /// Completes with session handle or error (`take` once via [`Self::wait`]).
+    opened: Option<oneshot::Receiver<Result<GrokSessionHandle, GrokConnectorError>>>,
     /// Control available while pending.
     pub control: GrokSessionControl,
+    /// Worker join — aborted if the pending is dropped (D-042).
+    worker_join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for PendingGrokSession {
+    fn drop(&mut self) {
+        if let Some(join) = self.worker_join.take() {
+            join.abort();
+        }
+    }
+}
+
+impl PendingGrokSession {
+    /// Construct a pending session with an owned worker join (D-042).
+    pub(crate) fn new(
+        opened: oneshot::Receiver<Result<GrokSessionHandle, GrokConnectorError>>,
+        control: GrokSessionControl,
+        worker_join: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            opened: Some(opened),
+            control,
+            worker_join: Some(worker_join),
+        }
+    }
+
+    /// Await session open, then join the worker (single safe join).
+    pub async fn wait(mut self) -> Result<GrokSessionHandle, GrokConnectorError> {
+        let rx = self
+            .opened
+            .take()
+            .expect("PendingGrokSession::wait called twice");
+        let result = rx
+            .await
+            .map_err(|_| GrokConnectorError::session("session open channel dropped"))?;
+        if let Some(join) = self.worker_join.take() {
+            let _ = join.await;
+        }
+        result
+    }
 }
 
 /// Factory for sessions on one connected server.
@@ -99,8 +139,35 @@ impl GrokSessionInput {
 
 /// Pending prompt/exchange result (JSON-RPC response bytes routed to caller).
 pub struct PendingGrokExchange {
-    /// Completes with response payload value or error.
-    pub response: oneshot::Receiver<Result<serde_json::Value, GrokConnectorError>>,
+    /// Completes with response payload value or error (`take` once via [`Self::wait`]).
+    response: Option<oneshot::Receiver<Result<serde_json::Value, GrokConnectorError>>>,
+    /// Worker join — aborted if the pending is dropped (D-042).
+    worker_join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for PendingGrokExchange {
+    fn drop(&mut self) {
+        if let Some(join) = self.worker_join.take() {
+            join.abort();
+        }
+    }
+}
+
+impl PendingGrokExchange {
+    /// Await exchange response, then join the worker (single safe join).
+    pub async fn wait(mut self) -> Result<serde_json::Value, GrokConnectorError> {
+        let rx = self
+            .response
+            .take()
+            .expect("PendingGrokExchange::wait called twice");
+        let result = rx
+            .await
+            .map_err(|_| GrokConnectorError::connection("exchange response channel dropped"))?;
+        if let Some(join) = self.worker_join.take() {
+            let _ = join.await;
+        }
+        result
+    }
 }
 
 /// Session control (scoped; cannot cancel sibling sessions).
@@ -255,11 +322,14 @@ impl SessionInner {
 
         let (tx, rx) = oneshot::channel();
         let session = Arc::clone(self);
-        tokio::spawn(async move {
+        let worker_join = tokio::spawn(async move {
             let result = session.send_rpc(message).await;
             let _ = tx.send(result);
         });
-        Ok(PendingGrokExchange { response: rx })
+        Ok(PendingGrokExchange {
+            response: Some(rx),
+            worker_join: Some(worker_join),
+        })
     }
 
     async fn send_rpc(

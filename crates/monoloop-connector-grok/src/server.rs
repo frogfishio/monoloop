@@ -156,16 +156,13 @@ async fn open_as_raw_connection(
                 GrokSessionLoadConfig::default(),
             )
             .map_err(|e| e.into_connector())?;
-        timeout(request.limits.connect_deadline, pending.opened)
+        timeout(request.limits.connect_deadline, pending.wait())
             .await
             .map_err(|_| {
                 monoloop_contracts::ConnectorError::new(
                     monoloop_contracts::ConnectorErrorKind::DeadlineExceeded,
                     "session load deadline exceeded",
                 )
-            })?
-            .map_err(|_| {
-                monoloop_contracts::ConnectorError::session_failed("session load channel dropped")
             })?
             .map_err(|e| e.into_connector())?
     } else {
@@ -186,16 +183,13 @@ async fn open_as_raw_connection(
             .sessions
             .begin_new(session_cfg)
             .map_err(|e| e.into_connector())?;
-        timeout(request.limits.connect_deadline, pending.opened)
+        timeout(request.limits.connect_deadline, pending.wait())
             .await
             .map_err(|_| {
                 monoloop_contracts::ConnectorError::new(
                     monoloop_contracts::ConnectorErrorKind::DeadlineExceeded,
                     "session new deadline exceeded",
                 )
-            })?
-            .map_err(|_| {
-                monoloop_contracts::ConnectorError::session_failed("session new channel dropped")
             })?
             .map_err(|e| e.into_connector())?
     };
@@ -308,22 +302,14 @@ async fn open_as_raw_connection(
                                     }
                                     return;
                                 }
-                                resp = pending.response => {
+                                resp = pending.wait() => {
                                     match resp {
-                                        Ok(Ok(_)) => {}
-                                        Ok(Err(e)) => {
+                                        Ok(_) => {}
+                                        Err(e) => {
                                             owner.finish(
                                                 ConnectionEndKind::TransportFailure,
                                                 EndInitiator::LocalTransport,
                                                 Some(e.to_string()),
-                                            );
-                                            return;
-                                        }
-                                        Err(_) => {
-                                            owner.finish(
-                                                ConnectionEndKind::TransportFailure,
-                                                EndInitiator::LocalTransport,
-                                                Some("exchange dropped".into()),
                                             );
                                             return;
                                         }
@@ -379,7 +365,7 @@ impl Drop for PendingGrokServer {
 }
 
 impl PendingGrokServer {
-    /// Await server open. Consumes the pending; does not abort a finished connect.
+    /// Await server open, then join the connect worker (single safe join).
     pub async fn wait(mut self) -> Result<GrokServerHandle, GrokConnectorError> {
         let rx = self
             .opened
@@ -388,8 +374,9 @@ impl PendingGrokServer {
         let result = rx
             .await
             .map_err(|_| GrokConnectorError::connection("server open channel dropped"))?;
-        // Connect task completed (or failed); clear join so Drop does not abort.
-        let _ = self.connect_join.take();
+        if let Some(join) = self.connect_join.take() {
+            let _ = join.await;
+        }
         result
     }
 }
@@ -538,6 +525,18 @@ pub(crate) struct ServerInner {
     connection_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+impl Drop for ServerInner {
+    fn drop(&mut self) {
+        // Last Arc gone (including init-failure after spawn): abort demux.
+        // Prefer `GrokServerHandle::shutdown` for abort+await; Drop is fail-closed.
+        if let Some(join) = self.connection_join.get_mut().take() {
+            join.abort();
+        }
+        self.closed.store(true, Ordering::SeqCst);
+        self.control.mark_terminal();
+    }
+}
+
 enum WriteCmd {
     Text(Bytes),
 }
@@ -575,14 +574,11 @@ impl ServerInner {
         });
         let control = placeholder.control_handle();
         let server = Arc::clone(self);
-        tokio::spawn(async move {
+        let worker_join = tokio::spawn(async move {
             let result = server.create_session(config).await;
             let _ = tx.send(result);
         });
-        Ok(PendingGrokSession {
-            opened: rx,
-            control,
-        })
+        Ok(PendingGrokSession::new(rx, control, worker_join))
     }
 
     pub(crate) fn begin_session_load(
@@ -608,14 +604,11 @@ impl ServerInner {
         });
         let control = placeholder.control_handle();
         let server = Arc::clone(self);
-        tokio::spawn(async move {
+        let worker_join = tokio::spawn(async move {
             let result = server.load_session(session_id, config).await;
             let _ = tx.send(result);
         });
-        Ok(PendingGrokSession {
-            opened: rx,
-            control,
-        })
+        Ok(PendingGrokSession::new(rx, control, worker_join))
     }
 
     fn ensure_capacity(&self) -> Result<(), GrokConnectorError> {
@@ -857,13 +850,23 @@ async fn connect_server(
             "version": env!("CARGO_PKG_VERSION")
         }
     });
-    let _init_result = inner
+    if let Err(e) = inner
         .rpc_call(
             "initialize",
             Some(init_params),
             config.limits.request_deadline,
         )
-        .await?;
+        .await
+    {
+        // Fail closed: do not leave run_connection ambient after init failure.
+        if let Some(join) = inner.connection_join.lock().await.take() {
+            join.abort();
+            let _ = join.await;
+        }
+        inner.closed.store(true, Ordering::SeqCst);
+        inner.control.mark_terminal();
+        return Err(e);
+    }
 
     let control_handle = GrokServerControl {
         flags: Arc::clone(&control),

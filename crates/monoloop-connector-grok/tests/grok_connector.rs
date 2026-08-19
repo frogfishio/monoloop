@@ -44,11 +44,10 @@ async fn initialize_session_new_and_prompt_roundtrip() {
                 ..Default::default()
             })
             .expect("begin_new")
-            .opened,
+            .wait(),
     )
     .await
     .expect("timeout")
-    .expect("channel")
     .expect("session");
 
     assert!(session.session_id.as_str().starts_with("sess-"));
@@ -63,10 +62,9 @@ async fn initialize_session_new_and_prompt_roundtrip() {
         })
         .expect("begin_send");
 
-    let result = tokio::time::timeout(Duration::from_secs(5), exchange.response)
+    let result = tokio::time::timeout(Duration::from_secs(5), exchange.wait())
         .await
         .expect("timeout")
-        .expect("channel")
         .expect("rpc");
     assert_eq!(result["stopReason"], "end_turn");
 
@@ -93,20 +91,14 @@ async fn raw_dump_captures_exact_inbound_from_grok() {
         .unwrap()
         .with_raw_dump(Arc::clone(&dump));
 
-    let server = connector
-        .connect(config)
-        .unwrap()
-        .wait()
-        .await
-        .unwrap();
+    let server = connector.connect(config).unwrap().wait().await.unwrap();
 
     let session = server
         .sessions
         .begin_new(GrokSessionConfig::default())
         .unwrap()
-        .opened
+        .wait()
         .await
-        .unwrap()
         .unwrap();
 
     let exchange = session
@@ -118,7 +110,7 @@ async fn raw_dump_captures_exact_inbound_from_grok() {
             }),
         })
         .unwrap();
-    let _ = exchange.response.await.unwrap().unwrap();
+    let _ = exchange.wait().await.unwrap();
     let _ = session.output.receive().await.unwrap().unwrap();
 
     // Allow demux path to finish recording.
@@ -189,28 +181,21 @@ async fn multiple_sessions_isolated() {
     secrets.insert("S", secret);
     let connector = GrokConnector::new(secrets);
     let config = GrokServerConfig::loopback(addr.port(), SecretRef::new("S")).unwrap();
-    let server = connector
-        .connect(config)
-        .unwrap()
-        .wait()
-        .await
-        .unwrap();
+    let server = connector.connect(config).unwrap().wait().await.unwrap();
 
     let s1 = server
         .sessions
         .begin_new(GrokSessionConfig::default())
         .unwrap()
-        .opened
+        .wait()
         .await
-        .unwrap()
         .unwrap();
     let s2 = server
         .sessions
         .begin_new(GrokSessionConfig::default())
         .unwrap()
-        .opened
+        .wait()
         .await
-        .unwrap()
         .unwrap();
     assert_ne!(s1.session_id.as_str(), s2.session_id.as_str());
 
@@ -228,8 +213,8 @@ async fn multiple_sessions_isolated() {
             params: serde_json::json!({ "prompt": [] }),
         })
         .unwrap();
-    let _ = e1.response.await.unwrap().unwrap();
-    let _ = e2.response.await.unwrap().unwrap();
+    let _ = e1.wait().await.unwrap();
+    let _ = e2.wait().await.unwrap();
 
     let u1 = s1.output.receive().await.unwrap().unwrap();
     let u2 = s2.output.receive().await.unwrap().unwrap();
@@ -247,21 +232,15 @@ async fn session_load_uses_explicit_id() {
     secrets.insert("S", secret);
     let connector = GrokConnector::new(secrets);
     let config = GrokServerConfig::loopback(addr.port(), SecretRef::new("S")).unwrap();
-    let server = connector
-        .connect(config)
-        .unwrap()
-        .wait()
-        .await
-        .unwrap();
+    let server = connector.connect(config).unwrap().wait().await.unwrap();
 
     let known = GrokSessionId::new("explicit-resume-id");
     let session = server
         .sessions
         .begin_load(known.clone(), GrokSessionLoadConfig::default())
         .unwrap()
-        .opened
+        .wait()
         .await
-        .unwrap()
         .unwrap();
     assert_eq!(session.session_id.as_str(), "explicit-resume-id");
 }
