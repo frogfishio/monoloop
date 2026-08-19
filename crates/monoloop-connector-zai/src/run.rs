@@ -66,16 +66,15 @@ pub async fn run_headless_prompt(
         .ok_or_else(|| ZaiConnectorError::process("missing stderr"))?;
 
     let dump_out = Arc::clone(&dump);
-    let out_pump = tokio::spawn(async move {
+    let mut pumps = tokio::task::JoinSet::new();
+    pumps.spawn(async move {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
-        let mut total = 0usize;
         loop {
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
-                Ok(n) => {
-                    total = total.saturating_add(n);
+                Ok(_) => {
                     let trimmed = line.trim_end_matches(['\r', '\n']);
                     if trimmed.starts_with('{') {
                         dump_out.push_line("<<", trimmed);
@@ -91,11 +90,10 @@ pub async fn run_headless_prompt(
                 Err(_) => break,
             }
         }
-        total
     });
 
     let dump_err = Arc::clone(&dump);
-    let err_pump = tokio::spawn(async move {
+    pumps.spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
         loop {
@@ -114,13 +112,25 @@ pub async fn run_headless_prompt(
         }
     });
 
-    let status = tokio::time::timeout(config.run_deadline, child.wait())
-        .await
-        .map_err(|_| ZaiConnectorError::timeout("zai headless exceeded run_deadline"))?
-        .map_err(|e| ZaiConnectorError::process(format!("wait: {e}")))?;
+    let status = match tokio::time::timeout(config.run_deadline, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            pumps.abort_all();
+            while pumps.join_next().await.is_some() {}
+            return Err(ZaiConnectorError::process(format!("wait: {e}")));
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            pumps.abort_all();
+            while pumps.join_next().await.is_some() {}
+            return Err(ZaiConnectorError::timeout(
+                "zai headless exceeded run_deadline",
+            ));
+        }
+    };
 
-    let _ = out_pump.await;
-    let _ = err_pump.await;
+    while pumps.join_next().await.is_some() {}
     dump.flush();
 
     if !status.success() {

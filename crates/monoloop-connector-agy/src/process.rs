@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 /// Shared runtime for one ACP process (one or more sessions).
@@ -23,6 +24,8 @@ pub(crate) struct ProcessInner {
     dump: Arc<AgyRawDump>,
     closed: AtomicBool,
     child: Mutex<Option<Child>>,
+    /// Stdout/stderr pumps — aborted and joined on shutdown (D-042).
+    pumps: Mutex<JoinSet<()>>,
 }
 
 impl ProcessInner {
@@ -68,16 +71,28 @@ impl ProcessInner {
             dump,
             closed: AtomicBool::new(false),
             child: Mutex::new(Some(child)),
+            pumps: Mutex::new(JoinSet::new()),
         });
 
         {
-            let this = Arc::clone(&inner);
-            let max_line = this.config.max_line_bytes;
-            tokio::spawn(async move {
+            let weak = Arc::downgrade(&inner);
+            let max_line = inner.config.max_line_bytes;
+            let mut pumps = inner.pumps.lock().await;
+            pumps.spawn(async move {
                 let mut reader = BufReader::new(stdout);
                 loop {
+                    let Some(this) = weak.upgrade() else {
+                        break;
+                    };
                     match read_line_bounded(&mut reader, max_line).await {
-                        Ok(None) => break,
+                        Ok(None) => {
+                            this.fail_all_pending(AgyConnectorError::connection(
+                                "agy ACP server stdout closed",
+                            ))
+                            .await;
+                            this.closed.store(true, Ordering::SeqCst);
+                            break;
+                        }
                         Ok(Some(line)) => {
                             let trimmed = line.trim_end_matches(['\r', '\n']);
                             if trimmed.is_empty() {
@@ -87,37 +102,33 @@ impl ProcessInner {
                             this.handle_inbound_line(trimmed).await;
                         }
                         Err(e) => {
-                            warn!("agy acp stdout bound/protocol failure: {e}");
+                            warn!("agy_agent stdout bound/protocol failure: {e}");
                             this.fail_all_pending(e).await;
+                            this.closed.store(true, Ordering::SeqCst);
                             break;
                         }
                     }
                 }
-                this.fail_all_pending(AgyConnectorError::connection(
-                    "agy ACP server stdout closed",
-                ))
-                .await;
-                this.closed.store(true, Ordering::SeqCst);
             });
-        }
 
-        if let Some(err) = stderr {
-            let max_line = inner.config.max_line_bytes.min(64 * 1024);
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(err);
-                loop {
-                    match read_line_bounded(&mut reader, max_line).await {
-                        Ok(None) => break,
-                        Ok(Some(line)) => {
-                            let t = line.trim();
-                            if !t.is_empty() {
-                                debug!(target: "agy_agent", "stderr: {t}");
+            if let Some(err) = stderr {
+                let max_line = inner.config.max_line_bytes.min(64 * 1024);
+                pumps.spawn(async move {
+                    let mut reader = BufReader::new(err);
+                    loop {
+                        match read_line_bounded(&mut reader, max_line).await {
+                            Ok(None) => break,
+                            Ok(Some(line)) => {
+                                let t = line.trim();
+                                if !t.is_empty() {
+                                    debug!(target: "agy_agent", "stderr: {t}");
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
-                }
-            });
+                });
+            }
         }
 
         Ok(inner)
@@ -270,7 +281,22 @@ impl ProcessInner {
             let _ = c.kill().await;
             let _ = c.wait().await;
         }
+        {
+            let mut pumps = self.pumps.lock().await;
+            pumps.abort_all();
+            while pumps.join_next().await.is_some() {}
+        }
         self.fail_all_pending(AgyConnectorError::cancelled()).await;
+    }
+}
+
+impl Drop for ProcessInner {
+    fn drop(&mut self) {
+        // Abort pumps so they release Weak upgrades; Child kill_on_drop can run.
+        self.pumps.get_mut().abort_all();
+        if let Some(mut c) = self.child.get_mut().take() {
+            let _ = c.start_kill();
+        }
     }
 }
 

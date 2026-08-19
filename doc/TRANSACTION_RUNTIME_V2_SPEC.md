@@ -2,14 +2,12 @@
 
 **Status:** Normative replacement specification; M0–M4 **connection-open**
 ownership landed (D-003, D-042). All product connectors return joinable
-`ConnectionOwnerWork` on `OpenedRawConnection` (Fake, StreamingHttp, Claude,
-Z.ai, Codex, Cursor, Agy, Grok Connector bridge). Lifecycle exchange spawns
-Connector/Interpreter owners via `TransactionTaskSpawner` with fail-closed
-cleanup. ACP update pumps are JoinSet-owned inside `ConnectionOwnerWork` (not
-fused with `prompt_text` awaits). **Not closed:** process-lifetime ACP
-stdout/stderr pumps and Grok multi-session `connect()` demux still use ambient
-spawn outside `ConnectionOwnerWork` — tracked as D-042; do not treat M4 as
-Golden-complete until those joins exist.
+`ConnectionOwnerWork` on `OpenedRawConnection`. Lifecycle exchange uses
+`TransactionTaskSpawner` with fail-closed cleanup. ACP process pumps use
+`Weak`+JoinSet (joined on shutdown/Drop); Grok retains `run_connection` join
+and `GrokServerHandle::shutdown`. **Residual (D-042):** Grok session
+new/load/send oneshot workers are still ambient if the pending handle is
+dropped mid-flight — close before Golden M4.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

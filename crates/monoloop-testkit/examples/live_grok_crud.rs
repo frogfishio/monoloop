@@ -74,13 +74,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pending = connector
         .connect(config)
         .map_err(|e| format!("connect begin: {e}"))?;
-    let server = tokio::time::timeout(Duration::from_secs(30), pending.opened)
+    let server = tokio::time::timeout(Duration::from_secs(30), pending.wait())
         .await
         .map_err(|_| {
             "connect timed out — start serve with ./scripts/grok-serve-detached.sh first"
                 .to_string()
         })?
-        .map_err(|e| format!("connect channel: {e}"))?
         .map_err(|e| format!("connect failed: {e}"))?;
 
     println!("connected + initialized");

@@ -1541,7 +1541,7 @@ These are honesty / law-22 issues, not a reason to rebuild the owner model.
 ## D-042: M4 ACP owner fusion and process-core join residuals
 
 **Priority:** P1
-**Status:** Open (partial remediations applied)
+**Status:** Open (most remediations applied; session oneshot workers remain)
 **Affected:**
 - `crates/monoloop-connector-codex/src/lib.rs` (and cursor/agy twins)
 - `crates/monoloop-connector-*/src/process.rs`, `run.rs`
@@ -1549,37 +1549,32 @@ These are honesty / law-22 issues, not a reason to rebuild the owner model.
 - `doc/TRANSACTION_RUNTIME_V2_SPEC.md` (M4 status wording)
 
 **Problem:** The first M4 ACP `ConnectionOwnerWork` cut fused the session
-update pump into the same `select!` as `prompt_text().await`. While the owner
-awaits the prompt RPC, it cannot drain `updates`, so the process stdout pump
-blocks on a full `update_tx` and the RPC never completes (deadlock). Finish
-under `SendAndFinish` also exited the fused loop before updates drained.
+update pump into the same `select!` as `prompt_text().await` (deadlock under
+`SendAndFinish`). ProcessInner pumps held `Arc<ProcessInner>` so
+`kill_on_drop` never ran. Grok `run_connection` / pending connect were ambient.
 
-Separately, long-lived ACP `ProcessInner` stdout/stderr pumps and the Grok
-multi-session `connect()` / `run_connection` tasks still use ambient
-`tokio::spawn` outside `ConnectionOwnerWork`. Marking M4 “fully landed” while
-those remain is shaped qualification (Advisor bar).
+**Remediation applied:**
 
-**Remediation applied this turn:**
-
-- Codex/Cursor/Agy: restore a JoinSet-owned update pump concurrent with the
-  input/control loop; `agent.shutdown()` then `join_next` before `ConnectionEnd`.
-- Claude/Z.ai: observe `control.interrupted()` during input wait and run.
-- Grok Connector open path: observe cancel during pending prompt RPC; Finish
-  no longer cancels the session as a side effect of SendAndFinish.
+- Connection-owner update pumps JoinSet-owned (Codex/Cursor/Agy); Claude/Z.ai
+  observe control; Grok open path cancel-aware during prompt RPC.
+- ProcessInner: `Weak` pumps + JoinSet joined on shutdown; Drop aborts pumps /
+  `start_kill`s child.
+- Claude/Z.ai `run_*`: JoinSet pumps joined/aborted on timeout.
+- Grok: `PendingGrokServer::wait` + Drop aborts connect join;
+  `ServerInner.connection_join` + `GrokServerHandle::shutdown`.
 
 **Still open:**
 
-- Extract shared ACP process core so stdout/stderr pumps are joinable under a
-  single owner (or register with `TaskSupervisor`).
-- Grok server `connect()` / demux / session factory ambient tasks need an
-  explicit owner/join story (or remain clearly outside the Connector trait
-  open contract with deferred M4 process-core work named in the spec).
+- Grok `begin_session_new` / `begin_session_load` / `SessionInner::begin_send`
+  oneshot workers if the pending is dropped mid-flight.
+- Optional shared ACP process-core helper crate.
 
 **Acceptance criteria:**
 
 - [x] Codex/Cursor/Agy connection owners do not fuse update drain with
-      `prompt_text` await (JoinSet pump joined before terminal).
+      `prompt_text` await.
 - [x] Claude/Z.ai owners observe cancel/terminate during input wait.
-- [ ] Process-core pumps have no detached ambient spawn after handle drop.
-- [ ] Spec status names process-core / Grok-server residuals honestly (not
-      “M4 complete” without qualification).
+- [x] ProcessInner pumps do not pin `Arc` after handle drop.
+- [x] Grok `run_connection` join retained; pending connect abort-on-drop.
+- [ ] Grok session pending RPC/new/load spawns join-owned or fail-closed on drop.
+- [x] Spec status names remaining residuals honestly.

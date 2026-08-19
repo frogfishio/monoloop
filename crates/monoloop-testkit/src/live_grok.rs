@@ -168,10 +168,9 @@ async fn run_session_with_serve(
     let pending = connector
         .connect(config)
         .map_err(|e| format!("connect begin: {e}"))?;
-    let server = tokio::time::timeout(opts.connect_timeout, pending.opened)
+    let server = tokio::time::timeout(opts.connect_timeout, pending.wait())
         .await
         .map_err(|_| "connect timed out".to_string())?
-        .map_err(|e| format!("connect channel: {e}"))?
         .map_err(|e| format!("connect failed: {e}"))?;
     println!("live-grok: connected + initialized");
 

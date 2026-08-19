@@ -30,10 +30,9 @@ async fn initialize_session_new_and_prompt_roundtrip() {
     let config =
         GrokServerConfig::loopback(addr.port(), SecretRef::new("GROK_WS_SECRET")).expect("config");
     let pending = connector.connect(config).expect("connect pending");
-    let server = tokio::time::timeout(Duration::from_secs(5), pending.opened)
+    let server = tokio::time::timeout(Duration::from_secs(5), pending.wait())
         .await
         .expect("timeout")
-        .expect("channel")
         .expect("server");
 
     let session = tokio::time::timeout(
@@ -97,9 +96,8 @@ async fn raw_dump_captures_exact_inbound_from_grok() {
     let server = connector
         .connect(config)
         .unwrap()
-        .opened
+        .wait()
         .await
-        .unwrap()
         .unwrap();
 
     let session = server
@@ -194,9 +192,8 @@ async fn multiple_sessions_isolated() {
     let server = connector
         .connect(config)
         .unwrap()
-        .opened
+        .wait()
         .await
-        .unwrap()
         .unwrap();
 
     let s1 = server
@@ -253,9 +250,8 @@ async fn session_load_uses_explicit_id() {
     let server = connector
         .connect(config)
         .unwrap()
-        .opened
+        .wait()
         .await
-        .unwrap()
         .unwrap();
 
     let known = GrokSessionId::new("explicit-resume-id");
@@ -314,7 +310,7 @@ async fn bad_secret_rejected() {
     secrets.insert("S", "wrong-secret");
     let connector = GrokConnector::new(secrets);
     let config = GrokServerConfig::loopback(addr.port(), SecretRef::new("S")).unwrap();
-    let result = connector.connect(config).unwrap().opened.await.unwrap();
+    let result = connector.connect(config).unwrap().wait().await;
     assert!(result.is_err(), "auth must fail");
 }
 

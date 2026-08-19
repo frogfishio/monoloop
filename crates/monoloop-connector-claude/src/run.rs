@@ -68,7 +68,9 @@ pub async fn run_claude_print(
     let dump_out = Arc::clone(&dump);
     let session_holder = Arc::new(std::sync::Mutex::new(None::<String>));
     let session_out = Arc::clone(&session_holder);
-    let out_pump = tokio::spawn(async move {
+    // JoinSet-owned pumps: joined before return (no ambient detach on timeout).
+    let mut pumps = tokio::task::JoinSet::new();
+    pumps.spawn(async move {
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         loop {
@@ -104,7 +106,7 @@ pub async fn run_claude_print(
     });
 
     let dump_err = Arc::clone(&dump);
-    let err_pump = tokio::spawn(async move {
+    pumps.spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
         loop {
@@ -123,13 +125,25 @@ pub async fn run_claude_print(
         }
     });
 
-    let status = tokio::time::timeout(config.run_deadline, child.wait())
-        .await
-        .map_err(|_| ClaudeConnectorError::timeout("claude print exceeded run_deadline"))?
-        .map_err(|e| ClaudeConnectorError::process(format!("wait: {e}")))?;
+    let status = match tokio::time::timeout(config.run_deadline, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            pumps.abort_all();
+            while pumps.join_next().await.is_some() {}
+            return Err(ClaudeConnectorError::process(format!("wait: {e}")));
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            pumps.abort_all();
+            while pumps.join_next().await.is_some() {}
+            return Err(ClaudeConnectorError::timeout(
+                "claude print exceeded run_deadline",
+            ));
+        }
+    };
 
-    let _ = out_pump.await;
-    let _ = err_pump.await;
+    while pumps.join_next().await.is_some() {}
     dump.flush();
 
     if !status.success() {

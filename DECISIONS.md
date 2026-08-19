@@ -109,6 +109,7 @@ together for in-process futures.
 - M4 (connection-open): connectors return `ConnectionOwnerWork` instead of
   ambient `tokio::spawn` on `Connector::begin_open` (Fake, HTTP, Claude, Z.ai,
   Codex, Cursor, Agy, Grok). Lifecycle exchange registers Connector/Interpreter
-  owners through `TransactionTaskSpawner`. ACP session update pumps run on a
-  JoinSet owned by `ConnectionOwnerWork` and are joined before terminal (D-042).
-  Process-lifetime ACP pumps and Grok `connect()` demux remain open under D-042.
+  owners through `TransactionTaskSpawner`. ACP session update pumps and
+  ProcessInner stdout/stderr use JoinSet/`Weak` and join on shutdown (D-042).
+  Grok retains `run_connection` join + `PendingGrokServer` abort-on-drop.
+  Residual under D-042: Grok session new/load/send oneshot workers.

@@ -59,13 +59,14 @@ impl GrokConnector {
         let (tx, rx) = oneshot::channel();
         let secrets_ok = true;
         let _ = secrets_ok;
-        tokio::spawn(async move {
+        let connect_join = tokio::spawn(async move {
             let result = connect_server(config, secret, Arc::clone(&control_flag)).await;
             let _ = tx.send(result);
         });
         Ok(PendingGrokServer {
-            opened: rx,
+            opened: Some(rx),
             control,
+            connect_join: Some(connect_join),
         })
     }
 }
@@ -137,16 +138,13 @@ async fn open_as_raw_connection(
 
     let connector = GrokConnector::new(secrets);
     let pending = connector.connect(config).map_err(|e| e.into_connector())?;
-    let server = timeout(request.limits.connect_deadline, pending.opened)
+    let server = timeout(request.limits.connect_deadline, pending.wait())
         .await
         .map_err(|_| {
             monoloop_contracts::ConnectorError::new(
                 monoloop_contracts::ConnectorErrorKind::DeadlineExceeded,
                 "connect deadline exceeded",
             )
-        })?
-        .map_err(|_| {
-            monoloop_contracts::ConnectorError::connection_failed("server open channel dropped")
         })?
         .map_err(|e| e.into_connector())?;
 
@@ -364,10 +362,36 @@ async fn open_as_raw_connection(
 
 /// Pending server connection.
 pub struct PendingGrokServer {
-    /// Completes with server handle.
-    pub opened: oneshot::Receiver<Result<GrokServerHandle, GrokConnectorError>>,
+    /// Completes with server handle (`take` once via [`Self::wait`]).
+    opened: Option<oneshot::Receiver<Result<GrokServerHandle, GrokConnectorError>>>,
     /// Server-level control.
     pub control: GrokServerControl,
+    /// Connect task join — aborted if the pending open is dropped (D-042).
+    connect_join: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for PendingGrokServer {
+    fn drop(&mut self) {
+        if let Some(join) = self.connect_join.take() {
+            join.abort();
+        }
+    }
+}
+
+impl PendingGrokServer {
+    /// Await server open. Consumes the pending; does not abort a finished connect.
+    pub async fn wait(mut self) -> Result<GrokServerHandle, GrokConnectorError> {
+        let rx = self
+            .opened
+            .take()
+            .expect("PendingGrokServer::wait called twice");
+        let result = rx
+            .await
+            .map_err(|_| GrokConnectorError::connection("server open channel dropped"))?;
+        // Connect task completed (or failed); clear join so Drop does not abort.
+        let _ = self.connect_join.take();
+        result
+    }
 }
 
 /// Connected Grok server handle.
@@ -382,8 +406,22 @@ pub struct GrokServerHandle {
     pub completion: GrokServerCompletion,
     /// Opt-in raw dump collector (shared with config if enabled).
     pub raw_dump: Option<std::sync::Arc<crate::raw_dump::RawDumpCollector>>,
-    #[allow(dead_code)]
     inner: Arc<ServerInner>,
+}
+
+impl GrokServerHandle {
+    /// Cancel/terminate the WebSocket demux and join `run_connection` (D-042).
+    pub async fn shutdown(self) {
+        let _ = self.control.terminate(TerminationReason::CallerForced);
+        self.inner.closed.store(true, Ordering::SeqCst);
+        // Dropping write_tx clone on ServerInner is not enough — close by
+        // replacing sender capacity: take the demux join and wait.
+        if let Some(join) = self.inner.connection_join.lock().await.take() {
+            join.abort();
+            let _ = join.await;
+        }
+        self.inner.control.mark_terminal();
+    }
 }
 
 /// Server health (content-free).
@@ -496,6 +534,8 @@ pub(crate) struct ServerInner {
     closed: AtomicBool,
     /// Opt-in exact inbound wire dump.
     raw_dump: Option<std::sync::Arc<crate::raw_dump::RawDumpCollector>>,
+    /// `run_connection` join — aborted/awaited on server shutdown (D-042).
+    connection_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 enum WriteCmd {
@@ -787,9 +827,10 @@ async fn connect_server(
         control: Arc::clone(&control),
         closed: AtomicBool::new(false),
         raw_dump,
+        connection_join: Mutex::new(None),
     });
 
-    tokio::spawn(run_connection(
+    let join = tokio::spawn(run_connection(
         ws,
         write_rx,
         Arc::clone(&inner),
@@ -797,6 +838,7 @@ async fn connect_server(
         config.limits.max_message_bytes,
         config.expected_acp_version.clone(),
     ));
+    *inner.connection_join.lock().await = Some(join);
 
     // initialize handshake — ACP uses numeric protocolVersion (e.g. 1).
     let protocol_version: serde_json::Value = config
