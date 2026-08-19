@@ -107,6 +107,12 @@ impl CallbackService {
         self.reserved.load(Ordering::SeqCst)
     }
 
+    /// Free callback semaphore permits (for tests / drain readiness).
+    pub fn available_permits(&self) -> usize {
+        Self::reap_retained(&self.retained, &self.inflight);
+        self.permits.available_permits()
+    }
+
     /// Reserve one callback slot at admission (fail closed when full).
     pub fn try_reserve(&self) -> Option<CallbackReservation> {
         // Reap finished retained callbacks *before* acquiring so permits held by
@@ -175,17 +181,25 @@ impl CallbackService {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
             match call {
                 Ok(fut) => {
-                    // Inner work is already admitted — spawn without gate so a
-                    // later gate close cannot park this callback forever.
+                    // Permit is released in the callback task itself so an outer
+                    // scheduling hop cannot starve capacity after the body finishes.
+                    let permit_slot = Arc::new(Mutex::new(Some(permit)));
+                    let slot_in_task = Arc::clone(&permit_slot);
                     let mut handle =
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             executor.spawn(async move {
                                 let _ = fut.await;
+                                drop(
+                                    slot_in_task
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .take(),
+                                );
                             })
                         })) {
                             Ok(h) => h,
                             Err(_) => {
-                                drop(permit);
+                                drop(permit_slot.lock().unwrap_or_else(|e| e.into_inner()).take());
                                 inflight_child.fetch_sub(1, Ordering::SeqCst);
                                 return;
                             }
@@ -193,18 +207,27 @@ impl CallbackService {
                     let abort = handle.abort_handle();
                     match tokio::time::timeout(budget, &mut handle).await {
                         Ok(Ok(_)) | Ok(Err(_)) => {
-                            drop(permit);
+                            // Residual take if task dropped without clearing.
+                            drop(permit_slot.lock().unwrap_or_else(|e| e.into_inner()).take());
                             inflight_child.fetch_sub(1, Ordering::SeqCst);
                         }
                         Err(_) => {
                             abort.abort();
-                            retained.lock().unwrap_or_else(|e| e.into_inner()).push(
-                                RetainedCallback {
-                                    abort,
-                                    join: handle,
-                                    permit,
-                                },
-                            );
+                            let leftover =
+                                permit_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                            if let Some(permit) = leftover {
+                                retained.lock().unwrap_or_else(|e| e.into_inner()).push(
+                                    RetainedCallback {
+                                        abort,
+                                        join: handle,
+                                        permit,
+                                    },
+                                );
+                            } else {
+                                // Body finished in the race window — observe join.
+                                let _ = handle.await;
+                                inflight_child.fetch_sub(1, Ordering::SeqCst);
+                            }
                         }
                     }
                 }
@@ -270,13 +293,25 @@ impl CallbackService {
             let mut g = self.joins.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *g)
         };
-        for (abort, join) in handles.drain(..) {
+        let mut still_joins = Vec::new();
+        for (abort, mut join) in handles.drain(..) {
             abort.abort();
             if remaining.is_zero() {
-                drop(join);
-            } else {
-                let _ = tokio::time::timeout(remaining, join).await;
+                if join.is_finished() {
+                    drop(join);
+                } else {
+                    // Keep ownership — do not detach when the drain budget is gone.
+                    still_joins.push((abort, join));
+                }
+                continue;
             }
+            match tokio::time::timeout(remaining, &mut join).await {
+                Ok(_) => {}
+                Err(_) => still_joins.push((abort, join)),
+            }
+        }
+        if !still_joins.is_empty() {
+            *self.joins.lock().unwrap_or_else(|e| e.into_inner()) = still_joins;
         }
         // Retained: abort and join within remaining budget; unfinished keep permits.
         let mut retained = {
@@ -288,7 +323,12 @@ impl CallbackService {
         for mut r in retained.drain(..) {
             r.abort.abort();
             if rem.is_zero() {
-                still.push(r);
+                if r.join.is_finished() {
+                    drop(r.permit);
+                    self.inflight.fetch_sub(1, Ordering::SeqCst);
+                } else {
+                    still.push(r);
+                }
                 continue;
             }
             match tokio::time::timeout(rem, &mut r.join).await {

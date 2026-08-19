@@ -112,7 +112,7 @@ fn open_scope(run: MonoloopRunId, loop_id: LoopId) -> LoopScope {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_does_not_dispatch() {
     let (pub_, sub) = SubscriptionPublisher::channel("loop", 16);
     let run = MonoloopRunId::new("r1");
@@ -138,7 +138,7 @@ async fn text_does_not_dispatch() {
     assert_eq!(end.outbound_results_emitted, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_registry_unavailable_zero_effects() {
     let (pub_, sub) = SubscriptionPublisher::channel("loop", 16);
     let run = MonoloopRunId::new("r2");
@@ -188,7 +188,7 @@ async fn empty_registry_unavailable_zero_effects() {
     assert!(end.duplicate_events >= 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn waiting_never_dispatches() {
     let (pub_, sub) = SubscriptionPublisher::channel("loop", 8);
     let run = MonoloopRunId::new("r3");
@@ -210,7 +210,7 @@ async fn waiting_never_dispatches() {
     assert_eq!(end.outbound_results_emitted, 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_stops_loop() {
     let (_pub_, sub) = SubscriptionPublisher::channel("loop", 8);
     let run = MonoloopRunId::new("r4");

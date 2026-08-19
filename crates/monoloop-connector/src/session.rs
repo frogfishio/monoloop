@@ -29,7 +29,7 @@ pub struct SessionAttachment {
     /// Opaque route; only meaningful to the owning instance.
     pub route: Arc<dyn SessionRoute>,
     /// When true, Connector MUST perform provider create (`session/new`), not load.
-    /// [`OpenConnection::with_session_attachment`] leaves `external_session_id` unset.
+    /// [`crate::OpenConnection::with_session_attachment`] leaves `external_session_id` unset.
     pub create_mode: bool,
     /// Optional MCP descriptor for CreationOnly install at create time (D-014).
     pub initial_mcp: Option<McpServerDescriptor>,

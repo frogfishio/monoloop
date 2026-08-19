@@ -130,7 +130,7 @@ fn empty_registry_and_unknown_duplicate() {
     assert!(dup_name.is_err());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_resolved_set_rejects_dispatch() {
     let d = TransactionToolDispatcher::new(
         TransactionId::generate(),
@@ -159,7 +159,7 @@ async fn empty_resolved_set_rejects_dispatch() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn success_and_domain_failure() {
     let host = build_registry(vec![
         ("echo", "echo", ok_handler()),
@@ -209,7 +209,7 @@ async fn success_and_domain_failure() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn schema_invalid_and_oversized_arguments() {
     let host = build_registry(vec![("echo", "echo", ok_handler())]);
     let d = dispatcher_from(&host, &["echo"]);
@@ -252,7 +252,7 @@ async fn schema_invalid_and_oversized_arguments() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_failure_panic_lost_completion() {
     let host = build_registry(vec![
         (
@@ -313,7 +313,7 @@ async fn start_failure_panic_lost_completion() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn output_contract_violation() {
     let bad_out = Arc::new(ImmediateToolHandler::new(|_call, _ctx| {
         Ok(ToolCompletion::Succeeded(CanonicalToolOutput::Text(
@@ -338,7 +338,7 @@ async fn output_contract_violation() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_dispatches_different_order() {
     let counter = Arc::new(AtomicUsize::new(0));
     let c2 = Arc::clone(&counter);
@@ -405,7 +405,7 @@ async fn concurrent_dispatches_different_order() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_limit_plus_one_rejects() {
     // Shared global capacity of 1: second concurrent start must reject.
     let hold = Arc::new(AsyncToolHandler::new(|_call, _ctx, ctl| {
@@ -432,11 +432,12 @@ async fn capacity_limit_plus_one_rejects() {
         host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone(),
     ];
     let resolved = ResolvedToolSet::from_registered(tools);
+    let shared = SharedToolCapacity::new(1);
     let d = TransactionToolDispatcher::new(
         TransactionId::generate(),
         session_key(),
         resolved,
-        SharedToolCapacity::new(1),
+        Arc::clone(&shared),
         8,
         16,
     );
@@ -456,7 +457,16 @@ async fn capacity_limit_plus_one_rejects() {
             .await
         }
     });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Wait until the hold tool has acquired the sole shared slot (not a fixed sleep).
+    let started = tokio::time::Instant::now();
+    while shared.active() < 1 {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hold tool never acquired capacity"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 
     let second = dispatch_ready_tool(
         &d,
@@ -481,7 +491,7 @@ async fn capacity_limit_plus_one_rejects() {
     blocker.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simultaneous_transactions_different_tools() {
     let host_a = build_registry(vec![("a", "tool_a", ok_handler())]);
     let host_b = build_registry(vec![("b", "tool_b", ok_handler())]);
@@ -531,7 +541,7 @@ async fn simultaneous_transactions_different_tools() {
     assert!(matches!(a_ok, DispatchOutcome::Canonical { .. }));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loop_adapters_available_not_dispatch_rejected_placeholder() {
     let host = build_registry(vec![("echo", "echo", ok_handler())]);
     let tools = vec![host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone()];
@@ -571,7 +581,7 @@ async fn loop_adapters_available_not_dispatch_rejected_placeholder() {
     assert!(!terminal.payload.contains("deferred"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_tool_registry_still_unavailable() {
     let empty = EmptyToolRegistry::new();
     let r = empty
@@ -588,7 +598,7 @@ async fn empty_tool_registry_still_unavailable() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_running_async_tool() {
     // Short deadline forces timeout cancel path while the handler still runs.
     // Abortable + AsyncToolHandler (supports_abort + kill handle) is the structural pair.
@@ -632,7 +642,7 @@ async fn cancel_running_async_tool() {
 }
 
 /// D-024: IsolatedKillable ignores cooperative cancel until kill; work stops after escalate.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn isolated_killable_escalates_after_grace_and_stops_work() {
     let still_alive = Arc::new(AtomicBool::new(true));
     let flag = Arc::clone(&still_alive);

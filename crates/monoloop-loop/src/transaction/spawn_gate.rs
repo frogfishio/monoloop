@@ -1,8 +1,8 @@
 //! Process-local spawn admission gate (D-032).
 //!
-//! Closed at the start of runtime shutdown *before* draining actors so
-//! `try_spawn` fails closed instead of returning success for work that will
-//! never be polled.
+//! Closed after supervisor callback finalization during shutdown so
+//! `try_spawn` fails closed for subsequent work while finalized callbacks
+//! can still be scheduled.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

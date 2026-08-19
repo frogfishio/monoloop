@@ -1,28 +1,26 @@
 //! Spawn on an injected [`tokio::runtime::Handle`] (D-032).
 //!
-//! Synchronous admission must not rely on ambient `tokio::spawn`. On multi-thread
-//! executors, [`try_spawn`] does not return `Ok` until the task has been polled
-//! once (or cancelled), so concurrent executor shutdown cannot admit never-started
-//! work. Already-spawned tasks always run their futures — the gate only blocks
-//! *new* spawns.
+//! Synchronous admission must not rely on ambient `tokio::spawn`. [`try_spawn`]
+//! is **non-blocking**: it never waits for first poll. Already-spawned tasks
+//! always run their futures — the gate only blocks *new* spawns.
+//!
+//! Cancel-before-start is fail-closed via an immediate finished-without-start
+//! check. Production runtimes reject current-thread executors at bootstrap so
+//! admission cannot rely on a confirm path that would deadlock the reactor.
 
 use super::spawn_gate::SpawnGate;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 /// Spawn `future` on `executor` without requiring an entered Tokio context.
 ///
 /// Returns `Err(())` when the gate is closed, spawn panics, or the task is
-/// cancelled without ever starting. On multi-thread runtimes, waits until first
-/// poll (or cancel) so the executor-shutdown race fails closed. On current-thread
-/// (typical in unit tests), returns after the immediate finished check only to
-/// avoid deadlocking the reactor.
+/// already finished without ever starting. Does **not** wait for first poll —
+/// callers that need start confirmation must use [`confirm_spawn`] (async).
 pub(crate) fn try_spawn<F>(
     executor: &Handle,
     gate: &SpawnGate,
@@ -38,9 +36,89 @@ where
     let started = Arc::new(AtomicBool::new(false));
     let started_flag = Arc::clone(&started);
     // Signal first poll without consulting the gate — accepted tasks must run.
-    let (started_tx, started_rx) = mpsc::channel::<()>();
     let wrapped = async move {
-        let _ = started_tx.send(());
+        started_flag.store(true, Ordering::SeqCst);
+        future.await
+    };
+    let handle = catch_unwind(AssertUnwindSafe(|| executor.spawn(wrapped))).map_err(|_| ())?;
+    if !gate.is_open() {
+        handle.abort();
+        return Err(());
+    }
+    // Fail closed only when the task is already gone without starting (e.g.
+    // executor shut down between spawn and return). Never block waiting for poll.
+    if handle.is_finished() && !started.load(Ordering::SeqCst) {
+        return Err(());
+    }
+    Ok(handle)
+}
+
+/// Async start confirmation for paths that can await (shutdown callbacks).
+///
+/// Aborts and returns `Err` if the task finishes without starting within
+/// `budget`. Does not block synchronous admission.
+pub(crate) async fn confirm_spawn<T>(
+    handle: JoinHandle<T>,
+    started: &AtomicBool,
+    budget: std::time::Duration,
+) -> Result<JoinHandle<T>, ()> {
+    if started.load(Ordering::SeqCst) {
+        return Ok(handle);
+    }
+    if handle.is_finished() {
+        return Err(());
+    }
+    if budget.is_zero() {
+        // Non-blocking check only.
+        return if started.load(Ordering::SeqCst) {
+            Ok(handle)
+        } else if handle.is_finished() {
+            Err(())
+        } else {
+            // Scheduled but not yet polled — accept; JoinHandle remains owned.
+            Ok(handle)
+        };
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if started.load(Ordering::SeqCst) {
+            return Ok(handle);
+        }
+        if handle.is_finished() {
+            return Err(());
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            handle.abort();
+            // One last observation after abort.
+            if started.load(Ordering::SeqCst) {
+                return Ok(handle);
+            }
+            return Err(());
+        }
+        tokio::task::yield_now().await;
+        let slice = left.min(std::time::Duration::from_millis(1));
+        tokio::time::sleep(slice).await;
+    }
+}
+
+/// Spawn and (asynchronously) confirm first poll within `budget`.
+pub(crate) async fn try_spawn_confirmed<F>(
+    executor: &Handle,
+    gate: &SpawnGate,
+    future: F,
+    budget: std::time::Duration,
+) -> Result<JoinHandle<F::Output>, ()>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    if !gate.is_open() {
+        return Err(());
+    }
+    let started = Arc::new(AtomicBool::new(false));
+    let started_flag = Arc::clone(&started);
+    let wrapped = async move {
         started_flag.store(true, Ordering::SeqCst);
         future.await
     };
@@ -52,52 +130,7 @@ where
     if handle.is_finished() && !started.load(Ordering::SeqCst) {
         return Err(());
     }
-
-    let on_current_thread = Handle::try_current()
-        .map(|h| h.runtime_flavor() == RuntimeFlavor::CurrentThread)
-        .unwrap_or(false);
-    if on_current_thread {
-        // Cannot wait for first poll without deadlocking the reactor.
-        return Ok(handle);
-    }
-
-    let confirm = || confirm_started(handle, started_rx, &started);
-    match Handle::try_current() {
-        Ok(_) => tokio::task::block_in_place(confirm),
-        Err(_) => confirm(),
-    }
-}
-
-fn confirm_started<T>(
-    handle: JoinHandle<T>,
-    started_rx: mpsc::Receiver<()>,
-    started: &AtomicBool,
-) -> Result<JoinHandle<T>, ()> {
-    // Fail closed if start never arrives (do not accept unstarted after a timeout).
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if started_rx.try_recv().is_ok() || started.load(Ordering::SeqCst) {
-            return Ok(handle);
-        }
-        if handle.is_finished() && !started.load(Ordering::SeqCst) {
-            return Err(());
-        }
-        if Instant::now() >= deadline {
-            handle.abort();
-            return Err(());
-        }
-        match started_rx.recv_timeout(Duration::from_millis(1)) {
-            Ok(()) => return Ok(handle),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return if started.load(Ordering::SeqCst) {
-                    Ok(handle)
-                } else {
-                    Err(())
-                };
-            }
-        }
-    }
+    confirm_spawn(handle, &started, budget).await
 }
 
 #[cfg(test)]
@@ -133,6 +166,42 @@ mod tests {
         drop(rt);
     }
 
+    #[test]
+    fn try_spawn_does_not_block_on_unstarted_task() {
+        // Park the only worker so a spawned task cannot be polled. try_spawn must
+        // still return promptly (non-blocking admission).
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = rt.handle().clone();
+        let gate = SpawnGate::open();
+        let (lock_tx, lock_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Occupy the single worker.
+        handle.spawn(async move {
+            lock_tx.send(()).ok();
+            let _ = release_rx.recv();
+        });
+        lock_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker occupied");
+        let started = std::time::Instant::now();
+        let result = try_spawn(&handle, &gate, async { 1u8 });
+        let elapsed = started.elapsed();
+        let _ = release_tx.send(());
+        assert!(
+            result.is_ok(),
+            "scheduled task must be accepted without waiting"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "try_spawn blocked for {elapsed:?}"
+        );
+        drop(rt);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn try_spawn_accepts_live_runtime() {
         let handle = tokio::runtime::Handle::current();
@@ -162,5 +231,15 @@ mod tests {
         gate.close();
         assert_eq!(rx.await.expect("callback body must run"), 42);
         assert_eq!(join.await.expect("join"), 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_spawn_confirmed_waits_for_start() {
+        let handle = tokio::runtime::Handle::current();
+        let gate = SpawnGate::open();
+        let join = try_spawn_confirmed(&handle, &gate, async { 3u8 }, Duration::from_secs(1))
+            .await
+            .expect("confirmed");
+        assert_eq!(join.await.expect("join"), 3);
     }
 }

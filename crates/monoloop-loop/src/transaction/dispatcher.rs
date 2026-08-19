@@ -285,11 +285,13 @@ impl TransactionToolDispatcher {
                 }
             }
         };
+        // Reap completed parked workers so prior cancels cannot permanently starve capacity.
+        self.tool_join_vault.reap_finished();
+
         // RAII: if this future is dropped mid-join, park worker+permit in the vault.
         let mut dispatch_guard = DispatchGuard {
             permit: Some(permit),
             kill: None,
-            retain_join: None,
             vault: Arc::clone(&self.tool_join_vault),
         };
 
@@ -396,18 +398,26 @@ impl TransactionToolDispatcher {
             ToolCancellationPolicy::Cooperative { .. } => true,
         };
         if !kill_ok {
-            // Handler lied about supports_*: own a waiter join so actor cancellation
-            // vaults the permit instead of releasing it while work may still run.
+            // Handler claimed abort/kill support but returned no ToolKillHandle —
+            // we do not own the real worker. Never fabricate a completion waiter
+            // whose abort would release the permit while work may still run.
             control.cancel();
             let completion = handle.completion;
-            let retain = tokio::spawn(async move {
-                let _ = completion.wait().await;
-            });
-            dispatch_guard.retain_join = Some(retain);
-            if let Some(ref mut j) = dispatch_guard.retain_join {
-                let _ = tokio::time::timeout(Duration::from_millis(200), &mut *j).await;
+            let wait = completion.wait();
+            tokio::pin!(wait);
+            match tokio::time::timeout(Duration::from_millis(200), &mut wait).await {
+                Ok(_) => {
+                    // Completion already observed — safe to release capacity.
+                    dispatch_guard.release_if_idle();
+                }
+                Err(_) => {
+                    // Pending work without a killable join: orphan the permit
+                    // (held until runtime shutdown). Do not vault an abortable waiter.
+                    if let Some(permit) = dispatch_guard.permit.take() {
+                        self.tool_join_vault.park_orphan_permit(permit);
+                    }
+                }
             }
-            dispatch_guard.release_if_idle();
             lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
                 tool_action_id: action.clone(),
                 tool_id: tool_id.clone(),
@@ -581,28 +591,22 @@ async fn await_tool_termination(
     }
 }
 
-/// Holds the tool permit and optional kill/retain joins for the duration of dispatch.
+/// Holds the tool permit and optional kill handle for the duration of dispatch.
 /// On drop (including actor cleanup cancelling this future), unfinished workers
 /// are parked in the runtime tool-join vault together with the permit.
 struct DispatchGuard {
     permit: Option<ToolPermit>,
     kill: Option<ToolKillHandle>,
-    /// Waiter join for missing-kill paths (holds capacity until completion).
-    retain_join: Option<tokio::task::JoinHandle<()>>,
     vault: Arc<ToolJoinVault>,
 }
 
 impl DispatchGuard {
-    /// Release permit only when no unfinished join remains.
+    /// Release permit only when no unfinished worker join remains.
     fn release_if_idle(&mut self) {
         if self.kill.as_ref().is_some_and(ToolKillHandle::has_join) {
             return;
         }
-        if self.retain_join.as_ref().is_some_and(|j| !j.is_finished()) {
-            return;
-        }
         self.kill.take();
-        self.retain_join.take();
         drop(self.permit.take());
     }
 }
@@ -613,17 +617,10 @@ impl Drop for DispatchGuard {
             k.kill();
             if let Some(join) = k.take_join() {
                 if !join.is_finished() {
+                    // Park the *real* worker join — never a completion waiter.
                     self.vault.park(join, self.permit.take());
-                    let _ = self.retain_join.take();
                     return;
                 }
-            }
-        }
-        if let Some(join) = self.retain_join.take() {
-            if !join.is_finished() {
-                join.abort();
-                self.vault.park(join, self.permit.take());
-                return;
             }
         }
         drop(self.permit.take());

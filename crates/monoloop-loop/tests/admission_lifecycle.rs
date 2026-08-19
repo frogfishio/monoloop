@@ -122,7 +122,7 @@ impl Recorders {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_returns_while_work_pending_and_completes_once() {
     let rt = start(vec![llm_binding("llm")]).await;
     let rec = Recorders::new();
@@ -152,7 +152,7 @@ async fn submit_returns_while_work_pending_and_completes_once() {
     assert_eq!(rt.active_count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_session_key_rejected_same_channel() {
     let rt = start(vec![llm_binding("llm")]).await;
     let sid = SessionId::try_new("sess-1").unwrap();
@@ -204,7 +204,7 @@ async fn duplicate_session_key_rejected_same_channel() {
     let _ = rec1;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn same_session_string_different_channels_ok() {
     let rt = start(vec![llm_binding("a"), llm_binding("b")]).await;
     let sid = SessionId::try_new("shared-string").unwrap();
@@ -223,7 +223,7 @@ async fn same_session_string_different_channels_ok() {
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_llm_rejects_session_config() {
     let rt = start(vec![llm_binding("llm")]).await;
     let rec = Recorders::new();
@@ -237,7 +237,7 @@ async fn direct_llm_rejects_session_config() {
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_tool_rejected() {
     let rt = start(vec![llm_binding("llm")]).await;
     let rec = Recorders::new();
@@ -248,7 +248,7 @@ async fn unknown_tool_rejected() {
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminate_cancels_in_flight() {
     let rt = start(vec![llm_binding("llm")]).await;
     let block = Arc::new(Notify::new());
@@ -322,7 +322,7 @@ async fn terminate_cancels_in_flight() {
     let _ = block;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn callback_exactly_once() {
     let rt = start(vec![llm_binding("llm")]).await;
     let rec = Recorders::new();
@@ -335,7 +335,7 @@ async fn callback_exactly_once() {
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_with_active_finalizes() {
     let rt = start(vec![llm_binding("llm")]).await;
     let rec = Recorders::new();
@@ -382,7 +382,7 @@ async fn shutdown_with_active_finalizes() {
     let _ = rec;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_and_supplied_direct_llm_sessions() {
     let rt = start(vec![llm_binding("llm")]).await;
     let r1 = Recorders::new();

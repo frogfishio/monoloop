@@ -92,7 +92,7 @@ fn resolved_echo() -> (HostToolRegistry, ResolvedToolSet) {
     (host, ResolvedToolSet::from_registered(vec![tool]))
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bind_loopback_and_shutdown_revokes_routes() {
     let gw = McpGateway::bind_loopback(32).await.unwrap();
     assert!(gw.local_addr().ip().is_loopback());
@@ -105,7 +105,7 @@ async fn bind_loopback_and_shutdown_revokes_routes() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_rejects_list_and_call_until_active() {
     let gw = McpGateway::bind_loopback(32).await.unwrap();
     let (_, tools) = resolved_echo();
@@ -145,7 +145,7 @@ async fn pending_rejects_list_and_call_until_active() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_resolved_set_lists_no_tools() {
     let gw = McpGateway::bind_loopback(8).await.unwrap();
     let tools = ResolvedToolSet::empty();
@@ -160,7 +160,7 @@ async fn empty_resolved_set_lists_no_tools() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_revoked_cross_transaction_isolation() {
     let gw = McpGateway::bind_loopback(16).await.unwrap();
     let (_, tools_a) = resolved_echo();
@@ -204,7 +204,7 @@ async fn unknown_revoked_cross_transaction_isolation() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delayed_capability_a_cannot_enter_b() {
     let gw = McpGateway::bind_loopback(16).await.unwrap();
     let (_, tools) = resolved_echo();
@@ -238,7 +238,7 @@ async fn delayed_capability_a_cannot_enter_b() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_redacted_in_debug() {
     let token = CapabilityToken::generate().unwrap();
     let dbg = format!("{token:?}");
@@ -259,7 +259,7 @@ async fn capability_redacted_in_debug() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_and_local_paths_same_handler_and_definitions() {
     let host = HostToolRegistry::build(vec![RegisteredTool::new(
         make_spec("echo", "echo"),
@@ -317,7 +317,7 @@ async fn mcp_and_local_paths_same_handler_and_definitions() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disallowed_tool_and_schema_invalid_on_mcp() {
     let gw = McpGateway::bind_loopback(8).await.unwrap();
     let (_, tools) = resolved_echo();
@@ -340,7 +340,7 @@ async fn disallowed_tool_and_schema_invalid_on_mcp() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_unknown_capability_is_404() {
     let gw = McpGateway::bind_loopback(4).await.unwrap();
     let addr = gw.local_addr();
@@ -352,7 +352,7 @@ async fn http_unknown_capability_is_404() {
 }
 
 /// D-018: oversized HTTP body is rejected before protocol dispatch.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_oversized_body_fails_closed() {
     let gw = McpGateway::bind_loopback(4).await.unwrap();
     let (_, tools) = resolved_echo();
@@ -376,7 +376,7 @@ async fn http_oversized_body_fails_closed() {
 }
 
 /// D-018: same capability token reuses HTTP service across requests (session manager).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_active_capability_accepts_repeated_posts() {
     let gw = McpGateway::bind_loopback(8).await.unwrap();
     let (_, tools) = resolved_echo();
@@ -444,7 +444,7 @@ fn first_jsonrpc_value(body: &str) -> Option<serde_json::Value> {
 }
 
 /// D-018: real Streamable HTTP initialize → initialized → tools/list → tools/call.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_mcp_initialize_list_call_sequence() {
     let gw = McpGateway::bind_loopback(8).await.unwrap();
     let (_, tools) = resolved_echo();
@@ -573,7 +573,7 @@ async fn http_mcp_initialize_list_call_sequence() {
 }
 
 /// D-018: pending (not activated) capability rejects tools/list after initialize.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_mcp_pending_token_rejects_tools_list() {
     let gw = McpGateway::bind_loopback(4).await.unwrap();
     let (_, tools) = resolved_echo();
@@ -635,7 +635,7 @@ async fn http_mcp_pending_token_rejects_tools_list() {
 }
 
 /// D-018: revoked capability 404s subsequent HTTP traffic.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_mcp_revoked_token_is_404() {
     let gw = McpGateway::bind_loopback(4).await.unwrap();
     let (_, tools) = resolved_echo();
@@ -661,7 +661,7 @@ async fn http_mcp_revoked_token_is_404() {
     gw.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn token_hex_roundtrip() {
     let t = CapabilityToken::generate().unwrap();
     let hex = t.to_hex();

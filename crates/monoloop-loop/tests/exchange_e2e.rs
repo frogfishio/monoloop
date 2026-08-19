@@ -45,7 +45,7 @@ fn test_llm(id: &str) -> ChannelBinding {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fake_provider_transaction_emits_canonical_units() {
     let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
         config: RuntimeConfig {
@@ -130,7 +130,7 @@ async fn fake_provider_transaction_emits_canonical_units() {
     assert_eq!(rt.active_count(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_transactions_isolated() {
     use std::sync::atomic::{AtomicBool, Ordering};
 

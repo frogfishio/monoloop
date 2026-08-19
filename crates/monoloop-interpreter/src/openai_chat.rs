@@ -87,7 +87,7 @@ impl OpenAiSseState {
         Ok(out)
     }
 
-    /// Flush on clean end: incomplete trailing event without [DONE] fails closed.
+    /// Flush on clean end: incomplete trailing event without a `DONE` marker fails closed.
     pub fn seal_clean(&mut self) -> Result<Vec<AcpFragment>, InterpreterError> {
         if !self.line_carry.is_empty() {
             let line = std::mem::take(&mut self.line_carry);

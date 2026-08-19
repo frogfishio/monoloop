@@ -891,11 +891,11 @@ considered delivered while these remain.
 |---|---|---|
 | D-026 | Fixed (residual closed) | Create: claim+`SessionEstablished`+MCP activate **before** prompt send (`prompt_ready` gate); ACP encode uses empty tools for `McpGateway` |
 | D-027 | Fixed (residual closed) | Per-exchange remaining output budget; limits before live publish; immediate `LimitExceeded` on retention exceed |
-| D-028 | Fixed (residual closed) | Per-runtime `ToolJoinVault`; missing-kill retain join vaults permit on cancel; no unbounded post-timeout join |
-| D-029 | Fixed (residual closed) | Accepted callbacks always run; oneshot-delivered schedule returns callback on spawn race; deferred never releases on timed-out restore; supervisor retains timed-out joins |
+| D-028 | Fixed (residual closed) | Per-runtime `ToolJoinVault` with normal-op `reap_finished`; missing-kill orphans permit (no fabricated waiter); vault parks real worker joins only |
+| D-029 | Fixed (residual closed) | Deferred restore miss owns a watcher (always releases capacity; late restore still schedulable); supervisor joins re-parked when budget is zero (never detached) |
 | D-030 | Fixed | ExchangeId-scoped ToolActionId; empty allowlist → rejection Completed; CallerControlled after observe |
 | D-031 | Fixed (residual closed) | OpenAI continuation encodes transcript only (no duplicate `results` append) |
-| D-032 | Fixed (residual closed) | Multi-thread `try_spawn` waits until first poll/cancel (fail closed); no gate-park of already-accepted tasks |
+| D-032 | Fixed (residual closed) | Non-blocking `try_spawn` (no first-poll wait); multi-thread executor required at bootstrap; async `try_spawn_confirmed` for shutdown callbacks |
 | D-033 | Fixed | absolute request deadline; enqueue selects deadline; output queue from output budget |
 | D-034 | Fixed (known residual) | Canonical hex + global/per-cap permits before body; body+dispatch share duration budget; process-global service map remains |
 | D-035 | Fixed | estimate covers names, args JSON, tool_call_id; serialize fail closed |

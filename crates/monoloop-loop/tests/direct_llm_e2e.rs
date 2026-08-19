@@ -240,7 +240,7 @@ async fn run_tx(
     (kind, evs)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn text_only_transaction() {
     let script = Arc::new(|_n: usize, _body: String| text_sse("Hello from direct LLM."));
     let (addr, join) = bind_sse_server(script).await;
@@ -286,7 +286,7 @@ async fn text_only_transaction() {
     join.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn caller_controlled_tool_exchange_is_continuation_required() {
     let script = Arc::new(|n: usize, body: String| {
         if n == 0 {
@@ -336,7 +336,7 @@ async fn caller_controlled_tool_exchange_is_continuation_required() {
     join.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inline_tool_continuation_second_exchange() {
     let script = Arc::new(|n: usize, body: String| match n {
         0 => tool_call_sse(),
@@ -388,7 +388,7 @@ async fn inline_tool_continuation_second_exchange() {
     join.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_profiles_same_impl_no_name_branch() {
     let script = Arc::new(|_n: usize, _b: String| text_sse("ok."));
     let (addr, join) = bind_sse_server(script).await;
@@ -443,7 +443,7 @@ async fn two_profiles_same_impl_no_name_branch() {
     join.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_direct_llm_isolated() {
     use std::sync::atomic::AtomicBool;
 
@@ -557,7 +557,7 @@ fn completed_tool_results(
 }
 
 /// D-030: empty allowlist must not report a model tool request as plain Completed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_allowlist_tool_request_is_continuation_required() {
     let script = Arc::new(|n: usize, _body: String| {
         if n == 0 {
@@ -612,7 +612,7 @@ async fn empty_allowlist_tool_request_is_continuation_required() {
 }
 
 /// D-030: rejection results reach inline continuation with the original provider call id.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_allowlist_inline_preserves_provider_call_id() {
     let script = Arc::new(|n: usize, body: String| match n {
         0 => tool_call_sse(),
@@ -677,7 +677,7 @@ async fn empty_allowlist_inline_preserves_provider_call_id() {
 }
 
 /// D-030: the same provider call id in two exchanges yields distinct internal action ids.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reused_provider_call_id_gets_distinct_internal_action_ids() {
     let script = Arc::new(|n: usize, body: String| match n {
         0 => tool_call_sse(),

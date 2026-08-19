@@ -145,7 +145,7 @@ fn free_request(
 }
 
 /// Global max N admits N blocked; N+1 fails; release drains capacity for a later admit.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_plus_one_global() {
     let max = 3usize;
     let rt = start_with_limits(vec![llm_binding("llm", max)], limits_cap(max, max)).await;
@@ -220,7 +220,7 @@ async fn capacity_plus_one_global() {
 }
 
 /// Per-channel max is tighter than global: channel overflow rejects while other channel works.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_plus_one_per_channel() {
     let rt = start_with_limits(
         vec![llm_binding("a", 2), llm_binding("b", 2)],
@@ -279,7 +279,7 @@ async fn capacity_plus_one_per_channel() {
 }
 
 /// Thousands of completed fake transactions within configured limits (wave concurrency).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thousands_of_fake_transactions_within_limits() {
     let wave = 32usize;
     let total = 2_048usize;
@@ -327,9 +327,9 @@ async fn thousands_of_fake_transactions_within_limits() {
         tokio::time::timeout(Duration::from_secs(30), notify.notified())
             .await
             .unwrap_or_else(|_| panic!("wave starting at {i} timed out"));
-        // Ensure capacity released before next wave.
-        for _ in 0..100 {
-            if rt.capacity().global_active() == 0 {
+        // Ensure transaction and callback capacity released before next wave.
+        for _ in 0..200 {
+            if rt.capacity().global_active() == 0 && rt.callback_available_permits() >= wave {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -344,7 +344,7 @@ async fn thousands_of_fake_transactions_within_limits() {
 }
 
 /// Identical session strings on different Channels are independent SessionKeys.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identical_session_strings_different_channels() {
     let rt = start_with_limits(
         vec![llm_binding("ch-a", 8), llm_binding("ch-b", 8)],
@@ -412,7 +412,7 @@ async fn identical_session_strings_different_channels() {
 }
 
 /// Slow sink on one transaction does not block completion of an independent peer.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscriber_backpressure_isolated() {
     // Keep event queue small so backpressure is visible on the slow txn only.
     let rt = start_with_limits(vec![llm_binding("llm", 8)], limits_cap_events(8, 8, 4)).await;
@@ -466,7 +466,7 @@ async fn subscriber_backpressure_isolated() {
 }
 
 /// Zero events after Ended; callback exactly once.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_events_after_ended_and_single_callback() {
     let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
 
@@ -528,7 +528,7 @@ async fn zero_events_after_ended_and_single_callback() {
 }
 
 /// Completion vs cancel race: exactly one terminal callback.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn complete_versus_cancel_single_terminal() {
     let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
 
@@ -591,7 +591,7 @@ async fn complete_versus_cancel_single_terminal() {
 }
 
 /// Short deadline produces a terminal outcome while the sink is blocked (outer race).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn short_deadline_terminal() {
     let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
 
@@ -646,7 +646,7 @@ async fn short_deadline_terminal() {
 }
 
 /// Shutdown with active blocked transactions finalizes and leaves zero owned state.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_with_active_zero_owned() {
     let rt = start_with_limits(vec![llm_binding("llm", 8)], limits_cap(8, 8)).await;
 
@@ -737,7 +737,7 @@ fn tool_capacity_plus_one() {
 
 /// D-009: actor does not run (no callback) when start gate is dropped before install start signal.
 /// Covered indirectly: after shutdown, capacity is zero and submits reject.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_after_shutdown_rejects_without_active_leak() {
     let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
     let done = Arc::new(Notify::new());
@@ -776,7 +776,7 @@ async fn submit_after_shutdown_rejects_without_active_leak() {
 }
 
 /// D-023: unknown invocation extension rejected when Channel allowlist is empty.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_extension_rejected_at_admission() {
     use monoloop_contracts::{ExtensionKey, VersionedExtension};
 
@@ -820,7 +820,7 @@ fn channel_option_policy_matrices_differ() {
 }
 
 /// D-023: allowed openai.seed extension admits; temperature rejected on external-agent policy.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn allowed_extension_admits_and_external_rejects_temperature() {
     use monoloop_contracts::{ExtensionKey, VersionedExtension};
 
@@ -927,7 +927,7 @@ fn abortable_requires_supports_abort_handler() {
 }
 
 /// D-015: max_tools_per_transaction plus-one rejects at admission.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tools_per_transaction_plus_one_rejected() {
     use monoloop_contracts::{
         JsonSchema, ToolCancellationPolicy, ToolId, ToolLimits, ToolName, ToolOutputContract,
@@ -1000,7 +1000,7 @@ async fn tools_per_transaction_plus_one_rejected() {
 }
 
 /// D-015: max_messages plus-one rejects at admission.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn max_messages_plus_one_rejected() {
     use monoloop_contracts::{CanonicalInput, CanonicalMessage, InputLimits, TextPart};
 
@@ -1045,7 +1045,7 @@ async fn max_messages_plus_one_rejected() {
 }
 
 /// D-015: max_input_bytes plus-one rejects at admission.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn max_input_bytes_plus_one_rejected() {
     use monoloop_contracts::{user_text_input, InputLimits};
 
@@ -1075,7 +1075,7 @@ async fn max_input_bytes_plus_one_rejected() {
 }
 
 /// D-015: transaction-wide tool payload cap rejects oversized arguments.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_payload_transaction_cap_rejects() {
     use monoloop_contracts::{
         ChannelId, ExchangeId, JsonSchema, SessionId, SessionKey, ToolActionId,
@@ -1192,7 +1192,7 @@ fn transaction_limits_zero_capacity_rejected() {
 }
 
 /// D-015: event byte budget rejects oversized enqueue.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn event_queue_byte_budget_plus_one() {
     use monoloop_contracts::{
         ChannelId, SessionId, TransactionEvent, TransactionEventPayload, TransactionId,
@@ -1229,7 +1229,7 @@ async fn event_queue_byte_budget_plus_one() {
 }
 
 /// D-021: host event-sink panic at invoke → delivery failure, one terminal callback.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sink_panic_on_invoke_yields_event_delivery_failed() {
     let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
     let ends = Arc::new(Mutex::new(Vec::<TransactionEndKind>::new()));
@@ -1265,7 +1265,7 @@ async fn sink_panic_on_invoke_yields_event_delivery_failed() {
 }
 
 /// D-021: host event-sink panic while polling deliver future → same fail-closed path.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sink_panic_in_future_yields_event_delivery_failed() {
     let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
     let ends = Arc::new(Mutex::new(Vec::<TransactionEndKind>::new()));
@@ -1304,7 +1304,7 @@ async fn sink_panic_in_future_yields_event_delivery_failed() {
 }
 
 /// D-021: slow host callback does not hold transaction capacity (runtime-owned service).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_callback_does_not_block_capacity_release() {
     let rt = start_with_limits(vec![llm_binding("llm", 2)], limits_cap(2, 2)).await;
     let hold = Arc::new(Notify::new());
@@ -1396,7 +1396,7 @@ async fn slow_callback_does_not_block_capacity_release() {
 }
 
 /// D-021: completion callback panic must not kill runtime; capacity fully released.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn callback_panic_does_not_kill_runtime() {
     let rt = start_with_limits(vec![llm_binding("llm", 4)], limits_cap(4, 4)).await;
     let done = Arc::new(Notify::new());
@@ -1448,7 +1448,7 @@ async fn callback_panic_does_not_kill_runtime() {
 }
 
 /// D-015: max_distinct_sessions plus-one rejects a new session on the channel.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn distinct_sessions_plus_one_rejected() {
     let binding = ChannelBinding {
         id: ChannelId::try_new("llm").unwrap(),
@@ -1507,7 +1507,7 @@ async fn distinct_sessions_plus_one_rejected() {
 }
 
 /// D-015: channel max_encoded_exchange_bytes fails closed as EncodingFailed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encoded_exchange_bytes_plus_one_fails() {
     let binding = ChannelBinding {
         id: ChannelId::try_new("llm").unwrap(),
@@ -1565,7 +1565,7 @@ async fn encoded_exchange_bytes_plus_one_fails() {
 }
 
 /// D-012: cancel while FakeConnector hangs after open (response wait) releases capacity.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_during_response_wait_releases_capacity() {
     use monoloop_connector::{FakeConnectorConfig, FakeEndpoint};
 
@@ -1651,7 +1651,7 @@ async fn cancel_during_response_wait_releases_capacity() {
 }
 
 /// D-012: cancel while FakeConnector open is delayed leaves zero active capacity.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_during_slow_open_releases_capacity() {
     use monoloop_connector::FakeConnectorConfig;
 
@@ -1753,7 +1753,7 @@ fn bound_diagnostics_respects_limits() {
 }
 
 /// D-012: configured cleanup_deadline is accepted and used (non-default value path).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cleanup_deadline_non_default_completes() {
     let limits = TransactionLimits {
         cleanup_deadline: Duration::from_millis(100),

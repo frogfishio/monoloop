@@ -87,7 +87,7 @@ async fn start_runtime(channels: Vec<ChannelBinding>) -> Arc<DefaultTransactionR
     DefaultTransactionRuntime::start(bootstrap).await.unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn starts_and_stops_with_fake_channels() {
     let rt = start_runtime(vec![
         direct_llm_binding("llm"),
@@ -103,7 +103,7 @@ async fn starts_and_stops_with_fake_channels() {
     assert_eq!(rt.state(), RuntimeState::Stopped);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_submit_after_draining() {
     let rt = start_runtime(vec![direct_llm_binding("llm")]).await;
     let _ = TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
@@ -111,7 +111,7 @@ async fn no_submit_after_draining() {
     assert_eq!(err.kind, AdmissionErrorKind::RuntimeShuttingDown);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn submit_while_accepting_admits() {
     let rt = start_runtime(vec![direct_llm_binding("llm")]).await;
     let receipt = TransactionRuntime::submit(rt.as_ref(), dummy_request("llm")).unwrap();
@@ -121,7 +121,7 @@ async fn submit_while_accepting_admits() {
     TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_start_shutdown_no_listener_leak() {
     for _ in 0..8 {
         let rt = start_runtime(vec![direct_llm_binding("llm")]).await;
@@ -222,7 +222,7 @@ fn duplicate_tool_names_rejected() {
     assert!(matches!(err, StartupError::ToolRegistry(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn partial_startup_cleans_mcp_on_connector_failure() {
     // First channel ok; second factory fails.
     struct FailFactory;
@@ -256,7 +256,7 @@ async fn partial_startup_cleans_mcp_on_connector_failure() {
     assert!(matches!(err, StartupError::ConnectorBuild(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_llm_with_session_adapter_fails_startup() {
     // External factory on DirectLlm kind.
     let mut b = direct_llm_binding("mismatch");
@@ -280,7 +280,7 @@ async fn direct_llm_with_session_adapter_fails_startup() {
     assert!(matches!(err, StartupError::SessionAdapterMismatch(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_managers_installed() {
     let rt = start_runtime(vec![direct_llm_binding("llm")]).await;
     assert_eq!(rt.capacity().global_active(), 0);

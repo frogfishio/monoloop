@@ -7,7 +7,7 @@ use super::callback_service::CallbackService;
 use super::capacity::CapacityManagers;
 use super::channel_registry::{ChannelBinding, LiveChannel};
 use super::error::StartupError;
-use super::executor_spawn::try_spawn;
+use super::executor_spawn::try_spawn_confirmed;
 use super::finalization::build_transaction_end;
 use super::host_tools::HostToolRegistry;
 use super::mcp::McpGateway;
@@ -85,6 +85,13 @@ impl DefaultTransactionRuntime {
         bootstrap.config.validate()?;
         let executor = bootstrap.executor.clone();
         let _ = executor.id();
+        // Close the current-thread cancel-before-start race: production admission
+        // is non-blocking and cannot confirm first poll on a current-thread reactor.
+        if executor.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(StartupError::InvalidConfig(
+                "executor must be a multi-thread Tokio runtime",
+            ));
+        }
 
         let mut realized: Vec<(ChannelId, LiveChannel)> = Vec::new();
         let mut capacity_pairs: Vec<(ChannelId, usize)> = Vec::new();
@@ -212,6 +219,11 @@ impl DefaultTransactionRuntime {
     /// Active transaction count.
     pub fn active_count(&self) -> usize {
         self.inner.registry.lock().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// Free completion-callback permits (tests / readiness).
+    pub fn callback_available_permits(&self) -> usize {
+        self.inner.callbacks.available_permits()
     }
 
     /// Channel count.
@@ -476,20 +488,43 @@ impl DefaultTransactionRuntime {
                 }
                 (release)();
             } else {
-                // Still unrestored: keep capacity held (fail closed) and count invariant.
+                // Still unrestored within the shutdown deadline: do not leak capacity
+                // via forget(release), and do not drop the guard (late restore must
+                // still be schedulable). Own a watcher that waits for restore, runs
+                // the callback if possible, then always releases capacity.
                 invariant_failed += 1;
-                // Intentionally do not call release — orphan capacity rather than
-                // drop an admitted callback on the floor.
-                std::mem::forget(release);
-                // Keep guard alive so a late restore is not uselessly dropped...
-                // actually restore needs the guard; forgetting release is enough.
-                // Dropping guard is OK if payload was lost with aborted actor.
-                drop(guard);
+                let watcher = self.inner.executor.spawn(async move {
+                    let grace = Duration::from_secs(5);
+                    if let Some(payload) = guard.claim_for_shutdown(grace).await {
+                        guard.mark_callback_scheduled();
+                        let end = build_transaction_end(
+                            &payload,
+                            TransactionEndKind::RuntimeShutdown,
+                            None,
+                            EventDeliveryOutcome::Failed,
+                            guard.sequencer().last_allocated(),
+                        );
+                        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            payload.callback.call(end)
+                        }));
+                        if let Ok(fut) = call {
+                            let _ = fut.await;
+                        }
+                        (release)();
+                    } else if guard.callback_was_scheduled() {
+                        (release)();
+                    } else {
+                        // Restore never arrived — release capacity (no permanent leak).
+                        (release)();
+                    }
+                });
+                self.inner
+                    .supervisor_cb_retained
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(watcher);
             }
         }
-
-        // Also update first-pass supervisor callbacks to use retained list.
-        // (already done via run_callback_isolated signature change below)
 
         // Now reject further spawns; callbacks above have been scheduled.
         self.inner.spawn_gate.close();
@@ -504,15 +539,15 @@ impl DefaultTransactionRuntime {
 
         // Drain runtime-owned host callbacks (D-021 / D-029).
         let cb_drain = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-        if !cb_drain.is_zero() {
-            self.inner.callbacks.drain(cb_drain).await;
-        }
+        self.inner.callbacks.drain(cb_drain).await;
 
         // Drain tool workers parked when dispatch was dropped mid-join.
+        // release_orphans: missing-kill capacity holds end with the runtime.
         let tool_drain = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-        self.inner.tool_join_vault.drain(tool_drain).await;
+        self.inner.tool_join_vault.drain(tool_drain, true).await;
 
-        // Join supervisor callbacks retained after deadline abort.
+        // Join supervisor callbacks retained after deadline abort. Never detach:
+        // unfinished joins stay owned on the runtime after shutdown returns.
         let mut retained = {
             let mut g = self
                 .inner
@@ -522,17 +557,27 @@ impl DefaultTransactionRuntime {
             std::mem::take(&mut *g)
         };
         let rem = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        let mut still_retained = Vec::new();
         for mut h in retained.drain(..) {
             h.abort();
             if rem.is_zero() {
-                // Keep ownership without unbounded await — park by forgetting join
-                // would detach; drop after abort is the remaining residual for
-                // non-yielding host callbacks once the absolute deadline is gone.
-                drop(h);
-            } else {
-                let _ = tokio::time::timeout(rem, &mut h).await;
+                if h.is_finished() {
+                    drop(h);
+                } else {
+                    still_retained.push(h);
+                }
+                continue;
+            }
+            match tokio::time::timeout(rem, &mut h).await {
+                Ok(_) => {}
+                Err(_) => still_retained.push(h),
             }
         }
+        *self
+            .inner
+            .supervisor_cb_retained
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = still_retained;
 
         let disposition = ShutdownDisposition {
             normally_finalized,
@@ -566,17 +611,25 @@ async fn run_callback_isolated(
     let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
     match call {
         Ok(fut) => {
-            // Use oneshot delivery so a failed spawn can be reported without
-            // losing the callback into a dropped future — supervisor path has
-            // already taken ownership of the callback from finalization.
-            let mut handle = match try_spawn(executor, gate, async move {
-                let _ = fut.await;
-            }) {
+            // Confirm first poll asynchronously so cancel-before-start fails closed
+            // without blocking synchronous admission (`try_spawn`).
+            let confirm_budget = deadline.min(Duration::from_millis(100));
+            let mut handle = match try_spawn_confirmed(
+                executor,
+                gate,
+                async move {
+                    let _ = fut.await;
+                },
+                confirm_budget,
+            )
+            .await
+            {
                 Ok(h) => h,
                 Err(()) => return CallbackRun::Failed,
             };
             let abort = handle.abort_handle();
-            match tokio::time::timeout(deadline, &mut handle).await {
+            let join_budget = deadline.saturating_sub(confirm_budget);
+            match tokio::time::timeout(join_budget, &mut handle).await {
                 Ok(Ok(())) => CallbackRun::Ok,
                 Ok(Err(_)) => CallbackRun::Failed, // join error = panic in future
                 Err(_) => {

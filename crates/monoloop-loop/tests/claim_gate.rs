@@ -51,7 +51,7 @@ fn external_agent_omit_session(id: &str) -> ChannelBinding {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_without_provider_session_id_ends_invariant_failed() {
     let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
         config: RuntimeConfig {

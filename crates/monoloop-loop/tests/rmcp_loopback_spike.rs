@@ -28,7 +28,7 @@ impl ServerHandler for EmptySpikeHandler {
 }
 
 /// Bind Streamable HTTP on `127.0.0.1:0`, then cancel. No product behavior.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rmcp_streamable_http_binds_loopback_and_shuts_down() {
     let cancellation = CancellationToken::new();
     let mut config = StreamableHttpServerConfig::default();
