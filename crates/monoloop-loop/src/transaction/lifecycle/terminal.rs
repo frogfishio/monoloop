@@ -1,4 +1,4 @@
-//! Terminal decision and completion construction (v2 §13 / M2 publish path).
+//! Terminal decision, proposals, and completion construction (v2 §13).
 
 use monoloop_contracts::{
     CleanupStatus, TerminalEventDelivery, TransactionCompletion, TransactionEndEvent,
@@ -19,7 +19,21 @@ impl TerminalDecision {
     }
 }
 
-/// Build a completion mailbox payload from a terminal event and delivery result.
+/// Coordinator proposal — supervisor accepts or upgrades (Cancel→Terminated).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalProposal {
+    /// Proposed primary cause.
+    pub kind: TransactionEndKind,
+}
+
+impl TerminalProposal {
+    /// Construct a proposal.
+    pub fn new(kind: TransactionEndKind) -> Self {
+        Self { kind }
+    }
+}
+
+/// Build a completion mailbox payload.
 pub fn build_completion(
     end: TransactionEndEvent,
     terminal_event_delivery: TerminalEventDelivery,
@@ -32,7 +46,7 @@ pub fn build_completion(
     }
 }
 
-/// Build a minimal terminal event body for M2 shutdown / stub paths.
+/// Build a terminal event body.
 pub fn end_event(
     transaction_id: TransactionId,
     channel_id: monoloop_contracts::ChannelId,

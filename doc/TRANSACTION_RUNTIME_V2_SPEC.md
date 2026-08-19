@@ -1,6 +1,7 @@
 # Transaction Runtime v2 Specification
 
-**Status:** Normative replacement specification; M0–M2 landed and hardened (D-003)
+**Status:** Normative replacement specification; M0–M3 landed (D-003). M3 uses a
+synthetic DirectLlm unit path; real Fake/HTTP exchange TaskSpawner is M4.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

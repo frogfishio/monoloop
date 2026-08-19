@@ -40,8 +40,8 @@ pub use transaction::{
     RejectEncoder, ReservationPool, ReservationPoolError, ResolvedTool, ResolvedToolSet,
     RuntimeBootstrap, RuntimeConfig, RuntimeOwner, RuntimeState, SharedToolCapacity,
     ShutdownTicket, StartFailHandler, StartedRuntime, StartupError, SupervisorCommand, TaskClass,
-    TaskExit, TaskId, TaskSupervisor, TerminalDecision, TestTextEncoder, ToolExecutionCompletion,
-    ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionCoordinator, TransactionPhase,
+    TaskExit, TaskId, TaskSupervisor, TerminalDecision, TerminalProposal, TestTextEncoder,
+    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionPhase,
     TransactionReservations, TransactionRuntimeHandle, TransactionToolCapacity,
 };
 

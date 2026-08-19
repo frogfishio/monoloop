@@ -172,6 +172,14 @@ impl TaskSupervisor {
         }
     }
 
+    /// Abort all tasks and observe joins until the set is empty.
+    pub async fn abort_and_drain(&mut self) {
+        self.abort_all();
+        while self.join_next().await.is_some() {}
+        self.meta.clear();
+        self.by_transaction.clear();
+    }
+
     /// Poll for the next finished task and deregister it.
     pub async fn join_next(&mut self) -> Option<(TaskId, TaskClass, TaskExit)> {
         let finished = self.joins.join_next().await?;
@@ -184,7 +192,7 @@ impl TaskSupervisor {
                 } else {
                     exit
                 };
-                let class = self.deregister(id);
+                let class = self.deregister(id)?;
                 Some((id, class, exit))
             }
             Err(err) => {
@@ -195,7 +203,7 @@ impl TaskSupervisor {
                     TaskExit::Panicked
                 };
                 let id = self.find_finished_meta()?;
-                let class = self.deregister(id);
+                let class = self.deregister(id)?;
                 Some((id, class, exit))
             }
         }
@@ -207,8 +215,9 @@ impl TaskSupervisor {
         while let Some(finished) = self.joins.try_join_next() {
             match finished {
                 Ok((id, exit)) => {
-                    let class = self.deregister(id);
-                    out.push((id, class, exit));
+                    if let Some(class) = self.deregister(id) {
+                        out.push((id, class, exit));
+                    }
                 }
                 Err(err) => {
                     let exit = if err.is_cancelled() {
@@ -217,8 +226,9 @@ impl TaskSupervisor {
                         TaskExit::Panicked
                     };
                     if let Some(id) = self.find_finished_meta() {
-                        let class = self.deregister(id);
-                        out.push((id, class, exit));
+                        if let Some(class) = self.deregister(id) {
+                            out.push((id, class, exit));
+                        }
                     }
                 }
             }
@@ -233,8 +243,8 @@ impl TaskSupervisor {
             .map(|(id, _)| *id)
     }
 
-    fn deregister(&mut self, id: TaskId) -> TaskClass {
-        let meta = self.meta.remove(&id).expect("task meta present at join");
+    fn deregister(&mut self, id: TaskId) -> Option<TaskClass> {
+        let meta = self.meta.remove(&id)?;
         if let Some(tx) = meta.class.transaction_id() {
             if let Some(set) = self.by_transaction.get_mut(&tx) {
                 set.remove(&id);
@@ -243,6 +253,6 @@ impl TaskSupervisor {
                 }
             }
         }
-        meta.class
+        Some(meta.class)
     }
 }

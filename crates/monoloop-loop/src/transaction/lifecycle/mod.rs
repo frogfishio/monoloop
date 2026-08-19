@@ -10,6 +10,8 @@ mod admission;
 mod capacity;
 mod coordinator;
 mod delivery;
+mod event_publisher;
+mod exchange_direct;
 mod ledger;
 mod owner;
 mod shutdown;
@@ -18,16 +20,17 @@ mod task_supervisor;
 mod terminal;
 
 pub use capacity::{ReservationPool, ReservationPoolError, TransactionReservations};
-pub use coordinator::TransactionCoordinator;
 pub use delivery::{
     adapt_completion_callback, adapt_event_sink, HostCompletionAdapter, HostEventAdapter,
 };
+#[allow(unused_imports)]
+pub use event_publisher::{EventPublisherCommand, TerminalPublicationResult};
 pub use ledger::{LedgerEntry, LifecycleLedger, TransactionPhase};
 pub use owner::{RuntimeOwner, StartedRuntime, TransactionRuntimeHandle};
 pub use shutdown::ShutdownTicket;
 pub use supervisor::SupervisorCommand;
 pub use task_supervisor::{TaskClass, TaskExit, TaskId, TaskSupervisor};
-pub use terminal::{build_completion, TerminalDecision};
+pub use terminal::{build_completion, TerminalDecision, TerminalProposal};
 
 #[cfg(test)]
 mod tests;

@@ -249,8 +249,10 @@ pub enum TransactionEventPayload {
     ToolLifecycle(ToolLifecycleEvent),
     /// Safe diagnostic.
     Diagnostic(TransactionDiagnostic),
-    /// Terminal event (exactly once).
+    /// Terminal event (exactly once) — legacy v1 shape with embedded delivery.
     Ended(TransactionEnd),
+    /// Terminal event body without self-referential delivery (Runtime v2).
+    EndedEvent(TransactionEndEvent),
 }
 
 /// Bounded safe transaction diagnostic.

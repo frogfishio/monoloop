@@ -42,8 +42,8 @@ pub use lifecycle::{
     adapt_completion_callback, adapt_event_sink, build_completion, HostCompletionAdapter,
     HostEventAdapter, LedgerEntry, LifecycleLedger, ReservationPool, ReservationPoolError,
     RuntimeOwner, ShutdownTicket, StartedRuntime, SupervisorCommand, TaskClass, TaskExit, TaskId,
-    TaskSupervisor, TerminalDecision, TransactionCoordinator, TransactionPhase,
-    TransactionReservations, TransactionRuntimeHandle,
+    TaskSupervisor, TerminalDecision, TerminalProposal, TransactionPhase, TransactionReservations,
+    TransactionRuntimeHandle,
 };
 pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};
 pub use resolved_tools::{ResolvedTool, ResolvedToolSet};

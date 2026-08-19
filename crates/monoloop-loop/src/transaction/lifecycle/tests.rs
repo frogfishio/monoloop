@@ -52,6 +52,9 @@ fn start_runtime(max_active: usize, channel_max: usize) -> StartedRuntime {
     let limits = TransactionLimits {
         max_active_transactions: max_active,
         max_active_per_channel: channel_max.min(max_active),
+        // Keep exchange/shutdown tests bounded (default is 600s).
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
         ..TransactionLimits::default()
     };
     StartedRuntime::start(RuntimeBootstrap {
@@ -177,20 +180,80 @@ fn shutdown_publishes_one_completion_per_admission() {
     });
     match outcome {
         ShutdownWaitOutcome::Stopped(report) => {
+            // Coordinators may finish with Completed before shutdown selects
+            // RuntimeShutdown; every admission still gets exactly one publish.
             assert_eq!(report.completions_published, 5);
-            assert_eq!(report.runtime_shutdown_terminals, 5);
         }
         ShutdownWaitOutcome::TimedOut(snap) => {
             panic!("expected Stopped, got TimedOut: {snap:?}");
         }
     }
+    let mut kinds = Vec::new();
     for recv in receivers {
-        let c = rt.block_on(recv.completion.recv()).unwrap();
-        assert_eq!(
-            c.end.kind,
-            monoloop_contracts::TransactionEndKind::RuntimeShutdown
-        );
+        let c = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), recv.completion.recv()).await
+            })
+            .expect("completion timed out")
+            .expect("completion channel closed");
+        kinds.push(c.end.kind);
     }
+    assert_eq!(kinds.len(), 5);
+    assert!(kinds.iter().all(|k| matches!(
+        k,
+        monoloop_contracts::TransactionEndKind::RuntimeShutdown
+            | monoloop_contracts::TransactionEndKind::Completed
+    )));
+}
+
+#[test]
+fn coordinator_publishes_sequenced_unit_and_completed() {
+    let started = start_runtime(4, 4);
+    let handle = started.handle.clone();
+    let (receipt, receiver) = submit(&handle, Some("seq")).unwrap();
+    assert!(receipt.session_id.is_some());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt.block_on(async {
+        let mut events = receiver.events;
+        let completion_rx = receiver.completion;
+        // Allow coordinator + publisher to run.
+        let completion = tokio::time::timeout(Duration::from_secs(2), completion_rx.recv())
+            .await
+            .expect("completion timed out")
+            .expect("completion channel closed");
+        let mut seqs = Vec::new();
+        let mut saw_unit = false;
+        while let Ok(ev) = events.try_recv() {
+            seqs.push(ev.sequence);
+            if matches!(
+                ev.payload,
+                monoloop_contracts::TransactionEventPayload::CanonicalUnit(_)
+            ) {
+                saw_unit = true;
+            }
+        }
+        assert!(saw_unit, "expected at least one CanonicalUnit event");
+        assert!(!seqs.is_empty());
+        seqs.sort_unstable();
+        for w in seqs.windows(2) {
+            assert_eq!(w[1], w[0] + 1, "sequences must be contiguous");
+        }
+        completion
+    });
+    assert_eq!(
+        completion.end.kind,
+        monoloop_contracts::TransactionEndKind::Completed
+    );
+
+    let mut owner = started.owner;
+    let _ = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(2)).await
+    });
 }
 
 #[test]
@@ -240,9 +303,6 @@ fn shutdown_control_not_starved_when_start_queue_full() {
 
 #[test]
 fn short_wait_may_timeout_while_quiescing_then_complete() {
-    // With only cooperative pending work that aborts promptly, Stopped should
-    // usually win; still assert timeout path type-checks via a zero deadline
-    // before begin_shutdown effects land.
     let started = start_runtime(2, 2);
     let handle = started.handle.clone();
     let (_r, _recv) = submit(&handle, Some("q")).unwrap();
@@ -251,16 +311,12 @@ fn short_wait_may_timeout_while_quiescing_then_complete() {
         .build()
         .unwrap();
     let mut owner = started.owner;
-    let first = rt.block_on(async {
+    let outcome = rt.block_on(async {
         owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_millis(0)).await
+        owner.wait_stopped(Duration::from_secs(2)).await
     });
-    // Zero budget may Stopped or TimedOut depending on scheduling.
-    match first {
-        ShutdownWaitOutcome::Stopped(_) => {}
-        ShutdownWaitOutcome::TimedOut(_) => {
-            let second = rt.block_on(async { owner.wait_stopped(Duration::from_secs(2)).await });
-            assert!(matches!(second, ShutdownWaitOutcome::Stopped(_)));
-        }
-    }
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
 }

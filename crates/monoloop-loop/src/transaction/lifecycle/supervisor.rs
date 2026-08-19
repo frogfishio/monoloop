@@ -1,20 +1,24 @@
 //! Supervisor command loop and terminal authority (v2 §10 / §13).
 //!
 //! Start commands use a dedicated bounded queue (capacity ≥ max_active).
-//! Cancel / shutdown use a separate control queue so control cannot be starved
-//! when the start queue is full.
+//! Cancel / shutdown use a separate control queue. WorkerExited uses a third
+//! worker queue so coordinators cannot starve start or control.
 
+use super::coordinator::{run_coordinator, CoordinatorParams, WorkerMessage};
+use super::event_publisher::{run_event_publisher, EventPublisherCommand};
 use super::ledger::{LifecycleLedger, TransactionPhase};
 use super::task_supervisor::{TaskClass, TaskSupervisor};
-use super::terminal::{build_completion, end_event, TerminalDecision};
+use super::terminal::{build_completion, end_event, TerminalDecision, TerminalProposal};
+use crate::transaction::channel_registry::LiveChannel;
 use monoloop_contracts::{
-    CleanupStatus, CompletionPublishResult, ShutdownReport, ShutdownSnapshot,
+    ChannelId, CleanupStatus, CompletionPublishResult, ShutdownReport, ShutdownSnapshot,
     TerminalEventDelivery, TransactionEndKind, TransactionId,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// Start-queue commands (admission only).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,7 +27,7 @@ pub enum StartCommand {
     Start(TransactionId),
 }
 
-/// Control-queue commands (cancel / shutdown). Never share the start queue.
+/// Control-queue commands (cancel / shutdown).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlCommand {
     /// Request cooperative cancel.
@@ -36,18 +40,18 @@ pub enum ControlCommand {
     StopSupervisor,
 }
 
-/// Backward-compatible name for docs / exports (control + start vocabulary).
+/// Backward-compatible aggregate name for exports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SupervisorCommand {
-    /// Start an admitted queued transaction.
+    /// Start.
     Start(TransactionId),
-    /// Request cooperative cancel.
+    /// Cancel.
     Cancel(TransactionId),
-    /// Request forced terminate.
+    /// Force terminate.
     ForceTerminate(TransactionId),
-    /// Begin shutdown generation (idempotent).
+    /// Begin shutdown.
     BeginShutdown,
-    /// Driver thread asks the supervisor to stop after quiesce work.
+    /// Stop supervisor.
     StopSupervisor,
 }
 
@@ -60,12 +64,12 @@ pub(crate) const STATE_STOPPED: u8 = 3;
 pub(crate) struct RuntimeShared {
     pub state: AtomicU8,
     pub ledger: Mutex<LifecycleLedger>,
-    /// Admission → supervisor start queue (capacity = max_active).
     pub start_tx: mpsc::Sender<StartCommand>,
-    /// Cancel / shutdown control queue (never shares start capacity).
     pub control_tx: mpsc::Sender<ControlCommand>,
-    /// Wakes the supervisor when Quiescing is set even if control send fails.
+    pub worker_tx: mpsc::Sender<WorkerMessage>,
     pub wake: Notify,
+    pub channels: Arc<HashMap<ChannelId, LiveChannel>>,
+    pub default_deadline: Duration,
     pub shutdown_generation: AtomicU64,
     pub shutdown_report: Mutex<Option<ShutdownReport>>,
     pub completions_published: AtomicU64,
@@ -111,27 +115,24 @@ pub(crate) async fn run_supervisor(
     shared: Arc<RuntimeShared>,
     mut start_rx: mpsc::Receiver<StartCommand>,
     mut control_rx: mpsc::Receiver<ControlCommand>,
+    mut worker_rx: mpsc::Receiver<WorkerMessage>,
 ) {
     let mut tasks = TaskSupervisor::new();
     let mut stopping = false;
 
     loop {
-        // Prefer reaping finished tasks without waiting when busy.
         for (_id, class, _exit) in tasks.try_reap_finished() {
-            if let TaskClass::TransactionCoordinator(tx) = class {
-                finish_cleanup_if_pending(&shared, &tx);
-            }
+            on_task_exit(&shared, &mut tasks, &class);
         }
 
-        // Quiescing may be set by the owner even when control try_send fails.
         if !stopping && shared.state.load(Ordering::SeqCst) == STATE_QUIESCING {
             begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
         }
 
-        if stopping
-            && shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true)
-            && tasks.is_empty()
-        {
+        if stopping && shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true) {
+            if !tasks.is_empty() {
+                tasks.abort_and_drain().await;
+            }
             shared.state.store(STATE_STOPPED, Ordering::SeqCst);
             *shared
                 .shutdown_report
@@ -143,13 +144,8 @@ pub(crate) async fn run_supervisor(
         tokio::select! {
             biased;
             finished = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some((
-                    _id,
-                    TaskClass::TransactionCoordinator(tx),
-                    _exit,
-                )) = finished
-                {
-                    finish_cleanup_if_pending(&shared, &tx);
+                if let Some((_id, class, _exit)) = finished {
+                    on_task_exit(&shared, &mut tasks, &class);
                 }
             }
             ctrl = control_rx.recv() => {
@@ -159,10 +155,10 @@ pub(crate) async fn run_supervisor(
                         tasks.abort_all();
                     }
                     Some(ControlCommand::Cancel(tx)) => {
-                        request_cancel(&shared, &mut tasks, tx, false);
+                        accept_terminal(&shared, &mut tasks, tx, TerminalProposal::new(TransactionEndKind::Cancelled), false);
                     }
                     Some(ControlCommand::ForceTerminate(tx)) => {
-                        request_cancel(&shared, &mut tasks, tx, true);
+                        accept_terminal(&shared, &mut tasks, tx, TerminalProposal::new(TransactionEndKind::Terminated), true);
                     }
                     Some(ControlCommand::BeginShutdown) => {
                         begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
@@ -173,22 +169,19 @@ pub(crate) async fn run_supervisor(
                     }
                 }
             }
+            msg = worker_rx.recv() => {
+                if let Some(WorkerMessage::WorkerExited { transaction_id, proposal }) = msg {
+                    accept_terminal(&shared, &mut tasks, transaction_id, proposal, false);
+                }
+            }
             _ = shared.wake.notified() => {
                 if shared.state.load(Ordering::SeqCst) == STATE_QUIESCING {
                     begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
                 }
             }
             start = start_rx.recv() => {
-                match start {
-                    None => {
-                        // Start queue closed — do not treat as shutdown by itself.
-                    }
-                    Some(StartCommand::Start(tx)) => {
-                        // Reject starting new work once quiescing.
-                        if shared.state.load(Ordering::SeqCst) != STATE_ACCEPTING {
-                            // Leave the ledger entry for shutdown finalization.
-                            continue;
-                        }
+                if let Some(StartCommand::Start(tx)) = start {
+                    if shared.state.load(Ordering::SeqCst) == STATE_ACCEPTING {
                         handle_start(&shared, &mut tasks, tx);
                     }
                 }
@@ -197,8 +190,26 @@ pub(crate) async fn run_supervisor(
     }
 }
 
+fn on_task_exit(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, class: &TaskClass) {
+    let Some(tx) = class.transaction_id() else {
+        return;
+    };
+    if tasks.tasks_for(&tx).is_empty() {
+        try_remove_tombstone(shared, &tx);
+    }
+}
+
 fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: TransactionId) {
-    let cancel = {
+    let (
+        cancel,
+        channel_id,
+        session_id,
+        input,
+        invocation_config,
+        session_config,
+        event_tx,
+        deadline,
+    ) = {
         let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = ledger.get_mut(&tx) else {
             return;
@@ -206,45 +217,202 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         if entry.phase != TransactionPhase::Queued {
             return;
         }
-        // M2: no Connector/Interpreter yet — park in Running until cancel/shutdown.
+        let Some(delivery) = entry.delivery.take() else {
+            return;
+        };
+        entry.completion_tx = Some(delivery.completion_tx);
         entry.phase = TransactionPhase::Running;
-        std::sync::Arc::clone(&entry.resources.cancel)
+        let session_id = entry.session_key.as_ref().map(|k| k.session_id.clone());
+        (
+            Arc::clone(&entry.resources.cancel),
+            entry.channel_id.clone(),
+            session_id,
+            entry.input.clone(),
+            entry.invocation_config.clone(),
+            entry.session_config.clone(),
+            delivery.event_tx,
+            shared.default_deadline,
+        )
+    };
+
+    let (pub_tx, pub_rx) = mpsc::channel::<EventPublisherCommand>(64);
+    {
+        let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = ledger.get_mut(&tx) {
+            entry.publisher_cmd_tx = Some(pub_tx.clone());
+        }
+    }
+
+    let pub_tx_task = pub_tx.clone();
+    let channel_id_pub = channel_id.clone();
+    let session_id_pub = session_id.clone();
+    tasks.spawn(TaskClass::EventPublisher(tx), async move {
+        let _ = run_event_publisher(tx, channel_id_pub, session_id_pub, event_tx, pub_rx).await;
+        let _ = pub_tx_task;
+    });
+
+    let params = CoordinatorParams {
+        transaction_id: tx,
+        cancel,
+        channel_id,
+        session_id,
+        input,
+        invocation_config,
+        session_config,
+        channels: Arc::clone(&shared.channels),
+        publish_tx: pub_tx,
+        worker_tx: shared.worker_tx.clone(),
+        deadline,
     };
     tasks.spawn(TaskClass::TransactionCoordinator(tx), async move {
-        cancel.notified().await;
+        run_coordinator(params).await;
     });
-    let _ = shared;
 }
 
-fn request_cancel(
+fn accept_terminal(
     shared: &Arc<RuntimeShared>,
     tasks: &mut TaskSupervisor,
     tx: TransactionId,
-    force: bool,
+    proposal: TerminalProposal,
+    force_upgrade: bool,
 ) {
-    let kind = if force {
-        TransactionEndKind::Terminated
-    } else {
-        TransactionEndKind::Cancelled
-    };
-    {
+    let (first_decision, pub_cmd, kind) = {
         let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = ledger.get_mut(&tx) else {
             return;
         };
-        if entry.terminal.is_some() {
-            return;
+        let first = entry.terminal.is_none();
+        if let Some(existing) = entry.terminal.as_ref() {
+            if force_upgrade
+                && existing.kind == TransactionEndKind::Cancelled
+                && proposal.kind == TransactionEndKind::Terminated
+            {
+                entry.terminal = Some(TerminalDecision::new(TransactionEndKind::Terminated));
+            }
+        } else {
+            entry.terminal = Some(TerminalDecision::new(proposal.kind));
+            entry.phase = TransactionPhase::Finalizing;
         }
-        entry.phase = TransactionPhase::Cancelling;
         entry.resources.cancel.notify_waiters();
-        entry.terminal = Some(TerminalDecision::new(kind));
-        entry.phase = TransactionPhase::Finalizing;
+        let kind = entry
+            .terminal
+            .as_ref()
+            .map(|t| t.kind)
+            .unwrap_or(proposal.kind);
+        (first, entry.publisher_cmd_tx.clone(), kind)
+    };
+
+    // Wake coordinator; do not abort publisher until Seal is sent.
+    if let Ok(mut ledger) = shared.ledger.lock() {
+        if let Some(entry) = ledger.get_mut(&tx) {
+            entry.resources.cancel.notify_waiters();
+        }
     }
-    tasks.abort_transaction(&tx);
-    publish_and_tombstone(shared, tx, kind);
-    if tasks.tasks_for(&tx).is_empty() {
-        finish_cleanup_if_pending(shared, &tx);
+
+    if first_decision {
+        let shared2 = Arc::clone(shared);
+        tasks.spawn(TaskClass::RuntimeService, async move {
+            finalize_after_terminal(shared2, tx, kind, pub_cmd).await;
+        });
     }
+}
+
+async fn finalize_after_terminal(
+    shared: Arc<RuntimeShared>,
+    tx: TransactionId,
+    kind: TransactionEndKind,
+    pub_cmd: Option<mpsc::Sender<EventPublisherCommand>>,
+) {
+    let (channel_id, session_id) = {
+        let ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = ledger.get(&tx) else {
+            return;
+        };
+        (
+            entry.channel_id.clone(),
+            entry.session_key.as_ref().map(|k| k.session_id.clone()),
+        )
+    };
+
+    let mut terminal_delivery = TerminalEventDelivery::Published;
+    let mut last_seq = 0u64;
+    if let Some(cmd_tx) = pub_cmd {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let terminal = end_event(tx, channel_id.clone(), session_id.clone(), kind, 0);
+        if cmd_tx
+            .send(EventPublisherCommand::Seal {
+                terminal,
+                reply: reply_tx,
+            })
+            .await
+            .is_ok()
+        {
+            if let Ok(Ok(res)) = tokio::time::timeout(Duration::from_secs(5), reply_rx).await {
+                terminal_delivery = res.delivery;
+                last_seq = res.last_sequence;
+            } else {
+                terminal_delivery = TerminalEventDelivery::DeadlineExceeded;
+            }
+        } else {
+            terminal_delivery = TerminalEventDelivery::QueueClosed;
+        }
+    }
+
+    let completion_tx = {
+        let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = ledger.get_mut(&tx) else {
+            return;
+        };
+        // Shutdown may win before Start splits delivery ports.
+        if entry.completion_tx.is_none() {
+            if let Some(delivery) = entry.delivery.take() {
+                entry.completion_tx = Some(delivery.completion_tx);
+                // Drop unused event sender — no publisher was started.
+                drop(delivery.event_tx);
+            }
+        }
+        entry.event_sequence = last_seq;
+        entry.phase = TransactionPhase::CleanupPending;
+        entry.completion_tx.take()
+    };
+
+    let end = end_event(tx, channel_id, session_id, kind, last_seq);
+    let completion = build_completion(
+        end,
+        terminal_delivery,
+        CleanupStatus::Pending {
+            owned_tasks: 1,
+            owned_processes: 0,
+            cooperative_tools: 0,
+        },
+    );
+    if let Some(sender) = completion_tx {
+        match sender.send(completion) {
+            CompletionPublishResult::Published => {
+                shared.completions_published.fetch_add(1, Ordering::SeqCst);
+            }
+            CompletionPublishResult::ReceiverDropped => {
+                shared.completions_published.fetch_add(1, Ordering::SeqCst);
+                shared
+                    .completions_receiver_dropped
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            CompletionPublishResult::InvariantFailed => {
+                shared
+                    .completions_invariant_failed
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    } else {
+        shared
+            .completions_invariant_failed
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    // Completion published — remove tombstone once no per-tx tasks remain.
+    // (RuntimeService finalize has no TransactionId, so on_task_exit alone
+    // would miss this transition.)
+    try_remove_tombstone(&shared, &tx);
 }
 
 fn begin_shutdown_inner(
@@ -269,107 +437,51 @@ fn begin_shutdown_inner(
         .unwrap_or_else(|e| e.into_inner())
         .transaction_ids();
     for tx in ids {
-        let should_publish = {
-            let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(entry) = ledger.get_mut(&tx) else {
-                continue;
-            };
-            if entry.terminal.is_some() {
-                false
-            } else {
-                entry.terminal = Some(TerminalDecision::new(TransactionEndKind::RuntimeShutdown));
-                entry.phase = TransactionPhase::Finalizing;
-                entry.resources.cancel.notify_waiters();
-                true
-            }
+        let already = {
+            let ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            ledger.get(&tx).and_then(|e| e.terminal.as_ref()).is_some()
         };
-        tasks.abort_transaction(&tx);
-        if should_publish {
+        if !already {
             shared
                 .runtime_shutdown_terminals
                 .fetch_add(1, Ordering::SeqCst);
-            publish_and_tombstone(shared, tx, TransactionEndKind::RuntimeShutdown);
-        }
-        if tasks.tasks_for(&tx).is_empty() {
-            finish_cleanup_if_pending(shared, &tx);
-        }
-    }
-    tasks.abort_all();
-}
-
-fn publish_and_tombstone(shared: &Arc<RuntimeShared>, tx: TransactionId, kind: TransactionEndKind) {
-    let (delivery, channel_id, session_id, seq) = {
-        let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = ledger.get_mut(&tx) else {
-            return;
-        };
-        let delivery = entry.delivery.take();
-        let channel_id = entry.channel_id.clone();
-        let session_id = entry.session_key.as_ref().map(|k| k.session_id.clone());
-        let seq = entry.event_sequence.saturating_add(1);
-        entry.event_sequence = seq;
-        entry.phase = TransactionPhase::CleanupPending;
-        (delivery, channel_id, session_id, seq)
-    };
-
-    let Some(delivery) = delivery else {
-        shared
-            .completions_invariant_failed
-            .fetch_add(1, Ordering::SeqCst);
-        // Still remove to avoid permanent ledger leak when delivery missing.
-        let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = ledger.remove(&tx);
-        return;
-    };
-
-    let end = end_event(tx, channel_id, session_id, kind, seq);
-    // M2: skip event stream Ended enqueue details; record delivery as Published
-    // when completion send is attempted (event path fills in M3).
-    let terminal_event_delivery = TerminalEventDelivery::Published;
-    let completion = build_completion(
-        end,
-        terminal_event_delivery,
-        CleanupStatus::Pending {
-            owned_tasks: 1,
-            owned_processes: 0,
-            cooperative_tools: 0,
-        },
-    );
-    match delivery.completion_tx.send(completion) {
-        CompletionPublishResult::Published => {
-            shared.completions_published.fetch_add(1, Ordering::SeqCst);
-        }
-        CompletionPublishResult::ReceiverDropped => {
-            shared.completions_published.fetch_add(1, Ordering::SeqCst);
-            shared
-                .completions_receiver_dropped
-                .fetch_add(1, Ordering::SeqCst);
-        }
-        CompletionPublishResult::InvariantFailed => {
-            shared
-                .completions_invariant_failed
-                .fetch_add(1, Ordering::SeqCst);
+            accept_terminal(
+                shared,
+                tasks,
+                tx,
+                TerminalProposal::new(TransactionEndKind::RuntimeShutdown),
+                false,
+            );
+        } else {
+            // Ensure cancel wake + abort for residual work.
+            if let Ok(mut ledger) = shared.ledger.lock() {
+                if let Some(entry) = ledger.get_mut(&tx) {
+                    entry.resources.cancel.notify_waiters();
+                }
+            }
+            tasks.abort_transaction(&tx);
         }
     }
-
-    // If coordinator already gone, finish cleanup now; else wait for join.
-    // Reservations release on ledger remove.
 }
 
-fn finish_cleanup_if_pending(shared: &Arc<RuntimeShared>, tx: &TransactionId) {
+fn try_remove_tombstone(shared: &Arc<RuntimeShared>, tx: &TransactionId) {
     let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
     let Some(entry) = ledger.get(tx) else {
         return;
     };
-    if matches!(
-        entry.phase,
-        TransactionPhase::CleanupPending | TransactionPhase::Finalizing
-    ) {
+    // After completion publish, M3 synthetic path has no residual owned work
+    // that requires a tombstone — remove so shutdown can reach Stopped.
+    if entry.completion_tx.is_none()
+        && matches!(
+            entry.phase,
+            TransactionPhase::CleanupPending | TransactionPhase::Finalizing
+        )
+    {
         let _ = ledger.remove(tx);
     }
 }
 
-/// Wait helper used by owner: poll until Stopped or deadline.
+/// Wait helper used by owner.
 pub(crate) async fn wait_until_stopped(
     shared: &Arc<RuntimeShared>,
     deadline: Duration,

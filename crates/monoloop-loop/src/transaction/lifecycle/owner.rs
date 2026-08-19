@@ -7,6 +7,7 @@ use super::super::host_tools::HostToolRegistry;
 use super::super::state::RuntimeState;
 use super::admission::admit;
 use super::capacity::{ReservationPool, ReservationPoolError};
+use super::coordinator::WorkerMessage;
 use super::ledger::LifecycleLedger;
 use super::shutdown::ShutdownTicket;
 use super::supervisor::{
@@ -124,12 +125,18 @@ impl StartedRuntime {
         let (start_tx, start_rx) = mpsc::channel(max_active);
         let control_capacity = max_active.saturating_add(8);
         let (control_tx, control_rx) = mpsc::channel(control_capacity);
+        let worker_capacity = max_active.saturating_add(8);
+        let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(worker_capacity);
+        let channels = Arc::new(live);
         let shared = Arc::new(RuntimeShared {
             state: AtomicU8::new(STATE_STARTING),
             ledger: Mutex::new(LifecycleLedger::new()),
             start_tx,
             control_tx,
+            worker_tx,
             wake: Notify::new(),
+            channels: Arc::clone(&channels),
+            default_deadline: bootstrap.config.transaction_limits.transaction_deadline,
             shutdown_generation: AtomicU64::new(0),
             shutdown_report: Mutex::new(None),
             completions_published: AtomicU64::new(0),
@@ -157,7 +164,12 @@ impl StartedRuntime {
                 };
                 shared_thread.state.store(STATE_ACCEPTING, Ordering::SeqCst);
                 let _ = ready_tx.send(Ok(()));
-                rt.block_on(run_supervisor(shared_thread, start_rx, control_rx));
+                rt.block_on(run_supervisor(
+                    shared_thread,
+                    start_rx,
+                    control_rx,
+                    worker_rx,
+                ));
             })
             .map_err(|_| StartupError::ExecutorUnavailable)?;
 
@@ -165,7 +177,6 @@ impl StartedRuntime {
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| StartupError::ExecutorUnavailable)??;
 
-        let channels = Arc::new(live);
         let tools = bootstrap.tools;
         let max_tools = bootstrap
             .config

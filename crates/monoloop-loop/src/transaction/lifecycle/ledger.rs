@@ -3,7 +3,8 @@
 use super::capacity::TransactionReservations;
 use super::terminal::TerminalDecision;
 use monoloop_contracts::{
-    ChannelId, SessionKey, TransactionDelivery, TransactionId, TransactionUsage,
+    CanonicalInput, ChannelId, InvocationConfig, SessionConfig, SessionKey, ToolId,
+    TransactionCompletionSender, TransactionDelivery, TransactionId, TransactionUsage,
 };
 use std::collections::HashMap;
 use tokio::sync::Notify;
@@ -38,15 +39,28 @@ pub struct LedgerEntry {
     pub terminal: Option<TerminalDecision>,
     /// Last allocated event sequence (0 = none yet).
     pub event_sequence: u64,
-    /// Delivery ports (taken at completion publish).
+    /// Full delivery ports at admit; taken at Start (split into publisher + completion).
     pub delivery: Option<TransactionDelivery>,
+    /// Completion sender retained until Seal + publish.
+    pub completion_tx: Option<TransactionCompletionSender>,
+    /// Command sender to this transaction's event publisher (for Seal).
+    pub publisher_cmd_tx:
+        Option<tokio::sync::mpsc::Sender<super::event_publisher::EventPublisherCommand>>,
+    /// Canonical input captured at admission.
+    pub input: CanonicalInput,
+    /// Invocation configuration.
+    pub invocation_config: InvocationConfig,
+    /// Optional session configuration.
+    pub session_config: Option<SessionConfig>,
+    /// Selected tool ids.
+    pub tools: Vec<ToolId>,
     /// RAII reservations.
     pub reservations: Option<TransactionReservations>,
     /// Cancel / control knobs.
     pub resources: ResourceControls,
     /// Usage facts.
     pub usage: TransactionUsage,
-    /// Bounded diagnostics (count only for M2; codes land with coordinator).
+    /// Bounded diagnostics count.
     pub diagnostic_count: u32,
 }
 
