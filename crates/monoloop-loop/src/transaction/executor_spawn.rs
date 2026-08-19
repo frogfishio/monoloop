@@ -1,8 +1,10 @@
 //! Spawn on an injected [`tokio::runtime::Handle`] (D-032).
 //!
 //! Synchronous admission must not rely on ambient `tokio::spawn`. Spawns are
-//! non-blocking and fail closed when the [`SpawnGate`] is closed or the
-//! executor has already cancelled the join without polling.
+//! non-blocking and fail closed when the [`SpawnGate`] is closed, spawn panics,
+//! or the join is already cancelled without starting. Concurrent executor
+//! shutdown after return is narrowed by a post-spawn yield + recheck; the task
+//! body also refuses caller work if the gate closed before first poll.
 
 use super::spawn_gate::SpawnGate;
 use std::future::Future;
@@ -14,13 +16,8 @@ use tokio::task::JoinHandle;
 
 /// Spawn `future` on `executor` without requiring an entered Tokio context.
 ///
-/// Returns `Err(())` when:
-/// - the [`SpawnGate`] is closed (runtime shutting down),
-/// - `spawn` panics,
-/// - or the join is already finished without the task having started.
-///
-/// If the gate closes after return but before first poll, the task parks on
-/// `pending` until aborted (never runs caller work) and shutdown joins it.
+/// Returns `Err(())` when the gate is closed, spawn panics, or the join is
+/// already cancelled without the task having started (executor shut down).
 pub(crate) fn try_spawn<F>(
     executor: &Handle,
     gate: &SpawnGate,
@@ -38,7 +35,7 @@ where
     let gate_body = gate.clone();
     let wrapped = async move {
         if !gate_body.is_open() {
-            // Do not run caller work after shutdown closed the gate.
+            // Gate closed between spawn and first poll — do not run caller work.
             std::future::pending::<F::Output>().await
         } else {
             started_flag.store(true, Ordering::SeqCst);
@@ -50,6 +47,12 @@ where
         handle.abort();
         return Err(());
     }
+    // Detect executor-shutdown cancel that completed before first poll.
+    // One scheduler yield narrows the race without a timed wait (non-blocking admit).
+    if handle.is_finished() && !started.load(Ordering::SeqCst) {
+        return Err(());
+    }
+    std::thread::yield_now();
     if handle.is_finished() && !started.load(Ordering::SeqCst) {
         return Err(());
     }

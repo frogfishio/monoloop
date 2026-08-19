@@ -138,13 +138,17 @@ impl ToolKillHandle {
         }
     }
 
-    /// Await worker teardown after kill (unbounded). Prefer after abort so the
-    /// join completes when the task is cancelled; keeps ownership until Ready.
-    pub async fn join(&self) {
-        let handle = self.join.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(h) = handle {
-            let _ = h.await;
-        }
+    /// Take the join handle if still present (for vaulting on dispatch drop).
+    pub(crate) fn take_join(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.join.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// Whether a join handle is still owned (not yet completed/taken).
+    pub(crate) fn has_join(&self) -> bool {
+        self.join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 }
 

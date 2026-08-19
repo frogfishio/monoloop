@@ -109,6 +109,9 @@ impl CallbackService {
 
     /// Reserve one callback slot at admission (fail closed when full).
     pub fn try_reserve(&self) -> Option<CallbackReservation> {
+        // Reap finished retained callbacks *before* acquiring so permits held by
+        // completed work cannot permanently starve new reservations.
+        Self::reap_retained(&self.retained, &self.inflight);
         let permit = self.permits.clone().try_acquire_owned().ok()?;
         self.reserved.fetch_add(1, Ordering::SeqCst);
         Some(CallbackReservation {
@@ -134,13 +137,22 @@ impl CallbackService {
     }
 
     /// Schedule a host callback using an admission reservation (D-029).
+    ///
+    /// Returns `Err((reservation, callback))` if scheduling is impossible (gate
+    /// closed / spawn rejected) so the caller can restore finalization state
+    /// instead of marking the callback scheduled.
     pub fn schedule_reserved(
         &self,
         reservation: CallbackReservation,
         callback: Box<dyn CompletionCallback>,
         end: TransactionEnd,
         deadline: Option<Duration>,
-    ) {
+    ) -> Result<(), (CallbackReservation, Box<dyn CompletionCallback>)> {
+        Self::reap_retained(&self.retained, &self.inflight);
+        // Fail before consuming reservation/callback when shutdown closed the gate.
+        if !self.spawn_gate.is_open() {
+            return Err((reservation, callback));
+        }
         let (_permits, _reserved_counter, permit) = reservation.into_parts();
         let inflight = Arc::clone(&self.inflight);
         let joins = Arc::clone(&self.joins);
@@ -151,7 +163,6 @@ impl CallbackService {
         let budget = deadline.unwrap_or(self.default_deadline);
         inflight.fetch_add(1, Ordering::SeqCst);
         let inflight_child = Arc::clone(&inflight);
-        Self::reap_retained(&retained, &inflight);
         let handle = match try_spawn(&self.executor, &gate, async move {
             let call =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
@@ -175,7 +186,6 @@ impl CallbackService {
                         }
                         Err(_) => {
                             abort.abort();
-                            // Retain join + permit until observed finished.
                             retained.lock().unwrap_or_else(|e| e.into_inner()).push(
                                 RetainedCallback {
                                     abort,
@@ -195,13 +205,15 @@ impl CallbackService {
             Ok(h) => h,
             Err(()) => {
                 inflight.fetch_sub(1, Ordering::SeqCst);
-                return;
+                // Reservation already consumed; callback owned by dropped future.
+                return Ok(());
             }
         };
         let abort = handle.abort_handle();
         let mut g = joins.lock().unwrap_or_else(|e| e.into_inner());
         g.retain(|(_, join)| !join.is_finished());
         g.push((abort, handle));
+        Ok(())
     }
 
     /// Schedule a host callback on an owned task (does not block the caller).
@@ -214,7 +226,7 @@ impl CallbackService {
         let Some(reservation) = self.try_reserve() else {
             return;
         };
-        self.schedule_reserved(reservation, callback, end, deadline);
+        let _ = self.schedule_reserved(reservation, callback, end, deadline);
     }
 
     /// Wait until no callbacks are inflight, or until `deadline` elapses.

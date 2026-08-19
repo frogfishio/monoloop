@@ -1,8 +1,9 @@
 //! Single validated execution path for linked tools (MCP and model share this).
 
 use super::resolved_tools::ResolvedToolSet;
-use super::tool_capacity::{SharedToolCapacity, TransactionToolCapacity};
+use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapacity};
 use super::tool_handler::{ToolExecutionControl, ToolKillHandle};
+use super::tool_join_vault::global_tool_join_vault;
 use super::validation::{
     validate_tool_completion, validate_tool_input, InputValidationFailure, DEFAULT_MAX_JSON_DEPTH,
 };
@@ -262,6 +263,11 @@ impl TransactionToolDispatcher {
                 }
             }
         };
+        // RAII: if this future is dropped mid-join, park worker+permit in the vault.
+        let mut dispatch_guard = DispatchGuard {
+            permit: Some(permit),
+            kill: None,
+        };
 
         let mut lifecycle = vec![ToolLifecycleEvent::Started {
             tool_action_id: action.clone(),
@@ -299,7 +305,7 @@ impl TransactionToolDispatcher {
             ToolCancellationPolicy::Cooperative { .. } => true,
         };
         if !supports_required_termination {
-            drop(permit);
+            drop(dispatch_guard);
             lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
                 tool_action_id: action.clone(),
                 tool_id: tool_id.clone(),
@@ -317,7 +323,7 @@ impl TransactionToolDispatcher {
         let handle = match start_result {
             Ok(Ok(h)) => h,
             Ok(Err(ToolStartError::CapacityExceeded)) => {
-                drop(permit);
+                drop(dispatch_guard);
                 return DispatchOutcome::Rejected {
                     tool_action_id: action,
                     code: "tool_capacity_exceeded",
@@ -326,7 +332,7 @@ impl TransactionToolDispatcher {
                 };
             }
             Ok(Err(ToolStartError::Rejected(reason))) => {
-                drop(permit);
+                drop(dispatch_guard);
                 lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
                     tool_action_id: action.clone(),
                     tool_id: tool_id.clone(),
@@ -340,7 +346,7 @@ impl TransactionToolDispatcher {
                 };
             }
             Err(_) => {
-                drop(permit);
+                drop(dispatch_guard);
                 lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
                     tool_action_id: action.clone(),
                     tool_id: tool_id.clone(),
@@ -356,7 +362,8 @@ impl TransactionToolDispatcher {
         };
 
         let control = handle.control.clone();
-        let kill = handle.kill.clone();
+        dispatch_guard.kill = handle.kill.clone();
+        let kill = dispatch_guard.kill.clone();
         // Post-start invariant: claimed Abortable/IsolatedKillable must return a kill handle.
         let kill_ok = match &policy {
             ToolCancellationPolicy::Abortable | ToolCancellationPolicy::IsolatedKillable { .. } => {
@@ -365,12 +372,10 @@ impl TransactionToolDispatcher {
             ToolCancellationPolicy::Cooperative { .. } => true,
         };
         if !kill_ok {
-            // Handler lied about supports_*: without a kill handle we cannot
-            // escalate. Hold the concurrency permit until completion so capacity
-            // cannot be reused while the worker may still be active (D-024).
+            // Handler lied about supports_*: hold permit until completion (D-024).
             control.cancel();
             let _ = handle.completion.wait().await;
-            drop(permit);
+            dispatch_guard.release_if_idle();
             lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
                 tool_action_id: action.clone(),
                 tool_id: tool_id.clone(),
@@ -402,8 +407,11 @@ impl TransactionToolDispatcher {
                 await_tool_termination(&mut wait, &control, kill.as_ref(), &policy).await
             }
         };
-        // Capacity released only after worker joined / terminal selected.
-        drop(permit);
+        // Join worker within a short bound; if still pending, Drop parks join+permit.
+        if let Some(ref k) = dispatch_guard.kill {
+            let _ = k.join_timeout(Duration::from_millis(50)).await;
+        }
+        dispatch_guard.release_if_idle();
 
         let max_output = spec.limits.max_output_bytes.min(self.max_tool_output_bytes);
         let validated = match validate_tool_completion(
@@ -499,10 +507,10 @@ async fn await_tool_termination(
         ToolCancellationPolicy::Abortable => {
             if let Some(k) = kill {
                 k.kill();
-                // Join the worker; on timeout keep ownership and wait for abort
-                // teardown so the permit is not released while work is detached.
+                // Bounded join only — never await unboundedly here (actor cleanup
+                // may drop this future). Unfinished joins stay owned for
+                // DispatchGuard to vault with the permit.
                 if k.join_timeout(join_grace).await.is_err() {
-                    k.join().await;
                     return ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed);
                 }
             }
@@ -524,7 +532,6 @@ async fn await_tool_termination(
                     if let Some(k) = kill {
                         k.kill();
                         if k.join_timeout(join_grace).await.is_err() {
-                            k.join().await;
                             return ToolCompletion::RuntimeFailed(
                                 ToolRuntimeError::TerminationFailed,
                             );
@@ -539,6 +546,41 @@ async fn await_tool_termination(
                 }
             }
         }
+    }
+}
+
+/// Holds the tool permit and optional kill handle for the duration of dispatch.
+/// On drop (including actor cleanup cancelling this future), unfinished workers
+/// are parked in the tool-join vault together with the permit.
+struct DispatchGuard {
+    permit: Option<ToolPermit>,
+    kill: Option<ToolKillHandle>,
+}
+
+impl DispatchGuard {
+    /// Release permit only when the worker join is no longer pending.
+    fn release_if_idle(&mut self) {
+        if self.kill.as_ref().is_some_and(ToolKillHandle::has_join) {
+            // Leave for Drop → vault with permit.
+            return;
+        }
+        self.kill.take();
+        drop(self.permit.take());
+    }
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        if let Some(k) = self.kill.take() {
+            k.kill();
+            if let Some(join) = k.take_join() {
+                if !join.is_finished() {
+                    global_tool_join_vault().park(join, self.permit.take());
+                    return;
+                }
+            }
+        }
+        drop(self.permit.take());
     }
 }
 

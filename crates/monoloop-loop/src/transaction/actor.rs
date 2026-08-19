@@ -1376,12 +1376,22 @@ async fn finalize_and_cleanup(
     release_capacity();
 
     let payload = claimed.take();
-    guard.mark_callback_scheduled();
-    // D-021 / D-029: schedule with admission-reserved capacity; actor does not await.
-    callbacks.schedule_reserved(
+    // Mark scheduled only after spawn succeeds so shutdown accounting stays honest.
+    match callbacks.schedule_reserved(
         callback_reservation,
         payload.callback,
         end,
         Some(callback_deadline),
-    );
+    ) {
+        Ok(()) => guard.mark_callback_scheduled(),
+        Err((reservation, callback)) => {
+            reservation.release();
+            guard.restore_unscheduled(super::finalization::FinalizationPayload {
+                callback,
+                channel_id: payload.channel_id,
+                session_id: payload.session_id,
+                transaction_id: payload.transaction_id,
+            });
+        }
+    }
 }

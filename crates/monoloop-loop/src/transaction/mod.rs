@@ -30,6 +30,7 @@ mod state;
 mod sticky_cancel;
 mod tool_capacity;
 mod tool_handler;
+mod tool_join_vault;
 mod validation;
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};

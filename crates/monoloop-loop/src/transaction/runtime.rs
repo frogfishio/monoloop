@@ -232,9 +232,8 @@ impl DefaultTransactionRuntime {
         };
         let deadline_at = tokio::time::Instant::now() + global;
 
-        // D-032: reject new spawns before draining so try_spawn fails closed.
-        self.inner.spawn_gate.close();
-
+        // Enter draining first so admit rejects. Keep SpawnGate open through
+        // supervisor/actor callback scheduling (close only after finalization).
         let prev = self.inner.state.swap(STATE_DRAINING, Ordering::SeqCst);
         if prev == STATE_STOPPED || prev == STATE_DRAINING {
             // D-029: concurrent callers must share the same complete disposition.
@@ -283,6 +282,11 @@ impl DefaultTransactionRuntime {
             let abort = entry.actor_join.abort_handle();
             handles.push((entry, abort));
         }
+        type DeferredFinalization = (
+            Arc<super::finalization::FinalizationGuard>,
+            Arc<dyn Fn() + Send + Sync>,
+        );
+        let mut deferred: Vec<DeferredFinalization> = Vec::new();
 
         for (entry, abort) in handles {
             let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
@@ -332,6 +336,7 @@ impl DefaultTransactionRuntime {
             let claim_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
             if entry.guard.callback_was_scheduled() {
                 normally_finalized += 1;
+                (entry.release_capacity)();
             } else if let Some(payload) = entry.guard.claim_for_shutdown(claim_budget).await {
                 entry.guard.mark_callback_scheduled();
                 let end = build_transaction_end(
@@ -362,13 +367,68 @@ impl DefaultTransactionRuntime {
                         callback_aborted += 1;
                     }
                 }
+                (entry.release_capacity)();
+            } else if entry.guard.is_claimed() && !entry.guard.callback_was_scheduled() {
+                // Restore may still arrive after zero-budget claim — defer
+                // capacity release until a later claim pass (D-029).
+                deferred.push((
+                    Arc::clone(&entry.guard),
+                    Arc::clone(&entry.release_capacity),
+                ));
             } else if matches!(join_result, Some(Err(_))) {
                 invariant_failed += 1;
+                (entry.release_capacity)();
             } else if join_result.is_some() {
                 normally_finalized += 1;
+                (entry.release_capacity)();
+            } else {
+                (entry.release_capacity)();
             }
-            (entry.release_capacity)();
         }
+
+        // Second pass for deferred restores while the spawn gate is still open.
+        for (guard, release) in deferred {
+            let claim_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if guard.callback_was_scheduled() {
+                normally_finalized += 1;
+            } else if let Some(payload) = guard.claim_for_shutdown(claim_budget).await {
+                guard.mark_callback_scheduled();
+                let end = build_transaction_end(
+                    &payload,
+                    TransactionEndKind::RuntimeShutdown,
+                    None,
+                    EventDeliveryOutcome::Failed,
+                    guard.sequencer().last_allocated(),
+                );
+                let cb_budget =
+                    cb_cfg.min(deadline_at.saturating_duration_since(tokio::time::Instant::now()));
+                match run_callback_isolated(
+                    &self.inner.executor,
+                    &self.inner.spawn_gate,
+                    payload.callback,
+                    end,
+                    cb_budget,
+                )
+                .await
+                {
+                    CallbackRun::Ok => supervisor_finalized += 1,
+                    CallbackRun::Failed => {
+                        supervisor_finalized += 1;
+                        callback_failed += 1;
+                    }
+                    CallbackRun::Aborted => {
+                        supervisor_finalized += 1;
+                        callback_aborted += 1;
+                    }
+                }
+            } else {
+                invariant_failed += 1;
+            }
+            (release)();
+        }
+
+        // Now reject further spawns; callbacks above have been scheduled.
+        self.inner.spawn_gate.close();
 
         // D-029: use only remaining global shutdown time; never pad after expiry.
         let mcp_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
@@ -383,6 +443,12 @@ impl DefaultTransactionRuntime {
         if !cb_drain.is_zero() {
             self.inner.callbacks.drain(cb_drain).await;
         }
+
+        // Drain tool workers parked when dispatch was dropped mid-join.
+        let tool_drain = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        super::tool_join_vault::global_tool_join_vault()
+            .drain(tool_drain)
+            .await;
 
         let disposition = ShutdownDisposition {
             normally_finalized,
@@ -425,10 +491,9 @@ async fn run_callback_isolated(
                 Ok(Ok(Err(_))) => CallbackRun::Failed,
                 Ok(Err(_)) => CallbackRun::Failed, // join error = panic in future
                 Err(_) => {
-                    // Abort; keep awaiting within no extra pad — put-back style:
-                    // after abort, join should complete for async work.
+                    // Deadline already consumed — abort and do not await unboundedly.
                     abort.abort();
-                    let _ = handle.await;
+                    drop(handle);
                     CallbackRun::Aborted
                 }
             }
