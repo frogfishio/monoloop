@@ -48,8 +48,10 @@ pub struct AdmissionContext {
     pub callbacks: CallbackService,
     /// Injected Tokio handle for all runtime-owned spawns (D-032).
     pub executor: Handle,
-    /// Spawn gate closed at shutdown start (D-032).
+    /// Spawn gate closed after callback finalization (D-032).
     pub spawn_gate: super::spawn_gate::SpawnGate,
+    /// Runtime-scoped unfinished tool joins (D-028).
+    pub tool_join_vault: Arc<super::tool_join_vault::ToolJoinVault>,
 }
 
 /// Perform synchronous admission (no network/tool I/O).
@@ -260,6 +262,7 @@ pub fn admit(
     let actor_join = match spawn_actor(ActorSpawn {
         executor: ctx.executor.clone(),
         spawn_gate: ctx.spawn_gate.clone(),
+        tool_join_vault: Arc::clone(&ctx.tool_join_vault),
         transaction_id,
         channel_id: request.channel_id.clone(),
         channel_kind: live.binding.kind,

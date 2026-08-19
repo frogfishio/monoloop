@@ -1,23 +1,28 @@
 //! Spawn on an injected [`tokio::runtime::Handle`] (D-032).
 //!
-//! Synchronous admission must not rely on ambient `tokio::spawn`. Spawns are
-//! non-blocking and fail closed when the [`SpawnGate`] is closed, spawn panics,
-//! or the join is already cancelled without starting. Concurrent executor
-//! shutdown after return is narrowed by a post-spawn yield + recheck; the task
-//! body also refuses caller work if the gate closed before first poll.
+//! Synchronous admission must not rely on ambient `tokio::spawn`. On multi-thread
+//! executors, [`try_spawn`] does not return `Ok` until the task has been polled
+//! once (or cancelled), so concurrent executor shutdown cannot admit never-started
+//! work. Already-spawned tasks always run their futures — the gate only blocks
+//! *new* spawns.
 
 use super::spawn_gate::SpawnGate;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
-use tokio::runtime::Handle;
+use std::time::{Duration, Instant};
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinHandle;
 
 /// Spawn `future` on `executor` without requiring an entered Tokio context.
 ///
-/// Returns `Err(())` when the gate is closed, spawn panics, or the join is
-/// already cancelled without the task having started (executor shut down).
+/// Returns `Err(())` when the gate is closed, spawn panics, or the task is
+/// cancelled without ever starting. On multi-thread runtimes, waits until first
+/// poll (or cancel) so the executor-shutdown race fails closed. On current-thread
+/// (typical in unit tests), returns after the immediate finished check only to
+/// avoid deadlocking the reactor.
 pub(crate) fn try_spawn<F>(
     executor: &Handle,
     gate: &SpawnGate,
@@ -32,31 +37,67 @@ where
     }
     let started = Arc::new(AtomicBool::new(false));
     let started_flag = Arc::clone(&started);
-    let gate_body = gate.clone();
+    // Signal first poll without consulting the gate — accepted tasks must run.
+    let (started_tx, started_rx) = mpsc::channel::<()>();
     let wrapped = async move {
-        if !gate_body.is_open() {
-            // Gate closed between spawn and first poll — do not run caller work.
-            std::future::pending::<F::Output>().await
-        } else {
-            started_flag.store(true, Ordering::SeqCst);
-            future.await
-        }
+        let _ = started_tx.send(());
+        started_flag.store(true, Ordering::SeqCst);
+        future.await
     };
     let handle = catch_unwind(AssertUnwindSafe(|| executor.spawn(wrapped))).map_err(|_| ())?;
     if !gate.is_open() {
         handle.abort();
         return Err(());
     }
-    // Detect executor-shutdown cancel that completed before first poll.
-    // One scheduler yield narrows the race without a timed wait (non-blocking admit).
     if handle.is_finished() && !started.load(Ordering::SeqCst) {
         return Err(());
     }
-    std::thread::yield_now();
-    if handle.is_finished() && !started.load(Ordering::SeqCst) {
-        return Err(());
+
+    let on_current_thread = Handle::try_current()
+        .map(|h| h.runtime_flavor() == RuntimeFlavor::CurrentThread)
+        .unwrap_or(false);
+    if on_current_thread {
+        // Cannot wait for first poll without deadlocking the reactor.
+        return Ok(handle);
     }
-    Ok(handle)
+
+    let confirm = || confirm_started(handle, started_rx, &started);
+    match Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(confirm),
+        Err(_) => confirm(),
+    }
+}
+
+fn confirm_started<T>(
+    handle: JoinHandle<T>,
+    started_rx: mpsc::Receiver<()>,
+    started: &AtomicBool,
+) -> Result<JoinHandle<T>, ()> {
+    // Fail closed if start never arrives (do not accept unstarted after a timeout).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if started_rx.try_recv().is_ok() || started.load(Ordering::SeqCst) {
+            return Ok(handle);
+        }
+        if handle.is_finished() && !started.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        if Instant::now() >= deadline {
+            handle.abort();
+            return Err(());
+        }
+        match started_rx.recv_timeout(Duration::from_millis(1)) {
+            Ok(()) => return Ok(handle),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return if started.load(Ordering::SeqCst) {
+                    Ok(handle)
+                } else {
+                    Err(())
+                };
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -92,29 +133,6 @@ mod tests {
         drop(rt);
     }
 
-    #[test]
-    fn try_spawn_is_non_blocking_on_live_runtime() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let handle = rt.handle().clone();
-        let gate = SpawnGate::open();
-        let start = std::time::Instant::now();
-        let join = try_spawn(&handle, &gate, async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            1u8
-        })
-        .expect("live spawn");
-        assert!(
-            start.elapsed() < Duration::from_millis(20),
-            "try_spawn must not wait for task start"
-        );
-        join.abort();
-        drop(rt);
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn try_spawn_accepts_live_runtime() {
         let handle = tokio::runtime::Handle::current();
@@ -129,5 +147,20 @@ mod tests {
         let gate = SpawnGate::open();
         let join = try_spawn(&handle, &gate, std::future::ready(9u8)).expect("ready spawn");
         assert_eq!(join.await.expect("join"), 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_task_runs_after_gate_closes() {
+        let handle = tokio::runtime::Handle::current();
+        let gate = SpawnGate::open();
+        let (tx, rx) = tokio::sync::oneshot::channel::<u8>();
+        let join = try_spawn(&handle, &gate, async move {
+            tx.send(42).unwrap();
+            42u8
+        })
+        .expect("spawn while open");
+        gate.close();
+        assert_eq!(rx.await.expect("callback body must run"), 42);
+        assert_eq!(join.await.expect("join"), 42);
     }
 }

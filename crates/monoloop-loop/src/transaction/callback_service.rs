@@ -149,35 +149,47 @@ impl CallbackService {
         deadline: Option<Duration>,
     ) -> Result<(), (CallbackReservation, Box<dyn CompletionCallback>)> {
         Self::reap_retained(&self.retained, &self.inflight);
-        // Fail before consuming reservation/callback when shutdown closed the gate.
         if !self.spawn_gate.is_open() {
             return Err((reservation, callback));
         }
-        let (_permits, _reserved_counter, permit) = reservation.into_parts();
         let inflight = Arc::clone(&self.inflight);
         let joins = Arc::clone(&self.joins);
         let retained = Arc::clone(&self.retained);
         let executor = self.executor.clone();
         let gate = self.spawn_gate.clone();
-        let gate_inner = gate.clone();
         let budget = deadline.unwrap_or(self.default_deadline);
+        // Deliver work via oneshot so a failed try_spawn can return the callback.
+        let (work_tx, work_rx) = tokio::sync::oneshot::channel::<(
+            Box<dyn CompletionCallback>,
+            TransactionEnd,
+            OwnedSemaphorePermit,
+        )>();
         inflight.fetch_add(1, Ordering::SeqCst);
         let inflight_child = Arc::clone(&inflight);
         let handle = match try_spawn(&self.executor, &gate, async move {
+            let Ok((callback, end, permit)) = work_rx.await else {
+                inflight_child.fetch_sub(1, Ordering::SeqCst);
+                return;
+            };
             let call =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
             match call {
                 Ok(fut) => {
-                    let mut handle = match try_spawn(&executor, &gate_inner, async move {
-                        let _ = fut.await;
-                    }) {
-                        Ok(h) => h,
-                        Err(()) => {
-                            drop(permit);
-                            inflight_child.fetch_sub(1, Ordering::SeqCst);
-                            return;
-                        }
-                    };
+                    // Inner work is already admitted — spawn without gate so a
+                    // later gate close cannot park this callback forever.
+                    let mut handle =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            executor.spawn(async move {
+                                let _ = fut.await;
+                            })
+                        })) {
+                            Ok(h) => h,
+                            Err(_) => {
+                                drop(permit);
+                                inflight_child.fetch_sub(1, Ordering::SeqCst);
+                                return;
+                            }
+                        };
                     let abort = handle.abort_handle();
                     match tokio::time::timeout(budget, &mut handle).await {
                         Ok(Ok(_)) | Ok(Err(_)) => {
@@ -205,10 +217,24 @@ impl CallbackService {
             Ok(h) => h,
             Err(()) => {
                 inflight.fetch_sub(1, Ordering::SeqCst);
-                // Reservation already consumed; callback owned by dropped future.
-                return Ok(());
+                return Err((reservation, callback));
             }
         };
+        let (permits, reserved_counter, permit) = reservation.into_parts();
+        if let Err((callback, end, permit)) = work_tx.send((callback, end, permit)) {
+            let _ = end;
+            handle.abort();
+            inflight.fetch_sub(1, Ordering::SeqCst);
+            reserved_counter.fetch_add(1, Ordering::SeqCst);
+            return Err((
+                CallbackReservation {
+                    permits,
+                    reserved: reserved_counter,
+                    permit: Some(permit),
+                },
+                callback,
+            ));
+        }
         let abort = handle.abort_handle();
         let mut g = joins.lock().unwrap_or_else(|e| e.into_inner());
         g.retain(|(_, join)| !join.is_finished());

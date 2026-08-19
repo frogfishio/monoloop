@@ -34,8 +34,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 pub struct ActorSpawn {
     /// Injected Tokio handle for runtime-owned child tasks (D-032).
     pub executor: Handle,
-    /// Spawn gate closed at shutdown start (D-032).
+    /// Spawn gate closed after callback finalization (D-032).
     pub spawn_gate: super::spawn_gate::SpawnGate,
+    /// Runtime-scoped unfinished tool joins (D-028).
+    pub tool_join_vault: Arc<super::tool_join_vault::ToolJoinVault>,
     /// Transaction id.
     pub transaction_id: TransactionId,
     /// Channel id.
@@ -151,6 +153,7 @@ async fn run_actor(spawn: ActorSpawn) {
     let ActorSpawn {
         executor,
         spawn_gate,
+        tool_join_vault,
         transaction_id,
         channel_id,
         channel_kind: _,
@@ -287,7 +290,7 @@ async fn run_actor(spawn: ActorSpawn) {
                     let sk = session_key.clone().unwrap_or_else(|| {
                         SessionKey::new(channel_id.clone(), SessionId::generate())
                     });
-                    let dispatcher = TransactionToolDispatcher::with_limits(
+                    let dispatcher = TransactionToolDispatcher::with_limits_and_vault(
                         transaction_id,
                         sk,
                         tools.clone(),
@@ -298,6 +301,7 @@ async fn run_actor(spawn: ActorSpawn) {
                             max_tool_payload_bytes,
                             max_tool_output_bytes,
                         },
+                        Arc::clone(&tool_join_vault),
                     );
                     let pending = handle
                         .install_pending(
@@ -698,7 +702,7 @@ async fn run_actor(spawn: ActorSpawn) {
                 .ok_or(TransactionEndKind::InvariantFailed)?;
 
             // Empty allowlist still dispatches so each request gets a correlated rejection.
-            let dispatcher = TransactionToolDispatcher::with_limits(
+            let dispatcher = TransactionToolDispatcher::with_limits_and_vault(
                 transaction_id,
                 sk.clone(),
                 tools.clone(),
@@ -709,6 +713,7 @@ async fn run_actor(spawn: ActorSpawn) {
                     max_tool_payload_bytes,
                     max_tool_output_bytes,
                 },
+                Arc::clone(&tool_join_vault),
             );
 
             let mut results: Vec<CanonicalToolResult> = Vec::with_capacity(ready.len());

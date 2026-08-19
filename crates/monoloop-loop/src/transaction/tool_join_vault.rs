@@ -1,8 +1,10 @@
 //! Retains tool worker joins (+ permits) when dispatch is dropped before join
 //! completes, so workers are not detached while concurrency capacity is freed.
+//!
+//! Each [`DefaultTransactionRuntime`] owns its own vault — never process-global.
 
 use super::tool_capacity::ToolPermit;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
 struct VaultItem {
@@ -10,9 +12,9 @@ struct VaultItem {
     permit: Option<ToolPermit>,
 }
 
-/// Process-local vault for unfinished tool joins (drained at runtime shutdown).
+/// Runtime-scoped vault for unfinished tool joins (drained at that runtime's shutdown).
 #[derive(Clone, Default)]
-pub(crate) struct ToolJoinVault {
+pub struct ToolJoinVault {
     items: Arc<Mutex<Vec<VaultItem>>>,
 }
 
@@ -61,10 +63,4 @@ impl ToolJoinVault {
             *self.items.lock().unwrap_or_else(|e| e.into_inner()) = still;
         }
     }
-}
-
-/// Shared vault used when a dispatch future is dropped mid-join.
-pub(crate) fn global_tool_join_vault() -> &'static ToolJoinVault {
-    static VAULT: OnceLock<ToolJoinVault> = OnceLock::new();
-    VAULT.get_or_init(ToolJoinVault::new)
 }

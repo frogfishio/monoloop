@@ -3,7 +3,7 @@
 use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapacity};
 use super::tool_handler::{ToolExecutionControl, ToolKillHandle};
-use super::tool_join_vault::global_tool_join_vault;
+use super::tool_join_vault::ToolJoinVault;
 use super::validation::{
     validate_tool_completion, validate_tool_input, InputValidationFailure, DEFAULT_MAX_JSON_DEPTH,
 };
@@ -101,6 +101,8 @@ pub struct TransactionToolDispatcher {
     session_key: std::sync::Mutex<SessionKey>,
     tools: ResolvedToolSet,
     capacity: Arc<TransactionToolCapacity>,
+    /// Runtime-scoped vault for unfinished joins (D-028).
+    tool_join_vault: Arc<ToolJoinVault>,
     /// Transaction-wide payload cap (D-015); applied as min with per-tool limit.
     max_tool_payload_bytes: usize,
     /// Transaction-wide output cap (D-015); applied as min with per-tool limit.
@@ -141,6 +143,25 @@ impl TransactionToolDispatcher {
         shared_capacity: Arc<SharedToolCapacity>,
         limits: DispatcherLimits,
     ) -> Arc<Self> {
+        Self::with_limits_and_vault(
+            transaction_id,
+            session_key,
+            tools,
+            shared_capacity,
+            limits,
+            Arc::new(ToolJoinVault::new()),
+        )
+    }
+
+    /// Build with an explicit runtime-scoped tool join vault (D-028).
+    pub fn with_limits_and_vault(
+        transaction_id: TransactionId,
+        session_key: SessionKey,
+        tools: ResolvedToolSet,
+        shared_capacity: Arc<SharedToolCapacity>,
+        limits: DispatcherLimits,
+        tool_join_vault: Arc<ToolJoinVault>,
+    ) -> Arc<Self> {
         let capacity = TransactionToolCapacity::new(
             shared_capacity,
             limits.max_concurrent_tools,
@@ -154,6 +175,7 @@ impl TransactionToolDispatcher {
             session_key: std::sync::Mutex::new(session_key),
             tools,
             capacity,
+            tool_join_vault,
             max_tool_payload_bytes: limits.max_tool_payload_bytes.max(1),
             max_tool_output_bytes: limits.max_tool_output_bytes.max(1),
             max_error_message_bytes: 1024,
@@ -267,6 +289,8 @@ impl TransactionToolDispatcher {
         let mut dispatch_guard = DispatchGuard {
             permit: Some(permit),
             kill: None,
+            retain_join: None,
+            vault: Arc::clone(&self.tool_join_vault),
         };
 
         let mut lifecycle = vec![ToolLifecycleEvent::Started {
@@ -372,9 +396,17 @@ impl TransactionToolDispatcher {
             ToolCancellationPolicy::Cooperative { .. } => true,
         };
         if !kill_ok {
-            // Handler lied about supports_*: hold permit until completion (D-024).
+            // Handler lied about supports_*: own a waiter join so actor cancellation
+            // vaults the permit instead of releasing it while work may still run.
             control.cancel();
-            let _ = handle.completion.wait().await;
+            let completion = handle.completion;
+            let retain = tokio::spawn(async move {
+                let _ = completion.wait().await;
+            });
+            dispatch_guard.retain_join = Some(retain);
+            if let Some(ref mut j) = dispatch_guard.retain_join {
+                let _ = tokio::time::timeout(Duration::from_millis(200), &mut *j).await;
+            }
             dispatch_guard.release_if_idle();
             lifecycle.push(ToolLifecycleEvent::RuntimeFailed {
                 tool_action_id: action.clone(),
@@ -549,22 +581,28 @@ async fn await_tool_termination(
     }
 }
 
-/// Holds the tool permit and optional kill handle for the duration of dispatch.
+/// Holds the tool permit and optional kill/retain joins for the duration of dispatch.
 /// On drop (including actor cleanup cancelling this future), unfinished workers
-/// are parked in the tool-join vault together with the permit.
+/// are parked in the runtime tool-join vault together with the permit.
 struct DispatchGuard {
     permit: Option<ToolPermit>,
     kill: Option<ToolKillHandle>,
+    /// Waiter join for missing-kill paths (holds capacity until completion).
+    retain_join: Option<tokio::task::JoinHandle<()>>,
+    vault: Arc<ToolJoinVault>,
 }
 
 impl DispatchGuard {
-    /// Release permit only when the worker join is no longer pending.
+    /// Release permit only when no unfinished join remains.
     fn release_if_idle(&mut self) {
         if self.kill.as_ref().is_some_and(ToolKillHandle::has_join) {
-            // Leave for Drop → vault with permit.
+            return;
+        }
+        if self.retain_join.as_ref().is_some_and(|j| !j.is_finished()) {
             return;
         }
         self.kill.take();
+        self.retain_join.take();
         drop(self.permit.take());
     }
 }
@@ -575,9 +613,17 @@ impl Drop for DispatchGuard {
             k.kill();
             if let Some(join) = k.take_join() {
                 if !join.is_finished() {
-                    global_tool_join_vault().park(join, self.permit.take());
+                    self.vault.park(join, self.permit.take());
+                    let _ = self.retain_join.take();
                     return;
                 }
+            }
+        }
+        if let Some(join) = self.retain_join.take() {
+            if !join.is_finished() {
+                join.abort();
+                self.vault.park(join, self.permit.take());
+                return;
             }
         }
         drop(self.permit.take());

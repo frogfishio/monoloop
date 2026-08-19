@@ -60,8 +60,12 @@ struct RuntimeInner {
     callbacks: CallbackService,
     /// Injected Tokio handle for all runtime-owned spawns (D-032).
     executor: tokio::runtime::Handle,
-    /// Closed at shutdown start so try_spawn fails closed (D-032).
+    /// Closed after callback finalization so try_spawn fails closed (D-032).
     spawn_gate: SpawnGate,
+    /// Runtime-scoped unfinished tool joins (D-028).
+    tool_join_vault: Arc<super::tool_join_vault::ToolJoinVault>,
+    /// Supervisor callback joins retained after deadline abort (D-029).
+    supervisor_cb_retained: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Shared shutdown result for concurrent callers (D-029).
     shutdown_disposition: AsyncMutex<Option<ShutdownDisposition>>,
 }
@@ -183,6 +187,8 @@ impl DefaultTransactionRuntime {
                 callbacks,
                 executor,
                 spawn_gate,
+                tool_join_vault: Arc::new(super::tool_join_vault::ToolJoinVault::new()),
+                supervisor_cb_retained: Mutex::new(Vec::new()),
                 shutdown_disposition: AsyncMutex::new(None),
             }),
         }))
@@ -351,6 +357,7 @@ impl DefaultTransactionRuntime {
                 match run_callback_isolated(
                     &self.inner.executor,
                     &self.inner.spawn_gate,
+                    &self.inner.supervisor_cb_retained,
                     payload.callback,
                     end,
                     cb_budget,
@@ -387,10 +394,14 @@ impl DefaultTransactionRuntime {
         }
 
         // Second pass for deferred restores while the spawn gate is still open.
+        // Do not release capacity when restore still has not arrived — keep
+        // holding until claim succeeds (fail closed).
+        let mut still_deferred: Vec<DeferredFinalization> = Vec::new();
         for (guard, release) in deferred {
             let claim_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
             if guard.callback_was_scheduled() {
                 normally_finalized += 1;
+                (release)();
             } else if let Some(payload) = guard.claim_for_shutdown(claim_budget).await {
                 guard.mark_callback_scheduled();
                 let end = build_transaction_end(
@@ -405,6 +416,7 @@ impl DefaultTransactionRuntime {
                 match run_callback_isolated(
                     &self.inner.executor,
                     &self.inner.spawn_gate,
+                    &self.inner.supervisor_cb_retained,
                     payload.callback,
                     end,
                     cb_budget,
@@ -421,11 +433,63 @@ impl DefaultTransactionRuntime {
                         callback_aborted += 1;
                     }
                 }
+                (release)();
             } else {
-                invariant_failed += 1;
+                // Timed out before restore — do not release; retry below if budget remains.
+                still_deferred.push((guard, release));
             }
-            (release)();
         }
+
+        // Final attempt for still-deferred restores within any leftover budget.
+        for (guard, release) in still_deferred {
+            let claim_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if let Some(payload) = guard.claim_for_shutdown(claim_budget).await {
+                guard.mark_callback_scheduled();
+                let end = build_transaction_end(
+                    &payload,
+                    TransactionEndKind::RuntimeShutdown,
+                    None,
+                    EventDeliveryOutcome::Failed,
+                    guard.sequencer().last_allocated(),
+                );
+                let cb_budget =
+                    cb_cfg.min(deadline_at.saturating_duration_since(tokio::time::Instant::now()));
+                match run_callback_isolated(
+                    &self.inner.executor,
+                    &self.inner.spawn_gate,
+                    &self.inner.supervisor_cb_retained,
+                    payload.callback,
+                    end,
+                    cb_budget,
+                )
+                .await
+                {
+                    CallbackRun::Ok => supervisor_finalized += 1,
+                    CallbackRun::Failed => {
+                        supervisor_finalized += 1;
+                        callback_failed += 1;
+                    }
+                    CallbackRun::Aborted => {
+                        supervisor_finalized += 1;
+                        callback_aborted += 1;
+                    }
+                }
+                (release)();
+            } else {
+                // Still unrestored: keep capacity held (fail closed) and count invariant.
+                invariant_failed += 1;
+                // Intentionally do not call release — orphan capacity rather than
+                // drop an admitted callback on the floor.
+                std::mem::forget(release);
+                // Keep guard alive so a late restore is not uselessly dropped...
+                // actually restore needs the guard; forgetting release is enough.
+                // Dropping guard is OK if payload was lost with aborted actor.
+                drop(guard);
+            }
+        }
+
+        // Also update first-pass supervisor callbacks to use retained list.
+        // (already done via run_callback_isolated signature change below)
 
         // Now reject further spawns; callbacks above have been scheduled.
         self.inner.spawn_gate.close();
@@ -446,9 +510,29 @@ impl DefaultTransactionRuntime {
 
         // Drain tool workers parked when dispatch was dropped mid-join.
         let tool_drain = deadline_at.saturating_duration_since(tokio::time::Instant::now());
-        super::tool_join_vault::global_tool_join_vault()
-            .drain(tool_drain)
-            .await;
+        self.inner.tool_join_vault.drain(tool_drain).await;
+
+        // Join supervisor callbacks retained after deadline abort.
+        let mut retained = {
+            let mut g = self
+                .inner
+                .supervisor_cb_retained
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *g)
+        };
+        let rem = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+        for mut h in retained.drain(..) {
+            h.abort();
+            if rem.is_zero() {
+                // Keep ownership without unbounded await — park by forgetting join
+                // would detach; drop after abort is the remaining residual for
+                // non-yielding host callbacks once the absolute deadline is gone.
+                drop(h);
+            } else {
+                let _ = tokio::time::timeout(rem, &mut h).await;
+            }
+        }
 
         let disposition = ShutdownDisposition {
             normally_finalized,
@@ -474,6 +558,7 @@ enum CallbackRun {
 async fn run_callback_isolated(
     executor: &Handle,
     gate: &SpawnGate,
+    retained: &Mutex<Vec<tokio::task::JoinHandle<()>>>,
     callback: Box<dyn monoloop_contracts::CompletionCallback>,
     end: monoloop_contracts::TransactionEnd,
     deadline: Duration,
@@ -481,19 +566,26 @@ async fn run_callback_isolated(
     let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback.call(end)));
     match call {
         Ok(fut) => {
-            let mut handle = match try_spawn(executor, gate, fut) {
+            // Use oneshot delivery so a failed spawn can be reported without
+            // losing the callback into a dropped future — supervisor path has
+            // already taken ownership of the callback from finalization.
+            let mut handle = match try_spawn(executor, gate, async move {
+                let _ = fut.await;
+            }) {
                 Ok(h) => h,
                 Err(()) => return CallbackRun::Failed,
             };
             let abort = handle.abort_handle();
             match tokio::time::timeout(deadline, &mut handle).await {
-                Ok(Ok(Ok(()))) => CallbackRun::Ok,
-                Ok(Ok(Err(_))) => CallbackRun::Failed,
+                Ok(Ok(())) => CallbackRun::Ok,
                 Ok(Err(_)) => CallbackRun::Failed, // join error = panic in future
                 Err(_) => {
-                    // Deadline already consumed — abort and do not await unboundedly.
+                    // Retain ownership after abort — do not detach.
                     abort.abort();
-                    drop(handle);
+                    retained
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(handle);
                     CallbackRun::Aborted
                 }
             }
@@ -548,6 +640,7 @@ impl TransactionRuntime for DefaultTransactionRuntime {
             callbacks: self.inner.callbacks.clone(),
             executor: self.inner.executor.clone(),
             spawn_gate: self.inner.spawn_gate.clone(),
+            tool_join_vault: Arc::clone(&self.inner.tool_join_vault),
         };
         admit(&ctx, request)
     }

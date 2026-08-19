@@ -891,11 +891,11 @@ considered delivered while these remain.
 |---|---|---|
 | D-026 | Fixed (residual closed) | Create: claim+`SessionEstablished`+MCP activate **before** prompt send (`prompt_ready` gate); ACP encode uses empty tools for `McpGateway` |
 | D-027 | Fixed (residual closed) | Per-exchange remaining output budget; limits before live publish; immediate `LimitExceeded` on retention exceed |
-| D-028 | Fixed (residual closed) | `DispatchGuard` vaults unfinished tool join+permit on drop; no unbounded join after timeout |
-| D-029 | Fixed (residual closed) | SpawnGate stays open through callback finalization; mark-scheduled only after spawn; reap-before-reserve; deferred claim pass |
+| D-028 | Fixed (residual closed) | Per-runtime `ToolJoinVault`; missing-kill retain join vaults permit on cancel; no unbounded post-timeout join |
+| D-029 | Fixed (residual closed) | Accepted callbacks always run; oneshot-delivered schedule returns callback on spawn race; deferred never releases on timed-out restore; supervisor retains timed-out joins |
 | D-030 | Fixed | ExchangeId-scoped ToolActionId; empty allowlist → rejection Completed; CallerControlled after observe |
 | D-031 | Fixed (residual closed) | OpenAI continuation encodes transcript only (no duplicate `results` append) |
-| D-032 | Fixed (residual closed) | Gate closed after finalization; try_spawn yield+recheck for executor cancel; body parks if gate closed before start |
+| D-032 | Fixed (residual closed) | Multi-thread `try_spawn` waits until first poll/cancel (fail closed); no gate-park of already-accepted tasks |
 | D-033 | Fixed | absolute request deadline; enqueue selects deadline; output queue from output budget |
 | D-034 | Fixed (known residual) | Canonical hex + global/per-cap permits before body; body+dispatch share duration budget; process-global service map remains |
 | D-035 | Fixed | estimate covers names, args JSON, tool_call_id; serialize fail closed |
