@@ -338,7 +338,7 @@ async fn open_http(
     let connect_deadline = request.limits.connect_deadline;
     let dialect = config.dialect.clone();
 
-    tokio::spawn(run_http_owner(
+    let owner_work = crate::open::ConnectionOwnerWork::new(run_http_owner(
         connection_id.clone(),
         control_state,
         in_rx,
@@ -359,6 +359,7 @@ async fn open_http(
         output,
         control,
         completion,
+        owner_work: Some(owner_work),
     })
 }
 

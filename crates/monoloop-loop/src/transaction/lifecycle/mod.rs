@@ -11,11 +11,12 @@ mod capacity;
 mod coordinator;
 mod delivery;
 mod event_publisher;
-mod exchange_direct;
+mod exchange;
 mod ledger;
 mod owner;
 mod shutdown;
 mod supervisor;
+mod task_spawner;
 mod task_supervisor;
 mod terminal;
 

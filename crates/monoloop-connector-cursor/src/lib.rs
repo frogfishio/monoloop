@@ -245,6 +245,7 @@ async fn open_raw(
         output,
         control,
         completion,
+        owner_work: None,
     })
 }
 

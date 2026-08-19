@@ -7,6 +7,7 @@
 use super::coordinator::{run_coordinator, CoordinatorParams, WorkerMessage};
 use super::event_publisher::{run_event_publisher, EventPublisherCommand};
 use super::ledger::{LifecycleLedger, TransactionPhase};
+use super::task_spawner::{SpawnRequest, TransactionTaskSpawner};
 use super::task_supervisor::{TaskClass, TaskSupervisor};
 use super::terminal::{build_completion, end_event, TerminalDecision, TerminalProposal};
 use crate::transaction::channel_registry::LiveChannel;
@@ -70,6 +71,8 @@ pub(crate) struct RuntimeShared {
     pub wake: Notify,
     pub channels: Arc<HashMap<ChannelId, LiveChannel>>,
     pub default_deadline: Duration,
+    pub cleanup_deadline: Duration,
+    pub task_spawner: TransactionTaskSpawner,
     pub shutdown_generation: AtomicU64,
     pub shutdown_report: Mutex<Option<ShutdownReport>>,
     pub completions_published: AtomicU64,
@@ -116,6 +119,7 @@ pub(crate) async fn run_supervisor(
     mut start_rx: mpsc::Receiver<StartCommand>,
     mut control_rx: mpsc::Receiver<ControlCommand>,
     mut worker_rx: mpsc::Receiver<WorkerMessage>,
+    mut spawn_rx: mpsc::Receiver<SpawnRequest>,
 ) {
     let mut tasks = TaskSupervisor::new();
     let mut stopping = false;
@@ -125,11 +129,21 @@ pub(crate) async fn run_supervisor(
             on_task_exit(&shared, &mut tasks, &class);
         }
 
+        // Preferential drain: never starve spawn registration behind join_next.
+        while let Ok(req) = spawn_rx.try_recv() {
+            let id = tasks.spawn(req.class, req.future);
+            let _ = req.reply.send(id);
+        }
+
         if !stopping && shared.state.load(Ordering::SeqCst) == STATE_QUIESCING {
             begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
         }
 
         if stopping && shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true) {
+            // Reject any queued spawns so workers cannot block on reply forever.
+            while let Ok(req) = spawn_rx.try_recv() {
+                drop(req);
+            }
             if !tasks.is_empty() {
                 tasks.abort_and_drain().await;
             }
@@ -143,6 +157,18 @@ pub(crate) async fn run_supervisor(
 
         tokio::select! {
             biased;
+            spawn = spawn_rx.recv() => {
+                match spawn {
+                    Some(req) => {
+                        let id = tasks.spawn(req.class, req.future);
+                        let _ = req.reply.send(id);
+                    }
+                    None => {
+                        // Spawner dropped — treat as shutdown pressure.
+                        begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
+                    }
+                }
+            }
             finished = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some((_id, class, _exit)) = finished {
                     on_task_exit(&shared, &mut tasks, &class);
@@ -262,7 +288,9 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         channels: Arc::clone(&shared.channels),
         publish_tx: pub_tx,
         worker_tx: shared.worker_tx.clone(),
+        tasks: shared.task_spawner.clone(),
         deadline,
+        cleanup_deadline: shared.cleanup_deadline,
     };
     tasks.spawn(TaskClass::TransactionCoordinator(tx), async move {
         run_coordinator(params).await;

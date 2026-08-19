@@ -10,11 +10,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+fn drive_owner(opened: &mut monoloop_connector::OpenedRawConnection) {
+    if let Some(work) = opened.take_owner_work() {
+        tokio::spawn(work.into_future());
+    }
+}
+
 #[tokio::test]
 async fn echo_preserves_order_and_bytes() {
     let connector = FakeConnector::echo();
     let pending = connector.begin_open(OpenConnection::new(ConnectionId::new("c1"), "default"));
-    let opened = pending.opened.await.expect("open");
+    let mut opened = pending.opened.await.expect("open");
+    drive_owner(&mut opened);
     opened
         .input
         .send(Bytes::from_static(b"hello"))
@@ -51,7 +58,8 @@ async fn scripted_output_independent_of_fragmentation() {
         ..Default::default()
     });
     let pending = connector.begin_open(OpenConnection::new(ConnectionId::new("c2"), "script"));
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     let a = opened.output.receive().await.unwrap().unwrap();
     let b = opened.output.receive().await.unwrap().unwrap();
     assert_eq!(&a[..], b"ab");
@@ -80,7 +88,8 @@ async fn cancel_during_open_returns_cancelled() {
 async fn cancel_after_open_yields_cancelled_terminal() {
     let connector = FakeConnector::echo();
     let pending = connector.begin_open(OpenConnection::new(ConnectionId::new("c4"), "default"));
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     assert_eq!(
         opened.control.cancel(CancellationReason::CallerRequested),
         ControlDisposition::Accepted
@@ -95,7 +104,8 @@ async fn cancel_after_open_yields_cancelled_terminal() {
 async fn terminate_wins_over_cancel() {
     let connector = FakeConnector::echo();
     let pending = connector.begin_open(OpenConnection::new(ConnectionId::new("c5"), "default"));
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     opened.control.cancel(CancellationReason::CallerRequested);
     opened
         .control
@@ -108,7 +118,8 @@ async fn terminate_wins_over_cancel() {
 async fn repeated_cancel_is_idempotent() {
     let connector = FakeConnector::echo();
     let pending = connector.begin_open(OpenConnection::new(ConnectionId::new("c6"), "default"));
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     assert_eq!(
         opened.control.cancel(CancellationReason::CallerRequested),
         ControlDisposition::Accepted
@@ -127,16 +138,18 @@ async fn repeated_cancel_is_idempotent() {
 #[tokio::test]
 async fn sibling_connections_are_isolated() {
     let connector = FakeConnector::echo();
-    let a = connector
+    let mut a = connector
         .begin_open(OpenConnection::new(ConnectionId::new("a"), "default"))
         .opened
         .await
         .unwrap();
-    let b = connector
+    drive_owner(&mut a);
+    let mut b = connector
         .begin_open(OpenConnection::new(ConnectionId::new("b"), "default"))
         .opened
         .await
         .unwrap();
+    drive_owner(&mut b);
     a.control.cancel(CancellationReason::CallerRequested);
     b.input.send(Bytes::from_static(b"ok")).await.unwrap();
     let got = b.output.receive().await.unwrap().unwrap();
@@ -159,7 +172,8 @@ async fn proxy_routes_by_prefix() {
         .unwrap();
 
     let pending = proxy.begin_open(OpenConnection::new(ConnectionId::new("p1"), "fake:default"));
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     opened.input.send(Bytes::from_static(b"z")).await.unwrap();
     let got = opened.output.receive().await.unwrap().unwrap();
     assert_eq!(&got[..], b"z");
@@ -192,7 +206,8 @@ async fn external_session_id_propagated_unchanged() {
     req.external_session_id = Some(monoloop_connector::ExternalSessionId::new(
         "grok-session-xyz",
     ));
-    let opened = connector.begin_open(req).opened.await.unwrap();
+    let mut opened = connector.begin_open(req).opened.await.unwrap();
+    drive_owner(&mut opened);
     assert_eq!(
         opened.external_session_id.as_ref().map(|s| s.as_str()),
         Some("grok-session-xyz")
@@ -202,11 +217,12 @@ async fn external_session_id_propagated_unchanged() {
 #[tokio::test]
 async fn send_after_finish_fails() {
     let connector = FakeConnector::echo();
-    let opened = connector
+    let mut opened = connector
         .begin_open(OpenConnection::new(ConnectionId::new("c8"), "default"))
         .opened
         .await
         .unwrap();
+    drive_owner(&mut opened);
     opened.input.finish().await.unwrap();
     let err = opened
         .input

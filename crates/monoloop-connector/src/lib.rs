@@ -44,7 +44,7 @@ pub use http::{
     StreamingHttpConnectorFactory,
 };
 pub use instance::{ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId};
-pub use open::{OpenConnection, OpenedRawConnection, PendingRawConnection};
+pub use open::{ConnectionOwnerWork, OpenConnection, OpenedRawConnection, PendingRawConnection};
 pub use proxy::{ConnectorProxy, ConnectorProxyBuilder, ProxyRoute};
 pub use session::{
     validate_open_attachment_owner, validate_session_id_match, McpServerDescriptor,

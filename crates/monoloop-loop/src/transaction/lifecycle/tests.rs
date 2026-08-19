@@ -207,6 +207,48 @@ fn shutdown_publishes_one_completion_per_admission() {
 }
 
 #[test]
+fn fake_echo_exchange_emits_canonical_text_unit() {
+    let started = start_runtime(4, 4);
+    let handle = started.handle.clone();
+    let (receipt, receiver) = submit(&handle, Some("echo")).unwrap();
+    assert!(receipt.session_id.is_some());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (completion, saw_text) = rt.block_on(async {
+        let mut events = receiver.events;
+        let completion = tokio::time::timeout(Duration::from_secs(3), receiver.completion.recv())
+            .await
+            .expect("completion timed out")
+            .expect("completion channel closed");
+        let mut saw_text = false;
+        while let Ok(ev) = events.try_recv() {
+            if let monoloop_contracts::TransactionEventPayload::CanonicalUnit(unit) = &ev.payload {
+                if let monoloop_contracts::CanonicalUnit::Text(t) = &unit.snapshot().unit {
+                    // TestTextEncoder appends ". " to "hi"
+                    assert!(t.content.contains("hi"), "unexpected text: {}", t.content);
+                    saw_text = true;
+                }
+            }
+        }
+        (completion, saw_text)
+    });
+    assert!(saw_text, "expected Text canonical unit from Fake echo");
+    assert_eq!(
+        completion.end.kind,
+        monoloop_contracts::TransactionEndKind::Completed
+    );
+
+    let mut owner = started.owner;
+    let _ = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(2)).await
+    });
+}
+
+#[test]
 fn coordinator_publishes_sequenced_unit_and_completed() {
     let started = start_runtime(4, 4);
     let handle = started.handle.clone();

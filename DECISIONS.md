@@ -106,3 +106,7 @@ together for in-process futures.
   the production constructor (M2).
 - Shutdown timeout yields `Quiescing`, never false `Stopped`.
 - Only process-isolated work is described as hard-killable.
+- M4 (Fake/HTTP slice): connectors return `ConnectionOwnerWork` instead of
+  ambient `tokio::spawn`; lifecycle exchange registers Connector/Interpreter
+  owners through `TransactionTaskSpawner`. ACP stdio profiles still return
+  `owner_work: None` until a later M4 slice.

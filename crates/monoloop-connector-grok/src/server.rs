@@ -336,6 +336,7 @@ async fn open_as_raw_connection(
         output: out,
         control,
         completion: ConnectionCompletionHandle::new(end_rx),
+        owner_work: None,
     })
 }
 

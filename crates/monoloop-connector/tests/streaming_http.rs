@@ -17,6 +17,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+fn drive_owner(opened: &mut monoloop_connector::OpenedRawConnection) {
+    if let Some(work) = opened.take_owner_work() {
+        tokio::spawn(work.into_future());
+    }
+}
+
 async fn bind_router(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -47,7 +53,8 @@ async fn open_and_send(
     open.credential_ref = credential_ref.map(|s| s.to_string());
     open.limits = limits;
     let pending = c.begin_open(open);
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     if !body.is_empty() {
         opened.input.send(Bytes::from(body.to_vec())).await.unwrap();
     }
@@ -223,7 +230,8 @@ async fn max_request_bytes_plus_one() {
         max_chunk_bytes: 64,
     };
     let pending = c.begin_open(open);
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     opened.input.send(Bytes::from(vec![b'x'; 9])).await.unwrap();
     opened.input.finish().await.unwrap();
     let end = opened.completion.wait().await;
@@ -280,7 +288,8 @@ async fn cancel_while_request_in_flight() {
     open.limits.connect_deadline = Duration::from_secs(10);
     let pending = c.begin_open(open);
     let control = pending.control.clone();
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     opened.input.send(Bytes::from_static(b"{}")).await.unwrap();
     opened.input.finish().await.unwrap();
     // Cancel while HTTP request is in flight.
@@ -310,7 +319,8 @@ async fn cancel_before_request_send() {
         format!("http://{addr}/ok"),
     ));
     let control = pending.control.clone();
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     // Cancel while waiting for body finish.
     control.cancel(CancellationReason::CallerRequested);
     let end = opened.completion.wait().await;
@@ -330,7 +340,8 @@ async fn terminate_during_open_collect() {
         format!("http://{addr}/ok"),
     ));
     let control = pending.control.clone();
-    let opened = pending.opened.await.unwrap();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
     control.terminate(TerminationReason::CallerForced);
     let end = opened.completion.wait().await;
     assert_eq!(end.kind, ConnectionEndKind::Terminated);

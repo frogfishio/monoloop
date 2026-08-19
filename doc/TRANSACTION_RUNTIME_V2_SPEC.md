@@ -1,7 +1,11 @@
 # Transaction Runtime v2 Specification
 
-**Status:** Normative replacement specification; M0–M3 landed (D-003). M3 uses a
-synthetic DirectLlm unit path; real Fake/HTTP exchange TaskSpawner is M4.
+**Status:** Normative replacement specification; M0–M4 (Fake/HTTP slice) landed
+(D-003). Fake and StreamingHttp return joinable `ConnectionOwnerWork`; lifecycle
+exchange spawns Connector/Interpreter owners via `TransactionTaskSpawner` with
+fail-closed cleanup (terminate + concurrent child join on every early exit),
+non-blocking spawn mailbox (`try_send` + preferential drain), and no silent unit
+publish drops. ACP stdio profile migration remains a later M4 slice.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

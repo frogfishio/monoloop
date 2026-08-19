@@ -127,6 +127,9 @@ impl StartedRuntime {
         let (control_tx, control_rx) = mpsc::channel(control_capacity);
         let worker_capacity = max_active.saturating_add(8);
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(worker_capacity);
+        let spawn_capacity = max_active.saturating_mul(8).max(32);
+        let (task_spawner, spawn_rx) =
+            super::task_spawner::TransactionTaskSpawner::channel(spawn_capacity);
         let channels = Arc::new(live);
         let shared = Arc::new(RuntimeShared {
             state: AtomicU8::new(STATE_STARTING),
@@ -137,6 +140,8 @@ impl StartedRuntime {
             wake: Notify::new(),
             channels: Arc::clone(&channels),
             default_deadline: bootstrap.config.transaction_limits.transaction_deadline,
+            cleanup_deadline: bootstrap.config.transaction_limits.cleanup_deadline,
+            task_spawner,
             shutdown_generation: AtomicU64::new(0),
             shutdown_report: Mutex::new(None),
             completions_published: AtomicU64::new(0),
@@ -169,6 +174,7 @@ impl StartedRuntime {
                     start_rx,
                     control_rx,
                     worker_rx,
+                    spawn_rx,
                 ));
             })
             .map_err(|_| StartupError::ExecutorUnavailable)?;

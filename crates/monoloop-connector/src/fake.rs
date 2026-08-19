@@ -248,48 +248,46 @@ async fn open_fake(
     ));
     let completion = ConnectionCompletionHandle::new(end_rx);
 
-    match endpoint {
-        FakeEndpoint::Echo => {
-            tokio::spawn(run_echo_owner(
-                connection_id.clone(),
-                control_state,
-                in_rx,
-                out_tx,
-                end_tx,
-            ));
-        }
+    let owner_work = match endpoint {
+        FakeEndpoint::Echo => crate::open::ConnectionOwnerWork::new(run_echo_owner(
+            connection_id.clone(),
+            control_state,
+            in_rx,
+            out_tx,
+            end_tx,
+        )),
         FakeEndpoint::Scripted { chunks } => {
-            tokio::spawn(run_scripted_owner(
+            crate::open::ConnectionOwnerWork::new(run_scripted_owner(
                 connection_id.clone(),
                 control_state,
                 in_rx,
                 out_tx,
                 end_tx,
                 chunks,
-            ));
+            ))
         }
         FakeEndpoint::Pair { pair_key } => {
             let peer_tx = register_pair(&pairs, &pair_key, out_tx.clone()).await?;
-            tokio::spawn(run_pair_owner(
+            crate::open::ConnectionOwnerWork::new(run_pair_owner(
                 connection_id.clone(),
                 control_state,
                 in_rx,
                 peer_tx,
                 out_tx,
                 end_tx,
-            ));
+            ))
         }
         FakeEndpoint::Hang => {
             // Never emit output; hold until local cancel/terminate.
             drop(out_tx);
-            tokio::spawn(run_hang_owner(
+            crate::open::ConnectionOwnerWork::new(run_hang_owner(
                 connection_id.clone(),
                 control_state,
                 in_rx,
                 end_tx,
-            ));
+            ))
         }
-    }
+    };
 
     Ok(OpenedRawConnection {
         connection_id,
@@ -299,6 +297,7 @@ async fn open_fake(
         output,
         control,
         completion,
+        owner_work: Some(owner_work),
     })
 }
 

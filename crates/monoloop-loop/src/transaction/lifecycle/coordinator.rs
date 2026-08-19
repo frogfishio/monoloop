@@ -1,7 +1,8 @@
-//! Per-transaction coordinator (v2 §11) — M3 DirectLlm path.
+//! Per-transaction coordinator (v2 §11) — supervised DirectLlm exchange (M4).
 
 use super::event_publisher::EventPublisherCommand;
-use super::exchange_direct::run_direct_llm_exchange;
+use super::exchange::run_direct_llm_exchange;
+use super::task_spawner::TransactionTaskSpawner;
 use super::terminal::TerminalProposal;
 use crate::transaction::channel_registry::LiveChannel;
 use monoloop_contracts::{
@@ -49,8 +50,12 @@ pub struct CoordinatorParams {
     pub publish_tx: mpsc::Sender<EventPublisherCommand>,
     /// Worker → supervisor.
     pub worker_tx: mpsc::Sender<WorkerMessage>,
+    /// Task supervisor spawn proxy.
+    pub tasks: TransactionTaskSpawner,
     /// Transaction deadline.
     pub deadline: Duration,
+    /// Cleanup join grace for exchange children.
+    pub cleanup_deadline: Duration,
 }
 
 /// Run the coordinator to a terminal proposal and report `WorkerExited`.
@@ -78,7 +83,9 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         channels,
         publish_tx,
         worker_tx: _,
+        tasks,
         deadline,
+        cleanup_deadline,
     } = params;
 
     let Some(live) = channels.get(&channel_id) else {
@@ -102,10 +109,18 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         Err(_) => return TerminalProposal::new(TransactionEndKind::InvariantFailed),
     };
 
-    // M3: synthetic exchange (real Fake I/O → M4 TaskSpawner). LoopRuntime
-    // still ambient-spawns; wiring under TaskSupervisor is M4/M5.
+    let max_encoded = live.binding.limits.max_encoded_exchange_bytes;
+    // Retain budget: channel output-oriented bound (fallback to encoded max).
+    let max_retained = live
+        .binding
+        .limits
+        .max_encoded_exchange_bytes
+        .max(64 * 1024);
+    let max_provider_input = max_encoded;
+
     let outcome = run_direct_llm_exchange(
         transaction_id,
+        &tasks,
         live.instance.connector.as_ref(),
         live.binding.encoder.as_ref(),
         live.binding.interpreter.as_ref(),
@@ -115,18 +130,34 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         &config,
         Arc::clone(&cancel),
         deadline,
+        cleanup_deadline,
+        max_encoded,
+        max_retained,
+        max_provider_input,
     )
     .await;
 
+    // Publish complete units without silent drop (LAW 24). Publisher closure or
+    // cancel during publish fails closed as EventDeliveryFailed.
+    let mut terminal = outcome.terminal;
     for unit in &outcome.units {
-        let _ = tokio::time::timeout(
-            Duration::from_millis(50),
-            publish_tx.send(EventPublisherCommand::Publish(Box::new(
-                TransactionEventPayload::CanonicalUnit(unit.clone()),
-            ))),
-        )
-        .await;
+        let send = publish_tx.send(EventPublisherCommand::Publish(Box::new(
+            TransactionEventPayload::CanonicalUnit(unit.clone()),
+        )));
+        tokio::select! {
+            biased;
+            _ = cancel.notified() => {
+                terminal = TransactionEndKind::Cancelled;
+                break;
+            }
+            res = send => {
+                if res.is_err() {
+                    terminal = TransactionEndKind::EventDeliveryFailed;
+                    break;
+                }
+            }
+        }
     }
 
-    TerminalProposal::new(outcome.terminal)
+    TerminalProposal::new(terminal)
 }

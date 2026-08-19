@@ -8,6 +8,39 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// Unspawned connection-local owner future (v2 §15).
+///
+/// The Loop MUST spawn this via `TaskSupervisor` as `ConnectorOwner` before
+/// relying on input/output. Transport semantic completion does not imply this
+/// future has finished unless the profile documents that equivalence.
+pub struct ConnectionOwnerWork {
+    run: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl ConnectionOwnerWork {
+    /// Build owner work from an unspawned future.
+    pub fn new<F>(future: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            run: Box::pin(future),
+        }
+    }
+
+    /// No-op owner (open failed before any owner ran, or inert placeholder).
+    pub fn noop() -> Self {
+        Self {
+            run: Box::pin(async {}),
+        }
+    }
+
+    /// Consume into a spawnable future.
+    pub fn into_future(self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.run
+    }
+}
+
 /// Transport-only open request (no prompt, task, or UI types).
 #[derive(Clone, Debug)]
 pub struct OpenConnection {
@@ -91,4 +124,16 @@ pub struct OpenedRawConnection {
     pub control: ConnectionControlHandle,
     /// Exactly-one terminal outcome.
     pub completion: ConnectionCompletionHandle,
+    /// Connection owner work the Loop MUST spawn via TaskSupervisor (v2 §15).
+    ///
+    /// `None` is a temporary migration residual for profiles not yet converted
+    /// off ambient spawn; v2 exchange fails closed when this is missing.
+    pub owner_work: Option<ConnectionOwnerWork>,
+}
+
+impl OpenedRawConnection {
+    /// Take owner work for supervised spawn (exactly once).
+    pub fn take_owner_work(&mut self) -> Option<ConnectionOwnerWork> {
+        self.owner_work.take()
+    }
 }

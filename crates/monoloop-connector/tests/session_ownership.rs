@@ -10,6 +10,12 @@ use monoloop_contracts::{ChannelId, ConnectionId, SessionConfig, SessionId, Tran
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn drive_owner(opened: &mut monoloop_connector::OpenedRawConnection) {
+    if let Some(work) = opened.take_owner_work() {
+        tokio::spawn(work.into_future());
+    }
+}
+
 fn attach_request(requested: Option<SessionId>, config: SessionConfig) -> SessionAttachRequest {
     SessionAttachRequest {
         transaction_id: TransactionId::generate(),
@@ -57,7 +63,8 @@ async fn same_instance_accepts_own_attachment() {
     let attachment = pending.completion.await.unwrap();
     let open = OpenConnection::new(ConnectionId::new("c-ok"), "default")
         .with_session_attachment(attachment);
-    let opened = inst.connector.begin_open(open).opened.await.unwrap();
+    let mut opened = inst.connector.begin_open(open).opened.await.unwrap();
+    drive_owner(&mut opened);
     assert!(opened.external_session_id.is_some());
 }
 
@@ -235,12 +242,13 @@ async fn blocked_session_does_not_block_unrelated() {
 async fn direct_llm_factory_has_no_session_adapter() {
     let inst = FakeConnectorFactory::direct_llm().create().unwrap();
     assert!(inst.sessions.is_none());
-    let opened = inst
+    let mut opened = inst
         .connector
         .begin_open(OpenConnection::new(ConnectionId::new("d1"), "default"))
         .opened
         .await
         .unwrap();
+    drive_owner(&mut opened);
     assert!(opened.external_session_id.is_none());
 }
 
@@ -278,10 +286,11 @@ fn same_session_key_excluded_before_connector_invocation() {
 #[tokio::test]
 async fn fake_connector_without_attachment_still_works() {
     let c = FakeConnector::echo();
-    let opened = c
+    let mut opened = c
         .begin_open(OpenConnection::new(ConnectionId::new("plain"), "default"))
         .opened
         .await
         .unwrap();
+    drive_owner(&mut opened);
     assert!(opened.external_session_id.is_none());
 }
