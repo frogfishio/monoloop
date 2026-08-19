@@ -1343,3 +1343,197 @@ is false even before the reopened behavioral defects are exercised.
 
 - [ ] Formatting, all-target/all-feature tests, strict Clippy, and docs all pass.
 - [ ] Independent re-review finds no unresolved P0, P1, or P2 defect.
+
+---
+
+# Runtime v2 M2 review (2026-08-19)
+
+Advisor review of milestone **M2 — Owner, task supervisor, and ledger** against
+`doc/TRANSACTION_RUNTIME_V2_SPEC.md` §7–§9 / §18 / §21 / §22.1 / §24, Laws 1–9
+and 21–25, and D-003 (do not resurrect the seven deleted v1 lifecycle files).
+
+**Verdict:** M2 is **not accepted**. Isolated `monoloop-loop --lib` tests pass
+(19). The workspace does not compile under the spec §23 gates. Mandatory §22.1
+admission tests are incomplete. Claiming “M0–M2 landed” is a shaped
+qualification. **Do not start M3 coordinator/event work until D-038–D-040 are
+closed.**
+
+Verification performed:
+
+- `cargo test -p monoloop-loop --lib`: passed (includes five M2 lifecycle tests).
+- `cargo test -p monoloop-contracts`: architecture gates passed.
+- `cargo test --workspace --all-targets`: failed (`DefaultTransactionRuntime`
+  / `RuntimeBootstrap.executor` in façade example and testkit).
+- `cargo test -p monoloop-loop --features legacy_runtime_tests --no-run`:
+  failed (deleted v1 types).
+- Deleted v1 files (`transaction/{runtime,admission,actor,finalization,
+  callback_service,executor_spawn,tool_join_vault}.rs`) are **absent**.
+- Replacement lives under `transaction/lifecycle/` as required by D-003.
+
+## D-038: Workspace gates still compile deleted v1 runtime types
+
+**Priority:** P1
+**Status:** Open
+**Affected:**
+- `crates/monoloop/examples/fake_echo.rs`
+- `crates/monoloop/examples/host_grok_wiring.rs`
+- `crates/monoloop-testkit/tests/canonical_event_presentation.rs`
+- `crates/monoloop-loop` tests/examples behind `legacy_runtime_tests`
+- crate READMEs still documenting `DefaultTransactionRuntime` + bare `Handle`
+
+**Problem:** M2 correctly removed `DefaultTransactionRuntime` and
+`RuntimeBootstrap.executor`. Downstream examples, the testkit suite, and the
+`legacy_runtime_tests` feature still import those symbols. Spec §23 requires
+`cargo test --workspace --all-targets --all-features`. That gate cannot pass.
+`--all-features` also compiles the explicitly broken legacy suite.
+
+**Required remediation:**
+
+- Port façade examples to `StartedRuntime::start` (no external `Handle`), or
+  gate them until M7 cutover so `--all-targets` stays green.
+- Gate or port `canonical_event_presentation` the same way.
+- Do not advertise `legacy_runtime_tests` as a workspace feature until those
+  tests are rewritten or removed. A feature that cannot compile is not a
+  deferred suite.
+- Update host-facing READMEs so they do not instruct callers to pass a bare
+  Tokio `Handle`.
+
+**Acceptance criteria:**
+
+- [ ] `cargo test --workspace --all-targets` compiles and runs.
+- [ ] `cargo test --workspace --all-targets --all-features` does not compile
+      deleted v1 symbols.
+- [ ] No in-tree example still constructs `RuntimeBootstrap { executor, .. }`.
+
+## D-039: Shutdown and control share the start queue at exact capacity
+
+**Priority:** P1
+**Status:** Open
+**Affected:**
+- `crates/monoloop-loop/src/transaction/lifecycle/owner.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/admission.rs`
+
+**Problem:** The supervisor `mpsc` is sized `max_active_transactions` and carries
+`Start`, `Cancel`, `ForceTerminate`, `BeginShutdown`, and `StopSupervisor`.
+Admission can fill that queue with `Start` commands before the supervisor
+polls. `begin_shutdown` then `try_send`s `BeginShutdown` and **drops the
+command on `Full`**, after already CAS-ing state to `Quiescing`.
+
+`wait_stopped` only re-sends shutdown when state is still `Accepting`. After a
+lost `BeginShutdown` the owner stays `Quiescing` with parked coordinators and
+never retries. `terminate` reports `AlreadyTerminal` on the same `Full` path
+(a lie). This is the D-010 class of defect in v2 clothing: admission-closed
+does not imply the supervisor will drain.
+
+Spec §9.2 requires start-queue capacity ≥ `max_active_transactions` for
+**start** commands. Control and shutdown must not be starved by that bound.
+
+**Required remediation:**
+
+- Separate control/shutdown from the start queue, or size the shared queue
+  with dedicated control slack that admission cannot consume.
+- Retry `BeginShutdown` / `StopSupervisor` from `wait_stopped` while
+  `Quiescing`.
+- Do not map `try_send` failure to `AlreadyTerminal`.
+
+**Acceptance criteria:**
+
+- [ ] With `max_active` admitted and unprocessed `Start`s queued,
+      `begin_shutdown` + `wait_stopped` still reaches `Stopped` (or honest
+      `Quiescing` with a later successful wait).
+- [ ] A full start queue cannot drop shutdown or cancel.
+- [ ] `terminate` on a live transaction is never reported as `AlreadyTerminal`
+      solely because the command queue was full.
+
+## D-040: Mandatory §22.1 admission tests are not implemented
+
+**Priority:** P1
+**Status:** Open
+**Affected:**
+- `crates/monoloop-loop/src/transaction/lifecycle/tests.rs`
+
+**Problem:** Present tests cover OS-thread submit, duplicate session, capacity
+plus-one, one completion per shutdown, and a best-effort zero-deadline wait.
+Spec §22.1 also requires, before treating M2 as done:
+
+- a parked runtime worker cannot delay synchronous admission;
+- start-queue full rolls back ledger, session, delivery, and every permit;
+- submit versus `begin_shutdown` has only two legal outcomes;
+- rejected admission publishes no event and no completion.
+
+`short_wait_may_timeout_while_quiescing_then_complete` accepts either
+`Stopped` or `TimedOut` (spec §21 forbids conditional tests that weaken
+mandatory assertions). `wait_until_stopped` snapshots `owned_tasks: 0`
+unconditionally.
+
+**Required remediation:**
+
+- Add deterministic tests for the four missing §22.1 cases.
+- Prove start-queue rollback releases global/channel/ledger permits to zero.
+- Prove rejected submit never completes the oneshot and never enqueues events.
+- Make the short-wait test force `TimedOut` (parked non-yielding worker in an
+  isolated subprocess if needed) rather than accepting `Stopped`.
+
+**Acceptance criteria:**
+
+- [ ] Every §22.1 item has a direct deterministic test.
+- [ ] No M2 test is green for both of two contradictory outcomes.
+
+## D-041: M2 still substitutes limits and fabricates terminal-event delivery
+
+**Priority:** P2
+**Status:** Open
+**Affected:**
+- `crates/monoloop-loop/src/transaction/lifecycle/capacity.rs` (`.max(1)`)
+- `crates/monoloop-loop/src/transaction/lifecycle/owner.rs` (start queue `.max(1)`)
+- `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs`
+  (`TerminalEventDelivery::Published` without an `Ended` enqueue)
+- `crates/monoloop-loop/src/transaction/capacity.rs` (`CapacityManagers`
+  counter API still compiled and re-exported)
+- `doc/TRANSACTION_RUNTIME_V2_SPEC.md` status line “M0–M2 landed”
+
+**Problem:** D-015 forbade silent `.max(1)` substitution of invalid capacities.
+M2 repeats it. Completion always reports `TerminalEventDelivery::Published`
+without attempting the event mailbox (spec §6.4 / §13.2). The old
+counter-only `CapacityManagers` remains on the public surface beside the RAII
+pool. The spec header marks M2 landed.
+
+These are honesty / law-22 issues, not a reason to rebuild the owner model.
+
+**Required remediation:**
+
+- Fail closed on zero capacity (startup already validates; do not clamp).
+- Record terminal-event delivery as not-yet-attempted, or skip the field
+  until M3 actually enqueues `Ended`.
+- Stop exporting unused v1 `CapacityManagers`.
+- Change the v2 spec status to M0–M1 landed, M2 in progress, until D-038–D-040
+  close.
+
+**Acceptance criteria:**
+
+- [ ] No production lifecycle `.max(1)` on caller-configured capacities.
+- [ ] Completion does not claim `Published` for an event that was not sent.
+- [ ] Spec status matches review acceptance.
+
+## M2 boundary notes (not separate defects)
+
+- **No v1 file resurrection.** The seven files named in D-003 were not
+  recreated. Uncompiled leftovers (`active_registry.rs`, `spawn_gate.rs`,
+  `dispatcher.rs`, `exchange.rs`, `events.rs`, `mcp/`, `loop_adapters.rs`)
+  match D-003 “deferred until their stage.” `spawn_gate.rs` still comments on
+  deleted `executor_spawn` — delete at M7, do not revive.
+- **Three components hold.** Connector/Interpreter crates are untouched by M2.
+  Loop still composes them. Product crates do not depend on testkit.
+  Architecture import gates pass.
+- **Identity.** Duplicate `SessionKey` is rejected; no most-recent-session
+  heuristic. Grok `sessionId` is not replaced.
+- **Core does not invoke host sinks/callbacks.** Host adapters live in the
+  Loop crate and run only when the host calls them (spec-allowed). They are
+  not a fourth component.
+- **Inner `DefaultLoopRuntime`** still uses ambient `tokio::spawn`. That is
+  the preserved complete-unit machine (M3/M7 consolidation), not an M2
+  resurrection of `DefaultTransactionRuntime`.
+- **Accepted structural gap until M4:** realized Connector instances live on
+  the cloneable handle `Arc`, not on `RuntimeOwner` (spec §7.1). Do not
+  deepen this in M3.

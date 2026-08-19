@@ -11,6 +11,13 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 description = "Test kit: console renderer, fixtures, and composition helpers (not a product component)"
+# Explicit test targets so suites needing deleted v1 DefaultTransactionRuntime
+# are gated during Runtime v2 migration (M7 cutover).
+autotests = false
+
+[features]
+default = []
+legacy_runtime_tests = []
 
 [dependencies]
 bytes = { workspace = true }
@@ -36,3 +43,32 @@ futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 url = { workspace = true }
 http = { workspace = true }
+
+[[test]]
+name = "console_pipeline"
+path = "tests/console_pipeline.rs"
+
+[[test]]
+name = "driver_e2e"
+path = "tests/driver_e2e.rs"
+
+[[test]]
+name = "html_dump"
+path = "tests/html_dump.rs"
+
+[[test]]
+name = "profile_bindings"
+path = "tests/profile_bindings.rs"
+
+[[test]]
+name = "qualification_projection"
+path = "tests/qualification_projection.rs"
+
+[[test]]
+name = "raw_dump_pipeline"
+path = "tests/raw_dump_pipeline.rs"
+
+[[test]]
+name = "canonical_event_presentation"
+path = "tests/canonical_event_presentation.rs"
+required-features = ["legacy_runtime_tests"]

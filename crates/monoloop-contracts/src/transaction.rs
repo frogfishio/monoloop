@@ -61,8 +61,7 @@ where
 /// Transaction submission request (synchronous admission; async progress).
 ///
 /// **v1 fields** `events` / `completion` remain until Runtime v2 cutover (M7).
-/// New code SHOULD construct [`crate::delivery::TransactionDelivery`] ports and
-/// will migrate onto a delivery-based request shape during M2–M3.
+/// New code SHOULD use [`TransactionSubmitRequest`] with concrete delivery ports.
 pub struct TransactionRequest {
     /// Explicit Channel selection.
     pub channel_id: ChannelId,
@@ -80,6 +79,24 @@ pub struct TransactionRequest {
     pub events: Arc<dyn TransactionEventSink>,
     /// Required completion callback (v1; retired from the core at v2 cutover).
     pub completion: Box<dyn CompletionCallback>,
+}
+
+/// Runtime v2 submission request — concrete mailboxes, no host traits in-core.
+pub struct TransactionSubmitRequest {
+    /// Explicit Channel selection.
+    pub channel_id: ChannelId,
+    /// Existing session when known; `None` for new external create or direct-LLM generate.
+    pub session_id: Option<SessionId>,
+    /// Canonical input messages.
+    pub input: CanonicalInput,
+    /// Optional external-agent session configuration.
+    pub session_config: Option<SessionConfig>,
+    /// Invocation configuration.
+    pub invocation_config: InvocationConfig,
+    /// Selected host tool ids (deduplicated at admission).
+    pub tools: Vec<ToolId>,
+    /// Library-created delivery ports (caller holds the receiver half).
+    pub delivery: crate::delivery::TransactionDelivery,
 }
 
 /// Immediate admission receipt (no network performed).

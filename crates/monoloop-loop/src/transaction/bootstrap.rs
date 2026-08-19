@@ -1,17 +1,16 @@
-//! Runtime bootstrap inputs.
+//! Runtime bootstrap inputs (Transaction Runtime v2).
 
 use super::channel_registry::ChannelRegistry;
 use super::host_tools::HostToolRegistry;
 use monoloop_contracts::TransactionLimits;
 use std::time::Duration;
-use tokio::runtime::Handle;
 
 /// Runtime-wide configuration validated at startup.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Transaction / event / callback bounds.
     pub transaction_limits: TransactionLimits,
-    /// When true, bind a loopback MCP listener shell (WP-07 fills protocol).
+    /// When true, bind a loopback MCP listener (deferred until M5).
     pub enable_mcp_listener: bool,
     /// Maximum time to wait for graceful drain during shutdown when not specified.
     pub default_shutdown_deadline: Duration,
@@ -21,7 +20,8 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             transaction_limits: TransactionLimits::default(),
-            enable_mcp_listener: true,
+            // MCP deferred until M5 — default off so start succeeds.
+            enable_mcp_listener: false,
             default_shutdown_deadline: Duration::from_secs(30),
         }
     }
@@ -47,20 +47,15 @@ impl RuntimeConfig {
     }
 }
 
-/// Bootstrap inputs for Runtime v2 start (M2 will return [`super::lifecycle::StartedRuntime`]).
+/// Production bootstrap for [`super::lifecycle::StartedRuntime::start`].
 ///
-/// # Executor ownership (v2)
-///
-/// Production start MUST construct and own its executor (`doc/TRANSACTION_RUNTIME_V2_SPEC.md`
-/// §7.2). The `executor` field remains temporarily for leftover callers during
-/// migration and will be removed from the production constructor in M2.
+/// The runtime constructs and owns its Tokio executor (v2 §7.2). There is no
+/// external `Handle` on this struct.
 pub struct RuntimeBootstrap {
     /// Limits and feature flags.
     pub config: RuntimeConfig,
-    /// Immutable Channel bindings (factories not yet realized).
+    /// Immutable Channel bindings (factories realized at start).
     pub channels: ChannelRegistry,
     /// Immutable host tool shell (empty allowed).
     pub tools: HostToolRegistry,
-    /// Temporary external handle (removed from production API in M2).
-    pub executor: Handle,
 }

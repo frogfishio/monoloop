@@ -4,12 +4,7 @@
 //! Component 03 — The Loop.
 //!
 //! Inner `LoopRuntime` (complete-unit tool reaction) plus the outer
-//! transaction composition layer.
-//!
-//! Transaction lifecycle is being replaced by Runtime v2
-//! (`doc/TRANSACTION_RUNTIME_V2_SPEC.md`). Public exports below reflect the
-//! modules that compile during migration; full `TransactionRuntime` cutover is
-//! M7.
+//! transaction composition layer (Runtime v2 lifecycle under `transaction::lifecycle`).
 
 #![deny(missing_docs)]
 
@@ -35,17 +30,17 @@ pub use tools::{
     ToolRuntimeTerminal,
 };
 pub use transaction::{
-    adapt_completion_callback, adapt_event_sink, begin_shutdown_placeholder, build_completion,
-    rejecting, validate_tool_completion, validate_tool_input, AcpPromptEncoder, AcpPromptWireShape,
-    AsyncToolHandler, CapacityManagers, ChannelBinding, ChannelRegistry, EmptyBytesEncoder,
-    HeadlessPromptEncoder, HostCompletionAdapter, HostEventAdapter, HostToolRegistry,
-    ImmediateToolHandler, InputValidationFailure, IsolatedKillableToolHandler, LedgerEntry,
-    LifecycleLedger, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
-    OpenAiChatCompletionsEncoder, OpenAiEncoderOptions, OutputValidationFailure,
-    PanicOnStartHandler, RegisteredTool, RejectEncoder, ResolvedTool, ResolvedToolSet,
+    adapt_completion_callback, adapt_event_sink, build_completion, validate_tool_completion,
+    validate_tool_input, AcpPromptEncoder, AcpPromptWireShape, AsyncToolHandler, CapacityManagers,
+    ChannelBinding, ChannelRegistry, EmptyBytesEncoder, HeadlessPromptEncoder,
+    HostCompletionAdapter, HostEventAdapter, HostToolRegistry, ImmediateToolHandler,
+    InputValidationFailure, IsolatedKillableToolHandler, LedgerEntry, LifecycleLedger,
+    LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler, OpenAiChatCompletionsEncoder,
+    OpenAiEncoderOptions, OutputValidationFailure, PanicOnStartHandler, RegisteredTool,
+    RejectEncoder, ReservationPool, ReservationPoolError, ResolvedTool, ResolvedToolSet,
     RuntimeBootstrap, RuntimeConfig, RuntimeOwner, RuntimeState, SharedToolCapacity,
     ShutdownTicket, StartFailHandler, StartedRuntime, StartupError, SupervisorCommand, TaskClass,
-    TaskId, TaskSupervisor, TerminalDecision, TestTextEncoder, ToolExecutionCompletion,
+    TaskExit, TaskId, TaskSupervisor, TerminalDecision, TestTextEncoder, ToolExecutionCompletion,
     ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionCoordinator, TransactionPhase,
     TransactionReservations, TransactionRuntimeHandle, TransactionToolCapacity,
 };
@@ -59,4 +54,5 @@ pub use monoloop_contracts::{
     OutboundToolResult, ShutdownReport, ShutdownSnapshot, ShutdownWaitOutcome,
     TerminalEventDelivery, ToolActionId, ToolRequestState, ToolUnavailableReason,
     TransactionCompletion, TransactionDelivery, TransactionEndEvent, TransactionReceiver,
+    TransactionSubmitRequest,
 };

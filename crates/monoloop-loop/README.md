@@ -27,19 +27,22 @@ Prefer the façade crate `monoloop` unless you need this crate as a direct depen
 
 Do not recreate the deleted v1 files (`runtime`, `admission`, `actor`,
 `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`).
-Follow the seven-stage plan in the v2 spec. Deferred on-disk modules
-(`dispatcher`, `exchange`, `mcp`, …) stay uncompiled until their stage.
+Follow the seven-stage plan in the v2 spec. **M0–M2 landed (hardened):** owned
+executor, task supervisor, ledger, RAII reservations (no silent `.max(1)`),
+synchronous admission, **separate start vs control supervisor queues**, and
+workspace gating for v1 `DefaultTransactionRuntime` consumers. Deferred on-disk
+modules (`dispatcher`, `exchange`, `mcp`, …) stay uncompiled until their stage.
+Legacy suites need `--features legacy_runtime_tests`.
 
-## Agent assembly recipe (v2 target)
+## Agent assembly recipe (v2 / M2)
 
 ```text
 1. Build ChannelBinding { … }
 2. ChannelRegistry::build(vec![binding])
-3. start → StartedRuntime { owner, handle }   // M2: owned executor
-4. handle.submit with TransactionDelivery ports
-5. Host drains TransactionReceiver outside the runtime executor
-6. owner.begin_shutdown(); owner.wait_stopped(deadline)
+3. StartedRuntime::start(RuntimeBootstrap { config, channels, tools })
+     // no external Tokio Handle — runtime owns its executor
+4. let (delivery, receiver) = transaction_delivery(limits)?;
+5. handle.submit(TransactionSubmitRequest { …, delivery })
+6. Host drains receiver outside the runtime executor
+7. owner.begin_shutdown(); owner.wait_stopped(deadline) // timeout ⇒ Quiescing
 ```
-
-Until M7 cutover, integration tests that still expect `DefaultTransactionRuntime`
-will not compile against this crate.

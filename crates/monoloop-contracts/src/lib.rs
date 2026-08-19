@@ -87,7 +87,8 @@ pub use transaction::{
     TerminationDisposition, TerminationMode, TerminationReason, TerminationReasonCode,
     TransactionCompletion, TransactionDiagnostic, TransactionEnd, TransactionEndEvent,
     TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionEventSink,
-    TransactionRequest, TransactionRuntime, TransactionSelector, TransactionUsage,
+    TransactionRequest, TransactionRuntime, TransactionSelector, TransactionSubmitRequest,
+    TransactionUsage,
 };
 
 pub use bytes::Bytes;

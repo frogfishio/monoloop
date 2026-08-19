@@ -21,6 +21,7 @@ monoloop-contracts = { workspace = true }
 monoloop-connector = { workspace = true }
 monoloop-interpreter = { workspace = true }
 axum = { workspace = true }
+futures-util = { workspace = true }
 jsonschema = { workspace = true }
 rand = { workspace = true }
 rmcp = { workspace = true }

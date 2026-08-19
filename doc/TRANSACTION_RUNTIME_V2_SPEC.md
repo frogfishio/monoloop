@@ -1,6 +1,6 @@
 # Transaction Runtime v2 Specification
 
-**Status:** Normative replacement specification; M0 accepted (D-003), M1 in progress
+**Status:** Normative replacement specification; M0–M2 landed and hardened (D-003)
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 
