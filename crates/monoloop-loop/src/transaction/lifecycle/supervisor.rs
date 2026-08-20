@@ -12,7 +12,9 @@ use super::task_supervisor::{TaskClass, TaskExit, TaskSupervisor};
 use super::terminal::{build_completion, end_event, TerminalDecision, TerminalProposal};
 use crate::transaction::bootstrap::{FinalizerHoldGate, StartHoldGate, StoppedGate};
 use crate::transaction::channel_registry::LiveChannel;
+use crate::transaction::dispatcher::RuntimeToolSpill;
 use crate::transaction::host_tools::HostToolRegistry;
+use crate::transaction::mcp::{McpGatewayHandle, PreparedMcpGateway};
 use crate::transaction::tool_capacity::SharedToolCapacity;
 use monoloop_contracts::{
     ChannelId, CleanupStatus, CompletionPublishResult, ShutdownReport, ShutdownSnapshot,
@@ -23,6 +25,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Notify};
+use tokio_util::sync::CancellationToken;
 
 /// Start-queue commands (admission only).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,10 +87,14 @@ pub(crate) struct RuntimeShared {
     pub runtime_shutdown_terminals: AtomicU64,
     /// Live TaskSupervisor task count (updated by supervisor loop).
     pub owned_tasks: AtomicU32,
-    /// When true, supervisor owns a loopback MCP placeholder listener (D-043).
+    /// When true, supervisor owns a loopback MCP gateway as RuntimeService (D-043 / §17).
     pub enable_mcp_listener: bool,
-    /// Bound address once the MCP listener task reports ready.
+    /// Bound address once the MCP gateway task reports ready.
     pub mcp_listen_addr: Mutex<Option<std::net::SocketAddr>>,
+    /// Cloneable MCP install/activate handle while the RuntimeService is live.
+    pub mcp_gateway: Mutex<Option<McpGatewayHandle>>,
+    /// Cancels the MCP axum serve future on quiesce.
+    pub mcp_cancel: Mutex<Option<CancellationToken>>,
     /// When `Some`, defer `Stopped` until the gate is released (§22.5).
     pub block_stopped: Option<Arc<StoppedGate>>,
     /// When `Some` and held, supervisor does not drain the start queue (D-040).
@@ -100,6 +107,8 @@ pub(crate) struct RuntimeShared {
     pub tools_registry: HostToolRegistry,
     /// Process-wide concurrent tool execution budget.
     pub shared_tool_capacity: Arc<SharedToolCapacity>,
+    /// Runtime-scoped unfinished tool joins/permits (Law 8 — not process-global).
+    pub tool_spill: Arc<RuntimeToolSpill>,
 }
 
 impl RuntimeShared {
@@ -118,12 +127,18 @@ impl RuntimeShared {
 
     pub fn snapshot(&self) -> ShutdownSnapshot {
         let ledger_entries = self.ledger.lock().map(|l| l.len()).unwrap_or(0) as u32;
+        let mcp_routes = self
+            .mcp_gateway
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|h| h.routes().len() as u32))
+            .unwrap_or(0);
         ShutdownSnapshot {
             generation: self.shutdown_generation.load(Ordering::SeqCst),
             ledger_entries,
             owned_tasks: self.owned_tasks.load(Ordering::SeqCst),
             owned_processes: 0,
-            mcp_routes: 0,
+            mcp_routes,
             completions_published: self.completions_published.load(Ordering::SeqCst),
         }
     }
@@ -145,18 +160,16 @@ pub(crate) async fn run_supervisor(
     mut control_rx: mpsc::Receiver<ControlCommand>,
     mut worker_rx: mpsc::Receiver<WorkerMessage>,
     mut spawn_rx: mpsc::Receiver<SpawnRequest>,
-    mcp_listener: Option<std::net::TcpListener>,
+    mcp_prepared: Option<PreparedMcpGateway>,
 ) {
     let mut tasks = TaskSupervisor::new();
     let mut stopping = false;
     let mut quiesce_started: Option<tokio::time::Instant> = None;
 
-    if let Some(std_listener) = mcp_listener {
-        let mcp_shared = Arc::clone(&shared);
-        tasks.spawn(
-            TaskClass::RuntimeService,
-            super::mcp_listener::run_loopback_mcp_listener(mcp_shared, std_listener),
-        );
+    if let Some(prepared) = mcp_prepared {
+        // Handle/addr already published before start ready (§7.1).
+        let serve = super::mcp_listener::serve_runtime_mcp(Arc::clone(&shared), prepared);
+        tasks.spawn(TaskClass::RuntimeService, serve);
     }
     // §22.3 sacrificial: never-awaiting future pins one worker; abort cannot
     // join it, so shutdown must stay Quiescing (never false Stopped).
@@ -242,6 +255,9 @@ pub(crate) async fn run_supervisor(
         }
 
         if stopping {
+            // Drain AbortableAtYield; release join-less orphans; JoinOnly blocks Stopped.
+            let _ = shared.tool_spill.shutdown_progress();
+
             // Drive residual abort every lap so coordinator/tool work cannot
             // strand Finalizer → tombstone → Stopped.
             let tx_ids: Vec<TransactionId> = {
@@ -298,20 +314,25 @@ pub(crate) async fn run_supervisor(
             }
             // Ledger may have been re-populated if a late WorkerExited arrived.
             if shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true) {
-                if tasks.is_empty() {
+                // Tool spill must be empty before Stopped (Law 23 / §7 / §21).
+                let spill_pending = shared.tool_spill.shutdown_progress();
+                if tasks.is_empty() && spill_pending == 0 {
                     ready_to_stop = true;
-                } else {
+                } else if !tasks.is_empty() {
                     // One bounded drain; on timeout fall through to select (50ms
                     // tick) — never tight-loop abort_and_drain (§18.2 / Drop).
                     if tasks.abort_and_drain().await {
+                        let spill_pending = shared.tool_spill.shutdown_progress();
                         ready_to_stop = shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true)
-                            && tasks.is_empty();
+                            && tasks.is_empty()
+                            && spill_pending == 0;
                     } else {
                         shared
                             .owned_tasks
                             .store(tasks.registered_count() as u32, Ordering::SeqCst);
                     }
                 }
+                // else: spill still holds JoinOnly/orphans — stay Quiescing.
             }
         }
         if ready_to_stop {
@@ -501,6 +522,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         let _ = pub_tx_task;
     });
 
+    let mcp_gateway = shared.mcp_gateway.lock().ok().and_then(|g| g.clone());
     let params = CoordinatorParams {
         transaction_id: tx,
         cancel,
@@ -518,6 +540,9 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         selected_tools,
         tools_registry: shared.tools_registry.clone(),
         shared_tool_capacity: Arc::clone(&shared.shared_tool_capacity),
+        tool_spill: Arc::clone(&shared.tool_spill),
+        mcp_gateway,
+        shared: Arc::clone(shared),
     };
     tasks.spawn(TaskClass::TransactionCoordinator(tx), async move {
         run_coordinator(params).await;
@@ -706,7 +731,9 @@ fn begin_shutdown_inner(
         shared.state.store(STATE_QUIESCING, Ordering::SeqCst);
     }
     *stopping = true;
-    // Wake MCP listener and any other runtime-wide waiters (D-043).
+    // Revoke MCP routes + cancel axum serve so RuntimeService can join (§17).
+    super::mcp_listener::signal_mcp_shutdown(shared);
+    // Wake any other runtime-wide waiters (D-043).
     shared.wake.notify_waiters();
 
     let ids = shared

@@ -9,7 +9,7 @@ use monoloop_contracts::{
 use monoloop_loop::{
     dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, HostToolRegistry, ImmediateToolHandler,
     IsolatedKillableToolHandler, LinkedToolExecutionHandle, ProcessIsolatedToolHandler,
-    RegisteredTool, ResolvedToolSet, SharedToolCapacity, ToolExecutionCompletion,
+    RegisteredTool, ResolvedToolSet, RuntimeToolSpill, SharedToolCapacity, ToolExecutionCompletion,
     ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionToolDispatcher,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -474,6 +474,70 @@ async fn s22_4_process_isolated_killed_and_reaped() {
         ),
         "expected process kill/reap path, got {out:?}"
     );
+}
+
+/// Law 8: unfinished tool work stays on a runtime-scoped spill — not a process-global set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s22_4_tool_spill_is_runtime_scoped_not_process_global() {
+    let spill_a = Arc::new(RuntimeToolSpill::new());
+    let spill_b = Arc::new(RuntimeToolSpill::new());
+    let spec = base_spec(
+        "ign2",
+        "ign2",
+        ToolExecutionClass::CooperativeInProcess {
+            grace: Duration::from_millis(30),
+        },
+        Duration::from_millis(20),
+    );
+    let host = HostToolRegistry::build(vec![RegisteredTool::new(
+        spec,
+        Arc::new(IgnoreCancelCooperative),
+    )])
+    .unwrap();
+    let tool = host.get(&ToolId::try_new("ign2").unwrap()).unwrap().clone();
+    let shared = SharedToolCapacity::new(1);
+    let d = TransactionToolDispatcher::with_runtime_spill(
+        TransactionId::generate(),
+        session_key(),
+        ResolvedToolSet::from_registered(vec![tool]),
+        Arc::clone(&shared),
+        Arc::clone(&spill_a),
+        4,
+        8,
+    );
+    let out = dispatch_ready_tool(
+        &d,
+        ExchangeId::generate(),
+        ToolActionId::new("a"),
+        "ign2",
+        "p",
+        0,
+        r#"{"q":"x"}"#,
+    )
+    .await;
+    assert!(
+        matches!(
+            &out,
+            DispatchOutcome::RuntimeFailed { code, .. } if code == "deadline_exceeded"
+        ),
+        "expected deadline_exceeded, got {out:?}"
+    );
+    d.reap_vault();
+    assert!(
+        spill_a.pending_permits() >= 1,
+        "work must park on the runtime spill passed into the dispatcher"
+    );
+    assert!(
+        spill_b.is_empty(),
+        "a sibling spill must stay empty (no process-global transfer)"
+    );
+    // Dropping the dispatcher Arc must not move work onto spill_b / a global set.
+    drop(d);
+    assert!(
+        spill_a.pending_permits() >= 1,
+        "parked work remains on the same runtime spill after dispatcher drop"
+    );
+    assert!(spill_b.is_empty());
 }
 
 /// §22.4: tool cannot self-assert a stronger execution class than structural factory.

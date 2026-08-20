@@ -37,24 +37,25 @@ pub use bootstrap::{
 };
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
 pub use dispatcher::{
-    DispatchOutcome, DispatchRequest, DispatcherLimits, TransactionToolDispatcher,
+    DispatchOutcome, DispatchRequest, DispatcherLimits, RuntimeToolSpill, TransactionToolDispatcher,
 };
 pub use error::StartupError;
 pub use fake_support::{EmptyBytesEncoder, PanicEncoder, RejectEncoder, TestTextEncoder};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
+pub use lifecycle::{
+    adapt_completion_callback, adapt_event_sink, build_completion, HostCompletionAdapter,
+    HostEventAdapter, LedgerEntry, LifecycleLedger, ReservationPool, ReservationPoolError,
+    RuntimeOwner, ShutdownTicket, SpawnReject, StartedRuntime, SupervisorCommand, TaskClass,
+    TaskExit, TaskId, TaskSupervisor, TerminalDecision, TerminalProposal, TransactionPhase,
+    TransactionReservations, TransactionRuntimeHandle, TransactionTaskSpawner,
+};
 pub use loop_adapters::{
     dispatch_ready_tool, dispatch_ready_tool_cancellable, HostToolRuntime, ResolvedToolRegistry,
 };
 pub use mcp::{
     tool_definitions_from_resolved, CapabilityToken, McpBindingState, McpGateway, McpGatewayHandle,
-    McpInstallError, McpRouteTable, PendingMcpBinding, TransactionMcpHandler,
-};
-pub use lifecycle::{
-    adapt_completion_callback, adapt_event_sink, build_completion, HostCompletionAdapter,
-    HostEventAdapter, LedgerEntry, LifecycleLedger, ReservationPool, ReservationPoolError,
-    RuntimeOwner, ShutdownTicket, StartedRuntime, SupervisorCommand, TaskClass, TaskExit, TaskId,
-    TaskSupervisor, TerminalDecision, TerminalProposal, TransactionPhase, TransactionReservations,
-    TransactionRuntimeHandle, TransactionTaskSpawner,
+    McpInstallError, McpRequestOwner, McpRouteTable, PendingMcpBinding, PreparedMcpGateway,
+    TransactionMcpHandler,
 };
 
 pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};

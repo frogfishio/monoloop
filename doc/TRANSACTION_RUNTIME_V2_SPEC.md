@@ -1,12 +1,12 @@
 # Transaction Runtime v2 Specification
 
 **Status:** Normative replacement specification; **M0–M5 landed** (D-003; D-042;
-D-043; D-044 Fixed). **M6 partial — not done** (D-045): §22.1–§22.6 landed;
-non-empty `HostToolRegistry` Loop path + MCP loopback gateway module/tests
-landed (instance-owned routes/services); remaining §22.7 host-adapter proofs +
-RuntimeOwner MCP `RuntimeService` wiring deferred. **M7 façade landed**
-(D-038 Fixed). **Not** M0–M7 complete / Golden / §25 DoD while D-045 remainder
-is open. D-039 / D-040 / D-041 Fixed.
+D-043; D-044 Fixed). **M6 §22 matrix closed enough** (D-045): §22.1–§22.7
+proofs landed (host adapters outside core); MCP RuntimeService + CreationOnly
++ `TaskClass::McpRequest` ownership landed. Refreshable MCP undeclared by
+current profiles (WP12). **M7 façade landed** (D-038 Fixed). **§23 core commands** (fmt / clippy / test / doc -D warnings) green on tree;
+remaining §23 extras + independent review still open. **Not** Golden / §25.
+D-039 / D-040 / D-041 Fixed.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

@@ -8,11 +8,12 @@
 //! child's machine-readable line, then kills the child (outer harness bound).
 //! Timing out without the TimedOut line is a failure (no shaped green).
 
-use monoloop_connector::{FakeConnectorFactory};
+use monoloop_connector::FakeConnectorFactory;
 use monoloop_contracts::{
-    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy,
-    DialectDescriptor, ExchangeMode, McpConfigurationCapability, McpReachability, OptionPolicy,
-    SessionMode, ShutdownWaitOutcome, ToolExecutionMode, TransactionLimits,
+    ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
+    ContinuationPolicy, DialectDescriptor, ExchangeMode, McpConfigurationCapability,
+    McpReachability, OptionPolicy, SessionMode, ShutdownWaitOutcome, ToolExecutionMode,
+    TransactionLimits,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{

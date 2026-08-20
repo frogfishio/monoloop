@@ -45,9 +45,8 @@ impl RegisteredTool {
 
     /// Construct a registered tool, rejecting unstoppable / mismatched class (D-024).
     ///
-    /// [`ToolExecutionClass::ProcessIsolated`] MUST use
-    /// [`Self::try_new_process_isolated`] with a concrete
-    /// [`super::process_tool::ProcessIsolatedToolHandler`] (V2 §14.3 structural factory).
+    /// Process-isolated tools MUST use [`Self::try_new_process_isolated`] with a
+    /// concrete [`super::process_tool::ProcessIsolatedToolHandler`] (V2 §14.3).
     pub fn try_new(
         spec: ToolSpec,
         handler: Arc<dyn ToolHandler>,

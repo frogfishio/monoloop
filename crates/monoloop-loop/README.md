@@ -27,19 +27,24 @@ Prefer the façade crate `monoloop` unless you need this crate as a direct depen
 
 Do not recreate the deleted v1 files (`runtime`, `admission`, `actor`,
 `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`).
-Follow the seven-stage plan in the v2 spec.
+Follow the seven-stage plan in the v2 spec. Runtime-scoped
+`RuntimeToolSpill` (in `dispatcher.rs`) is the interim honesty fix for
+parked tool joins — not a revived v1 vault module; M5 end state still
+deletes join vaults once handler workers are TaskSupervisor-owned.
 
-**M0–M5 landed** (D-042 / D-043 / D-044). **M6 partial — not done** (D-045):
-§22.5 CAS/`StoppedGate`; Finalizer tombstone; hard-grace residuals until
-completion. Remaining §22 matrix / MCP / non-empty tools deferred.
+**M0–M5 landed** (D-042 / D-043 / D-044). **M6 §22 closed enough** (D-045):
+§22.1–§22.7 proofs landed (host-adapter proofs outside core);
+MCP RuntimeService + CreationOnly + `TaskClass::McpRequest` ownership landed.
+Process-global tool-join pending set removed (`RuntimeToolSpill` + Stopped
+spill-empty gate). Refreshable MCP undeclared (WP12).
 
 **M7 façade landed (D-038 Fixed):** `StartedRuntime` + `TransactionSubmitRequest`
 is the assembler recipe; deprecated sink-shaped `TransactionRequest` /
 `TransactionRuntime` trait are not core submit APIs. Host adapters
 `adapt_event_sink` / `adapt_completion_callback` stay (outside the kernel).
 Unregistered v1 integration `.rs` files remain on disk until rewritten.
-**M7 ≠ Golden / §25 DoD** while the M6 §22 remainder (D-045) is open.
-D-039 / D-040 / D-041 Fixed.
+**Not Golden / §25 DoD** while §23 workspace gates and independent review
+remain open. D-039 / D-040 / D-041 Fixed.
 
 Deferred on-disk modules (`active_registry`, `spawn_gate`, …) stay uncompiled
 until Loop-machine consolidation — deleting them is not part of façade cutover.

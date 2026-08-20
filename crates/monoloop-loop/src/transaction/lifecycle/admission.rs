@@ -4,16 +4,22 @@ use super::capacity::ReservationPool;
 use super::ledger::{LedgerEntry, LedgerInsertError, ResourceControls, TransactionPhase};
 use super::supervisor::{RuntimeShared, StartCommand, STATE_ACCEPTING};
 use monoloop_contracts::{
-    AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId, SessionKey, TransactionId,
-    TransactionSubmitRequest, TransactionUsage,
+    AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId, McpConfigurationCapability,
+    SessionKey, ToolExecutionMode, TransactionId, TransactionSubmitRequest, TransactionUsage,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// Channel presence check used by admission (live map or registry ids).
+/// Channel presence + capability checks used by admission (live map or registry ids).
 pub(crate) trait ChannelIndex {
     fn contains(&self, id: &ChannelId) -> bool;
+
+    /// CreationOnly + McpGateway Channels reject tool-enabled existing-session reuse (D-014).
+    fn rejects_creation_only_tool_reuse(&self, id: &ChannelId) -> bool {
+        let _ = id;
+        false
+    }
 }
 
 impl ChannelIndex for HashMap<ChannelId, ()> {
@@ -25,6 +31,14 @@ impl ChannelIndex for HashMap<ChannelId, ()> {
 impl ChannelIndex for HashMap<ChannelId, super::super::channel_registry::LiveChannel> {
     fn contains(&self, id: &ChannelId) -> bool {
         self.contains_key(id)
+    }
+
+    fn rejects_creation_only_tool_reuse(&self, id: &ChannelId) -> bool {
+        self.get(id).is_some_and(|live| {
+            live.binding.tool_mode == ToolExecutionMode::McpGateway
+                && live.binding.capabilities.mcp_configuration
+                    == McpConfigurationCapability::CreationOnly
+        })
     }
 }
 
@@ -72,6 +86,18 @@ pub(crate) fn admit(
                 "unknown tool id",
             ));
         }
+    }
+
+    // D-014: CreationOnly cannot install MCP on an existing session — reject
+    // tool-enabled reuse at admission (CapabilityMismatch), not mid-coordinator.
+    if request.session_id.is_some()
+        && !request.tools.is_empty()
+        && channels.rejects_creation_only_tool_reuse(&request.channel_id)
+    {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::CapabilityMismatch,
+            "CreationOnly rejects tool-enabled existing-session reuse",
+        ));
     }
 
     // 5. Allocate ids / session key when known.

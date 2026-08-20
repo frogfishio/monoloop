@@ -4,16 +4,19 @@ use super::super::bootstrap::RuntimeBootstrap;
 use super::super::channel_registry::{ChannelBinding, LiveChannel};
 use super::super::error::StartupError;
 use super::super::host_tools::HostToolRegistry;
+use super::super::mcp::McpGatewayHandle;
 use super::super::state::RuntimeState;
 use super::admission::admit;
 use super::capacity::{ReservationPool, ReservationPoolError};
 use super::coordinator::WorkerMessage;
 use super::ledger::LifecycleLedger;
+use super::mcp_listener::DEFAULT_MCP_MAX_ROUTES;
 use super::shutdown::ShutdownTicket;
 use super::supervisor::{
     run_supervisor, wait_until_stopped, ControlCommand, RuntimeShared, STATE_ACCEPTING,
     STATE_QUIESCING, STATE_STARTING, STATE_STOPPED,
 };
+use crate::transaction::mcp::McpGateway;
 use monoloop_contracts::{
     AdmissionError, AdmissionReceipt, ChannelId, ChannelKind, ShutdownWaitOutcome,
     TerminationDisposition, TerminationMode, TransactionSelector, TransactionSubmitRequest,
@@ -148,6 +151,8 @@ impl StartedRuntime {
             owned_tasks: AtomicU32::new(0),
             enable_mcp_listener: bootstrap.config.enable_mcp_listener,
             mcp_listen_addr: Mutex::new(None),
+            mcp_gateway: Mutex::new(None),
+            mcp_cancel: Mutex::new(None),
             block_stopped: bootstrap.config.block_stopped.clone(),
             hold_start: bootstrap.config.hold_start.clone(),
             hold_finalizer_after_seal: bootstrap.config.hold_finalizer_after_seal.clone(),
@@ -161,10 +166,17 @@ impl StartedRuntime {
                     .saturating_mul(4)
                     .max(8),
             ),
+            tool_spill: Arc::new(crate::transaction::dispatcher::RuntimeToolSpill::new()),
         });
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartupError>>();
         let shared_thread = Arc::clone(&shared);
+        let mcp_max_routes = bootstrap
+            .config
+            .transaction_limits
+            .max_active_transactions
+            .saturating_mul(2)
+            .max(DEFAULT_MCP_MAX_ROUTES);
         let thread = std::thread::Builder::new()
             .name("monoloop-runtime".into())
             .spawn(move || {
@@ -183,37 +195,63 @@ impl StartedRuntime {
                         return;
                     }
                 };
-                // Bind MCP before Accepting so enable_mcp_listener fails closed (D-043).
-                let mcp_listener = if shared_thread.enable_mcp_listener {
-                    match std::net::TcpListener::bind("127.0.0.1:0") {
-                        Ok(l) => {
-                            if l.set_nonblocking(true).is_err() {
+                // Bind + prepare + publish MCP inside the executor before
+                // Accepting so enable_mcp_listener fails closed and §7.1
+                // `start` returns only after the gateway handle is ready.
+                // Serve is TaskSupervisor-owned (no ambient spawn).
+                rt.block_on(async {
+                    let mcp_prepared = if shared_thread.enable_mcp_listener {
+                        match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                            Ok(listener) => {
+                                let request_owner: Option<
+                                    std::sync::Arc<dyn crate::transaction::mcp::McpRequestOwner>,
+                                > = Some(std::sync::Arc::new(
+                                    super::mcp_request_owner::SupervisedMcpRequestOwner::new(
+                                        shared_thread.task_spawner.clone(),
+                                    ),
+                                ));
+                                match McpGateway::prepare_from_tokio_listener(
+                                    listener,
+                                    mcp_max_routes,
+                                    request_owner,
+                                ) {
+                                    Ok(prepared) => {
+                                        super::mcp_listener::publish_runtime_mcp(
+                                            &shared_thread,
+                                            &prepared,
+                                        );
+                                        Some(prepared)
+                                    }
+                                    Err(_) => {
+                                        let _ = ready_tx.send(Err(StartupError::InvalidConfig(
+                                            "MCP gateway prepare failed",
+                                        )));
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(_) => {
                                 let _ = ready_tx.send(Err(StartupError::InvalidConfig(
-                                    "MCP loopback set_nonblocking failed",
+                                    "MCP loopback bind failed",
                                 )));
                                 return;
                             }
-                            Some(l)
                         }
-                        Err(_) => {
-                            let _ = ready_tx
-                                .send(Err(StartupError::InvalidConfig("MCP loopback bind failed")));
-                            return;
-                        }
-                    }
-                } else {
-                    None
-                };
-                shared_thread.state.store(STATE_ACCEPTING, Ordering::SeqCst);
-                let _ = ready_tx.send(Ok(()));
-                rt.block_on(run_supervisor(
-                    shared_thread,
-                    start_rx,
-                    control_rx,
-                    worker_rx,
-                    spawn_rx,
-                    mcp_listener,
-                ));
+                    } else {
+                        None
+                    };
+                    shared_thread.state.store(STATE_ACCEPTING, Ordering::SeqCst);
+                    let _ = ready_tx.send(Ok(()));
+                    run_supervisor(
+                        shared_thread,
+                        start_rx,
+                        control_rx,
+                        worker_rx,
+                        spawn_rx,
+                        mcp_prepared,
+                    )
+                    .await;
+                });
                 // Bounded executor teardown so Drop/join cannot strand on
                 // residual background work after the supervisor has returned.
                 rt.shutdown_timeout(Duration::from_secs(2));
@@ -275,6 +313,16 @@ impl RuntimeOwner {
     /// Number of realized channels owned by this runtime.
     pub fn channel_count(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Bound MCP loopback address when `enable_mcp_listener` and the gateway is live.
+    pub fn mcp_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.shared.mcp_listen_addr.lock().ok().and_then(|g| *g)
+    }
+
+    /// Cloneable MCP gateway handle while the RuntimeService is live.
+    pub fn mcp_gateway(&self) -> Option<McpGatewayHandle> {
+        self.shared.mcp_gateway.lock().ok().and_then(|g| g.clone())
     }
 
     /// Begin shutdown (idempotent). Synchronously moves admission to Quiescing.
@@ -379,6 +427,16 @@ impl TransactionRuntimeHandle {
     /// Current lifecycle state.
     pub fn state(&self) -> RuntimeState {
         self.shared.runtime_state()
+    }
+
+    /// Bound MCP loopback address when the gateway RuntimeService is live.
+    pub fn mcp_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.shared.mcp_listen_addr.lock().ok().and_then(|g| *g)
+    }
+
+    /// Cloneable MCP gateway handle while the RuntimeService is live.
+    pub fn mcp_gateway(&self) -> Option<McpGatewayHandle> {
+        self.shared.mcp_gateway.lock().ok().and_then(|g| g.clone())
     }
 
     /// Synchronously admit a v2 transaction (no spawn / no executor wait).

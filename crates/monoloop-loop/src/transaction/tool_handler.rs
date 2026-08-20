@@ -26,7 +26,7 @@ pub trait ToolHandler: Send + Sync {
     }
 
     /// Whether isolated kill after grace is available (D-024 / D-028).
-    /// Default **false** (fail-closed). For [`ToolExecutionClass::ProcessIsolated`],
+    /// Default **false** (fail-closed). For process-isolated tool classes,
     /// registration also requires [`Self::os_process_isolated`].
     fn supports_isolated_kill(&self) -> bool {
         false
@@ -174,7 +174,7 @@ impl ToolKillHandle {
 
     /// Abort Tokio task or OS-kill the child (idempotent).
     ///
-    /// [`KillInner::JoinOnly`] is a no-op (cooperative — cancel via control only).
+    /// Join-only (cooperative) handles are a no-op — cancel via control only.
     pub fn kill(&self) {
         match &*self.inner {
             KillInner::Tokio { abort, .. } => abort.abort(),

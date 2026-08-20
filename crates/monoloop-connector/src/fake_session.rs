@@ -144,6 +144,8 @@ pub struct FakeSessionAdapterConfig {
     pub attach_delay: Duration,
     /// Fail attach with SessionFailed.
     pub fail_attach: bool,
+    /// Reject `begin_attach` immediately with SessionFailed (route-leak proofs).
+    pub reject_begin_attach: bool,
     /// Maximum concurrent in-flight attach operations (0 = unlimited).
     pub max_in_flight: usize,
     /// When true, `begin_refresh_mcp` is unsupported.
@@ -155,6 +157,7 @@ impl Default for FakeSessionAdapterConfig {
         Self {
             attach_delay: Duration::ZERO,
             fail_attach: false,
+            reject_begin_attach: false,
             max_in_flight: 64,
             mcp_refresh_unsupported: false,
         }
@@ -221,6 +224,9 @@ impl SessionAdapter for FakeSessionAdapter {
         &self,
         request: SessionAttachRequest,
     ) -> Result<PendingSessionAttachment, SessionAttachError> {
+        if self.state.config.reject_begin_attach {
+            return Err(SessionAttachError::SessionFailed);
+        }
         let max = self.state.config.max_in_flight;
         if max > 0 {
             let cur = self.state.in_flight.load(Ordering::SeqCst);

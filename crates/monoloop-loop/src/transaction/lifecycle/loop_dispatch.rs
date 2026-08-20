@@ -275,12 +275,8 @@ async fn run_supervised_loop(
                         if let Ok(mut decoded) =
                             serde_json::from_str::<CanonicalToolResult>(&r.payload)
                         {
-                            if matches!(
-                                decoded.outcome,
-                                CanonicalToolResultOutcome::Succeeded(_)
-                            ) {
-                                report.tools_completed =
-                                    report.tools_completed.saturating_add(1);
+                            if matches!(decoded.outcome, CanonicalToolResultOutcome::Succeeded(_)) {
+                                report.tools_completed = report.tools_completed.saturating_add(1);
                             }
                             // Keep envelope identities consistent with this Loop pass.
                             decoded.transaction_id = transaction_id;
@@ -292,9 +288,9 @@ async fn run_supervised_loop(
                             let output = match serde_json::from_str::<serde_json::Value>(&r.payload)
                             {
                                 Ok(v) => monoloop_contracts::CanonicalToolOutput::Json(v),
-                                Err(_) => monoloop_contracts::CanonicalToolOutput::Text(
-                                    r.payload.clone(),
-                                ),
+                                Err(_) => {
+                                    monoloop_contracts::CanonicalToolOutput::Text(r.payload.clone())
+                                }
                             };
                             CanonicalToolResult {
                                 transaction_id,

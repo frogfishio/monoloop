@@ -555,6 +555,7 @@ async fn loop_adapters_available_not_dispatch_rejected_placeholder() {
         8,
         16,
     );
+    #[allow(deprecated)]
     let runtime = HostToolRuntime::new(d, ExchangeId::generate());
 
     let resolution = reg

@@ -1710,7 +1710,7 @@ Grok / claimed sessions still use the authoritative external id.
 ## D-045: M6 harden2 — SessionKey post-grace clear + honest partial
 
 **Priority:** P2  
-**Status:** Accepted (SessionKey clear) / Open (M6 remainder)  
+**Status:** Accepted (SessionKey clear) / **M6 §22 closed enough** (2026-08-20)  
 **Affected:**
 - `lifecycle/supervisor.rs` post-grace `force_remove_tombstone`
 - `lifecycle/tests.rs` Seal payload sync + `owned_tasks` TimedOut
@@ -1872,10 +1872,122 @@ does not emit Ready tools end-to-end.
 services + request semaphore are **gateway-instance-owned** (no process-global
 service map — §17). Registered `tests/mcp_gateway.rs` (15): bind/shutdown,
 pending→active list/call, HTTP initialize/list/call, isolation, revoke 404,
-oversized body fail-closed. Residual: listener `tokio::spawn` is gateway
-JoinHandle-owned until RuntimeOwner `RuntimeService` integration; empty
-`mcp_listener` placeholder still used when `enable_mcp_listener` on
-StartedRuntime. M6 still partial (§22.7). **Not** Golden / §25.
+oversized body fail-closed.
 
-**Next pick:** Wire `McpGateway` into `RuntimeOwner` as `RuntimeService` **or**
-§22.7 host adapters (outside core) — do not promote M6/Golden/§25.
+**RuntimeOwner MCP RuntimeService wiring (2026-08-20):** When
+`enable_mcp_listener`, `StartedRuntime` binds/prepares `McpGateway` before
+Accepting (fail-closed), **publishes** `mcp_local_addr` / `mcp_gateway` before
+the start ready handshake (§7.1 — gate residual closed), and serves as
+`TaskClass::RuntimeService` via `PreparedMcpGateway` (no ambient serve spawn
+on the production path). Quiesce revokes routes, cancels axum serve, clears
+published handle; Stopped waits for join. Proof:
+`mcp_listener_owned_shutdown_reaches_stopped` — handle/addr present
+immediately after `start`; **live** unknown-capability HTTP 404 (not a
+post-shutdown claim). Standalone `McpGateway::bind_loopback` still
+JoinHandle-owned for unit tests only.
+
+**ExternalAgent + CreationOnly MCP consumption (2026-08-20):** Coordinator
+accepts `ExternalAgent`: SessionAdapter attach → open with attachment →
+`PromptReadyGate` (ledger `bind_session` + EstablishExternal + `rebind_session`
++ MCP activate **before** prompt send, D-026 / LAW 7) → exchange. Empty tools
+skip MCP install. Non-empty `McpGateway` + `CreationOnly` uses published
+`McpGatewayHandle` for `install_pending` → `initial_mcp` → rebind → activate →
+revoke after terminal. One shared `ExchangeId` for install + exchange. Attach
+failure after install revokes the route (no leak). Missing open external
+session id fails closed (no prompt). `McpGateway` skips Loop dual-dispatch.
+Admission rejects tool-enabled existing-session reuse on CreationOnly
+(`CapabilityMismatch`, D-014). Proofs:
+`external_agent_empty_tools_establishes_session_and_completes`,
+`creation_only_mcp_install_activate_revoke_round_trip`,
+`creation_only_tool_reuse_rejected_at_admission`,
+`mcp_route_revoked_when_attach_fails_after_install`,
+`mcp_dispatcher_rebind_session_before_activate`.
+
+**MCP `TaskClass::McpRequest` ownership (2026-08-20):** RuntimeOwner gateway
+prepare injects `SupervisedMcpRequestOwner` so each HTTP MCP request is
+registered as `TaskClass::McpRequest(transaction_id)` via TaskSupervisor.
+Concurrency permits + body buffering run **inside** the owned task (Law 22).
+Spawn uses non-blocking `try_send`; Busy/Rejected/Orphaned fail closed with 503
+(work undriven). Standalone `bind_loopback` remains inline (no supervisor).
+Proofs: `mcp_http_request_registers_task_class_mcp_request` (TaskClass via pump),
+`supervised_mcp_owner_returns_503_when_spawn_rejected`,
+`runtime_owner_mcp_http_uses_supervised_request_owner` (StartedRuntime:
+RuntimeService live + HTTP non-503 under injected owner). TaskClass
+observation is the instrumented-pump proof, not the RuntimeOwner smoke.
+**Bronze** for this residual. Refreshable MCP not declared by current profiles
+(WP12).
+
+**§22.7 host-adapter proofs (2026-08-20):** Outside-core proofs in
+`tests/s22_7_host_adapters.rs` (5): blocking completion callback before
+future; never-yielding completion future; event consumer stops draining;
+receivers dropped immediately; host adapter task destroyed. In all cases
+`wait_stopped` reaches `Stopped` — adapters run on caller tasks and cannot
+stall the supervisor. **M6 §22 matrix closed enough** (Refreshable undeclared).
+**Not** Golden / §25 DoD (independent review + additional §23 bullets still
+open).
+
+**§23 verification hygiene (2026-08-20):** Core §23 commands run green on
+this tree: `cargo fmt --all -- --check`, `cargo clippy --workspace
+--all-targets --all-features -- -D warnings`, `cargo test --workspace
+--all-targets --all-features`, `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps` (rustdoc private/broken link fixes in loop crate).
+Loop README aligned to **M6 §22 closed enough**. §22.5 compatible TimedOut
+snapshots: `m6_wait_stopped_timed_out_snapshots_compatible` (`wait_stopped`
+is `&mut self` — concurrent joiner not an API surface). Remaining §23
+extras: forbidden-pattern search, isolated adversarial subprocess harness
+inventory, exact-limit plus-one audit completeness, independent P0–P2
+review. Refreshable MCP undeclared (WP12). **Not** Golden / §25.
+
+**Tool spill runtime-scoped (2026-08-20):** Removed process-global
+`OnceLock` pending transfer. Unfinished joins/permits park on
+runtime-scoped `RuntimeToolSpill` (`RuntimeShared` → coordinator
+`with_runtime_spill`). Supervisor quiesce runs `shutdown_progress`
+(abort AbortableAtYield; release join-less orphans; reap finished);
+**JoinOnly blocks `Stopped`** until joined (Law 8 / 23 / §21). Spill Drop
+last-resort aborts when the runtime Arc is gone — no cross-runtime bleed.
+`ready_to_stop` requires spill empty. Proof:
+`s22_4_tool_spill_is_runtime_scoped_not_process_global`.
+`HostToolRuntime::new` deprecated (ambient spawn; use `with_spawner`).
+
+**Known residuals (honest — block Golden, not M6 §22 closed-enough):**
+- Ambient `tokio::spawn` remains on deprecated `DefaultLoopRuntime::start*`,
+  deprecated `HostToolRuntime::new`, `AsyncToolHandler` /
+  `IsolatedKillableToolHandler` worker bodies (JoinHandle retained → spill,
+  not fire-and-forget), sticky_cancel unit helper, and standalone
+  `McpGateway::bind_loopback`. Production RuntimeOwner / `with_spawner` /
+  `SupervisedMcpRequestOwner` avoid ambient spawn at the Loop edge.
+  Golden still wants handler-level spawn under TaskSupervisor (M5
+  delete-vaults end state / §21).
+
+**Advisor (2026-08-20, independent review — honesty residual slice):**
+
+**Bar (at review time):** **M6 §22 closed enough** held; **Not** Golden /
+§25. Review found two P1s (vault vs Stopped; ambient handler spawn).
+
+**Remediation note (same day):** P1 #1 (process-global vault / Stopped
+blind to parked tool work) **addressed** by `RuntimeToolSpill` +
+`ready_to_stop` spill-empty gate (see “Tool spill runtime-scoped” above).
+P1 #2 (handler-level `tokio::spawn`) **still open** for Golden —
+JoinHandles are retained into the spill, but §21 / M5.4 still ask for
+TaskSupervisor ownership of tool worker bodies. Re-gate before claiming
+§23 “no unresolved P0/P1/P2”.
+
+Unlisted residuals (block Golden; do not demote the named M6 bar):
+- `RuntimeOwner` Drop abandons the OS-thread join after grace (§18.4
+  MUST NOT detach).
+- `ProcessIsolated` `spawn_blocking` wait is still not
+  `TaskClass::ToolWorker`; `ShutdownSnapshot.owned_processes` is always `0`.
+- Spec M5.4 / §20 still lists “delete tool join vaults” as the end state;
+  spill is the interim honesty fix until handler joins are supervisor-owned.
+
+§23 extras still open: forbidden-pattern search, isolated adversarial
+harness inventory, exact-limit plus-one audit. Refreshable MCP undeclared
+(WP12).
+
+**Expert + Advisor (2026-08-20, post-spill gate):** **PASS — Silver.**
+Prior vault/Stopped/process-global **P1 closed**. M6 §22 closed-enough
+**still holds**. Handler-level `tokio::spawn` + M5.4 delete-vaults end state
+remain Golden blockers. Do **not** promote Golden / §25.
+
+**Next pick:** Route handler-internal spawns under TaskSupervisor **or**
+RuntimeOwner JoinOnly↔Stopped proof + remaining §23 extras.

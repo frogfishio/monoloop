@@ -5,6 +5,7 @@ use crate::transaction::bootstrap::{
     FinalizerHoldGate, RuntimeBootstrap, RuntimeConfig, StartHoldGate, StoppedGate,
 };
 use crate::transaction::channel_registry::{ChannelBinding, ChannelRegistry};
+use crate::transaction::fake_support::PanicEncoder;
 use crate::transaction::fake_support::TestTextEncoder;
 use crate::transaction::host_tools::HostToolRegistry;
 use monoloop_connector::{FakeConnectorConfig, FakeConnectorFactory, FakeEndpoint};
@@ -17,7 +18,6 @@ use monoloop_contracts::{
     TerminationReason, TerminationReasonCode, ToolExecutionMode, TransactionEndKind, TransactionId,
     TransactionLimits, TransactionReceiver, TransactionSelector, TransactionSubmitRequest,
 };
-use crate::transaction::fake_support::PanicEncoder;
 use monoloop_interpreter::DefaultInterpreterFactory;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Barrier};
@@ -939,6 +939,53 @@ fn m6_concurrent_begin_shutdown_same_generation() {
     assert!(matches!(outcome, ShutdownWaitOutcome::Stopped(_)));
 }
 
+/// §22.5: repeated TimedOut waiters observe compatible snapshots (same generation).
+///
+/// `wait_stopped` takes `&mut self` (thread join on Stopped), so true concurrent
+/// `&mut` waiters are not an API surface; compatible Quiescing snapshots are.
+#[test]
+fn m6_wait_stopped_timed_out_snapshots_compatible() {
+    use crate::transaction::state::RuntimeState;
+
+    let gate = Arc::new(StoppedGate::new());
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            block_stopped: Some(Arc::clone(&gate)),
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let mut owner = started.owner;
+    let ticket = owner.begin_shutdown();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let first = rt.block_on(owner.wait_stopped(Duration::ZERO));
+    let ShutdownWaitOutcome::TimedOut(snap_a) = first else {
+        panic!("expected TimedOut under block_stopped, got {first:?}");
+    };
+    assert_eq!(snap_a.generation, ticket.generation());
+    assert_eq!(owner.state(), RuntimeState::Quiescing);
+
+    let second = rt.block_on(owner.wait_stopped(Duration::ZERO));
+    let ShutdownWaitOutcome::TimedOut(snap_b) = second else {
+        panic!("second wait must TimedOut while gated, got {second:?}");
+    };
+    assert_eq!(
+        snap_a.generation, snap_b.generation,
+        "compatible TimedOut snapshots share shutdown generation"
+    );
+
+    gate.release();
+    let stopped = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(matches!(stopped, ShutdownWaitOutcome::Stopped(_)));
+}
+
 /// M6 / D-004: Seal with authoritative session id replaces synthetic key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn event_publisher_prefers_authoritative_session_on_seal() {
@@ -1017,25 +1064,797 @@ async fn event_publisher_prefers_authoritative_session_on_seal() {
     let _ = pub_task.await;
 }
 
-/// D-043: MCP loopback listener is TaskSupervisor-owned and joins before Stopped.
+/// D-043 / §17 / §7.1: MCP handle published before start returns; RuntimeService
+/// joins before Stopped.
 #[test]
 fn mcp_listener_owned_shutdown_reaches_stopped() {
     let started = start_runtime_with_mcp(2, 2, true);
+    let handle = started.handle.clone();
+    // §7.1: start returns only after gateway handle/addr are published.
+    let addr = handle
+        .mcp_local_addr()
+        .expect("MCP loopback addr published before start returns");
+    assert!(addr.ip().is_loopback());
+    assert!(
+        handle.mcp_gateway().is_some(),
+        "MCP gateway handle published before start returns"
+    );
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     let mut owner = started.owner;
     let outcome = rt.block_on(async {
-        // Give the RuntimeService listener a moment to bind.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Handle is ready at start return; serve may need one supervisor poll.
+        // Retry connect only — not a publication poll (§7.1 already asserted).
+        let url = format!(
+            "http://{addr}/mcp/deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        );
+        let client = reqwest::Client::new();
+        let mut resp = None;
+        for _ in 0..50 {
+            match client.get(&url).send().await {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        let resp = resp.expect("HTTP to live MCP gateway");
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
         owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_secs(3)).await
+        let stopped = owner.wait_stopped(Duration::from_secs(3)).await;
+        assert!(
+            owner.mcp_local_addr().is_none(),
+            "MCP addr cleared after Stopped"
+        );
+        assert!(
+            owner.mcp_gateway().is_none(),
+            "MCP handle cleared after Stopped"
+        );
+        stopped
     });
     assert!(
         matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
         "expected Stopped with MCP joined, got {outcome:?}"
     );
+}
+
+fn external_agent_binding(id: &str, channel_max: usize) -> ChannelBinding {
+    external_agent_binding_with_session(id, channel_max, Default::default())
+}
+
+fn external_agent_binding_with_session(
+    id: &str,
+    channel_max: usize,
+    session_config: monoloop_connector::FakeSessionAdapterConfig,
+) -> ChannelBinding {
+    let d = DialectDescriptor::test_raw();
+    ChannelBinding {
+        id: ChannelId::try_new(id).unwrap(),
+        kind: ChannelKind::ExternalAgent,
+        tool_mode: ToolExecutionMode::McpGateway,
+        connector_factory: Arc::new(FakeConnectorFactory::external_agent(session_config)),
+        encoder: Arc::new(TestTextEncoder),
+        interpreter: Arc::new(DefaultInterpreterFactory::new()),
+        endpoint_ref: "default".into(),
+        credential_ref: None,
+        defaults: ChannelDefaults::default(),
+        capabilities: ChannelCapabilities {
+            session_mode: SessionMode::External,
+            mcp_configuration: McpConfigurationCapability::CreationOnly,
+            mcp_reachability: McpReachability::SameLoopbackNamespace,
+            exchange_mode: ExchangeMode::Bidirectional,
+            continuation_policies: BTreeSet::from([ContinuationPolicy::CallerControlled]),
+            supports_distinct_session_concurrency: true,
+            input_dialect: d.clone(),
+            output_dialect: d,
+            option_policy: OptionPolicy::external_agent(),
+        },
+        limits: ChannelLimits {
+            max_active_transactions: channel_max,
+            ..ChannelLimits::default()
+        },
+    }
+}
+
+/// ExternalAgent empty-tool path: attach → open → EstablishExternal before prompt → Completed.
+#[test]
+fn external_agent_empty_tools_establishes_session_and_completes() {
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            enable_mcp_listener: true,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![external_agent_binding("agent", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    assert!(
+        started.handle.mcp_gateway().is_some(),
+        "§7.1 gateway published at start"
+    );
+    let handle = started.handle.clone();
+    let (delivery, mut recv) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let receipt = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("agent").unwrap(),
+            session_id: None,
+            input: user_text_input("hi").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect("admit");
+    let _ = receipt;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let kind = rt.block_on(async {
+        let mut saw_established = false;
+        let mut end_kind = None;
+        while let Some(ev) = recv.events.recv().await {
+            match &ev.payload {
+                monoloop_contracts::TransactionEventPayload::SessionEstablished { .. } => {
+                    saw_established = true;
+                }
+                monoloop_contracts::TransactionEventPayload::EndedEvent(term) => {
+                    end_kind = Some(term.kind);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let completion = recv.completion.recv().await.expect("completion");
+        assert!(saw_established, "SessionEstablished before end");
+        assert_eq!(completion.end.kind, end_kind.unwrap());
+        completion.end.kind
+    });
+    assert_eq!(kind, TransactionEndKind::Completed);
+    let mut owner = started.owner;
+    let stopped = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(matches!(stopped, ShutdownWaitOutcome::Stopped(_)));
+}
+
+/// §17: spawn Rejected (closed mailbox) fail closed with 503 (no ambient inline drive).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_mcp_owner_returns_503_when_spawn_rejected() {
+    use super::mcp_request_owner::SupervisedMcpRequestOwner;
+    use super::task_spawner::TransactionTaskSpawner;
+    use crate::transaction::mcp::McpRequestOwner;
+    use axum::body::Body;
+    use axum::http::{Response, StatusCode};
+    use monoloop_contracts::TransactionId;
+
+    let (spawner, spawn_rx) = TransactionTaskSpawner::channel(1);
+    drop(spawn_rx); // supervisor gone → Rejected
+    let owner = SupervisedMcpRequestOwner::new(spawner);
+    let resp = owner
+        .run_owned(
+            TransactionId::generate(),
+            Box::pin(async { Response::new(Body::from("unused")) }),
+        )
+        .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Rejected spawn must fail closed with 503"
+    );
+}
+
+/// RuntimeOwner injects SupervisedMcpRequestOwner onto the live gateway.
+///
+/// TaskClass::McpRequest observation is proven by
+/// `mcp_http_request_registers_task_class_mcp_request` (instrumented pump).
+/// This test proves StartedRuntime injection + live supervisor accept (non-503)
+/// and that RuntimeService is registered before HTTP.
+#[test]
+fn runtime_owner_mcp_http_uses_supervised_request_owner() {
+    use crate::transaction::dispatcher::TransactionToolDispatcher;
+    use crate::transaction::host_tools::RegisteredTool;
+    use crate::transaction::resolved_tools::ResolvedToolSet;
+    use crate::transaction::tool_capacity::SharedToolCapacity;
+    use crate::transaction::tool_handler::ImmediateToolHandler;
+    use monoloop_contracts::{
+        ExchangeId, JsonSchema, SessionKey, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits,
+        ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionId,
+    };
+
+    let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let out = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("echo").unwrap(),
+        ToolName::try_new("echo").unwrap(),
+        "echo",
+        schema,
+        ToolOutputContract {
+            success: ToolSuccessContract::json(out),
+            error_data_schema: None,
+        },
+        ToolLimits {
+            max_concurrent: 1,
+            max_input_bytes: 256,
+            max_output_bytes: 256,
+            execution_deadline: Duration::from_secs(1),
+        },
+        ToolExecutionClass::CooperativeInProcess {
+            grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    let tools = HostToolRegistry::build(vec![RegisteredTool::new(
+        spec.clone(),
+        Arc::new(ImmediateToolHandler::new(|_c, _x| {
+            Ok(ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({})),
+            ))
+        })),
+    )])
+    .unwrap();
+
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            enable_mcp_listener: true,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![external_agent_binding("agent", 2)]).unwrap(),
+        tools,
+    })
+    .expect("start");
+    let gw = started.handle.mcp_gateway().expect("injected gateway");
+    let resolved = ResolvedToolSet::from_registered(vec![RegisteredTool::new(
+        spec,
+        Arc::new(ImmediateToolHandler::new(|_c, _x| {
+            Ok(ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({})),
+            ))
+        })),
+    )]);
+    let tx = TransactionId::generate();
+    let dispatcher = TransactionToolDispatcher::new(
+        tx,
+        SessionKey {
+            channel_id: ChannelId::try_new("agent").unwrap(),
+            session_id: SessionId::try_new("s1").unwrap(),
+        },
+        resolved.clone(),
+        SharedToolCapacity::unlimited(),
+        8,
+        16,
+    );
+    let pending = gw
+        .install_pending(tx, resolved, dispatcher, ExchangeId::generate())
+        .unwrap();
+    gw.activate(&pending.token).unwrap();
+
+    let mut owner = started.owner;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let status = rt.block_on(async {
+        for _ in 0..100 {
+            if owner.owned_task_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            owner.owned_task_count() >= 1,
+            "RuntimeService must be live under StartedRuntime before HTTP"
+        );
+        let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+        let mut last = None;
+        for _ in 0..50 {
+            match reqwest::Client::new().get(&url).send().await {
+                Ok(r) => {
+                    last = Some(r.status());
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        last.expect("HTTP through RuntimeOwner MCP path")
+    });
+    assert_ne!(
+        status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "live supervisor must accept McpRequest spawn (injection present)"
+    );
+    gw.revoke(&pending.token);
+    let stopped = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(matches!(stopped, ShutdownWaitOutcome::Stopped(_)));
+}
+
+/// §17: SupervisedMcpRequestOwner registers HTTP work as TaskClass::McpRequest.
+/// (Pump simulates TaskSupervisor drain; RuntimeOwner injects the same owner type.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_http_request_registers_task_class_mcp_request() {
+    use super::mcp_request_owner::SupervisedMcpRequestOwner;
+    use super::task_spawner::TransactionTaskSpawner;
+    use super::task_supervisor::{TaskClass, TaskSupervisor};
+    use crate::transaction::dispatcher::TransactionToolDispatcher;
+    use crate::transaction::host_tools::RegisteredTool;
+    use crate::transaction::mcp::McpGateway;
+    use crate::transaction::resolved_tools::ResolvedToolSet;
+    use crate::transaction::tool_capacity::SharedToolCapacity;
+    use crate::transaction::tool_handler::ImmediateToolHandler;
+    use monoloop_contracts::{
+        ExchangeId, JsonSchema, SessionKey, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits,
+        ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionId,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (spawner, mut spawn_rx) = TransactionTaskSpawner::channel(16);
+    let saw_mcp_request = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&saw_mcp_request);
+    let pump = tokio::spawn(async move {
+        let mut tasks = TaskSupervisor::new();
+        while let Some(req) = spawn_rx.recv().await {
+            if matches!(req.class, TaskClass::McpRequest(_)) {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let id = tasks.spawn(req.class, req.future);
+            let _ = req.reply.send(id);
+        }
+        let _ = tasks.abort_and_drain().await;
+    });
+
+    let owner: Arc<dyn crate::transaction::mcp::McpRequestOwner> =
+        Arc::new(SupervisedMcpRequestOwner::new(spawner));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let prepared =
+        McpGateway::prepare_from_tokio_listener(listener, 8, Some(Arc::clone(&owner))).unwrap();
+    let addr = prepared.local_addr();
+    let handle = prepared.handle();
+    let serve = tokio::spawn(prepared.serve());
+
+    let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let out = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("echo").unwrap(),
+        ToolName::try_new("echo").unwrap(),
+        "echo",
+        schema,
+        ToolOutputContract {
+            success: ToolSuccessContract::json(out),
+            error_data_schema: None,
+        },
+        ToolLimits {
+            max_concurrent: 1,
+            max_input_bytes: 256,
+            max_output_bytes: 256,
+            execution_deadline: Duration::from_secs(1),
+        },
+        ToolExecutionClass::CooperativeInProcess {
+            grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    let registered = RegisteredTool::new(
+        spec,
+        Arc::new(ImmediateToolHandler::new(|_c, _x| {
+            Ok(ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({})),
+            ))
+        })),
+    );
+    let resolved = ResolvedToolSet::from_registered(vec![registered]);
+    let tx = TransactionId::generate();
+    let dispatcher = TransactionToolDispatcher::new(
+        tx,
+        SessionKey::new(
+            ChannelId::try_new("agent").unwrap(),
+            SessionId::try_new("s1").unwrap(),
+        ),
+        resolved.clone(),
+        SharedToolCapacity::unlimited(),
+        8,
+        16,
+    );
+    let pending = handle
+        .install_pending(tx, resolved, dispatcher, ExchangeId::generate())
+        .unwrap();
+    handle.activate(&pending.token).unwrap();
+
+    let url = format!("{}/mcp/{}", handle.base_url(), pending.token.to_hex());
+    let resp = reqwest::Client::new().get(&url).send().await.expect("http");
+    // Unknown method / MCP protocol may 4xx/2xx; ownership is what we assert.
+    let _ = resp.status();
+    assert!(
+        saw_mcp_request.load(Ordering::SeqCst),
+        "HTTP MCP dispatch must register TaskClass::McpRequest"
+    );
+
+    handle.revoke(&pending.token);
+    // Drop serve by aborting join — prepared.cancel is inside serve task.
+    serve.abort();
+    let _ = serve.await;
+    drop(owner);
+    // Close spawner by dropping pump's rx when pump exits — drop pump after abort.
+    pump.abort();
+    let _ = pump.await;
+    let _ = addr;
+}
+
+/// Attach failure after install_pending must revoke the MCP route (no leak to shutdown).
+#[test]
+fn mcp_route_revoked_when_attach_fails_after_install() {
+    use crate::transaction::host_tools::RegisteredTool;
+    use crate::transaction::tool_handler::ImmediateToolHandler;
+    use monoloop_connector::FakeSessionAdapterConfig;
+    use monoloop_contracts::{
+        JsonSchema, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName,
+        ToolOutputContract, ToolSpec, ToolSuccessContract,
+    };
+
+    let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let out = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("echo").unwrap(),
+        ToolName::try_new("echo").unwrap(),
+        "echo",
+        schema,
+        ToolOutputContract {
+            success: ToolSuccessContract::json(out),
+            error_data_schema: None,
+        },
+        ToolLimits {
+            max_concurrent: 1,
+            max_input_bytes: 256,
+            max_output_bytes: 256,
+            execution_deadline: Duration::from_secs(1),
+        },
+        ToolExecutionClass::CooperativeInProcess {
+            grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    let tools = HostToolRegistry::build(vec![RegisteredTool::new(
+        spec,
+        Arc::new(ImmediateToolHandler::new(|_c, _x| {
+            Ok(ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({})),
+            ))
+        })),
+    )])
+    .unwrap();
+
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            enable_mcp_listener: true,
+            transaction_limits: TransactionLimits {
+                max_active_transactions: 2,
+                max_active_per_channel: 2,
+                transaction_deadline: Duration::from_secs(2),
+                cleanup_deadline: Duration::from_millis(500),
+                ..TransactionLimits::default()
+            },
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![external_agent_binding_with_session(
+            "agent",
+            2,
+            FakeSessionAdapterConfig {
+                reject_begin_attach: true,
+                ..Default::default()
+            },
+        )])
+        .unwrap(),
+        tools,
+    })
+    .expect("start");
+    let gw = started.handle.mcp_gateway().expect("mcp gateway");
+    let handle = started.handle.clone();
+    let (delivery, mut recv) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let _ = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("agent").unwrap(),
+            session_id: None,
+            input: user_text_input("hi").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let kind = rt.block_on(async {
+        let completion = recv.completion.recv().await.expect("completion");
+        while let Some(_ev) = recv.events.recv().await {}
+        completion.end.kind
+    });
+    assert_eq!(kind, TransactionEndKind::InvariantFailed);
+    assert_eq!(
+        gw.routes().len(),
+        0,
+        "MCP route must be revoked when attach fails after install"
+    );
+    let mut owner = started.owner;
+    let stopped = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(matches!(stopped, ShutdownWaitOutcome::Stopped(_)));
+}
+
+/// D-026 / LAW 7: provisional MCP dispatcher SessionKey is rebound before activate.
+#[test]
+fn mcp_dispatcher_rebind_session_before_activate() {
+    use super::session_identity::session_key_for;
+    use crate::transaction::dispatcher::TransactionToolDispatcher;
+    use crate::transaction::host_tools::RegisteredTool;
+    use crate::transaction::mcp::McpGateway;
+    use crate::transaction::resolved_tools::ResolvedToolSet;
+    use crate::transaction::tool_capacity::SharedToolCapacity;
+    use crate::transaction::tool_handler::ImmediateToolHandler;
+    use monoloop_contracts::{
+        ExchangeId, JsonSchema, SessionKey, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits,
+        ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionId,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+        let out = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+        let spec = ToolSpec::try_new(
+            ToolId::try_new("echo").unwrap(),
+            ToolName::try_new("echo").unwrap(),
+            "echo",
+            schema,
+            ToolOutputContract {
+                success: ToolSuccessContract::json(out),
+                error_data_schema: None,
+            },
+            ToolLimits {
+                max_concurrent: 1,
+                max_input_bytes: 256,
+                max_output_bytes: 256,
+                execution_deadline: Duration::from_secs(1),
+            },
+            ToolExecutionClass::CooperativeInProcess {
+                grace: Duration::from_millis(50),
+            },
+        )
+        .unwrap();
+        let registered = RegisteredTool::new(
+            spec,
+            Arc::new(ImmediateToolHandler::new(|_c, _x| {
+                Ok(ToolCompletion::Succeeded(
+                    monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({})),
+                ))
+            })),
+        );
+        let resolved = ResolvedToolSet::from_registered(vec![registered]);
+        let tx = TransactionId::generate();
+        let provisional = session_key_for(ChannelId::try_new("agent").unwrap(), None, tx);
+        let dispatcher = TransactionToolDispatcher::new(
+            tx,
+            provisional.clone(),
+            resolved.clone(),
+            SharedToolCapacity::unlimited(),
+            8,
+            16,
+        );
+        assert_eq!(dispatcher.session_key(), provisional);
+        assert!(
+            provisional.session_id.as_str().starts_with("tx-"),
+            "provisional key is transaction-scoped"
+        );
+
+        let gw = McpGateway::bind_loopback(8).await.unwrap();
+        let pending = gw
+            .install_pending(
+                tx,
+                resolved,
+                Arc::clone(&dispatcher),
+                ExchangeId::generate(),
+            )
+            .unwrap();
+        let claimed = SessionKey {
+            channel_id: ChannelId::try_new("agent").unwrap(),
+            session_id: SessionId::try_new("fake-created-authoritative").unwrap(),
+        };
+        // Coordinator must rebind before activate (D-026).
+        pending.dispatcher.rebind_session(claimed.clone());
+        assert_eq!(pending.dispatcher.session_key(), claimed);
+        assert_ne!(pending.dispatcher.session_key(), provisional);
+        gw.activate(&pending.token).unwrap();
+        gw.revoke(&pending.token);
+        gw.shutdown().await;
+    });
+}
+
+/// D-014: CreationOnly rejects tool-enabled existing-session reuse at admission.
+#[test]
+fn creation_only_tool_reuse_rejected_at_admission() {
+    use crate::transaction::host_tools::RegisteredTool;
+    use crate::transaction::tool_handler::ImmediateToolHandler;
+    use monoloop_contracts::{
+        JsonSchema, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName,
+        ToolOutputContract, ToolSpec, ToolSuccessContract,
+    };
+
+    let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let out = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("echo").unwrap(),
+        ToolName::try_new("echo").unwrap(),
+        "echo",
+        schema,
+        ToolOutputContract {
+            success: ToolSuccessContract::json(out),
+            error_data_schema: None,
+        },
+        ToolLimits {
+            max_concurrent: 1,
+            max_input_bytes: 256,
+            max_output_bytes: 256,
+            execution_deadline: Duration::from_secs(1),
+        },
+        ToolExecutionClass::CooperativeInProcess {
+            grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    let tools = HostToolRegistry::build(vec![RegisteredTool::new(
+        spec,
+        Arc::new(ImmediateToolHandler::new(|_c, _x| {
+            Ok(ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({})),
+            ))
+        })),
+    )])
+    .unwrap();
+
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            enable_mcp_listener: true,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![external_agent_binding("agent", 2)]).unwrap(),
+        tools,
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (delivery, _recv) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let err = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("agent").unwrap(),
+            session_id: Some(SessionId::try_new("existing-session").unwrap()),
+            input: user_text_input("hi").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect_err("CreationOnly tool reuse must fail at admission");
+    assert_eq!(err.kind, AdmissionErrorKind::CapabilityMismatch);
+    let mut owner = started.owner;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let stopped = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(matches!(stopped, ShutdownWaitOutcome::Stopped(_)));
+}
+
+/// CreationOnly: non-empty tools install pending MCP, activate before prompt, revoke after.
+#[test]
+fn creation_only_mcp_install_activate_revoke_round_trip() {
+    use crate::transaction::host_tools::RegisteredTool;
+    use crate::transaction::tool_handler::ImmediateToolHandler;
+    use monoloop_contracts::{
+        JsonSchema, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName,
+        ToolOutputContract, ToolSpec, ToolSuccessContract,
+    };
+
+    let schema = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let out = JsonSchema::try_new(serde_json::json!({"type": "object"})).unwrap();
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("echo").unwrap(),
+        ToolName::try_new("echo").unwrap(),
+        "echo",
+        schema,
+        ToolOutputContract {
+            success: ToolSuccessContract::json(out),
+            error_data_schema: None,
+        },
+        ToolLimits {
+            max_concurrent: 1,
+            max_input_bytes: 256,
+            max_output_bytes: 256,
+            execution_deadline: Duration::from_secs(1),
+        },
+        ToolExecutionClass::CooperativeInProcess {
+            grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    let tools = HostToolRegistry::build(vec![RegisteredTool::new(
+        spec,
+        Arc::new(ImmediateToolHandler::new(|_c, _x| {
+            Ok(ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({})),
+            ))
+        })),
+    )])
+    .unwrap();
+
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            enable_mcp_listener: true,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![external_agent_binding("agent", 2)]).unwrap(),
+        tools,
+    })
+    .expect("start");
+    let gw = started.handle.mcp_gateway().expect("mcp gateway");
+    let handle = started.handle.clone();
+    let (delivery, mut recv) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let receipt = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("agent").unwrap(),
+            session_id: None,
+            input: user_text_input("hi").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit with tools");
+    let _ = receipt;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let kind = rt.block_on(async {
+        // Route may be live briefly during the turn; wait for terminal.
+        let mut end_kind = None;
+        while let Some(ev) = recv.events.recv().await {
+            if let monoloop_contracts::TransactionEventPayload::EndedEvent(term) = &ev.payload {
+                end_kind = Some(term.kind);
+                break;
+            }
+        }
+        let _ = recv.completion.recv().await;
+        end_kind.expect("ended")
+    });
+    assert_eq!(kind, TransactionEndKind::Completed);
+    // After coordinator revoke, route table must be empty.
+    assert_eq!(gw.routes().len(), 0, "MCP route revoked after terminal");
+    let mut owner = started.owner;
+    let stopped = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(matches!(stopped, ShutdownWaitOutcome::Stopped(_)));
 }
 
 /// §22.2: shutdown between Seal and completion send cannot lose ledger/completion.
@@ -1209,9 +2028,12 @@ async fn s22_3_abort_and_drain_counts_to_zero() {
     let tx = TransactionId::generate();
     let mut tasks = TaskSupervisor::new();
     for _ in 0..3 {
-        tasks.spawn(TaskClass::ConnectorOwner(tx, monoloop_contracts::ExchangeId::generate()), async {
-            std::future::pending::<()>().await;
-        });
+        tasks.spawn(
+            TaskClass::ConnectorOwner(tx, monoloop_contracts::ExchangeId::generate()),
+            async {
+                std::future::pending::<()>().await;
+            },
+        );
     }
     assert_eq!(tasks.registered_count(), 3);
     assert!(tasks.abort_and_drain().await);
@@ -1792,7 +2614,11 @@ async fn s22_6_session_established_is_sequence_one() {
         )))
         .await
         .unwrap();
-    let second = receiver.events.recv().await.expect("ordinary after establish");
+    let second = receiver
+        .events
+        .recv()
+        .await
+        .expect("ordinary after establish");
     assert_eq!(second.sequence, 2);
     assert!(matches!(
         second.payload,
@@ -1832,12 +2658,8 @@ async fn s22_6_concurrent_producers_contiguous_sequence() {
         joins.push(tokio::spawn(async move {
             tx.send(EventPublisherCommand::Publish(Box::new(
                 TransactionEventPayload::Diagnostic(TransactionDiagnostic {
-                    diagnostic: SafeDiagnostic::try_new(
-                        "noop",
-                        Some(&format!("p{i}")),
-                        64,
-                    )
-                    .unwrap(),
+                    diagnostic: SafeDiagnostic::try_new("noop", Some(&format!("p{i}")), 64)
+                        .unwrap(),
                 }),
             )))
             .await
@@ -1878,11 +2700,8 @@ fn s22_6_same_session_string_different_channels_isolated() {
             transaction_limits: limits,
             ..RuntimeConfig::default()
         },
-        channels: ChannelRegistry::build(vec![
-            llm_binding("llm-a", 2),
-            llm_binding("llm-b", 2),
-        ])
-        .unwrap(),
+        channels: ChannelRegistry::build(vec![llm_binding("llm-a", 2), llm_binding("llm-b", 2)])
+            .unwrap(),
         tools: HostToolRegistry::empty(),
     })
     .expect("start");
@@ -1892,8 +2711,14 @@ fn s22_6_same_session_string_different_channels_isolated() {
     let (r_b, recv_b) = submit_on(&handle, "llm-b", Some("shared-sid")).expect("b");
     assert_ne!(r_a.transaction_id, r_b.transaction_id);
     // Same session string is isolated by ChannelId inside SessionKey.
-    assert_eq!(r_a.session_id.as_ref().map(|s| s.as_str()), Some("shared-sid"));
-    assert_eq!(r_b.session_id.as_ref().map(|s| s.as_str()), Some("shared-sid"));
+    assert_eq!(
+        r_a.session_id.as_ref().map(|s| s.as_str()),
+        Some("shared-sid")
+    );
+    assert_eq!(
+        r_b.session_id.as_ref().map(|s| s.as_str()),
+        Some("shared-sid")
+    );
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1938,8 +2763,8 @@ fn s22_6_reused_provider_tool_call_ids_across_exchanges_distinct() {
 async fn s22_6_establish_external_capacity_fail_does_not_steal_seq1() {
     use super::event_publisher::{run_event_publisher, EventPublisherCommand};
     use monoloop_contracts::{
-        transaction_delivery, DeliveryLimits, ExternalSessionId, SafeDiagnostic, TransactionEvent,
-        TransactionDiagnostic, TransactionEventPayload, TransactionId,
+        transaction_delivery, DeliveryLimits, ExternalSessionId, SafeDiagnostic,
+        TransactionDiagnostic, TransactionEvent, TransactionEventPayload, TransactionId,
     };
     use tokio::sync::mpsc;
 
@@ -2441,12 +3266,8 @@ async fn supervised_non_empty_loop_dispatches_registered_tool() {
         completed_ok
     });
 
-    let runtime = HostToolRuntime::with_spawner(
-        Arc::clone(&dispatcher),
-        exchange_id,
-        tx_id,
-        spawner.clone(),
-    );
+    let runtime =
+        HostToolRuntime::with_spawner(Arc::clone(&dispatcher), exchange_id, tx_id, spawner.clone());
     let cancel = Arc::new(StickyCancel::new());
     let report = run_supervised_tool_loop(
         &spawner,

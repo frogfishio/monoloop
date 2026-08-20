@@ -7,5 +7,5 @@ mod handler;
 pub use binding::{
     CapabilityToken, McpBindingState, McpInstallError, McpRouteTable, PendingMcpBinding,
 };
-pub use gateway::{McpGateway, McpGatewayHandle};
+pub use gateway::{McpGateway, McpGatewayHandle, McpRequestOwner, PreparedMcpGateway};
 pub use handler::{tool_definitions_from_resolved, TransactionMcpHandler};

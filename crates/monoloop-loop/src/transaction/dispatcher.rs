@@ -4,40 +4,36 @@ use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapacity};
 use super::tool_handler::{ToolExecutionControl, ToolKillHandle};
 
-/// Holds unfinished tool worker joins and/or orphaned permits (§22.4 / D-028).
+/// Runtime-scoped unfinished tool joins and/or orphaned permits (§22.4 / D-028).
 ///
-/// Permits stay acquired until the corresponding join is observed finished (or
-/// until an orphaned cooperative permit is explicitly reaped at shutdown).
-struct ToolJoinVault {
+/// Shared across dispatchers of one runtime (Law 8 — not process-global).
+/// Permits stay acquired until the corresponding join is observed finished, or
+/// until supervisor quiesce aborts AbortableAtYield work. Cooperative JoinOnly
+/// / orphan permits block `Stopped` until the join finishes (or spill Drop as
+/// last-resort abort when the runtime Arc is gone).
+pub struct RuntimeToolSpill {
     parked: std::sync::Mutex<Vec<ParkedToolWork>>,
 }
 
 struct ParkedToolWork {
     join: Option<tokio::task::JoinHandle<()>>,
     permit: Option<ToolPermit>,
-    /// When true, a future supervisor drain may abort (AbortableAtYield).
+    /// When true, supervisor quiesce may abort (AbortableAtYield).
     /// Cooperative `JoinOnly` stays false — cancel is best-effort only (§14.1).
-    /// Retained on parked work for shutdown integration (not read on Drop transfer).
-    #[allow(dead_code)]
     may_abort: bool,
 }
 
-impl ToolJoinVault {
-    fn new() -> Self {
+impl RuntimeToolSpill {
+    /// Create an empty runtime-scoped spill.
+    pub fn new() -> Self {
         Self {
             parked: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Park a live worker join with its permit (released only after join finishes).
-    fn park(
-        &self,
-        join: tokio::task::JoinHandle<()>,
-        permit: Option<ToolPermit>,
-        may_abort: bool,
-    ) {
+    fn park(&self, join: tokio::task::JoinHandle<()>, permit: Option<ToolPermit>, may_abort: bool) {
         if join.is_finished() {
-            // Finished: drop handle (safe) and release permit immediately.
             drop(join);
             drop(permit);
             return;
@@ -61,7 +57,7 @@ impl ToolJoinVault {
     }
 
     /// Drop finished joins and release their permits. Orphan permits are retained.
-    fn reap_finished(&self) {
+    pub fn reap_finished(&self) {
         let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         parked.retain(|entry| match &entry.join {
             Some(join) => !join.is_finished(),
@@ -69,40 +65,69 @@ impl ToolJoinVault {
         });
     }
 
-    /// Number of permits still held by the vault (joins + orphans).
-    fn pending_permits(&self) -> usize {
+    /// Abort AbortableAtYield parked joins; JoinOnly / orphans remain.
+    ///
+    /// Call from supervisor quiesce. Finished joins release permits via reap.
+    pub fn abort_abortables(&self) {
+        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in parked.iter_mut() {
+            if entry.may_abort {
+                if let Some(join) = entry.join.as_ref() {
+                    join.abort();
+                }
+            }
+        }
+    }
+
+    /// Quiesce step: abort AbortableAtYield, release join-less orphans, reap
+    /// finished joins. Remaining JoinOnly work blocks `Stopped` until joined.
+    pub fn shutdown_progress(&self) -> usize {
+        self.abort_abortables();
+        // Orphan permits have no join to observe — release at quiesce so Stopped
+        // cannot be permanently blocked by missing-kill fallbacks.
+        {
+            let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+            parked.retain(|entry| entry.join.is_some());
+        }
+        self.reap_finished();
+        self.pending_count()
+    }
+
+    /// Number of permits still held (joins + orphans).
+    pub fn pending_permits(&self) -> usize {
         let parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         parked.iter().filter(|e| e.permit.is_some()).count()
     }
+
+    /// True when no parked joins or orphan permits remain.
+    pub fn is_empty(&self) -> bool {
+        self.pending_count() == 0
+    }
+
+    fn pending_count(&self) -> usize {
+        let parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        parked.len()
+    }
 }
 
-/// Process-scoped pending tool work transferred from a dropped vault (§22.4).
-///
-/// Keeps joins + permits owned without aborting cooperative work, without
-/// `mem::forget`, and without unbounded Drop waits. Slots stay unavailable
-/// until process exit or an explicit reap of this set (cleanup-pending).
-fn process_pending_tool_work() -> &'static std::sync::Mutex<Vec<ParkedToolWork>> {
-    static PENDING: std::sync::OnceLock<std::sync::Mutex<Vec<ParkedToolWork>>> =
-        std::sync::OnceLock::new();
-    PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+impl Default for RuntimeToolSpill {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl Drop for ToolJoinVault {
+impl Drop for RuntimeToolSpill {
     fn drop(&mut self) {
+        // Last Arc gone (runtime/test ended): fail-closed abort of remaining
+        // joins — including JoinOnly — then release permits. No process-global
+        // transfer (Law 8 / 22 / 23).
         let mut parked = std::mem::take(self.parked.get_mut().unwrap_or_else(|e| e.into_inner()));
-        if parked.is_empty() {
-            return;
-        }
-        // Transfer ownership out of this Drop — do not abort JoinOnly, detach,
-        // or release permits here. Fail-closed: capacity remains held.
-        if let Ok(mut global) = process_pending_tool_work().lock() {
-            global.append(&mut parked);
-        } else {
-            // Poisoned mutex: still do not free capacity / detach joins.
-            let mut guard = process_pending_tool_work()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            guard.append(&mut parked);
+        for entry in parked.drain(..) {
+            if let Some(join) = entry.join {
+                join.abort();
+                drop(join);
+            }
+            drop(entry.permit);
         }
     }
 }
@@ -112,8 +137,8 @@ use super::validation::{
 };
 use monoloop_contracts::{
     CanonicalToolError, CanonicalToolOutput, CanonicalToolResult, CanonicalToolResultOutcome,
-    ExchangeId, SessionKey, ToolActionId, ToolCall, ToolCallContext, ToolExecutionClass,
-    ToolCompletion, ToolId, ToolLifecycleEvent, ToolName, ToolRuntimeError, ToolStartError,
+    ExchangeId, SessionKey, ToolActionId, ToolCall, ToolCallContext, ToolCompletion,
+    ToolExecutionClass, ToolId, ToolLifecycleEvent, ToolName, ToolRuntimeError, ToolStartError,
     TransactionId,
 };
 use std::future::Future;
@@ -204,8 +229,8 @@ pub struct TransactionToolDispatcher {
     session_key: std::sync::Mutex<SessionKey>,
     tools: ResolvedToolSet,
     capacity: Arc<TransactionToolCapacity>,
-    /// Runtime-scoped vault for unfinished joins (D-028).
-    tool_join_vault: Arc<ToolJoinVault>,
+    /// Runtime-scoped spill for unfinished joins (D-028 / Law 8).
+    tool_spill: Arc<RuntimeToolSpill>,
     /// Transaction-wide payload cap (D-015); applied as min with per-tool limit.
     max_tool_payload_bytes: usize,
     /// Transaction-wide output cap (D-015); applied as min with per-tool limit.
@@ -215,7 +240,7 @@ pub struct TransactionToolDispatcher {
 }
 
 impl TransactionToolDispatcher {
-    /// Build a dispatcher for one admitted transaction.
+    /// Build a dispatcher for one admitted transaction (local spill for unit tests).
     pub fn new(
         transaction_id: TransactionId,
         session_key: SessionKey,
@@ -246,24 +271,49 @@ impl TransactionToolDispatcher {
         shared_capacity: Arc<SharedToolCapacity>,
         limits: DispatcherLimits,
     ) -> Arc<Self> {
-        Self::with_limits_and_vault(
+        Self::with_limits_and_spill(
             transaction_id,
             session_key,
             tools,
             shared_capacity,
             limits,
-            Arc::new(ToolJoinVault::new()),
+            Arc::new(RuntimeToolSpill::new()),
         )
     }
 
-    /// Build with an explicit runtime-scoped tool join vault (D-028).
-    fn with_limits_and_vault(
+    /// Build with a runtime-shared tool spill (production RuntimeOwner path).
+    pub fn with_runtime_spill(
+        transaction_id: TransactionId,
+        session_key: SessionKey,
+        tools: ResolvedToolSet,
+        shared_capacity: Arc<SharedToolCapacity>,
+        tool_spill: Arc<RuntimeToolSpill>,
+        max_concurrent_tools: usize,
+        max_queued_tools: usize,
+    ) -> Arc<Self> {
+        Self::with_limits_and_spill(
+            transaction_id,
+            session_key,
+            tools,
+            shared_capacity,
+            DispatcherLimits {
+                max_concurrent_tools,
+                max_queued_tools,
+                max_tool_payload_bytes: usize::MAX,
+                max_tool_output_bytes: usize::MAX,
+            },
+            tool_spill,
+        )
+    }
+
+    /// Build with an explicit runtime-scoped tool spill (D-028).
+    fn with_limits_and_spill(
         transaction_id: TransactionId,
         session_key: SessionKey,
         tools: ResolvedToolSet,
         shared_capacity: Arc<SharedToolCapacity>,
         limits: DispatcherLimits,
-        tool_join_vault: Arc<ToolJoinVault>,
+        tool_spill: Arc<RuntimeToolSpill>,
     ) -> Arc<Self> {
         let capacity = TransactionToolCapacity::new(
             shared_capacity,
@@ -278,7 +328,7 @@ impl TransactionToolDispatcher {
             session_key: std::sync::Mutex::new(session_key),
             tools,
             capacity,
-            tool_join_vault,
+            tool_spill,
             max_tool_payload_bytes: limits.max_tool_payload_bytes.max(1),
             max_tool_output_bytes: limits.max_tool_output_bytes.max(1),
             max_error_message_bytes: 1024,
@@ -311,12 +361,17 @@ impl TransactionToolDispatcher {
 
     /// Permits held by unfinished/orphaned tool workers (§22.4 observability).
     pub fn vault_pending_permits(&self) -> usize {
-        self.tool_join_vault.pending_permits()
+        self.tool_spill.pending_permits()
+    }
+
+    /// Runtime-scoped spill shared with the supervisor (when wired).
+    pub fn tool_spill(&self) -> &Arc<RuntimeToolSpill> {
+        &self.tool_spill
     }
 
     /// Reap finished parked joins so capacity can recover.
     pub fn reap_vault(&self) {
-        self.tool_join_vault.reap_finished();
+        self.tool_spill.reap_finished();
     }
 
     /// Dispatch one call end-to-end.
@@ -399,13 +454,13 @@ impl TransactionToolDispatcher {
             }
         };
         // Reap completed parked workers so prior cancels cannot permanently starve capacity.
-        self.tool_join_vault.reap_finished();
+        self.tool_spill.reap_finished();
 
-        // RAII: if this future is dropped mid-join, park worker+permit in the vault.
+        // RAII: if this future is dropped mid-join, park worker+permit in the spill.
         let mut dispatch_guard = DispatchGuard {
             permit: Some(permit),
             kill: None,
-            vault: Arc::clone(&self.tool_join_vault),
+            spill: Arc::clone(&self.tool_spill),
         };
 
         let mut lifecycle = vec![ToolLifecycleEvent::Started {
@@ -530,9 +585,9 @@ impl TransactionToolDispatcher {
                 }
                 Err(_) => {
                     // Pending work without a killable join: orphan the permit
-                    // (held until runtime shutdown). Do not vault an abortable waiter.
+                    // (held until runtime shutdown). Do not park an abortable waiter.
                     if let Some(permit) = dispatch_guard.permit.take() {
-                        self.tool_join_vault.park_orphan_permit(permit);
+                        self.tool_spill.park_orphan_permit(permit);
                     }
                 }
             }
@@ -579,7 +634,7 @@ impl TransactionToolDispatcher {
             // §22.4: cooperative non-ack (grace elapsed, no completion) — keep
             // capacity held. Acknowledged cancel that joins must not orphan.
             if let Some(permit) = dispatch_guard.permit.take() {
-                self.tool_join_vault.park_orphan_permit(permit);
+                self.tool_spill.park_orphan_permit(permit);
             }
         }
         dispatch_guard.release_if_idle();
@@ -699,37 +754,31 @@ async fn await_tool_termination(
         ToolExecutionClass::ProcessIsolated {
             grace,
             kill_deadline,
-        } => {
-            match tokio::time::timeout(*grace, &mut *wait).await {
-                Ok(c) => c,
-                Err(_) => {
-                    if let Some(k) = kill {
-                        k.kill();
-                        if k.join_timeout(*kill_deadline).await.is_err() {
-                            return ToolCompletion::RuntimeFailed(
-                                ToolRuntimeError::TerminationFailed,
-                            );
-                        }
-                    }
-                    match tokio::time::timeout(*kill_deadline, wait).await {
-                        Ok(c) => c,
-                        Err(_) => {
-                            ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed)
-                        }
+        } => match tokio::time::timeout(*grace, &mut *wait).await {
+            Ok(c) => c,
+            Err(_) => {
+                if let Some(k) = kill {
+                    k.kill();
+                    if k.join_timeout(*kill_deadline).await.is_err() {
+                        return ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed);
                     }
                 }
+                match tokio::time::timeout(*kill_deadline, wait).await {
+                    Ok(c) => c,
+                    Err(_) => ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed),
+                }
             }
-        }
+        },
     }
 }
 
 /// Holds the tool permit and optional kill handle for the duration of dispatch.
 /// On drop (including actor cleanup cancelling this future), unfinished workers
-/// are parked in the runtime tool-join vault together with the permit.
+/// are parked in the runtime tool spill together with the permit.
 struct DispatchGuard {
     permit: Option<ToolPermit>,
     kill: Option<ToolKillHandle>,
-    vault: Arc<ToolJoinVault>,
+    spill: Arc<RuntimeToolSpill>,
 }
 
 impl DispatchGuard {
@@ -751,7 +800,7 @@ impl Drop for DispatchGuard {
             if let Some(join) = k.take_join() {
                 if !join.is_finished() {
                     // Park the *real* worker join — never a completion waiter.
-                    self.vault.park(join, self.permit.take(), may_abort);
+                    self.spill.park(join, self.permit.take(), may_abort);
                     return;
                 }
             }

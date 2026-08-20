@@ -130,7 +130,7 @@ impl FinalizerHoldGate {
 pub struct RuntimeConfig {
     /// Transaction / event / callback bounds.
     pub transaction_limits: TransactionLimits,
-    /// When true, bind a loopback MCP listener (deferred until M5).
+    /// When true, bind a loopback MCP gateway as TaskSupervisor RuntimeService.
     pub enable_mcp_listener: bool,
     /// Maximum time to wait for graceful drain during shutdown when not specified.
     pub default_shutdown_deadline: Duration,
@@ -157,7 +157,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             transaction_limits: TransactionLimits::default(),
-            // MCP deferred until M5 — default off so start succeeds.
+            // Default off; hosts that need MCP set true at bootstrap.
             enable_mcp_listener: false,
             default_shutdown_deadline: Duration::from_secs(30),
             block_stopped: None,

@@ -13,10 +13,25 @@ use monoloop_contracts::{ExchangeId, TransactionId};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+/// Runs one MCP HTTP request under TaskSupervisor as `TaskClass::McpRequest` (§17).
+///
+/// Injected by RuntimeOwner; standalone `bind_loopback` tests leave this unset
+/// and execute request work inline.
+pub trait McpRequestOwner: Send + Sync {
+    /// Own `work` for `transaction_id` and return its response.
+    fn run_owned(
+        &self,
+        transaction_id: TransactionId,
+        work: Pin<Box<dyn Future<Output = Response<Body>> + Send>>,
+    ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send>>;
+}
 
 /// Axum state: routes + gateway-owned capability services (not process-global — §17).
 #[derive(Clone)]
@@ -24,6 +39,7 @@ struct GatewayState {
     routes: Arc<McpRouteTable>,
     services: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<CapabilityHttpService>>>>,
     request_permits: Arc<tokio::sync::Semaphore>,
+    request_owner: Option<Arc<dyn McpRequestOwner>>,
 }
 
 /// Cloneable handle for install/activate/revoke without owning the listener.
@@ -85,9 +101,57 @@ impl McpGatewayHandle {
         removed
     }
 
+    /// Revoke every route and cancel per-capability services (shutdown / quiesce).
+    pub fn revoke_all_services(&self) {
+        let tokens = self.routes.revoke_all();
+        for hex in tokens {
+            drop_capability_service(&self.services, &hex);
+        }
+    }
+}
+
+/// Listener + router prepared without spawning (TaskSupervisor / RuntimeService).
+pub struct PreparedMcpGateway {
+    handle: McpGatewayHandle,
+    cancel: CancellationToken,
+    listener: tokio::net::TcpListener,
+    app: Router,
+}
+
+impl PreparedMcpGateway {
+    /// Cloneable install/activate handle.
+    pub fn handle(&self) -> McpGatewayHandle {
+        self.handle.clone()
+    }
+
+    /// Cancellation token that stops [`Self::serve`].
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Bound loopback address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.handle.local_addr()
+    }
+
+    /// Serve until [`Self::cancel_token`] is cancelled. Revokes routes on exit.
+    pub async fn serve(self) {
+        let cancel_serve = self.cancel.clone();
+        let handle = self.handle;
+        let _ = axum::serve(self.listener, self.app)
+            .with_graceful_shutdown(async move {
+                cancel_serve.cancelled().await;
+            })
+            .await;
+        handle.revoke_all_services();
+    }
 }
 
 /// Production MCP gateway: one loopback listener, many capability routes.
+///
+/// Standalone helper for unit tests (`bind_loopback` + owned JoinHandle).
+/// Production RuntimeOwner path uses [`PreparedMcpGateway`] under
+/// `TaskClass::RuntimeService` (no ambient spawn).
 pub struct McpGateway {
     handle: McpGatewayHandle,
     cancel: CancellationToken,
@@ -96,10 +160,41 @@ pub struct McpGateway {
 
 impl McpGateway {
     /// Bind `127.0.0.1:0`, serve Streamable HTTP, fail closed if not loopback.
+    ///
+    /// Spawns an owned listener task for standalone tests. Prefer
+    /// [`Self::prepare_from_std_listener`] + TaskSupervisor in RuntimeOwner.
     pub async fn bind_loopback(max_routes: usize) -> Result<Self, McpInstallError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|_| McpInstallError::InvalidDescriptor)?;
+        let prepared = Self::prepare_from_tokio_listener(listener, max_routes, None)?;
+        let handle = prepared.handle();
+        let cancel = prepared.cancel_token();
+        let join = tokio::spawn(prepared.serve());
+        Ok(Self {
+            handle,
+            cancel,
+            join,
+        })
+    }
+
+    /// Build from a pre-bound non-blocking std listener (fail-closed startup bind).
+    pub fn prepare_from_std_listener(
+        std_listener: std::net::TcpListener,
+        max_routes: usize,
+        request_owner: Option<Arc<dyn McpRequestOwner>>,
+    ) -> Result<PreparedMcpGateway, McpInstallError> {
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .map_err(|_| McpInstallError::InvalidDescriptor)?;
+        Self::prepare_from_tokio_listener(listener, max_routes, request_owner)
+    }
+
+    /// Build from an already-bound Tokio loopback listener (no spawn).
+    pub fn prepare_from_tokio_listener(
+        listener: tokio::net::TcpListener,
+        max_routes: usize,
+        request_owner: Option<Arc<dyn McpRequestOwner>>,
+    ) -> Result<PreparedMcpGateway, McpInstallError> {
         let local_addr = listener
             .local_addr()
             .map_err(|_| McpInstallError::InvalidDescriptor)?;
@@ -112,11 +207,11 @@ impl McpGateway {
         let request_permits = Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_MCP_REQUESTS));
         let base_url = format!("http://{}", local_addr);
         let cancel = CancellationToken::new();
-        let cancel_serve = cancel.clone();
         let state = GatewayState {
             routes: Arc::clone(&routes),
             services: Arc::clone(&services),
             request_permits: Arc::clone(&request_permits),
+            request_owner,
         };
 
         let app = Router::new()
@@ -124,17 +219,7 @@ impl McpGateway {
             .route("/mcp/{token}/{*rest}", any(mcp_dispatch_rest))
             .with_state(state);
 
-        // Listener task is owned by this gateway JoinHandle until `shutdown`.
-        // RuntimeOwner integration (TaskClass::RuntimeService) is a follow-on.
-        let join = tokio::spawn(async move {
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    cancel_serve.cancelled().await;
-                })
-                .await;
-        });
-
-        Ok(Self {
+        Ok(PreparedMcpGateway {
             handle: McpGatewayHandle {
                 routes,
                 services,
@@ -143,7 +228,8 @@ impl McpGateway {
                 local_addr,
             },
             cancel,
-            join,
+            listener,
+            app,
         })
     }
 
@@ -191,11 +277,7 @@ impl McpGateway {
 
     /// Shutdown: revoke this gateway's routes, cancel their MCP services, stop listener.
     pub async fn shutdown(self) {
-        // Only drop services owned by this gateway (tokens in its route table).
-        let tokens = self.handle.routes.revoke_all();
-        for hex in tokens {
-            drop_capability_service(&self.handle.services, &hex);
-        }
+        self.handle.revoke_all_services();
         self.cancel.cancel();
         let _ = self.join.await;
     }
@@ -245,8 +327,9 @@ fn drop_capability_service(
 }
 
 async fn forward_mcp(state: GatewayState, token_hex: &str, req: Request) -> Response<Body> {
-    // D-034: canonicalize hex spelling before route/service-map access so
-    // uppercase/lowercase equivalents share one service and revoke key.
+    // Cheap fail-closed route lookup only — concurrency budget + body buffering
+    // run inside the owned McpRequest task so permits cannot outlive the handler
+    // if the axum task is dropped (Law 22 / §17).
     let Some(canonical) = CapabilityToken::from_hex(token_hex).map(|t| t.to_hex()) else {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -261,7 +344,34 @@ async fn forward_mcp(state: GatewayState, token_hex: &str, req: Request) -> Resp
             .unwrap_or_else(|_| Response::new(Body::empty()));
     };
 
-    // Acquire gateway + per-capability permits before body buffering (D-034).
+    let transaction_id = binding.transaction_id;
+    let state_work = state.clone();
+    let work = async move { execute_mcp_request(state_work, canonical, binding, req).await };
+
+    // RuntimeOwner path: each active request is TaskClass::McpRequest (§17).
+    if let Some(owner) = state.request_owner.as_ref() {
+        owner.run_owned(transaction_id, Box::pin(work)).await
+    } else {
+        work.await
+    }
+}
+
+/// Permit acquire + body buffer + Streamable HTTP handle (owned-task body).
+async fn execute_mcp_request(
+    state: GatewayState,
+    canonical: String,
+    binding: Arc<super::binding::McpBinding>,
+    req: Request,
+) -> Response<Body> {
+    // Re-check route after spawn (may have been revoked).
+    if state.routes.get_by_hex(&canonical).is_none() {
+        drop_capability_service(&state.services, &canonical);
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("unknown capability"))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+
     let Ok(_global) = state.request_permits.clone().try_acquire_owned() else {
         return Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
@@ -277,10 +387,8 @@ async fn forward_mcp(state: GatewayState, token_hex: &str, req: Request) -> Resp
                 let cancel = CancellationToken::new();
                 let mut config = StreamableHttpServerConfig::default();
                 config.cancellation_token = cancel.clone();
-                // No long-lived SSE keep-alive; request streams complete with the response.
                 config.sse_keep_alive = None;
                 config.sse_retry = None;
-                // Prefer JSON when possible for simpler clients; SSE still used when needed.
                 config.json_response = true;
                 Arc::new(CapabilityHttpService {
                     service: StreamableHttpService::new(

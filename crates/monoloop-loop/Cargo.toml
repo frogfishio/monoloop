@@ -67,3 +67,7 @@ path = "tests/linked_tools.rs"
 [[test]]
 name = "mcp_gateway"
 path = "tests/mcp_gateway.rs"
+
+[[test]]
+name = "s22_7_host_adapters"
+path = "tests/s22_7_host_adapters.rs"

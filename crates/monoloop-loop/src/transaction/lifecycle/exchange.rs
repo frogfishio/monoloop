@@ -10,7 +10,7 @@ use super::task_supervisor::TaskClass;
 use crate::transaction::sticky_cancel::StickyCancel;
 use monoloop_connector::{
     ConnectionControlHandle, ConnectionEnd, ConnectionEndKind, Connector, OpenConnection,
-    TerminationReason,
+    SessionAttachment, TerminationReason,
 };
 use monoloop_contracts::{
     CanonicalUnitEvent, ConnectionId, EffectiveConfig, ExchangeId, ExchangeInputPolicy,
@@ -108,10 +108,22 @@ impl ChildJoins {
     }
 }
 
-/// Run one DirectLlm exchange with TaskSupervisor-owned children.
+/// After open succeeds, before prompt send (CreationOnly claim / MCP activate).
+pub struct PromptReadyGate {
+    /// Exchange reports the opened external session (if any).
+    pub opened: oneshot::Sender<Option<monoloop_contracts::ExternalSessionId>>,
+    /// Coordinator signals ready to send prompt (`Ok`) or abort (`Err`).
+    pub proceed: oneshot::Receiver<Result<(), ()>>,
+}
+
+/// Run one supervised exchange with TaskSupervisor-owned children.
+///
+/// `exchange_id` MUST be the same id used for MCP `install_pending` when tools
+/// are CreationOnly-installed, so MCP tool lifecycle events correlate.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_direct_llm_exchange(
     transaction_id: TransactionId,
+    exchange_id: ExchangeId,
     tasks: &TransactionTaskSpawner,
     connector: &dyn Connector,
     encoder: &dyn OutboundDialectEncoder,
@@ -126,8 +138,9 @@ pub async fn run_direct_llm_exchange(
     max_encoded_exchange_bytes: usize,
     max_retained_unit_bytes: usize,
     max_remaining_provider_input_bytes: usize,
+    session_attachment: Option<std::sync::Arc<SessionAttachment>>,
+    prompt_ready: Option<PromptReadyGate>,
 ) -> DirectExchangeOutcome {
-    let exchange_id = ExchangeId::generate();
     match run_inner(
         transaction_id,
         exchange_id,
@@ -145,6 +158,8 @@ pub async fn run_direct_llm_exchange(
         max_encoded_exchange_bytes,
         max_retained_unit_bytes,
         max_remaining_provider_input_bytes,
+        session_attachment,
+        prompt_ready,
     )
     .await
     {
@@ -181,6 +196,8 @@ async fn run_inner(
     max_encoded_exchange_bytes: usize,
     max_retained_unit_bytes: usize,
     max_remaining_provider_input_bytes: usize,
+    session_attachment: Option<std::sync::Arc<SessionAttachment>>,
+    prompt_ready: Option<PromptReadyGate>,
 ) -> Result<
     (
         Vec<CanonicalUnitEvent>,
@@ -212,6 +229,9 @@ async fn run_inner(
 
     let mut open = OpenConnection::new(connection_id.clone(), endpoint_ref);
     open.credential_ref = credential_ref.map(|s| s.to_string());
+    if let Some(attachment) = session_attachment {
+        open = open.with_session_attachment(attachment);
+    }
 
     let pending = connector.begin_open(open);
     let control = pending.control.clone();
@@ -351,6 +371,46 @@ async fn run_inner(
                 ExchangeFailure::SpawnFailed,
             )
             .await;
+        }
+    }
+
+    // CreationOnly / ExternalAgent: claim + MCP activate before prompt (D-026).
+    if let Some(gate) = prompt_ready {
+        let external = opened.external_session_id.clone();
+        if gate.opened.send(external).is_err() {
+            return fail_cleanup(
+                &open_control,
+                children,
+                cleanup_deadline,
+                ExchangeFailure::InvariantFailed,
+            )
+            .await;
+        }
+        let proceed = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = open_control.terminate(TerminationReason::CallerForced);
+                return fail_cleanup(
+                    &open_control,
+                    children,
+                    cleanup_deadline,
+                    ExchangeFailure::Cancelled,
+                )
+                .await;
+            }
+            res = gate.proceed => res,
+        };
+        match proceed {
+            Ok(Ok(())) => {}
+            Ok(Err(())) | Err(_) => {
+                return fail_cleanup(
+                    &open_control,
+                    children,
+                    cleanup_deadline,
+                    ExchangeFailure::InvariantFailed,
+                )
+                .await;
+            }
         }
     }
 

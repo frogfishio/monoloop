@@ -67,7 +67,10 @@ pub struct HostToolRuntime {
 }
 
 impl HostToolRuntime {
-    /// Construct for one transaction / exchange scope (unit tests may omit spawner).
+    /// Unit-test path without a supervisor (ambient `tokio::spawn`).
+    ///
+    /// Prefer [`Self::with_spawner`] — production RuntimeOwner always supplies one.
+    #[deprecated(note = "ambient tokio::spawn; use with_spawner() under TaskSupervisor (Law 23)")]
     pub fn new(dispatcher: Arc<TransactionToolDispatcher>, exchange_id: ExchangeId) -> Self {
         Self {
             dispatcher,
@@ -142,8 +145,8 @@ fn map_outcome(outcome: DispatchOutcome) -> ToolRuntimeTerminal {
         DispatchOutcome::Canonical { result, .. } => {
             // Round-trip the full CanonicalToolResult so lifecycle publish preserves
             // Succeeded vs DomainFailed (and tool_id / ordinal).
-            let payload = serde_json::to_string(&result)
-                .unwrap_or_else(|_| "{\"error\":\"encode\"}".into());
+            let payload =
+                serde_json::to_string(&result).unwrap_or_else(|_| "{\"error\":\"encode\"}".into());
             let outcome = match &result.outcome {
                 monoloop_contracts::CanonicalToolResultOutcome::Succeeded(_) => {
                     OutboundToolOutcome::Success
