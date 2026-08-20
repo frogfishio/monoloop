@@ -17,7 +17,7 @@ use std::sync::Arc;
 pub struct ClaudeConnectorFactory;
 impl ClaudeConnectorFactory {
     /// Create a default factory.
-    /// Build a ChannelBinding for TransactionRuntime composition.
+    /// Build a ChannelBinding for StartedRuntime / ChannelRegistry composition.
     pub fn new() -> Self {
         Self
     }
@@ -34,7 +34,7 @@ impl ConnectorFactory for ClaudeConnectorFactory {
     }
 }
 
-/// Build a ChannelBinding for TransactionRuntime composition.
+/// Build a ChannelBinding for StartedRuntime / ChannelRegistry composition.
 pub fn claude_channel_binding(
     id: impl AsRef<str>,
     endpoint_ref: impl Into<String>,

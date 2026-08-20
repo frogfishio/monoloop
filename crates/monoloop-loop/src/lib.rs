@@ -32,19 +32,21 @@ pub use tools::{
 };
 pub use transaction::{
     adapt_completion_callback, adapt_event_sink, build_completion, validate_tool_completion,
-    validate_tool_input, AcpPromptEncoder, AcpPromptWireShape, AsyncToolHandler, CapacityManagers,
-    ChannelBinding, ChannelRegistry, EmptyBytesEncoder, HeadlessPromptEncoder,
+    validate_tool_input, AcpPromptEncoder, AcpPromptWireShape, AsyncToolHandler, ChannelBinding,
+    ChannelRegistry, EmptyBytesEncoder, HeadlessPromptEncoder,
     HostCompletionAdapter, HostEventAdapter, HostToolRegistry, ImmediateToolHandler,
     InputValidationFailure, IsolatedKillableToolHandler, LedgerEntry, LifecycleLedger,
     LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler, OpenAiChatCompletionsEncoder,
     OpenAiEncoderOptions, OutputValidationFailure, PanicOnStartHandler, ProcessIsolatedToolHandler,
-    ProcessToolCommand, RegisteredTool, RejectEncoder, ReservationPool, ReservationPoolError,
+    PanicEncoder, ProcessToolCommand, RegisteredTool, RejectEncoder, ReservationPool,
+    ReservationPoolError,
     ResolvedTool, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeOwner, RuntimeState,
-    SharedToolCapacity, ShutdownTicket, StartFailHandler, StartedRuntime, StartupError, StoppedGate,
-    SupervisorCommand, TaskClass, TaskExit, TaskId, TaskSupervisor, TerminalDecision,
-    TerminalProposal, TestTextEncoder, ToolExecutionCompletion, ToolExecutionControl, ToolHandler,
-    ToolKillHandle, TransactionPhase, TransactionReservations, TransactionRuntimeHandle,
-    TransactionToolCapacity,
+    FinalizerHoldGate, SharedToolCapacity, ShutdownTicket, StartFailHandler, StartHoldGate,
+    StartedRuntime, StartupError, StoppedGate, SupervisorCommand, TaskClass, TaskExit, TaskId,
+    TaskSupervisor,
+    TerminalDecision, TerminalProposal, TestTextEncoder, ToolExecutionCompletion,
+    ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionPhase, TransactionReservations,
+    TransactionRuntimeHandle, TransactionToolCapacity,
 };
 
 pub use monoloop_contracts::{

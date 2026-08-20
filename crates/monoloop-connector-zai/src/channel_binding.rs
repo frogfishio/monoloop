@@ -17,7 +17,7 @@ use std::sync::Arc;
 pub struct ZaiConnectorFactory;
 impl ZaiConnectorFactory {
     /// Create a default factory.
-    /// Build a ChannelBinding for TransactionRuntime composition.
+    /// Build a ChannelBinding for StartedRuntime / ChannelRegistry composition.
     pub fn new() -> Self {
         Self
     }
@@ -36,7 +36,7 @@ impl ConnectorFactory for ZaiConnectorFactory {
 }
 
 /// Z.ai headless Channel (tools inside CLI; Monoloop tools rejected by encoder).
-/// Build a ChannelBinding for TransactionRuntime composition.
+/// Build a ChannelBinding for StartedRuntime / ChannelRegistry composition.
 pub fn zai_channel_binding(
     id: impl AsRef<str>,
     endpoint_ref: impl Into<String>,

@@ -87,8 +87,9 @@ pub use transaction::{
     TerminationDisposition, TerminationMode, TerminationReason, TerminationReasonCode,
     TransactionCompletion, TransactionDiagnostic, TransactionEnd, TransactionEndEvent,
     TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionEventSink,
-    TransactionRequest, TransactionRuntime, TransactionSelector, TransactionSubmitRequest,
-    TransactionUsage,
+    TransactionSelector, TransactionSubmitRequest, TransactionUsage,
 };
+#[allow(deprecated)]
+pub use transaction::{TransactionRequest, TransactionRuntime};
 
 pub use bytes::Bytes;

@@ -58,10 +58,16 @@ where
     }
 }
 
-/// Transaction submission request (synchronous admission; async progress).
+/// Deprecated v1 sink-shaped submit request (host callbacks in the request).
 ///
-/// **v1 fields** `events` / `completion` remain until Runtime v2 cutover (M7).
-/// New code SHOULD use [`TransactionSubmitRequest`] with concrete delivery ports.
+/// **M7:** Core assemblers MUST use [`TransactionSubmitRequest`] +
+/// [`crate::delivery::transaction_delivery`]. Host adapters
+/// (`adapt_event_sink` / `adapt_completion_callback` in `monoloop-loop`) may
+/// still drain push receivers into [`TransactionEventSink`] /
+/// [`CompletionCallback`] **outside** the runtime.
+#[deprecated(
+    note = "use TransactionSubmitRequest with transaction_delivery(); sink/callback fields are not a core submit API (M7)"
+)]
 pub struct TransactionRequest {
     /// Explicit Channel selection.
     pub channel_id: ChannelId,
@@ -75,9 +81,9 @@ pub struct TransactionRequest {
     pub invocation_config: InvocationConfig,
     /// Selected host tool ids (deduplicated at admission).
     pub tools: Vec<ToolId>,
-    /// Required event sink (v1; retired from the core at v2 cutover).
+    /// Host event sink (v1; not accepted by `StartedRuntime` / `TransactionRuntimeHandle`).
     pub events: Arc<dyn TransactionEventSink>,
-    /// Required completion callback (v1; retired from the core at v2 cutover).
+    /// Host completion callback (v1; not accepted by `StartedRuntime` / `TransactionRuntimeHandle`).
     pub completion: Box<dyn CompletionCallback>,
 }
 
@@ -181,6 +187,12 @@ pub enum TerminationDisposition {
     AlreadyTerminal,
     /// Unknown selector.
     NotFound,
+    /// Control queue was full — request not enqueued (Law 22 fail-closed; D-039).
+    ///
+    /// This is **not** [`Self::AlreadyTerminal`]: the transaction may still be live.
+    ControlCapacityExceeded,
+    /// Control queue closed (runtime stopping / stopped) — request not enqueued.
+    RuntimeClosed,
 }
 
 /// Shutdown future type.
@@ -201,9 +213,17 @@ pub struct ShutdownDisposition {
     pub invariant_failed: u64,
 }
 
-/// Public transaction runtime port (implementation in monoloop-loop).
+/// Deprecated v1 runtime port (sink-shaped [`TransactionRequest`] submit).
+///
+/// **M7:** Production code uses `StartedRuntime` /
+/// `TransactionRuntimeHandle::submit(TransactionSubmitRequest)` in
+/// `monoloop-loop`. No live v2 type implements this trait.
+#[deprecated(
+    note = "use StartedRuntime / TransactionRuntimeHandle with TransactionSubmitRequest (M7)"
+)]
 pub trait TransactionRuntime: Send + Sync {
     /// Synchronously admit a transaction or return a typed error.
+    #[allow(deprecated)]
     fn submit(&self, request: TransactionRequest) -> Result<AdmissionReceipt, AdmissionError>;
 
     /// Request cancellation or forced termination.
@@ -319,6 +339,10 @@ pub enum TerminalEventDelivery {
     DeadlineExceeded,
     /// Item or byte capacity rejected the terminal event.
     LimitExceeded,
+    /// No publisher / Seal was ever attempted (e.g. shutdown before Start).
+    ///
+    /// Spec §6.4 / D-041: never-attempted is **not** [`Self::Published`].
+    NotAttempted,
 }
 
 /// Status of owned cleanup after completion publication (v2).
@@ -360,7 +384,8 @@ pub enum CleanupFailureCode {
 pub struct TransactionCompletion {
     /// Terminal event body (also published on the event stream when possible).
     pub end: TransactionEndEvent,
-    /// Result of the terminal event enqueue attempt.
+    /// Result of the terminal event enqueue attempt, or [`TerminalEventDelivery::NotAttempted`]
+    /// when Seal / `Ended` was never issued.
     pub terminal_event_delivery: TerminalEventDelivery,
     /// Whether owned cleanup is complete.
     pub cleanup: CleanupStatus,

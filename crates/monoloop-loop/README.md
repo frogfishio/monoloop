@@ -27,24 +27,22 @@ Prefer the façade crate `monoloop` unless you need this crate as a direct depen
 
 Do not recreate the deleted v1 files (`runtime`, `admission`, `actor`,
 `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`).
-Follow the seven-stage plan in the v2 spec. **M0–M4 landed (D-042 Fixed):** owned
-executor, task supervisor, ledger, RAII reservations, sync admission, separate
-start / control / worker / spawn queues, EventPublisher + Seal, Fake exchange
-under `TransactionTaskSpawner`, and joinable `ConnectionOwnerWork` on
-Fake/HTTP/ACP `begin_open` paths. ACP ProcessInner pumps use `Weak`+JoinSet;
-Grok pending connect/session/exchange workers abort on Drop and join on `wait`;
-`GrokServerHandle::shutdown` / `ServerInner` Drop tear down `run_connection`.
-Deferred on-disk modules stay uncompiled until their stage. Legacy suites need
-`--features legacy_runtime_tests`. **M5 (D-043/D-044 Fixed):** Ready tools via
-`DefaultLoopRuntime` + `TaskClass::LoopRuntime`; typed
-`try_new_process_isolated`; Busy supervisor retry; ambient `start` cfg-gated;
-MCP loopback `RuntimeService`; sessionless DirectLlm SessionKey = D-004.
-**M6 (partial, harden):** §22.5 generation CAS 0→1; `StoppedGate` / `block_stopped`;
-Finalizer tombstone (SessionKey until residual exit); WorkerExited `try_send` +
-coordinator `on_task_exit` terminal recovery; control/worker/start before
-`join_next` (Accepting not starved); `abort_and_drain` keeps joins (no false
-Stopped); grace abort without early SessionKey force-remove. Remaining: full
-adversarial §22 matrix, MCP gateway / non-empty tools (deferred), M7 façade.
+Follow the seven-stage plan in the v2 spec.
+
+**M0–M5 landed** (D-042 / D-043 / D-044). **M6 partial — not done** (D-045):
+§22.5 CAS/`StoppedGate`; Finalizer tombstone; hard-grace residuals until
+completion. Remaining §22 matrix / MCP / non-empty tools deferred.
+
+**M7 façade landed (D-038 Fixed):** `StartedRuntime` + `TransactionSubmitRequest`
+is the assembler recipe; deprecated sink-shaped `TransactionRequest` /
+`TransactionRuntime` trait are not core submit APIs. Host adapters
+`adapt_event_sink` / `adapt_completion_callback` stay (outside the kernel).
+Unregistered v1 integration `.rs` files remain on disk until rewritten.
+**M7 ≠ Golden / §25 DoD** while the M6 §22 remainder (D-045) is open.
+D-039 / D-040 / D-041 Fixed.
+
+Deferred on-disk modules (`active_registry`, `spawn_gate`, …) stay uncompiled
+until Loop-machine consolidation — deleting them is not part of façade cutover.
 
 ## Agent assembly recipe (v2 / M2)
 

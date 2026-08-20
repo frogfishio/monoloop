@@ -122,6 +122,14 @@ impl ReservationPool {
         self.ledger_active.load(Ordering::SeqCst)
     }
 
+    /// Observability: active reservations for one Channel.
+    pub fn channel_active(&self, id: &ChannelId) -> usize {
+        self.per_channel
+            .get(id)
+            .map(|ch| ch.active.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
     /// Configured global maximum.
     pub fn max_global(&self) -> usize {
         self.max_global

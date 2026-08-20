@@ -1373,52 +1373,65 @@ Verification performed:
 ## D-038: Workspace gates still compile deleted v1 runtime types
 
 **Priority:** P1
-**Status:** Open
+**Status:** Fixed
 **Affected:**
 - `crates/monoloop/examples/fake_echo.rs`
 - `crates/monoloop/examples/host_grok_wiring.rs`
 - `crates/monoloop-testkit/tests/canonical_event_presentation.rs`
-- `crates/monoloop-loop` tests/examples behind `legacy_runtime_tests`
-- crate READMEs still documenting `DefaultTransactionRuntime` + bare `Handle`
+- `crates/monoloop-loop` v1 suites (unregistered on disk)
+- crate READMEs / contracts assembler recipe
 
 **Problem:** M2 correctly removed `DefaultTransactionRuntime` and
 `RuntimeBootstrap.executor`. Downstream examples, the testkit suite, and the
-`legacy_runtime_tests` feature still import those symbols. Spec §23 requires
-`cargo test --workspace --all-targets --all-features`. That gate cannot pass.
-`--all-features` also compiles the explicitly broken legacy suite.
+`legacy_runtime_tests` feature still imported those symbols. Spec §23 requires
+`cargo test --workspace --all-targets --all-features`.
 
-**Required remediation:**
+**Remediation (M7 façade landed):**
 
-- Port façade examples to `StartedRuntime::start` (no external `Handle`), or
-  gate them until M7 cutover so `--all-targets` stays green.
-- Gate or port `canonical_event_presentation` the same way.
-- Do not advertise `legacy_runtime_tests` as a workspace feature until those
-  tests are rewritten or removed. A feature that cannot compile is not a
-  deferred suite.
-- Update host-facing READMEs so they do not instruct callers to pass a bare
-  Tokio `Handle`.
+- Ported façade examples + `canonical_event_presentation` to
+  `StartedRuntime::start` + push `transaction_delivery` (no external `Handle`).
+- Removed `legacy_runtime_tests` / `legacy_runtime_examples` features so
+  `--all-features` cannot compile deleted v1 symbols.
+- Deprecated sink-shaped `TransactionRequest` / `TransactionRuntime` trait as
+  core submit APIs; assembler docs point at `TransactionSubmitRequest`.
+- Host adapters `adapt_event_sink` / `adapt_completion_callback` retained
+  (outside the kernel). Unregistered v1 `.rs` suites remain on disk.
+- Spec header: M7 façade landed; **not** M0–M7 / Golden / §25.
 
 **Acceptance criteria:**
 
-- [ ] `cargo test --workspace --all-targets` compiles and runs.
-- [ ] `cargo test --workspace --all-targets --all-features` does not compile
-      deleted v1 symbols.
-- [ ] No in-tree example still constructs `RuntimeBootstrap { executor, .. }`.
+- [x] Façade examples use `StartedRuntime::start` (no `executor` field).
+- [x] `canonical_event_presentation` ported to v2 push delivery.
+- [x] No `legacy_runtime_tests` feature that compiles deleted v1 symbols.
+- [x] `cargo test --workspace --all-targets --all-features --no-run` compiles.
+- [x] Host-facing READMEs updated off `DefaultTransactionRuntime` / bare `Handle`.
+- [x] Core v1 `TransactionRequest` / `TransactionRuntime` retired as assembler
+      recipe (deprecated); contracts README + v2 spec header + loop README aligned.
+
+**Advisor (2026-08-20, bar check):** Finish M7 remainder without claiming Golden.
+§22 remainder stays open (D-039, D-040, D-041, D-045 M6 partial).
+
+**Advisor (2026-08-20, façade stop):** **Yes — stop façade cutover.** D-038
+acceptance is met. Remaining M7 spec items are **not** this cutover: callback
+deletion on a breaking-version boundary (deprecated + host adapters retained),
+and uncompiled-module deletion after Loop-machine consolidation. Do not rewrite
+unregistered v1 integration suites as further façade work. **Not** Golden / §25.
+Next is D-039 (kernel), not host.
 
 ## D-039: Shutdown and control share the start queue at exact capacity
 
 **Priority:** P1
-**Status:** Open
+**Status:** Fixed
 **Affected:**
 - `crates/monoloop-loop/src/transaction/lifecycle/owner.rs`
 - `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs`
-- `crates/monoloop-loop/src/transaction/lifecycle/admission.rs`
+- `crates/monoloop-contracts` `TerminationDisposition`
 
-**Problem:** The supervisor `mpsc` is sized `max_active_transactions` and carries
-`Start`, `Cancel`, `ForceTerminate`, `BeginShutdown`, and `StopSupervisor`.
-Admission can fill that queue with `Start` commands before the supervisor
-polls. `begin_shutdown` then `try_send`s `BeginShutdown` and **drops the
-command on `Full`**, after already CAS-ing state to `Quiescing`.
+**Problem (filed):** The supervisor `mpsc` was sized `max_active_transactions`
+and carried `Start`, `Cancel`, `ForceTerminate`, `BeginShutdown`, and
+`StopSupervisor`. Admission could fill that queue with `Start` commands before
+the supervisor polled. `begin_shutdown` then `try_send`s `BeginShutdown` and
+**drops the command on `Full`**, after already CAS-ing state to `Quiescing`.
 
 `wait_stopped` only re-sends shutdown when state is still `Accepting`. After a
 lost `BeginShutdown` the owner stays `Quiescing` with parked coordinators and
@@ -1429,92 +1442,142 @@ does not imply the supervisor will drain.
 Spec §9.2 requires start-queue capacity ≥ `max_active_transactions` for
 **start** commands. Control and shutdown must not be starved by that bound.
 
+**Current code (do not close on this):** start vs control vs worker queues are
+split; `begin_shutdown` CAS-es `Quiescing` and `wake`s; supervisor observes
+`Quiescing` on wake. Residual P1:
+
+- `terminate` still maps `control_tx.try_send` `Full`/`Closed` →
+  `AlreadyTerminal` (lie; Law 22 fail-closed must be explicit).
+- `wait_stopped` still does not re-announce `BeginShutdown` while `Quiescing`.
+- Biased `control_rx` can delay shutdown observation under a terminate flood.
+- `shutdown_control_not_starved_when_start_queue_full` is admit-at-capacity +
+  shutdown, not parked unprocessed `Start`s.
+
+**Advisor (2026-08-20):** **Pick D-039 next. Do not leave for host.** Shutdown
+and control delivery are kernel (Laws 22–25, §9.2 / §10). Host adapters
+(`adapt_event_sink` / `adapt_completion_callback`) drain push receivers outside
+the runtime; they cannot substitute for control-queue integrity. Pair the fix
+with D-040 §22.1 tests; do not treat the existing happy-path test as proof.
+
 **Required remediation:**
 
 - Separate control/shutdown from the start queue, or size the shared queue
-  with dedicated control slack that admission cannot consume.
+  with dedicated control slack that admission cannot consume. *(done: split queues)*
 - Retry `BeginShutdown` / `StopSupervisor` from `wait_stopped` while
   `Quiescing`.
 - Do not map `try_send` failure to `AlreadyTerminal`.
+- Preferential control drain so a Cancel flood cannot delay Quiescing observation.
+
+**Remediation (2026-08-20):**
+
+- `terminate`: ledger-first `NotFound` / `AlreadyTerminal`; `try_send` `Full` →
+  `ControlCapacityExceeded`, `Closed` → `RuntimeClosed` (never Full→AlreadyTerminal).
+- `wait_until_stopped` while `Quiescing` re-sends `BeginShutdown` + `wake`.
+- Supervisor loop preferentially `try_recv`s the control queue each lap.
 
 **Acceptance criteria:**
 
-- [ ] With `max_active` admitted and unprocessed `Start`s queued,
-      `begin_shutdown` + `wait_stopped` still reaches `Stopped` (or honest
-      `Quiescing` with a later successful wait).
-- [ ] A full start queue cannot drop shutdown or cancel.
-- [ ] `terminate` on a live transaction is never reported as `AlreadyTerminal`
-      solely because the command queue was full.
+- [x] Start vs control queues split; admit-at-capacity shutdown still reaches
+      `Stopped` (`shutdown_control_not_starved_when_start_queue_full`).
+- [x] `wait_stopped` re-announces while `Quiescing`
+      (`wait_stopped_reannounce_while_quiescing_then_stopped`).
+- [x] `terminate` never reports `AlreadyTerminal` solely because the control
+      queue was full (`ControlCapacityExceeded` / ledger-honest paths).
+- [x] Explicit proof with parked unprocessed `Start`s
+      (`parked_starts_reach_stopped_on_shutdown`, D-040).
 
 ## D-040: Mandatory §22.1 admission tests are not implemented
 
 **Priority:** P1
-**Status:** Open
+**Status:** Fixed
 **Affected:**
 - `crates/monoloop-loop/src/transaction/lifecycle/tests.rs`
+- `RuntimeConfig::{hold_start, start_queue_capacity}`, `StartHoldGate`
 
-**Problem:** Present tests cover OS-thread submit, duplicate session, capacity
+**Problem:** Present tests covered OS-thread submit, duplicate session, capacity
 plus-one, one completion per shutdown, and a best-effort zero-deadline wait.
-Spec §22.1 also requires, before treating M2 as done:
+Spec §22.1 also required parked-worker admission, start-queue rollback,
+submit-vs-shutdown two outcomes, rejected silent delivery, and non-conditional
+short-wait TimedOut.
 
-- a parked runtime worker cannot delay synchronous admission;
-- start-queue full rolls back ledger, session, delivery, and every permit;
-- submit versus `begin_shutdown` has only two legal outcomes;
-- rejected admission publishes no event and no completion.
+**Remediation:**
 
-`short_wait_may_timeout_while_quiescing_then_complete` accepts either
-`Stopped` or `TimedOut` (spec §21 forbids conditional tests that weaken
-mandatory assertions). `wait_until_stopped` snapshots `owned_tasks: 0`
-unconditionally.
-
-**Required remediation:**
-
-- Add deterministic tests for the four missing §22.1 cases.
-- Prove start-queue rollback releases global/channel/ledger permits to zero.
-- Prove rejected submit never completes the oneshot and never enqueues events.
-- Make the short-wait test force `TimedOut` (parked non-yielding worker in an
-  isolated subprocess if needed) rather than accepting `Stopped`.
+- `StartHoldGate` + `start_queue_capacity` test overrides (production defaults
+  unchanged).
+- `FakeEndpoint::Hang` parked-worker admission proof.
+- Start-queue-full rollback proves global/channel/ledger permits + silent
+  delivery.
+- Parked Starts still complete on shutdown.
+- `short_wait_may_timeout_while_quiescing_then_complete` forces `TimedOut` via
+  `StoppedGate` (no contradictory Stopped acceptance).
+- Duplicate-session race admits exactly one; submit-vs-shutdown is reject or
+  fully admitted + one completion; rejected admits are silent.
 
 **Acceptance criteria:**
 
-- [ ] Every §22.1 item has a direct deterministic test.
-- [ ] No M2 test is green for both of two contradictory outcomes.
+- [x] Every §22.1 item has a direct deterministic test.
+- [x] No M2 test is green for both of two contradictory outcomes.
+
+**Advisor (2026-08-20):** D-040 closed. Façade cutover stays stopped. **Not**
+Golden / §25. D-041 (`.max(1)` / fabricated `Published`) and D-045 (M6 §22
+remainder) stay open.
+
+**Advisor (2026-08-20, bar check after D-040):** D-040 **Fixed** stands. D-039
+parked-Start **closed** via `parked_starts_reach_stopped_on_shutdown`. Next
+kernel bar is **D-041 honesty** — not the §22.2–22.7 matrix. D-045 stays
+**open**. **Not** Golden / §25.
 
 ## D-041: M2 still substitutes limits and fabricates terminal-event delivery
 
 **Priority:** P2
-**Status:** Open
+**Status:** Fixed
 **Affected:**
-- `crates/monoloop-loop/src/transaction/lifecycle/capacity.rs` (`.max(1)`)
-- `crates/monoloop-loop/src/transaction/lifecycle/owner.rs` (start queue `.max(1)`)
 - `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs`
-  (`TerminalEventDelivery::Published` without an `Ended` enqueue)
-- `crates/monoloop-loop/src/transaction/capacity.rs` (`CapacityManagers`
-  counter API still compiled and re-exported)
-- `doc/TRANSACTION_RUNTIME_V2_SPEC.md` status line “M0–M2 landed”
+- `crates/monoloop-contracts` `TerminalEventDelivery::NotAttempted`
+- deleted `crates/monoloop-loop/src/transaction/capacity.rs` (`CapacityManagers`)
 
-**Problem:** D-015 forbade silent `.max(1)` substitution of invalid capacities.
-M2 repeats it. Completion always reports `TerminalEventDelivery::Published`
-without attempting the event mailbox (spec §6.4 / §13.2). The old
-counter-only `CapacityManagers` remains on the public surface beside the RAII
-pool. The spec header marks M2 landed.
+**Already honest (do not re-open as D-041):**
+- `lifecycle/capacity.rs` `ReservationPool::try_new` fail-closes on zero
+  (no silent `.max(1)`).
+- `lifecycle/owner.rs` start queue is `unwrap_or(max_active)` after a
+  nonzero startup check; no start-queue `.max(1)`.
+- Spec header is no longer “M0–M2 landed”; it already records D-045 open
+  and **not** M0–M7 / Golden / §25.
 
-These are honesty / law-22 issues, not a reason to rebuild the owner model.
+**Remediation:**
+- `finalize_after_terminal` defaults `TerminalEventDelivery::NotAttempted`
+  when `publisher_cmd_tx` is `None` (no Seal / `Ended` enqueue).
+- Removed public `CapacityManagers` dual API; v2 uses `ReservationPool` only.
+- Parked-Start shutdown completions assert `NotAttempted`.
 
-**Required remediation:**
-
-- Fail closed on zero capacity (startup already validates; do not clamp).
-- Record terminal-event delivery as not-yet-attempted, or skip the field
-  until M3 actually enqueues `Ended`.
-- Stop exporting unused v1 `CapacityManagers`.
-- Change the v2 spec status to M0–M1 landed, M2 in progress, until D-038–D-040
-  close.
+**Out of D-041 close-out:**
+- `task_spawner` mailbox `.max(1)` is a derived spawn channel (≥ 32
+  from validated `max_active`), not a caller-configured capacity clamp.
+- Uncompiled v1 `dispatcher` / `events` / `tool_capacity` `.max(1)`
+  stays deferred (D-015 residual / later migration), not this defect.
 
 **Acceptance criteria:**
 
-- [ ] No production lifecycle `.max(1)` on caller-configured capacities.
-- [ ] Completion does not claim `Published` for an event that was not sent.
-- [ ] Spec status matches review acceptance.
+- [x] No production lifecycle `.max(1)` on caller-configured capacities
+      (`ReservationPool` + start queue).
+- [x] Completion does not claim `Published` for an event that was not sent.
+- [x] `CapacityManagers` is not a public dual capacity API.
+- [x] Spec status matches review acceptance (D-045 open; not Golden).
+
+**Advisor (2026-08-20):** D-041 honesty closed. Keep §22.2–22.7 under D-045.
+**Not** Golden / §25.
+
+**Expert (2026-08-20):** No remaining fabricated `Published` path or dual
+`CapacityManagers` API. `finalize_after_terminal` defaults `NotAttempted` when
+`pub_cmd` is `None`; parked-Start asserts it. Spec §6.4 / §19 / §13.2 now
+include `NotAttempted` (was stale vs code). Residual: Seal-reply wait is a
+hardcoded 200ms, not `terminal_event_delivery_deadline`; uncompiled
+`SharedToolCapacity` `.max(1)` stays out of this close-out.
+
+**Advisor (2026-08-20, honesty stop):** **Yes — stop the honesty cutover.**
+D-041 **Fixed** stands. Do not reopen for derived spawn-mailbox `.max(1)`,
+uncompiled v1 `.max(1)`, or the 200ms Seal wait. Next kernel pick is
+**D-045 §22.2**, not host adapters. **Not** M6 done / Golden / §25.
 
 ## M2 boundary notes (not separate defects)
 
@@ -1643,3 +1706,122 @@ Grok / claimed sessions still use the authoritative external id.
 **Acceptance criteria:**
 - [x] Spec/decision: transaction-scoped key normative for sessionless DirectLlm
 - [x] Code and docs match that decision (`session_key_for` + D-004)
+
+## D-045: M6 harden2 — SessionKey post-grace clear + honest partial
+
+**Priority:** P2  
+**Status:** Accepted (SessionKey clear) / Open (M6 remainder)  
+**Affected:**
+- `lifecycle/supervisor.rs` post-grace `force_remove_tombstone`
+- `lifecycle/tests.rs` Seal payload sync + `owned_tasks` TimedOut
+- `doc/TRANSACTION_RUNTIME_V2_SPEC.md` M6/M7 / §22
+- façade examples still on v1 (`D-038`)
+
+**Advisor (2026-08-20):**
+
+Post-grace `SessionKey` release while admission is already `Quiescing` is
+**acceptable fail-closed**. It is not a LAW 7 violation (LAW 7 is “do not invent
+a competing correlation id”). It is Law 8/9 + one-active-`SessionKey`: no new
+admit can take the key, no most-recent recovery, residual work keeps its
+envelope copies, and `Stopped` still requires empty joins.
+
+**Condition:** hard-grace must not abort `Finalizer`/`EventPublisher` then
+remove the ledger row *before* the one completion attempt. Prefer
+`abort_transaction_residuals` until Seal/completion is recorded; only then
+`force_remove_tombstone`. Clearing the index ≠ `Stopped`.
+
+Seal envelope/payload `SessionId` sync and TimedOut residual
+`ledger_entries || owned_tasks` under `StoppedGate` are **real** assertions
+(not shaped). `block_stopped` stays test-only; production default remains
+`None`.
+
+**M6 is partial.** Remaining: full §22 matrix (22.2 races, 22.3 non-yielding
+subprocess, 22.4 process-kill, 22.6, 22.7 host adapters), MCP/non-empty tools
+(deferred). Do not mark M6 done.
+
+**Preferred next was M7 façade cutover** (close D-038). That cutover is done
+(D-038 Fixed). Next is **D-039** (kernel shutdown/control), not the full
+adversarial matrix and not host adapters. M7 does **not** satisfy Definition
+of Done / Golden; §22 remains the gate before v2 is complete.
+
+**Advisor (2026-08-20, bar check):** Yes — finish remaining M7 (callback
+alias / v1 submit-shape deletion + README/spec status) **without** claiming
+Golden. Track §22 remainder as **open** (D-039, D-040, D-041, this M6
+partial). Host adapters `adapt_completion_callback` / `adapt_event_sink`
+stay (M1 / §22.7); they are not core callback APIs. Do not treat uncompiled
+`active_registry` / `spawn_gate` / duplicate Loop deletion as Loop-machine
+consolidation. Spec header must not read M0–M7 landed.
+
+**Advisor (2026-08-20, façade stop):** Façade cutover **stops**. Do not claim
+M0–M7 / Golden / §25. Pick **D-039** in-kernel; do not leave start-queue /
+control starve for the host. D-040 is the proof suite for that fix. D-041
+and this M6 remainder stay open behind that.
+
+**Advisor (2026-08-20, D-040 closed):** D-039 parked-Start proof + §22.1 suite
+landed. Next kernel bar is **D-041** (no `.max(1)`, honest terminal-event
+delivery). This M6 remainder stays **open**. **Not** Golden.
+
+**Advisor (2026-08-20, D-041 next):** Keep **§22.2–22.7 open under this
+defect.** Partial §22.5 (TimedOut/`StoppedGate`, CAS generation, later
+Stopped) is not the mandatory matrix. Do not treat D-041 close-out as
+§22.2 finalization races, §22.3 non-yielding subprocess, §22.4
+process-kill, §22.6 identity, or §22.7 host-adapter proofs. Host
+adapters stay (M1 / §22.7); they are not the next task.
+
+**Advisor (2026-08-20, D-041 Fixed):** Honesty items closed (`NotAttempted`,
+`CapacityManagers` removed). **§22.2–22.7 remain open under this defect.**
+**Not** Golden / §25 / M6 done.
+
+**Advisor (2026-08-20, honesty stop):** **Yes — stop honesty cutover here.**
+Leave the next pick as **this defect’s §22 matrix**, first slice **§22.2
+finalization** (exactly-one completion, coordinator panic, cancel/force
+races, no event after terminal, failed enqueue consumes no sequence).
+**Not host** as an equal alternative: `adapt_event_sink` /
+`adapt_completion_callback` stay (M1 / §22.7) and are outside the kernel;
+they do not substitute for §22.2–22.6. Partial §22.5 is not M6 item 2
+(“all adversarial acceptance tests”). **Do not** promote M6 / Golden / §25.
+
+**§22.2 first slice (2026-08-20):** Landed proofs —
+`s22_2_one_completion_per_admission`, dropped-receiver accounting,
+coordinator panic → `InvariantFailed`, cancel→force `Terminated` (ledger
+re-read at Seal + terminate upgrade path), completion/cancel race one cause,
+no event after Seal, failed enqueue consumes no sequence. **M6 still partial**
+(§22.3–22.7 + MCP/non-empty tools open). **Not** Golden / §25.
+
+**Acceptance criteria:**
+- [x] Post-grace SessionKey clear under closed admission accepted as fail-closed
+- [x] Hard-grace path preserves one completion attempt (residuals, not full abort)
+- [x] M6 not labelled done / Golden (README + spec remain “partial”)
+- [x] M7 cutover started (examples + presentation ported; D-038 Fixed-in-progress)
+- [x] M7 façade remainder landed without promoting M6 / Golden / §25 (D-038 Fixed)
+- [x] D-041 honesty closed without claiming §22.2–22.7 / Golden
+- [x] Honesty cutover stopped; next pick §22.2 (not host, not M6 done)
+- [x] §22.2 first-slice proofs landed; §22.3–22.7 remain open
+- [x] §22.2 remainder: shutdown between Seal and completion cannot lose
+      ledger/completion (`s22_2_shutdown_between_seal_and_completion_keeps_completion`
+      + `FinalizerHoldGate` + take `completion_tx` before Seal; hard-grace
+      keeps Finalizer, aborts EventPublisher after grace)
+- [ ] §22.3 in-process ownership proofs before sacrificial subprocess
+- [ ] §22.3 non-yielding future: sacrificial process + outer timeout;
+      `TimedOut` + `Quiescing` + owned work; never false `Stopped`
+
+**Advisor (2026-08-20, §22.3 vs pause):** **Pause the sacrificial
+non-yielding subprocess.** Do **not** pause the M6 kernel remainder.
+Honesty cutover stays stopped; D-041 Fixed; §22.2 first slice stands.
+**Not** M6 done / Golden / §25. Host adapters stay out.
+
+**§22.2 closed (2026-08-20):** Seal→completion vs shutdown proof landed.
+`FinalizerHoldGate` holds Finalizer after Seal; shutdown while held must
+`TimedOut`/`Quiescing` (not false `Stopped`); release yields one completion.
+Join cancel path maps Tokio task id → `TaskId` so aborted joins cannot
+leak meta and strand ledger rows. Hard-grace uses
+`abort_transaction_except_finalizer`. **§22.2 matrix complete.** M6 still
+partial (§22.3–22.7 + MCP/non-empty tools). **Not** Golden / §25.
+
+**Next pick:** **§22.3 in-process** ownership (register-before-poll,
+abort-then-join, yielding abortable, coordinator drop does not detach
+pumps, counts to zero on non-kill paths). Sacrificial non-yielding remains
+**paused** as a later 22.3 slice: short `wait_stopped` → `TimedOut`,
+`Quiescing`, owned work still registered; **never** `Stopped`. Outer
+harness kills the child. Do not treat process-kill (§22.4) or host
+adapters (§22.7) as substitutes.

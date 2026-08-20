@@ -4,26 +4,27 @@
 //! cargo run -p monoloop --example host_grok_wiring --features grok
 //! ```
 //!
-//! This example **only wires** the Channel + runtime. It does not open a WebSocket
-//! unless you set `MONOLOOP_GROK_SUBMIT=1` and provide endpoint + secret env vars
-//! (see comments below). Live qualification drivers remain in `monoloop-testkit`.
+//! This example **only wires** the Channel + runtime by default. It does not open
+//! a WebSocket unless you set `MONOLOOP_GROK_SUBMIT=1` and provide endpoint +
+//! secret env vars. Live qualification drivers remain in `monoloop-testkit`.
+//!
+//! Runtime v2: `StartedRuntime::start` owns the executor (no external `Handle`).
 
 #[cfg(not(feature = "grok"))]
 compile_error!("enable `--features grok` for this example");
 
 use monoloop::contracts::{
-    user_text_input, CanonicalInput, CanonicalMessage, FnCompletionCallback, FnEventSink,
-    InputLimits, InvocationConfig, SessionId, TextPart, TransactionEnd, TransactionEvent,
-    TransactionEventPayload, TransactionRequest, TransactionRuntime,
+    transaction_delivery, user_text_input, CanonicalInput, CanonicalMessage, DeliveryLimits,
+    InputLimits, InvocationConfig, SessionId, ShutdownWaitOutcome, TextPart,
+    TransactionEventPayload, TransactionSubmitRequest,
 };
 use monoloop::interpreter::DefaultInterpreterFactory;
 use monoloop::loop_runtime::{
-    AcpPromptEncoder, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry,
-    RuntimeBootstrap, RuntimeConfig,
+    AcpPromptEncoder, ChannelRegistry, HostToolRegistry, RuntimeBootstrap, RuntimeConfig,
+    StartedRuntime,
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 
 /// Host keychain adapter: map Monoloop `SecretRef` names → secret material.
 ///
@@ -73,8 +74,7 @@ fn journal_to_input(
     CanonicalInput::try_new(messages, &limits)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // --- 1. Secrets (keychain / secure store) ---------------------------------
     let secrets = Arc::new(HostKeychainResolver {
         grok_server_secret: std::env::var("MONOLOOP_GROK_SECRET")
@@ -82,16 +82,6 @@ async fn main() {
     });
 
     // --- 2. Channel binding (public signature) --------------------------------
-    //
-    // pub fn grok_channel_binding(
-    //     id: impl AsRef<str>,
-    //     endpoint_ref: impl Into<String>,      // e.g. "ws://127.0.0.1:2419"
-    //     credential_ref: impl Into<String>,    // SecretResolver key name
-    //     secrets: Arc<dyn SecretResolver>,
-    //     encoder: Arc<dyn OutboundDialectEncoder>,
-    //     interpreter: Arc<dyn InterpreterFactory>,
-    // ) -> ChannelBinding
-    //
     let endpoint =
         std::env::var("MONOLOOP_GROK_ENDPOINT").unwrap_or_else(|_| "ws://127.0.0.1:2419".into());
 
@@ -112,23 +102,17 @@ async fn main() {
         binding.credential_ref
     );
 
-    // --- 3. Tokio Handle (Tauri / desktop hosts) ------------------------------
-    //
-    // RuntimeBootstrap.executor requires a tokio::runtime::Handle.
-    // Supported host pattern: start a dedicated multi-thread Tokio runtime at
-    // app setup and pass Handle::current() (or runtime.handle().clone()) here.
-    // #[tokio::main] is fine for CLI samples; Tauri should own the runtime.
-    //
-    let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
+    // --- 3. Runtime owns its executor (v2) ------------------------------------
+    // No bare tokio::Handle on RuntimeBootstrap. Desktop hosts call
+    // StartedRuntime::start from process setup; the owner thread joins on shutdown.
+    let started = StartedRuntime::start(RuntimeBootstrap {
         config: RuntimeConfig {
             enable_mcp_listener: false,
             ..Default::default()
         },
         channels: ChannelRegistry::build(vec![binding]).expect("registry"),
         tools: HostToolRegistry::empty(),
-        executor: tokio::runtime::Handle::current(),
     })
-    .await
     .expect("runtime start");
 
     // --- 4. Multi-turn input (host journal) -----------------------------------
@@ -138,10 +122,9 @@ async fn main() {
         ("user", "Say hello in one short sentence."),
     ])
     .expect("history");
-    let _one_shot = user_text_input("hello").expect("one-shot");
+    let one_shot = user_text_input("hello").expect("one-shot");
 
     // Live text path: TransactionEventPayload::CanonicalUnit only (complete units).
-    // There is no token / delta stream API.
     println!("events: match TransactionEventPayload::CanonicalUnit(_); no token stream");
 
     if std::env::var("MONOLOOP_GROK_SUBMIT").ok().as_deref() != Some("1") {
@@ -149,54 +132,73 @@ async fn main() {
             "assembly ok (no submit). Set MONOLOOP_GROK_SUBMIT=1 plus \
              MONOLOOP_GROK_ENDPOINT / MONOLOOP_GROK_SECRET to exercise a live turn."
         );
+        let mut owner = started.owner;
+        let wait_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("wait runtime");
+        let outcome = wait_rt.block_on(async {
+            owner.begin_shutdown();
+            owner.wait_stopped(Duration::from_secs(3)).await
+        });
+        assert!(
+            matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+            "expected Stopped, got {outcome:?}"
+        );
         return;
     }
 
-    // --- 5. Optional live submit ----------------------------------------------
+    // --- 5. Optional live submit (push delivery) ------------------------------
     // New session: session_id = None.
-    // Resume: session_id = Some(SessionId::from_external(
-    //     &ExternalSessionId::try_new("<grok-sessionId>").unwrap()))
-    let (done_tx, done_rx) = oneshot::channel::<()>();
-    let done_tx = Arc::new(std::sync::Mutex::new(Some(done_tx)));
+    // Resume: session_id = Some(SessionId::try_new("<grok-sessionId>").unwrap())
+    let handle = started.handle.clone();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).expect("limits"))
+            .expect("delivery");
 
-    let events = Arc::new(FnEventSink(move |ev: TransactionEvent| {
-        Box::pin(async move {
-            if let TransactionEventPayload::CanonicalUnit(unit) = &ev.payload {
-                println!("canonical unit: {:?}", unit.snapshot().unit.kind_label());
-            }
-            Ok(())
-        }) as monoloop::contracts::EventDelivery
-    }));
-
-    let done_cb = Arc::clone(&done_tx);
-    let completion = Box::new(FnCompletionCallback(move |end: TransactionEnd| {
-        let done_cb = Arc::clone(&done_cb);
-        Box::pin(async move {
-            println!("transaction end: {:?}", end.kind);
-            if let Some(tx) = done_cb.lock().expect("lock").take() {
-                let _ = tx.send(());
-            }
-            Ok(())
-        }) as monoloop::contracts::CompletionDelivery
-    }));
-
-    let _receipt = TransactionRuntime::submit(
-        rt.as_ref(),
-        TransactionRequest {
+    let _receipt = handle
+        .submit(TransactionSubmitRequest {
             channel_id: monoloop::contracts::ChannelId::try_new("grok").expect("id"),
             session_id: None::<SessionId>,
-            input: _one_shot,
+            input: one_shot,
             session_config: None,
             invocation_config: InvocationConfig {
                 deadline: Some(Duration::from_secs(120)),
                 ..Default::default()
             },
             tools: vec![],
-            events,
-            completion,
-        },
-    )
-    .expect("admit");
+            delivery,
+        })
+        .expect("admit");
 
-    let _ = tokio::time::timeout(Duration::from_secs(180), done_rx).await;
+    let wait_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("wait runtime");
+
+    let completion = wait_rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(180), receiver.completion.recv()).await
+    });
+    match completion {
+        Ok(Ok(end)) => {
+            while let Ok(ev) = receiver.events.try_recv() {
+                if let TransactionEventPayload::CanonicalUnit(unit) = &ev.payload {
+                    println!("canonical unit: {:?}", unit.snapshot().unit.kind_label());
+                }
+            }
+            println!("transaction end: {:?}", end.end.kind);
+        }
+        Ok(Err(_)) => println!("completion channel closed"),
+        Err(_) => println!("live submit timed out"),
+    }
+
+    let mut owner = started.owner;
+    let outcome = wait_rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
 }

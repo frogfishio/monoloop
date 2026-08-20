@@ -3,6 +3,7 @@
 use super::channel_registry::ChannelRegistry;
 use super::host_tools::HostToolRegistry;
 use monoloop_contracts::TransactionLimits;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -44,6 +45,86 @@ impl StoppedGate {
     }
 }
 
+/// Test-only gate that pauses supervisor drain of the start queue (D-040).
+///
+/// While held, `Start` commands remain queued so admission can observe
+/// start-queue-full rollback without the supervisor racing to drain.
+#[derive(Debug, Default)]
+pub struct StartHoldGate {
+    held: AtomicBool,
+}
+
+impl StartHoldGate {
+    /// New gate, initially not holding (start drain enabled).
+    pub fn new() -> Self {
+        Self {
+            held: AtomicBool::new(false),
+        }
+    }
+
+    /// Pause start-queue drain.
+    pub fn hold(&self) {
+        self.held.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume start-queue drain.
+    pub fn release(&self) {
+        self.held.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether start drain is currently paused.
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
+    }
+}
+
+/// Test-only gate that pauses the Finalizer between Seal and completion send (§22.2).
+///
+/// Proves shutdown / hard-grace cannot drop the ledger row or the one completion
+/// attempt while Seal has already run.
+#[derive(Debug)]
+pub struct FinalizerHoldGate {
+    released: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Default for FinalizerHoldGate {
+    fn default() -> Self {
+        Self {
+            released: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl FinalizerHoldGate {
+    /// New gate; Finalizer blocks after Seal until [`Self::release`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allow Finalizer to publish completion.
+    pub fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// Wait until release (used by Finalizer).
+    pub async fn wait_released(&self) {
+        loop {
+            if self.released.load(Ordering::SeqCst) {
+                return;
+            }
+            // Subscribe before re-check to avoid lost wakeup.
+            let notified = self.notify.notified();
+            if self.released.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Runtime-wide configuration validated at startup.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -56,6 +137,16 @@ pub struct RuntimeConfig {
     /// When `Some`, supervisor defers `Stopped` until the gate is released.
     /// Production leaves this `None`; §22.5 TimedOut proofs set it.
     pub block_stopped: Option<Arc<StoppedGate>>,
+    /// When `Some`, supervisor skips draining `Start` while the gate is held.
+    /// Production leaves this `None`; D-040 parked-Start proofs set it.
+    pub hold_start: Option<Arc<StartHoldGate>>,
+    /// Override start-queue capacity (tests). `None` ⇒ `max_active_transactions`.
+    /// Use a value smaller than reservation capacity to prove start-full rollback
+    /// while the reservation pool still has headroom (D-040 / §22.1).
+    pub start_queue_capacity: Option<usize>,
+    /// When `Some`, Finalizer waits after Seal before completion send (§22.2).
+    /// Production leaves this `None`.
+    pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
 }
 
 impl Default for RuntimeConfig {
@@ -66,6 +157,9 @@ impl Default for RuntimeConfig {
             enable_mcp_listener: false,
             default_shutdown_deadline: Duration::from_secs(30),
             block_stopped: None,
+            hold_start: None,
+            start_queue_capacity: None,
+            hold_finalizer_after_seal: None,
         }
     }
 }
@@ -85,6 +179,13 @@ impl RuntimeConfig {
             return Err(super::StartupError::InvalidConfig(
                 "default_shutdown_deadline",
             ));
+        }
+        if let Some(cap) = self.start_queue_capacity {
+            if cap == 0 {
+                return Err(super::StartupError::InvalidConfig(
+                    "start_queue_capacity must be nonzero when set",
+                ));
+            }
         }
         Ok(())
     }

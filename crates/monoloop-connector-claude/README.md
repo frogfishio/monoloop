@@ -15,7 +15,7 @@ Claude Code headless CLI profile.
 
 1. Construct profile config + secret resolver (if required).
 2. Call `claude_channel_binding(...)` to get a `monoloop_loop::ChannelBinding`.
-3. Insert into `ChannelRegistry` and start `DefaultTransactionRuntime` (see
+3. Insert into `ChannelRegistry` and start `StartedRuntime` (v2; no bare Handle) (see
    `monoloop` / `monoloop-loop` READMEs and `fake_echo` examples).
 
 ```rust

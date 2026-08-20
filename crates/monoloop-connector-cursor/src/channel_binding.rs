@@ -22,7 +22,7 @@ pub struct CursorConnectorFactory;
 
 impl CursorConnectorFactory {
     /// Default factory.
-    /// Build a ChannelBinding for TransactionRuntime composition.
+    /// Build a ChannelBinding for StartedRuntime / ChannelRegistry composition.
     pub fn new() -> Self {
         Self
     }
@@ -164,7 +164,7 @@ impl SessionAdapter for ProfileSessionAdapter {
 }
 
 /// Cursor Channel binding (ExternalAgent, MCP CreationOnly, Bidirectional).
-/// Build a ChannelBinding for TransactionRuntime composition.
+/// Build a ChannelBinding for StartedRuntime / ChannelRegistry composition.
 pub fn cursor_channel_binding(
     id: impl AsRef<str>,
     endpoint_ref: impl Into<String>,

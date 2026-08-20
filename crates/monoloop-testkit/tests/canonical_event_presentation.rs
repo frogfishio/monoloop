@@ -2,25 +2,26 @@
 //!
 //! Proves the testkit projection path does not require feeding presentation
 //! state back into the runtime — only Interpreter/canonical units matter.
+//!
+//! Runtime v2: `StartedRuntime::start` + push `transaction_delivery`.
 
 use monoloop_connector::FakeConnectorFactory;
 use monoloop_contracts::{
-    user_text_input, ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
-    ContinuationPolicy, DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink,
-    InterpreterOutputEvent, InvocationConfig, McpConfigurationCapability, McpReachability,
-    SessionMode, ToolExecutionMode, TransactionEnd, TransactionEndKind, TransactionEvent,
-    TransactionEventPayload, TransactionRequest, TransactionRuntime,
+    transaction_delivery, user_text_input, ChannelCapabilities, ChannelDefaults, ChannelId,
+    ChannelKind, ChannelLimits, ContinuationPolicy, DeliveryLimits, DialectDescriptor,
+    ExchangeMode, InterpreterOutputEvent, InvocationConfig, McpConfigurationCapability,
+    McpReachability, SessionMode, ShutdownWaitOutcome, ToolExecutionMode, TransactionEvent,
+    TransactionEventPayload, TransactionSubmitRequest,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
-    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, RuntimeBootstrap,
-    RuntimeConfig, TestTextEncoder,
+    ChannelBinding, ChannelRegistry, HostToolRegistry, RuntimeBootstrap, RuntimeConfig,
+    StartedRuntime, TestTextEncoder,
 };
 use monoloop_testkit::{project_chat, ChatRole};
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
 
 fn test_llm(id: &str) -> ChannelBinding {
     let d = DialectDescriptor::test_raw();
@@ -62,45 +63,25 @@ fn units_from_transaction_events(events: &[TransactionEvent]) -> Vec<Interpreter
         .collect()
 }
 
-#[tokio::test]
-async fn chat_projection_from_transaction_events_only() {
-    let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
+#[test]
+fn chat_projection_from_transaction_events_only() {
+    let started = StartedRuntime::start(RuntimeBootstrap {
         config: RuntimeConfig {
             enable_mcp_listener: false,
             ..Default::default()
         },
         channels: ChannelRegistry::build(vec![test_llm("echo")]).unwrap(),
         tools: HostToolRegistry::empty(),
-        executor: tokio::runtime::Handle::current(),
     })
-    .await
-    .unwrap();
+    .expect("start");
 
-    let events = Arc::new(Mutex::new(Vec::<TransactionEvent>::new()));
-    let done = Arc::new(Notify::new());
-    let events_s = Arc::clone(&events);
-    let sink: Arc<dyn monoloop_contracts::TransactionEventSink> = Arc::new(FnEventSink(move |e| {
-        let events_s = Arc::clone(&events_s);
-        Box::pin(async move {
-            events_s.lock().unwrap().push(e);
-            Ok(())
-        }) as monoloop_contracts::EventDelivery
-    }));
-    let done_s = Arc::clone(&done);
-    let completion: Box<dyn monoloop_contracts::CompletionCallback> =
-        Box::new(FnCompletionCallback(move |end: TransactionEnd| {
-            let done_s = Arc::clone(&done_s);
-            Box::pin(async move {
-                assert_eq!(end.kind, TransactionEndKind::Completed);
-                done_s.notify_waiters();
-                Ok(())
-            }) as monoloop_contracts::CompletionDelivery
-        }));
+    let handle = started.handle.clone();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
 
     let prompt = "Hello presentation reconstruction";
-    TransactionRuntime::submit(
-        rt.as_ref(),
-        TransactionRequest {
+    handle
+        .submit(TransactionSubmitRequest {
             channel_id: ChannelId::try_new("echo").unwrap(),
             session_id: None,
             input: user_text_input(prompt).unwrap(),
@@ -111,21 +92,31 @@ async fn chat_projection_from_transaction_events_only() {
                 ..Default::default()
             },
             tools: vec![],
-            events: sink,
-            completion,
-        },
-    )
-    .unwrap();
+            delivery,
+        })
+        .expect("admit");
 
-    tokio::time::timeout(Duration::from_secs(5), done.notified())
-        .await
-        .expect("transaction completed");
+    let wait_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-    let evs = events.lock().unwrap().clone();
+    let (completion, evs) = wait_rt.block_on(async {
+        let completion = tokio::time::timeout(Duration::from_secs(5), receiver.completion.recv())
+            .await
+            .expect("completion timeout")
+            .expect("completion channel");
+        let mut evs = Vec::new();
+        while let Ok(ev) = receiver.events.try_recv() {
+            evs.push(ev);
+        }
+        (completion, evs)
+    });
+
     assert!(
         evs.iter()
-            .any(|e| matches!(e.payload, TransactionEventPayload::Ended(_))),
-        "need Ended for a complete stream"
+            .any(|e| matches!(e.payload, TransactionEventPayload::EndedEvent(_))),
+        "need EndedEvent for a complete stream"
     );
     let units = units_from_transaction_events(&evs);
     assert!(
@@ -135,7 +126,6 @@ async fn chat_projection_from_transaction_events_only() {
 
     // Presentation is built only from extracted canonical units — no runtime handle.
     let chat = project_chat(&units);
-    // Fake echo + test dialect yields public response text containing the prompt.
     let agent: Vec<_> = chat
         .lines
         .iter()
@@ -156,6 +146,14 @@ async fn chat_projection_from_transaction_events_only() {
         assert_eq!(a.text, b.text);
     }
 
-    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
-    assert_eq!(rt.active_count(), 0);
+    let _ = completion;
+    let mut owner = started.owner;
+    let outcome = wait_rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
 }

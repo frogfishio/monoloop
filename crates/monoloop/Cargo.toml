@@ -37,16 +37,13 @@ codex = ["dep:monoloop-connector-codex"]
 agy = ["dep:monoloop-connector-agy"]
 zai = ["dep:monoloop-connector-zai"]
 claude = ["dep:monoloop-connector-claude"]
-# Examples that still expect deleted v1 DefaultTransactionRuntime (M7 cutover).
-legacy_runtime_examples = []
 
 [[example]]
 name = "fake_echo"
-required-features = ["legacy_runtime_examples"]
 
 [[example]]
 name = "host_grok_wiring"
-required-features = ["grok", "legacy_runtime_examples"]
+required-features = ["grok"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

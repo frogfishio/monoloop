@@ -4,6 +4,29 @@ Explicit project decisions that change contracts, MSRV, or delivery assumptions.
 Normative behavior still lives under `doc/`; this file records *why* a deliberate
 change was made.
 
+## D-041 — Never-attempted terminal delivery is `NotAttempted`
+
+**Date:** 2026-08-20
+
+**Context:** Parked-Start / shutdown-before-Start never starts an event publisher.
+Recording `TerminalEventDelivery::Published` (or a failed-enqueue variant) when
+`publisher_cmd_tx` is `None` fabricates an `Ended` attempt that did not occur.
+Spec §6.4 requires honest recording of terminal-event delivery; §19 previously
+omitted a never-attempted variant.
+
+**Decision:** Add `TerminalEventDelivery::NotAttempted`. When no publisher
+exists, skip `Seal` and record `NotAttempted`. Do not map never-attempted to
+`Published`, `QueueClosed`, `DeadlineExceeded`, or `LimitExceeded`.
+
+**Consequences:**
+
+- Completions still fire once (§6.3). The event mailbox may close without
+  `Ended`; the completion field is the honest record.
+- Host adapters that only speak v1 `EventDeliveryOutcome` MAY collapse
+  `NotAttempted` to `Failed` (not `Accepted`).
+- Transaction admission capacity remains `ReservationPool` only; the former
+  public `CapacityManagers` counter API stays deleted.
+
 ## D-004 — Sessionless DirectLlm tool envelope SessionKey (D-044)
 
 **Date:** 2026-08-20

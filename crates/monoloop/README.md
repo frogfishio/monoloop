@@ -91,16 +91,17 @@ There is **no token / delta stream API**. UI should render from push events:
 structures / tool lifecycle units. `InterpretationEnd` / EOF alone ≠ turn success;
 wait for the completion callback / `Ended` payload.
 
-### 5. Tokio `Handle` in Tauri / desktop hosts
+### 5. Executor ownership (v2)
 
-`RuntimeBootstrap.executor` is a `tokio::runtime::Handle`. Supported pattern:
+`StartedRuntime::start` owns a dedicated multi-thread Tokio executor. Hosts do
+**not** pass a bare `Handle` into `RuntimeBootstrap`. Pattern:
 
-1. At app startup, build a dedicated **multi-thread** Tokio runtime and keep it for process life.
-2. Pass `runtime.handle().clone()` (or `Handle::current()` inside that runtime) into `RuntimeBootstrap`.
-3. Drive `submit` / async work on that runtime.
+1. Call `StartedRuntime::start(...)` once at process setup; keep `owner` + `handle`.
+2. `handle.submit(...)` is synchronous (no executor wait on the caller).
+3. Drain `TransactionReceiver` on a host runtime of your choice.
+4. Shutdown: `owner.begin_shutdown()` then `wait_stopped` until `Stopped`.
 
-`#[tokio::main]` is fine for CLI samples; embedded hosts (Tauri) should own the runtime explicitly.
-Set `RuntimeConfig { enable_mcp_listener: false, ..Default::default() }` unless you want the MCP shell (`Default` enables it).
+Set `RuntimeConfig { enable_mcp_listener: false, ..Default::default() }` unless you want the MCP shell.
 
 ### Hard rules
 
@@ -114,12 +115,14 @@ Set `RuntimeConfig { enable_mcp_listener: false, ..Default::default() }` unless 
 ```text
 1. ChannelBinding { connector_factory, encoder, interpreter, capabilities, … }
 2. ChannelRegistry::build(vec![binding])
-3. DefaultTransactionRuntime::start(RuntimeBootstrap {
+3. StartedRuntime::start(RuntimeBootstrap {
      config: RuntimeConfig { enable_mcp_listener: false, ..Default::default() },
-     channels, tools: HostToolRegistry::empty(), executor
-   })
-4. TransactionRuntime::submit(TransactionRequest { … push events + completion … })
-5. Await the one completion callback
+     channels, tools: HostToolRegistry::empty()
+   })   // owns its executor — no bare Handle
+4. let (delivery, receiver) = transaction_delivery(limits)?;
+5. handle.submit(TransactionSubmitRequest { …, delivery })
+6. Drain receiver.events / await receiver.completion (host side)
+7. owner.begin_shutdown(); owner.wait_stopped(deadline)  // TimedOut ⇒ Quiescing
 ```
 
 ### Module map

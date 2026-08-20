@@ -35,9 +35,10 @@ uuid = { workspace = true }
 
 [features]
 default = []
-# Integration tests that still expect the deleted v1 `DefaultTransactionRuntime`
-# (and related modules). Disabled until Runtime v2 cutover (M7).
-legacy_runtime_tests = []
+# v1 integration suites under tests/{admission_lifecycle,exchange_e2e,…}.rs and
+# examples/fake_echo.rs are kept on disk but not registered until rewritten for
+# StartedRuntime (D-038 / M7). Do not reintroduce a feature that compiles deleted
+# v1 symbols.
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
@@ -50,48 +51,3 @@ path = "tests/empty_loop.rs"
 [[test]]
 name = "rmcp_loopback_spike"
 path = "tests/rmcp_loopback_spike.rs"
-
-[[test]]
-name = "admission_lifecycle"
-path = "tests/admission_lifecycle.rs"
-required-features = ["legacy_runtime_tests"]
-
-[[test]]
-name = "claim_gate"
-path = "tests/claim_gate.rs"
-required-features = ["legacy_runtime_tests"]
-
-[[test]]
-name = "direct_llm_e2e"
-path = "tests/direct_llm_e2e.rs"
-required-features = ["legacy_runtime_tests"]
-
-[[test]]
-name = "exchange_e2e"
-path = "tests/exchange_e2e.rs"
-required-features = ["legacy_runtime_tests"]
-
-[[test]]
-name = "hardening"
-path = "tests/hardening.rs"
-required-features = ["legacy_runtime_tests"]
-
-[[test]]
-name = "linked_tools"
-path = "tests/linked_tools.rs"
-required-features = ["legacy_runtime_tests"]
-
-[[test]]
-name = "mcp_gateway"
-path = "tests/mcp_gateway.rs"
-required-features = ["legacy_runtime_tests"]
-
-[[test]]
-name = "runtime_startup"
-path = "tests/runtime_startup.rs"
-required-features = ["legacy_runtime_tests"]
-
-[[example]]
-name = "fake_echo"
-path = "examples/fake_echo.rs"
-required-features = ["legacy_runtime_tests"]

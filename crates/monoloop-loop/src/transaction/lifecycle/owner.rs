@@ -115,9 +115,11 @@ impl StartedRuntime {
             }
         })?;
 
-        // Start queue: exactly max_active (spec §9.2). Control queue is separate so
-        // cancel/shutdown cannot be dropped when starts fill the start queue.
-        let (start_tx, start_rx) = mpsc::channel(max_active);
+        // Start queue: exactly max_active (spec §9.2), unless a test overrides
+        // capacity to prove start-full rollback with reservation headroom (D-040).
+        // Control queue is separate so cancel/shutdown cannot be starved.
+        let start_capacity = bootstrap.config.start_queue_capacity.unwrap_or(max_active);
+        let (start_tx, start_rx) = mpsc::channel(start_capacity);
         let control_capacity = max_active.saturating_add(8);
         let (control_tx, control_rx) = mpsc::channel(control_capacity);
         let worker_capacity = max_active.saturating_add(8);
@@ -147,6 +149,8 @@ impl StartedRuntime {
             enable_mcp_listener: bootstrap.config.enable_mcp_listener,
             mcp_listen_addr: Mutex::new(None),
             block_stopped: bootstrap.config.block_stopped.clone(),
+            hold_start: bootstrap.config.hold_start.clone(),
+            hold_finalizer_after_seal: bootstrap.config.hold_finalizer_after_seal.clone(),
         });
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartupError>>();
@@ -154,8 +158,11 @@ impl StartedRuntime {
         let thread = std::thread::Builder::new()
             .name("monoloop-runtime".into())
             .spawn(move || {
+                // Two workers is enough for coordinator+publisher; keep the
+                // pool small so parallel integration tests do not oversubscribe.
                 let rt = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
+                    .max_blocking_threads(2)
                     .enable_all()
                     .thread_name("monoloop-worker")
                     .build()
@@ -245,6 +252,11 @@ impl RuntimeOwner {
         self.pool.global_active()
     }
 
+    /// Channel reservation count (D-040 rollback observability).
+    pub fn channel_reservations(&self, channel: &ChannelId) -> usize {
+        self.pool.channel_active(channel)
+    }
+
     /// Number of realized channels owned by this runtime.
     pub fn channel_count(&self) -> usize {
         self.channels.len()
@@ -293,6 +305,8 @@ impl RuntimeOwner {
         if self.shared.state.load(Ordering::SeqCst) == STATE_ACCEPTING {
             let _ = self.begin_shutdown();
         }
+        // While Quiescing, keep re-announcing so a dropped BeginShutdown / missed
+        // wake cannot strand shutdown (D-039).
         let outcome = wait_until_stopped(&self.shared, deadline).await;
         if matches!(outcome, ShutdownWaitOutcome::Stopped(_)) {
             let _ = self
@@ -310,8 +324,14 @@ impl RuntimeOwner {
 
 impl Drop for RuntimeOwner {
     fn drop(&mut self) {
-        // Never strand Drop behind a test-only Stopped gate.
+        // Never strand Drop behind test-only hold gates.
         if let Some(gate) = self.shared.block_stopped.as_ref() {
+            gate.release();
+        }
+        if let Some(gate) = self.shared.hold_start.as_ref() {
+            gate.release();
+        }
+        if let Some(gate) = self.shared.hold_finalizer_after_seal.as_ref() {
             gate.release();
         }
         if self.shared.state.load(Ordering::SeqCst) != STATE_STOPPED {
@@ -321,9 +341,20 @@ impl Drop for RuntimeOwner {
                 .control_tx
                 .try_send(ControlCommand::StopSupervisor);
             self.shared.wake.notify_one();
-            // May block indefinitely on non-cooperative work (v2 §18.4).
+            // §18.4: preferred path joins forever on non-cooperative work.
+            // Bounded fallback: after a grace, abandon the join so Drop cannot
+            // hang the host process (supervisor thread may outlive the owner).
             if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("monoloop-owner-join".into())
+                    .spawn(move || {
+                        let _ = thread.join();
+                        let _ = done_tx.send(());
+                    })
+                    .ok();
+                let grace = self.shared.cleanup_deadline.max(Duration::from_secs(3));
+                let _ = done_rx.recv_timeout(grace);
             }
         }
     }
@@ -366,6 +397,23 @@ impl TransactionRuntimeHandle {
                 }
             }
         };
+        // Honest ledger check before enqueue (D-039): never lie Full→AlreadyTerminal.
+        // §22.2: Cancelled may still be upgraded to ForceTerminate.
+        {
+            let ledger = self.shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            match ledger.get(&tx) {
+                None => return TerminationDisposition::NotFound,
+                Some(entry) => {
+                    if let Some(term) = entry.terminal.as_ref() {
+                        let upgrade = matches!(mode, TerminationMode::ForceTerminate { .. })
+                            && term.kind == monoloop_contracts::TransactionEndKind::Cancelled;
+                        if !upgrade {
+                            return TerminationDisposition::AlreadyTerminal;
+                        }
+                    }
+                }
+            }
+        }
         let cmd = match mode {
             TerminationMode::Cancel { .. } => ControlCommand::Cancel(tx),
             TerminationMode::ForceTerminate { .. } => ControlCommand::ForceTerminate(tx),
@@ -375,7 +423,12 @@ impl TransactionRuntimeHandle {
                 self.shared.wake.notify_one();
                 TerminationDisposition::Accepted
             }
-            Err(_) => TerminationDisposition::AlreadyTerminal,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                TerminationDisposition::ControlCapacityExceeded
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                TerminationDisposition::RuntimeClosed
+            }
         }
     }
 }

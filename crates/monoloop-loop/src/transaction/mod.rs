@@ -8,7 +8,6 @@
 
 mod acp_encoder;
 mod bootstrap;
-mod capacity;
 mod channel_registry;
 mod error;
 mod fake_support;
@@ -33,11 +32,12 @@ mod validation;
 // mod spawn_gate;
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
-pub use bootstrap::{RuntimeBootstrap, RuntimeConfig, StoppedGate};
-pub use capacity::CapacityManagers;
+pub use bootstrap::{
+    FinalizerHoldGate, RuntimeBootstrap, RuntimeConfig, StartHoldGate, StoppedGate,
+};
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
 pub use error::StartupError;
-pub use fake_support::{EmptyBytesEncoder, RejectEncoder, TestTextEncoder};
+pub use fake_support::{EmptyBytesEncoder, PanicEncoder, RejectEncoder, TestTextEncoder};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
 pub use lifecycle::{
     adapt_completion_callback, adapt_event_sink, build_completion, HostCompletionAdapter,

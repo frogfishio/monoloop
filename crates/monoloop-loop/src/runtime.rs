@@ -177,7 +177,7 @@ impl DefaultLoopRuntime {
     /// Legacy ambient spawn — **not** compiled into production builds (D-043).
     ///
     /// Prefer [`Self::prepare`] / [`Self::prepare_empty`] and an explicit owner.
-    #[cfg(any(test, feature = "legacy_runtime_tests"))]
+    #[cfg(test)]
     #[deprecated(
         note = "ambient tokio::spawn; use prepare()/prepare_empty() and an explicit owner (M5)"
     )]
@@ -188,7 +188,7 @@ impl DefaultLoopRuntime {
     }
 
     /// Legacy ambient empty-tool start — **not** compiled into production builds (D-043).
-    #[cfg(any(test, feature = "legacy_runtime_tests"))]
+    #[cfg(test)]
     #[deprecated(note = "ambient tokio::spawn; use prepare_empty() and an explicit owner (M5)")]
     pub fn start_empty(
         &self,

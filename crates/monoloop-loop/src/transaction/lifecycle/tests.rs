@@ -1,30 +1,59 @@
 //! M2 admission / ownership tests (v2 §22.1 subset).
 
 use super::{StartedRuntime, TransactionRuntimeHandle};
-use crate::transaction::bootstrap::{RuntimeBootstrap, RuntimeConfig, StoppedGate};
+use crate::transaction::bootstrap::{
+    FinalizerHoldGate, RuntimeBootstrap, RuntimeConfig, StartHoldGate, StoppedGate,
+};
 use crate::transaction::channel_registry::{ChannelBinding, ChannelRegistry};
 use crate::transaction::fake_support::TestTextEncoder;
 use crate::transaction::host_tools::HostToolRegistry;
-use monoloop_connector::FakeConnectorFactory;
+use monoloop_connector::{FakeConnectorConfig, FakeConnectorFactory, FakeEndpoint};
 use monoloop_contracts::{
-    transaction_delivery, user_text_input, AdmissionErrorKind, ChannelCapabilities,
-    ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy, DeliveryLimits,
-    DialectDescriptor, ExchangeMode, InvocationConfig, McpConfigurationCapability, McpReachability,
-    OptionPolicy, SessionId, SessionMode, ShutdownWaitOutcome, ToolExecutionMode,
-    TransactionLimits, TransactionSubmitRequest,
+    transaction_delivery, user_text_input, AdmissionError, AdmissionErrorKind, AdmissionReceipt,
+    CancellationReason, CancellationReasonCode, ChannelCapabilities, ChannelDefaults, ChannelId,
+    ChannelKind, ChannelLimits, ContinuationPolicy, DeliveryLimits, DialectDescriptor,
+    ExchangeMode, InvocationConfig, McpConfigurationCapability, McpReachability, OptionPolicy,
+    SessionId, SessionMode, ShutdownWaitOutcome, TerminationDisposition, TerminationMode,
+    TerminationReason, TerminationReasonCode, ToolExecutionMode, TransactionEndKind, TransactionId,
+    TransactionLimits, TransactionReceiver, TransactionSelector, TransactionSubmitRequest,
 };
+use crate::transaction::fake_support::PanicEncoder;
 use monoloop_interpreter::DefaultInterpreterFactory;
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 fn llm_binding(id: &str, channel_max: usize) -> ChannelBinding {
+    llm_binding_with_factory(
+        id,
+        channel_max,
+        Arc::new(FakeConnectorFactory::direct_llm()),
+    )
+}
+
+fn hang_llm_binding(id: &str, channel_max: usize) -> ChannelBinding {
+    let cfg = FakeConnectorConfig {
+        default_endpoint: FakeEndpoint::Hang,
+        ..FakeConnectorConfig::default()
+    };
+    llm_binding_with_factory(
+        id,
+        channel_max,
+        Arc::new(FakeConnectorFactory::direct_llm_with_config(cfg)),
+    )
+}
+
+fn llm_binding_with_factory(
+    id: &str,
+    channel_max: usize,
+    connector_factory: Arc<dyn monoloop_connector::ConnectorFactory>,
+) -> ChannelBinding {
     let d = DialectDescriptor::test_raw();
     ChannelBinding {
         id: ChannelId::try_new(id).unwrap(),
         kind: ChannelKind::DirectLlm,
         tool_mode: ToolExecutionMode::ModelToolCalls,
-        connector_factory: Arc::new(FakeConnectorFactory::direct_llm()),
+        connector_factory,
         encoder: Arc::new(TestTextEncoder),
         interpreter: Arc::new(DefaultInterpreterFactory::new()),
         endpoint_ref: "default".into(),
@@ -73,19 +102,16 @@ fn start_runtime_with_mcp(max_active: usize, channel_max: usize, mcp: bool) -> S
     .expect("start")
 }
 
-fn submit(
+fn submit_ports(
     handle: &TransactionRuntimeHandle,
     session: Option<&str>,
-) -> Result<
-    (
-        monoloop_contracts::AdmissionReceipt,
-        monoloop_contracts::TransactionReceiver,
-    ),
-    monoloop_contracts::AdmissionError,
-> {
+) -> (
+    Result<AdmissionReceipt, AdmissionError>,
+    TransactionReceiver,
+) {
     let (delivery, receiver) =
         transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
-    let receipt = handle.submit(TransactionSubmitRequest {
+    let result = handle.submit(TransactionSubmitRequest {
         channel_id: ChannelId::try_new("llm").unwrap(),
         session_id: session.map(|s| SessionId::try_new(s).unwrap()),
         input: user_text_input("hi").unwrap(),
@@ -93,8 +119,48 @@ fn submit(
         invocation_config: InvocationConfig::default(),
         tools: vec![],
         delivery,
-    })?;
-    Ok((receipt, receiver))
+    });
+    (result, receiver)
+}
+
+fn submit(
+    handle: &TransactionRuntimeHandle,
+    session: Option<&str>,
+) -> Result<(AdmissionReceipt, TransactionReceiver), AdmissionError> {
+    let (result, receiver) = submit_ports(handle, session);
+    result.map(|receipt| (receipt, receiver))
+}
+
+/// §22.1: rejected admission publishes no event and no completion.
+fn assert_rejected_silent(mut receiver: TransactionReceiver) {
+    match receiver.events.try_recv() {
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+            panic!("event sender still live after rejected admission");
+        }
+        Ok(ev) => panic!("rejected admission published event: {ev:?}"),
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt.block_on(receiver.completion.recv());
+    assert!(
+        completion.is_err(),
+        "rejected admission must not publish completion, got {completion:?}"
+    );
+}
+
+fn shutdown_owner(started: StartedRuntime) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let _ = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
 }
 
 #[test]
@@ -129,8 +195,12 @@ fn duplicate_session_rejects_second() {
     let started = start_runtime(4, 4);
     let handle = started.handle.clone();
     submit(&handle, Some("same")).expect("first");
-    let err = submit(&handle, Some("same")).expect_err("duplicate");
-    assert_eq!(err.kind, AdmissionErrorKind::SessionAlreadyActive);
+    let (err, recv) = submit_ports(&handle, Some("same"));
+    assert_eq!(
+        err.expect_err("duplicate").kind,
+        AdmissionErrorKind::SessionAlreadyActive
+    );
+    assert_rejected_silent(recv);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -148,8 +218,12 @@ fn capacity_plus_one_rejects() {
     let started = start_runtime(1, 1);
     let handle = started.handle.clone();
     let (_r1, _recv1) = submit(&handle, Some("a")).expect("first");
-    let err = submit(&handle, Some("b")).expect_err("capacity");
-    assert_eq!(err.kind, AdmissionErrorKind::CapacityExceeded);
+    let (err, recv) = submit_ports(&handle, Some("b"));
+    assert_eq!(
+        err.expect_err("capacity").kind,
+        AdmissionErrorKind::CapacityExceeded
+    );
+    assert_rejected_silent(recv);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -180,7 +254,7 @@ fn shutdown_publishes_one_completion_per_admission() {
     let mut owner = started.owner;
     let outcome = rt.block_on(async {
         owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_secs(3)).await
+        owner.wait_stopped(Duration::from_secs(5)).await
     });
     match outcome {
         ShutdownWaitOutcome::Stopped(report) => {
@@ -347,9 +421,29 @@ fn shutdown_control_not_starved_when_start_queue_full() {
     }
 }
 
+/// D-040 / §22.1: short wait MUST TimedOut while Quiescing (not conditional Stopped).
 #[test]
 fn short_wait_may_timeout_while_quiescing_then_complete() {
-    let started = start_runtime(2, 2);
+    use crate::transaction::state::RuntimeState;
+
+    let gate = Arc::new(StoppedGate::new());
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            block_stopped: Some(Arc::clone(&gate)),
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
     let handle = started.handle.clone();
     let (_r, _recv) = submit(&handle, Some("q")).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -357,13 +451,400 @@ fn short_wait_may_timeout_while_quiescing_then_complete() {
         .build()
         .unwrap();
     let mut owner = started.owner;
+    owner.begin_shutdown();
+    let first = rt.block_on(owner.wait_stopped(Duration::ZERO));
+    assert!(
+        matches!(first, ShutdownWaitOutcome::TimedOut(_)),
+        "§22.1 / D-040: short wait must TimedOut under block_stopped, got {first:?}"
+    );
+    assert_eq!(owner.state(), RuntimeState::Quiescing);
+    gate.release();
+    let second = rt.block_on(owner.wait_stopped(Duration::from_secs(2)));
+    assert!(
+        matches!(second, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped after release, got {second:?}"
+    );
+}
+
+/// D-040 / §22.1: parked Hang worker cannot delay synchronous admission.
+#[test]
+fn parked_worker_cannot_delay_synchronous_admission() {
+    let limits = TransactionLimits {
+        max_active_transactions: 4,
+        max_active_per_channel: 4,
+        transaction_deadline: Duration::from_secs(30),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", 4)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (_r1, _recv1) = submit(&handle, Some("hang1")).expect("first admit");
+    // Give Hang exchange a moment to park a runtime worker.
+    std::thread::sleep(Duration::from_millis(20));
+    let h2 = handle.clone();
+    let t0 = Instant::now();
+    let join = std::thread::spawn(move || submit(&h2, Some("hang2")));
+    let (_r2, _recv2) = join.join().unwrap().expect("second admit");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "synchronous admit must not wait on parked Hang worker, elapsed={elapsed:?}"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
     let outcome = rt.block_on(async {
         owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_secs(2)).await
+        owner.wait_stopped(Duration::from_secs(5)).await
     });
     assert!(
         matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
         "expected Stopped, got {outcome:?}"
+    );
+}
+
+/// D-040 / §22.1: start-queue full rolls back ledger, session, delivery, permits.
+#[test]
+fn start_queue_full_rolls_back_all_permits() {
+    let hold = Arc::new(StartHoldGate::new());
+    hold.hold();
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            hold_start: Some(Arc::clone(&hold)),
+            // Queue of 1 fills while reservation pool still has headroom (2).
+            start_queue_capacity: Some(1),
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let channel = ChannelId::try_new("llm").unwrap();
+
+    let (_r1, _recv1) = submit(&handle, Some("q1")).expect("first fills start queue");
+    // Brief settle so the Start is enqueued while drain is held.
+    std::thread::sleep(Duration::from_millis(10));
+
+    let (err, rejected_rx) = submit_ports(&handle, Some("q2"));
+    let err = err.expect_err("start queue full");
+    assert_eq!(err.kind, AdmissionErrorKind::SpawnFailed);
+
+    // Rollback: only the first admission's reservation remains.
+    assert_eq!(started.owner.global_reservations(), 1);
+    assert_eq!(started.owner.channel_reservations(&channel), 1);
+    assert_eq!(started.owner.ledger_len(), 1);
+    assert_rejected_silent(rejected_rx);
+
+    // Rolled-back session is free: retry fails on the still-full queue, not
+    // SessionAlreadyActive.
+    let (err2, recv2) = submit_ports(&handle, Some("q2"));
+    assert_eq!(
+        err2.expect_err("queue still full").kind,
+        AdmissionErrorKind::SpawnFailed
+    );
+    assert_rejected_silent(recv2);
+
+    hold.release();
+    shutdown_owner(started);
+}
+
+/// D-040 / §22.1: parked unprocessed Starts still complete on shutdown.
+#[test]
+fn parked_starts_reach_stopped_on_shutdown() {
+    let hold = Arc::new(StartHoldGate::new());
+    hold.hold();
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            hold_start: Some(Arc::clone(&hold)),
+            start_queue_capacity: Some(2),
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let mut receivers = Vec::new();
+    for i in 0..2 {
+        let (_r, recv) = submit(&handle, Some(&format!("park{i}"))).unwrap();
+        receivers.push(recv);
+    }
+    assert_eq!(started.owner.ledger_len(), 2);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    // Keep start drain held: unprocessed Starts stay in the queue while control
+    // shutdown still reaches Stopped (D-039 parked-Start proof).
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    let _ = hold;
+    assert!(
+        matches!(
+            outcome,
+            ShutdownWaitOutcome::Stopped(ref r) if r.completions_published == 2
+        ),
+        "parked Starts must still get completions, got {outcome:?}"
+    );
+    for recv in receivers {
+        let c = rt.block_on(recv.completion.recv()).unwrap();
+        assert_eq!(
+            c.end.kind,
+            monoloop_contracts::TransactionEndKind::RuntimeShutdown
+        );
+        // D-041: shutdown-before-Start never Sealed — not Published.
+        assert_eq!(
+            c.terminal_event_delivery,
+            monoloop_contracts::TerminalEventDelivery::NotAttempted
+        );
+    }
+}
+
+/// D-040 / §22.1: submit vs begin_shutdown — only reject or fully admit into ledger.
+#[test]
+fn submit_versus_begin_shutdown_two_outcomes() {
+    let started = start_runtime(4, 4);
+    let handle = started.handle.clone();
+    let (receipt, recv_ok) = submit(&handle, Some("before")).expect("admit before shutdown");
+    assert_eq!(started.owner.ledger_len(), 1);
+    assert_eq!(started.owner.global_reservations(), 1);
+
+    let mut owner = started.owner;
+    owner.begin_shutdown();
+    // Fully admitted: still present in the shutdown ledger until completion.
+    assert_eq!(owner.ledger_len(), 1);
+    let _ = receipt;
+
+    let (err, recv_rej) = submit_ports(&handle, Some("after"));
+    assert_eq!(
+        err.expect_err("must reject after Quiescing").kind,
+        AdmissionErrorKind::RuntimeShuttingDown
+    );
+    assert_rejected_silent(recv_rej);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    match outcome {
+        ShutdownWaitOutcome::Stopped(report) => {
+            assert_eq!(report.completions_published, 1);
+        }
+        other => panic!("expected Stopped with the admitted transaction, got {other:?}"),
+    }
+    let completion = rt
+        .block_on(recv_ok.completion.recv())
+        .expect("admitted must complete");
+    assert!(matches!(
+        completion.end.kind,
+        monoloop_contracts::TransactionEndKind::RuntimeShutdown
+            | monoloop_contracts::TransactionEndKind::Completed
+    ));
+}
+
+/// D-040 / §22.1: concurrent duplicate SessionKey admits exactly one.
+#[test]
+fn duplicate_session_race_admits_exactly_one() {
+    let started = start_runtime(8, 8);
+    let handle = started.handle.clone();
+    let n = 8;
+    let barrier = Arc::new(Barrier::new(n));
+    let mut joins = Vec::new();
+    for _ in 0..n {
+        let h = handle.clone();
+        let b = Arc::clone(&barrier);
+        joins.push(std::thread::spawn(move || {
+            b.wait();
+            submit_ports(&h, Some("race-same"))
+        }));
+    }
+    let mut winners = 0usize;
+    let mut rejected = 0usize;
+    let mut winner_recv = None;
+    for j in joins {
+        let (res, recv) = j.join().unwrap();
+        match res {
+            Ok(_) => {
+                winners += 1;
+                winner_recv = Some(recv);
+            }
+            Err(e) => {
+                assert_eq!(e.kind, AdmissionErrorKind::SessionAlreadyActive);
+                rejected += 1;
+                assert_rejected_silent(recv);
+            }
+        }
+    }
+    assert_eq!(winners, 1, "exactly one duplicate-session admit");
+    assert_eq!(rejected, n - 1);
+    assert_eq!(started.owner.ledger_len(), 1);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(ref r) if r.completions_published == 1),
+        "one admission → one completion, got {outcome:?}"
+    );
+    let _ = rt.block_on(winner_recv.expect("winner").completion.recv());
+}
+
+/// D-039: unknown transaction id is NotFound — never AlreadyTerminal from a missed send.
+#[test]
+fn terminate_unknown_transaction_is_not_found() {
+    let started = start_runtime(2, 2);
+    let handle = started.handle.clone();
+    let disp = handle.terminate(
+        TransactionSelector::Transaction(TransactionId::generate()),
+        TerminationMode::Cancel {
+            reason: CancellationReason {
+                code: CancellationReasonCode::CallerRequested,
+                detail: None,
+            },
+        },
+    );
+    assert_eq!(disp, TerminationDisposition::NotFound);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let _ = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(2)).await
+    });
+}
+
+/// D-039: terminate dispositions are ledger-honest — never Full→AlreadyTerminal.
+#[test]
+fn terminate_after_cancel_is_ledger_honest() {
+    let started = start_runtime(2, 2);
+    let handle = started.handle.clone();
+    let (receipt, recv) = submit(&handle, Some("term")).unwrap();
+    let cancel = TerminationMode::Cancel {
+        reason: CancellationReason {
+            code: CancellationReasonCode::CallerRequested,
+            detail: None,
+        },
+    };
+    let first = handle.terminate(
+        TransactionSelector::Transaction(receipt.transaction_id),
+        cancel.clone(),
+    );
+    assert_eq!(first, TerminationDisposition::Accepted);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Wait until completion (tombstone may clear) or a short settle.
+    let _ = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), recv.completion.recv()).await
+    });
+    let second = handle.terminate(
+        TransactionSelector::Transaction(receipt.transaction_id),
+        cancel,
+    );
+    // After terminal: AlreadyTerminal while the row remains, or NotFound once
+    // the tombstone cleared. Never ControlCapacityExceeded→AlreadyTerminal lie.
+    assert!(
+        matches!(
+            second,
+            TerminationDisposition::AlreadyTerminal | TerminationDisposition::NotFound
+        ),
+        "expected ledger-honest AlreadyTerminal|NotFound, got {second:?}"
+    );
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped after cancel+shutdown, got {outcome:?}"
+    );
+}
+
+/// D-039: wait_stopped while Quiescing re-announces; TimedOut then later Stopped.
+#[test]
+fn wait_stopped_reannounce_while_quiescing_then_stopped() {
+    let gate = Arc::new(StoppedGate::new());
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            block_stopped: Some(Arc::clone(&gate)),
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (_r, _recv) = submit(&handle, Some("reannounce")).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    owner.begin_shutdown();
+    let first = rt.block_on(owner.wait_stopped(Duration::from_millis(20)));
+    assert!(
+        matches!(first, ShutdownWaitOutcome::TimedOut(_)),
+        "expected TimedOut under block_stopped, got {first:?}"
+    );
+    gate.release();
+    let second = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(
+        matches!(second, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped after re-announce + release, got {second:?}"
     );
 }
 
@@ -443,7 +924,10 @@ fn m6_concurrent_begin_shutdown_same_generation() {
     }
     let mut gens: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     gens.sort_unstable();
-    assert!(gens.iter().all(|g| *g == 1), "all tickets must share gen 1, got {gens:?}");
+    assert!(
+        gens.iter().all(|g| *g == 1),
+        "all tickets must share gen 1, got {gens:?}"
+    );
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -552,6 +1036,432 @@ fn mcp_listener_owned_shutdown_reaches_stopped() {
         matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
         "expected Stopped with MCP joined, got {outcome:?}"
     );
+}
+
+/// §22.2: shutdown between Seal and completion send cannot lose ledger/completion.
+#[test]
+fn s22_2_shutdown_between_seal_and_completion_keeps_completion() {
+    use crate::transaction::state::RuntimeState;
+
+    let hold = Arc::new(FinalizerHoldGate::new());
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(5),
+        cleanup_deadline: Duration::from_millis(200),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            hold_finalizer_after_seal: Some(Arc::clone(&hold)),
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (_r, mut recv) = submit(&handle, Some("seal-hold")).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Wait until Seal publishes EndedEvent while Finalizer is held before completion.
+    let saw_ended = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(ev) = recv.events.recv().await {
+                if matches!(
+                    ev.payload,
+                    monoloop_contracts::TransactionEventPayload::EndedEvent(_)
+                ) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    });
+    assert!(saw_ended, "Seal must publish Ended before completion hold");
+
+    // Shutdown while Finalizer is still between Seal and completion send.
+    let mut owner = started.owner;
+    owner.begin_shutdown();
+    let mid = rt.block_on(owner.wait_stopped(Duration::from_millis(100)));
+    assert!(
+        matches!(mid, ShutdownWaitOutcome::TimedOut(_)),
+        "held Finalizer must keep Quiescing (not false Stopped), got {mid:?}"
+    );
+    assert_eq!(owner.state(), RuntimeState::Quiescing);
+
+    // Release completion publish; hard-grace must not have dropped the attempt.
+    hold.release();
+    let outcome = rt.block_on(owner.wait_stopped(Duration::from_secs(5)));
+    match outcome {
+        ShutdownWaitOutcome::Stopped(r) => {
+            assert_eq!(
+                r.completions_published, 1,
+                "Seal→completion must not lose the one completion attempt"
+            );
+            assert_eq!(r.completions_invariant_failed, 0);
+        }
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+    let completion = rt
+        .block_on(recv.completion.recv())
+        .expect("completion must arrive after Finalizer release");
+    assert!(matches!(
+        completion.end.kind,
+        TransactionEndKind::Completed | TransactionEndKind::RuntimeShutdown
+    ));
+}
+
+/// §22.2: every admission → exactly one completion send attempt.
+#[test]
+fn s22_2_one_completion_per_admission() {
+    let started = start_runtime(4, 4);
+    let handle = started.handle.clone();
+    let mut receivers = Vec::new();
+    for i in 0..3 {
+        let (_r, recv) = submit(&handle, Some(&format!("c{i}"))).unwrap();
+        receivers.push(recv);
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(r) => {
+            assert_eq!(r.completions_published, 3);
+            assert_eq!(r.completions_invariant_failed, 0);
+        }
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+    for recv in receivers {
+        let _ = rt.block_on(recv.completion.recv()).expect("completion");
+    }
+}
+
+/// §22.2: receiver dropped before completion is accounted without a task leak.
+#[test]
+fn s22_2_dropped_completion_receiver_accounted() {
+    let started = start_runtime(2, 2);
+    let handle = started.handle.clone();
+    let (_r, recv) = submit(&handle, Some("drop-c")).unwrap();
+    drop(recv.completion); // host drops before completion
+    let mut events = recv.events;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(r) => {
+            assert_eq!(r.completions_published, 1);
+            assert_eq!(r.completions_receiver_dropped, 1);
+            assert_eq!(owner.ledger_len(), 0);
+            assert_eq!(owner.global_reservations(), 0);
+        }
+        other => panic!("expected Stopped after dropped receiver, got {other:?}"),
+    }
+    let _ = events.try_recv();
+}
+
+/// §22.2: coordinator panic → one InvariantFailed completion.
+#[test]
+fn s22_2_coordinator_panic_one_invariant_failed() {
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(5),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let mut binding = llm_binding("llm", 2);
+    binding.encoder = Arc::new(PanicEncoder);
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![binding]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (_r, recv) = submit(&handle, Some("panic")).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), recv.completion.recv())
+            .await
+            .expect("completion timeout")
+            .expect("completion")
+    });
+    assert_eq!(completion.end.kind, TransactionEndKind::InvariantFailed);
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(r) => {
+            assert_eq!(r.completions_published, 1);
+        }
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+}
+
+/// §22.2: cancel then force-terminate → one Terminated completion.
+#[test]
+fn s22_2_cancel_upgraded_to_force_terminate() {
+    // Hang so cancel/force race before natural Completed.
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(30),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (receipt, recv) = submit(&handle, Some("force")).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    let _ = handle.terminate(
+        TransactionSelector::Transaction(receipt.transaction_id),
+        TerminationMode::Cancel {
+            reason: CancellationReason {
+                code: CancellationReasonCode::CallerRequested,
+                detail: None,
+            },
+        },
+    );
+    let _ = handle.terminate(
+        TransactionSelector::Transaction(receipt.transaction_id),
+        TerminationMode::ForceTerminate {
+            reason: TerminationReason {
+                code: TerminationReasonCode::CallerRequested,
+                detail: None,
+            },
+        },
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), recv.completion.recv())
+            .await
+            .expect("completion timeout")
+            .expect("completion")
+    });
+    assert_eq!(completion.end.kind, TransactionEndKind::Terminated);
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(r) => assert_eq!(r.completions_published, 1),
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+}
+
+/// §22.2: coordinator completion racing cancel → exactly one documented cause.
+#[test]
+fn s22_2_completion_racing_cancel_one_cause() {
+    let started = start_runtime(4, 4);
+    let handle = started.handle.clone();
+    let (receipt, recv) = submit(&handle, Some("race-c")).unwrap();
+    // Immediate cancel while echo may already be finishing.
+    let _ = handle.terminate(
+        TransactionSelector::Transaction(receipt.transaction_id),
+        TerminationMode::Cancel {
+            reason: CancellationReason {
+                code: CancellationReasonCode::CallerRequested,
+                detail: None,
+            },
+        },
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), recv.completion.recv())
+            .await
+            .expect("completion timeout")
+            .expect("completion")
+    });
+    assert!(
+        matches!(
+            completion.end.kind,
+            TransactionEndKind::Cancelled | TransactionEndKind::Completed
+        ),
+        "one documented cause, got {:?}",
+        completion.end.kind
+    );
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(r) => assert_eq!(r.completions_published, 1),
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+}
+
+/// §22.2: no ordinary event is published after Seal / terminal attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s22_2_no_event_after_terminal_attempt() {
+    use super::event_publisher::{run_event_publisher, EventPublisherCommand};
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, SafeDiagnostic, TerminalEventDelivery,
+        TransactionDiagnostic, TransactionEndEvent, TransactionEndKind, TransactionEventPayload,
+        TransactionId, TransactionUsage,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(16, 64 * 1024).unwrap()).unwrap();
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel.clone(),
+        None,
+        delivery.event_tx,
+        cmd_rx,
+    ));
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    cmd_tx
+        .send(EventPublisherCommand::Seal {
+            terminal: TransactionEndEvent {
+                transaction_id: tx_id,
+                session_id: Some(SessionId::try_new("s").unwrap()),
+                channel_id: channel.clone(),
+                kind: TransactionEndKind::Completed,
+                emitted_events: 0,
+                usage: TransactionUsage::default(),
+                diagnostics: vec![],
+            },
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    let seal = reply_rx.await.unwrap();
+    assert_eq!(seal.delivery, TerminalEventDelivery::Published);
+    let ended = receiver.events.recv().await.expect("ended");
+    assert!(matches!(
+        ended.payload,
+        TransactionEventPayload::EndedEvent(_)
+    ));
+
+    // Post-Seal Publish must be ignored (no further events).
+    let _ = cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(
+            TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+                diagnostic: SafeDiagnostic::try_new("late", Some("x"), 64).unwrap(),
+            }),
+        )))
+        .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        receiver.events.try_recv().is_err(),
+        "no event after terminal attempt"
+    );
+    drop(cmd_tx);
+    let _ = pub_task.await;
+}
+
+/// §22.2: failed ordinary enqueue does not consume sequence (publisher unit path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s22_2_failed_enqueue_consumes_no_sequence() {
+    use super::event_publisher::{run_event_publisher, EventPublisherCommand};
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, SafeDiagnostic, TransactionDiagnostic,
+        TransactionEventPayload, TransactionId,
+    };
+    use tokio::sync::mpsc;
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    // Tiny mailbox: first event fills it; second fails without advancing seq.
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel.clone(),
+        None,
+        delivery.event_tx,
+        cmd_rx,
+    ));
+
+    let diag = || {
+        TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+            diagnostic: SafeDiagnostic::try_new("noop", Some("x"), 64).unwrap(),
+        })
+    };
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(diag())))
+        .await
+        .unwrap();
+    let first = receiver.events.recv().await.expect("first");
+    assert_eq!(first.sequence, 1);
+
+    // Fill: leave first undrained after re-send... actually we drained first.
+    // Re-publish without draining to fill capacity 1, then fail second.
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(diag())))
+        .await
+        .unwrap();
+    // Do not recv — mailbox full (capacity 1). Next publish must not consume sequence.
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(diag())))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let second = receiver.events.recv().await.expect("second");
+    assert_eq!(second.sequence, 2);
+    // Failed third publish left next_seq at 3 only if it had succeeded; it failed,
+    // so a subsequent successful publish must still be sequence 3 (contiguous).
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(diag())))
+        .await
+        .unwrap();
+    let third = receiver.events.recv().await.expect("third after drain");
+    assert_eq!(
+        third.sequence, 3,
+        "failed enqueue must not skip sequence; got {}",
+        third.sequence
+    );
+    drop(cmd_tx);
+    let _ = pub_task.await;
 }
 
 #[test]

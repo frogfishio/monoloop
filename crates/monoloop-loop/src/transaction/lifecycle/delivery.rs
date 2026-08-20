@@ -38,7 +38,12 @@ pub async fn adapt_completion_callback(
                     monoloop_contracts::TerminalEventDelivery::Published => {
                         monoloop_contracts::EventDeliveryOutcome::Accepted
                     }
-                    _ => monoloop_contracts::EventDeliveryOutcome::Failed,
+                    monoloop_contracts::TerminalEventDelivery::NotAttempted
+                    | monoloop_contracts::TerminalEventDelivery::QueueClosed
+                    | monoloop_contracts::TerminalEventDelivery::DeadlineExceeded
+                    | monoloop_contracts::TerminalEventDelivery::LimitExceeded => {
+                        monoloop_contracts::EventDeliveryOutcome::Failed
+                    }
                 },
                 emitted_events: completion.end.emitted_events,
                 usage: completion.end.usage,

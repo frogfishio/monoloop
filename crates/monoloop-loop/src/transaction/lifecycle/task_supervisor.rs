@@ -9,7 +9,7 @@ use monoloop_contracts::{ExchangeId, ToolExecutionId, TransactionId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::{AbortHandle, Id as TokioTaskId, JoinSet};
 
 /// Stable task id within one runtime owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -71,6 +71,7 @@ struct TaskMeta {
     class: TaskClass,
     abort: AbortHandle,
     abort_requested: bool,
+    tokio_id: TokioTaskId,
 }
 
 /// Retains every runtime join until observed complete.
@@ -79,6 +80,8 @@ pub struct TaskSupervisor {
     joins: JoinSet<(TaskId, TaskExit)>,
     meta: HashMap<TaskId, TaskMeta>,
     by_transaction: HashMap<TransactionId, HashSet<TaskId>>,
+    /// Maps Tokio task id → supervisor TaskId so cancelled joins never leak meta.
+    by_tokio_id: HashMap<TokioTaskId, TaskId>,
     next_id: u64,
 }
 
@@ -95,6 +98,7 @@ impl TaskSupervisor {
             joins: JoinSet::new(),
             meta: HashMap::new(),
             by_transaction: HashMap::new(),
+            by_tokio_id: HashMap::new(),
             next_id: 1,
         }
     }
@@ -137,16 +141,19 @@ impl TaskSupervisor {
                 Err(_) => (id, TaskExit::Cancelled),
             }
         });
+        let tokio_id = abort.id();
 
         if let Some(tx) = class.transaction_id() {
             self.by_transaction.entry(tx).or_default().insert(id);
         }
+        self.by_tokio_id.insert(tokio_id, id);
         self.meta.insert(
             id,
             TaskMeta {
                 class,
                 abort,
                 abort_requested: false,
+                tokio_id,
             },
         );
         // Release start gate only after registration is complete.
@@ -188,6 +195,21 @@ impl TaskSupervisor {
         }
     }
 
+    /// Hard-grace abort: keep only [`TaskClass::Finalizer`] so Seal→completion
+    /// can finish; abort a stuck EventPublisher that already Sealed or timed out.
+    pub fn abort_transaction_except_finalizer(&mut self, tx: &TransactionId) {
+        let ids = self.tasks_for(tx);
+        for id in ids {
+            let keep = self
+                .meta
+                .get(&id)
+                .is_some_and(|m| matches!(m.class, TaskClass::Finalizer(_)));
+            if !keep {
+                self.abort(id);
+            }
+        }
+    }
+
     /// Abort every registered task (shutdown).
     pub fn abort_all(&mut self) {
         let ids: Vec<_> = self.meta.keys().copied().collect();
@@ -203,9 +225,7 @@ impl TaskSupervisor {
     /// Live `JoinHandle`s are retained (§7.3 / §21: no drop on deadline).
     pub async fn abort_and_drain(&mut self) -> bool {
         self.abort_all();
-        let drain = async {
-            while self.join_next().await.is_some() {}
-        };
+        let drain = async { while self.join_next().await.is_some() {} };
         if tokio::time::timeout(std::time::Duration::from_secs(2), drain)
             .await
             .is_err()
@@ -214,14 +234,34 @@ impl TaskSupervisor {
         }
         self.meta.clear();
         self.by_transaction.clear();
+        self.by_tokio_id.clear();
         true
     }
 
     /// Poll for the next finished task and deregister it.
     pub async fn join_next(&mut self) -> Option<(TaskId, TaskClass, TaskExit)> {
-        let finished = self.joins.join_next().await?;
+        let finished = self.joins.join_next_with_id().await?;
+        self.reap_finished(finished)
+    }
+
+    /// Non-blocking reap of already-finished joins.
+    pub fn try_reap_finished(&mut self) -> Vec<(TaskId, TaskClass, TaskExit)> {
+        let mut out = Vec::new();
+        while let Some(finished) = self.joins.try_join_next_with_id() {
+            if let Some(item) = self.reap_finished(finished) {
+                out.push(item);
+            }
+        }
+        out
+    }
+
+    fn reap_finished(
+        &mut self,
+        finished: Result<(TokioTaskId, (TaskId, TaskExit)), tokio::task::JoinError>,
+    ) -> Option<(TaskId, TaskClass, TaskExit)> {
         match finished {
-            Ok((id, exit)) => {
+            Ok((tokio_id, (id, exit))) => {
+                self.by_tokio_id.remove(&tokio_id);
                 let exit = if self.meta.get(&id).is_some_and(|m| m.abort_requested)
                     && matches!(exit, TaskExit::Completed)
                 {
@@ -239,38 +279,15 @@ impl TaskSupervisor {
                 } else {
                     TaskExit::Panicked
                 };
-                let id = self.find_finished_meta()?;
+                let tokio_id = err.id();
+                let id = self
+                    .by_tokio_id
+                    .remove(&tokio_id)
+                    .or_else(|| self.find_finished_meta())?;
                 let class = self.deregister(id)?;
                 Some((id, class, exit))
             }
         }
-    }
-
-    /// Non-blocking reap of already-finished joins.
-    pub fn try_reap_finished(&mut self) -> Vec<(TaskId, TaskClass, TaskExit)> {
-        let mut out = Vec::new();
-        while let Some(finished) = self.joins.try_join_next() {
-            match finished {
-                Ok((id, exit)) => {
-                    if let Some(class) = self.deregister(id) {
-                        out.push((id, class, exit));
-                    }
-                }
-                Err(err) => {
-                    let exit = if err.is_cancelled() {
-                        TaskExit::Cancelled
-                    } else {
-                        TaskExit::Panicked
-                    };
-                    if let Some(id) = self.find_finished_meta() {
-                        if let Some(class) = self.deregister(id) {
-                            out.push((id, class, exit));
-                        }
-                    }
-                }
-            }
-        }
-        out
     }
 
     fn find_finished_meta(&self) -> Option<TaskId> {
@@ -282,6 +299,7 @@ impl TaskSupervisor {
 
     fn deregister(&mut self, id: TaskId) -> Option<TaskClass> {
         let meta = self.meta.remove(&id)?;
+        self.by_tokio_id.remove(&meta.tokio_id);
         if let Some(tx) = meta.class.transaction_id() {
             if let Some(set) = self.by_transaction.get_mut(&tx) {
                 set.remove(&id);

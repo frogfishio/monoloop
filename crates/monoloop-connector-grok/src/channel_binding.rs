@@ -202,7 +202,7 @@ impl SessionAdapter for GrokSessionAdapter {
 ///
 /// # Session identity
 ///
-/// Grok’s `sessionId` is the correlation id. New turn: `TransactionRequest.session_id = None`.
+/// Grok’s `sessionId` is the correlation id. New turn: `TransactionSubmitRequest.session_id = None`.
 /// Resume: pass `SessionId::from_external(&ExternalSessionId::try_new(session_id)?)`.
 ///
 /// # Example (façade)

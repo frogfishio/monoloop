@@ -11,22 +11,22 @@ and **no Tokio runtime** of its own.
 
 | Is | Is not |
 |---|---|
-| Shared vocabulary (`SessionKey`, `TransactionRequest`, canonical units, …) | The Monoloop product façade (use `monoloop`) |
-| Traits/ports (`TransactionRuntime`, event sink, completion callback) | Connector / Interpreter / Loop implementations |
-| Config merge + option policy types | Persistence, UI, or tools |
+| Shared vocabulary (`SessionKey`, `TransactionSubmitRequest`, canonical units, …) | The Monoloop product façade (use `monoloop`) |
+| Push delivery ports (`transaction_delivery`, `TransactionDelivery`) | Connector / Interpreter / Loop implementations |
+| Host-side sink/callback **adapters** (`TransactionEventSink`, `CompletionCallback`) | Persistence, UI, or tools |
 
-## How an assembler uses it
+## How an assembler uses it (Runtime v2)
 
 This crate alone does **not** run a transaction. Prefer the façade:
 
 1. Depend on `monoloop` (or wire `monoloop-loop` + connector + interpreter).
 2. Build `CanonicalInput` (e.g. `user_text_input("…")`).
-3. Build `TransactionRequest` with:
-   - explicit `channel_id` (and optional `session_id`)
-   - `invocation_config` (deadline, continuation policy, …)
-   - push `events: Arc<dyn TransactionEventSink>` (e.g. `FnEventSink`)
-   - one `completion: Box<dyn CompletionCallback>` (e.g. `FnCompletionCallback`)
-4. Call `TransactionRuntime::submit` on a started `DefaultTransactionRuntime`.
+3. `let (delivery, receiver) = transaction_delivery(limits)?;`
+4. `StartedRuntime::start(RuntimeBootstrap { … })` — runtime owns its executor.
+5. `handle.submit(TransactionSubmitRequest { …, delivery })`.
+6. Drain `receiver.events` / await `receiver.completion` on the host side.
+7. Optional: `adapt_event_sink` / `adapt_completion_callback` (in `monoloop-loop`)
+   to bridge push receivers into host sinks **outside** the runtime.
 
 ```rust
 use monoloop_contracts::user_text_input;
@@ -34,18 +34,22 @@ use monoloop_contracts::user_text_input;
 let input = user_text_input("hello")?;
 ```
 
-Full wiring: `monoloop` / `monoloop-loop` `examples/fake_echo.rs`.
+Full wiring: `monoloop` `examples/fake_echo.rs`.
+
+**Do not** build core submits with deprecated `TransactionRequest { events, completion }`
+or the deprecated `TransactionRuntime` trait. Those shapes are not accepted by
+`StartedRuntime`.
 
 ## Key modules
 
 | Module area | Examples |
 |---|---|
 | Identity | `ChannelId`, `SessionId`, `SessionKey`, `TransactionId`, `ExchangeId` |
-| Transaction ports | `TransactionRuntime`, `TransactionRequest`, `TransactionEventSink`, `CompletionCallback` |
-| Push adapters | `FnEventSink`, `FnCompletionCallback`, `EventDelivery`, `CompletionDelivery` |
+| Core submit (v2) | `TransactionSubmitRequest`, `transaction_delivery`, `TransactionDelivery` |
+| Host adapters (outside core) | `TransactionEventSink`, `CompletionCallback`, `FnEventSink`, `FnCompletionCallback` |
 | Canonical | `CanonicalUnitEvent`, `ToolRequestState`, `CanonicalInput` |
 | Config | `InvocationConfig`, `EffectiveConfig`, `OptionPolicy`, `ChannelCapabilities` |
 | Dialects | `DialectDescriptor`, `DialectFamily` |
-| Outcomes | `TransactionEvent`, `TransactionEventPayload`, `TransactionEnd`, `TransactionEndKind` |
+| Outcomes | `TransactionEvent`, `TransactionEventPayload`, `TransactionEndEvent`, `TransactionEndKind` |
 
-Normative: `doc/REQUIREMENTS.md`, `doc/TRANSACTION_RUNTIME_IMPLEMENTATION.md`.
+Normative: `doc/TRANSACTION_RUNTIME_V2_SPEC.md`, `doc/REQUIREMENTS.md`.

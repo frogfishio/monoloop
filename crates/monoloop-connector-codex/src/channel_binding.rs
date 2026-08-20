@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 pub struct CodexConnectorFactory;
 impl CodexConnectorFactory {
     /// Create a default factory.
-    /// Build a ChannelBinding for TransactionRuntime composition.
+    /// Build a ChannelBinding for StartedRuntime / ChannelRegistry composition.
     pub fn new() -> Self {
         Self
     }
@@ -155,7 +155,7 @@ impl SessionAdapter for ProfileSessionAdapter {
     }
 }
 
-/// Build a ChannelBinding for TransactionRuntime composition.
+/// Build a ChannelBinding for StartedRuntime / ChannelRegistry composition.
 pub fn codex_channel_binding(
     id: impl AsRef<str>,
     endpoint_ref: impl Into<String>,

@@ -6,6 +6,26 @@ use monoloop_contracts::{
     ToolContinuationEncodeRequest,
 };
 
+/// Encoder that panics on encode (§22.2 coordinator-panic proofs).
+#[derive(Debug, Default)]
+pub struct PanicEncoder;
+
+impl OutboundDialectEncoder for PanicEncoder {
+    fn encode_initial(
+        &self,
+        _request: InitialEncodeRequest<'_>,
+    ) -> Result<EncodedExchange, EncodingError> {
+        panic!("PanicEncoder::encode_initial (§22.2)");
+    }
+
+    fn encode_tool_continuation(
+        &self,
+        _request: ToolContinuationEncodeRequest<'_>,
+    ) -> Result<EncodedExchange, EncodingError> {
+        panic!("PanicEncoder::encode_tool_continuation (§22.2)");
+    }
+}
+
 /// Encoder that rejects all encode calls.
 #[derive(Debug, Default)]
 pub struct RejectEncoder;

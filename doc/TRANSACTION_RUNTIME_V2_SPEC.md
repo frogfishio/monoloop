@@ -1,14 +1,13 @@
 # Transaction Runtime v2 Specification
 
-**Status:** Normative replacement specification; M0–M5 landed (D-003; D-042;
-D-043; D-044 Fixed) — Ready units feed canonical `DefaultLoopRuntime` under
-`TaskClass::LoopRuntime`; `StickyCancel`; oneshot take for completion/output;
-typed `try_new_process_isolated`; Busy supervisor retry; ambient `start`
-cfg-gated; MCP loopback listener as `RuntimeService`; sessionless DirectLlm
-tool envelopes use transaction-scoped `SessionKey` (DECISIONS D-004). **M6 partial:** short `wait_stopped` TimedOut→Quiescing then Stopped; Seal
-prefers authoritative session over synthetic. Remaining: full §22 adversarial
-matrix (subprocess barriers), full MCP gateway + non-empty tools (deferred),
-**M7** façade cutover.
+**Status:** Normative replacement specification; **M0–M5 landed** (D-003; D-042;
+D-043; D-044 Fixed). **M6 partial — not done** (D-045): §22.1 + §22.2
+(including Seal→completion vs shutdown) + §22.5 TimedOut/`StoppedGate`/CAS
+generation landed; remaining §22.3–22.7 (in-process ownership then later
+subprocess barriers, process-kill, identity, host-adapter proofs), full MCP
+gateway + non-empty tools deferred. **M7 façade landed** (D-038 Fixed).
+**Not** M0–M7 complete / Golden / §25 DoD while D-045 remainder is open.
+D-039 / D-040 / D-041 Fixed.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 
@@ -219,6 +218,10 @@ transaction deadline permits waiting for capacity.
 - `Ended` enqueue is bounded by an independent terminal-event budget.
 - No event may be enqueued after the terminal enqueue attempt.
 - A failed `Ended` enqueue MUST be recorded in the completion result.
+- When no event publisher exists (shutdown before `Start` / `publisher_cmd_tx`
+  is `None`), the runtime MUST NOT issue `Seal` and MUST record
+  `TerminalEventDelivery::NotAttempted`. Never-attempted MUST NOT be reported
+  as `Published`, `QueueClosed`, `DeadlineExceeded`, or `LimitExceeded`.
 - `TransactionEnd` inside `Ended` MUST NOT contain the outcome of its own
   delivery. That outcome is unknowable until after the event has been sent.
 
@@ -379,7 +382,8 @@ removed only after:
 1. all transaction tasks have joined and all isolated processes have been
    reaped;
 2. routes and capabilities are revoked;
-3. the terminal event enqueue has been attempted;
+3. the terminal event enqueue has been attempted, or recorded as
+   `NotAttempted` when no publisher was started;
 4. the completion send has been attempted; and
 5. reservations have been released according to policy.
 
@@ -549,7 +553,9 @@ Sequence rules:
 - new external sessions publish `SessionEstablished` before every other ordinary
   event;
 - after the coordinator joins, the supervisor sends `Seal`; the event publisher
-  alone allocates and attempts the terminal event; and
+  alone allocates and attempts the terminal event;
+- if no publisher was started, the supervisor MUST NOT send `Seal` and MUST
+  record `NotAttempted`; and
 - no sequence can be allocated after the terminal attempt.
 
 The last committed sequence is reported to and stored in the ledger, not only in
@@ -595,6 +601,7 @@ For one ledger entry, the supervisor MUST:
 5. Await or observe joins according to cleanup policy without dropping handles.
 6. Record `CleanupStatus`.
 7. Send `Seal` to the event publisher and receive its bounded terminal result.
+   When `publisher_cmd_tx` is `None`, skip `Seal` and record `NotAttempted`.
 8. Join the sealed event publisher or retain its ownership as cleanup pending.
 9. Release the `SessionKey` reservation only if cleanup is complete.
 10. Build immutable `TransactionCompletion`.
@@ -841,6 +848,9 @@ pub enum TerminalEventDelivery {
     QueueClosed,
     DeadlineExceeded,
     LimitExceeded,
+    /// No publisher / Seal was ever issued (e.g. shutdown before Start).
+    /// Never-attempted is not Published (§6.4).
+    NotAttempted,
 }
 ```
 
