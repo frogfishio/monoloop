@@ -247,6 +247,11 @@ impl RuntimeOwner {
         self.shared.ledger.lock().map(|l| l.len()).unwrap_or(0)
     }
 
+    /// Supervisor-owned task count (§22.3 stopped proof).
+    pub fn owned_task_count(&self) -> u32 {
+        self.shared.owned_tasks.load(Ordering::SeqCst)
+    }
+
     /// Global reservation count.
     pub fn global_reservations(&self) -> usize {
         self.pool.global_active()

@@ -1118,6 +1118,287 @@ fn s22_2_shutdown_between_seal_and_completion_keeps_completion() {
     ));
 }
 
+/// §22.3: spawn registers in the supervisor before the user future can first-poll.
+#[tokio::test(flavor = "current_thread")]
+async fn s22_3_spawn_registers_before_first_poll() {
+    use super::task_supervisor::{TaskClass, TaskSupervisor};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tx = TransactionId::generate();
+    let entered = Arc::new(AtomicBool::new(false));
+    let (block_tx, block_rx) = tokio::sync::oneshot::channel::<()>();
+    let entered_task = Arc::clone(&entered);
+
+    let mut tasks = TaskSupervisor::new();
+    let id = tasks.spawn(TaskClass::TransactionCoordinator(tx), async move {
+        // First action of the user future — must run only after registration.
+        entered_task.store(true, Ordering::SeqCst);
+        let _ = block_rx.await;
+    });
+
+    // Registration is synchronous in `spawn` before the start-gate release.
+    assert_eq!(tasks.registered_count(), 1);
+    assert_eq!(tasks.tasks_for(&tx), vec![id]);
+
+    // Allow one poll; user future may now set `entered`.
+    tokio::task::yield_now().await;
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "start-gate must release so the registered future can poll"
+    );
+    assert_eq!(
+        tasks.registered_count(),
+        1,
+        "registration must outlive first poll"
+    );
+
+    let _ = block_tx.send(());
+    let finished = tasks.join_next().await.expect("join");
+    assert_eq!(finished.0, id);
+    assert_eq!(tasks.registered_count(), 0);
+}
+
+/// §22.3: abort is followed by an observed join before stopped proof.
+#[tokio::test(flavor = "current_thread")]
+async fn s22_3_abort_then_observed_join() {
+    use super::task_supervisor::{TaskClass, TaskExit, TaskSupervisor};
+
+    let tx = TransactionId::generate();
+    let mut tasks = TaskSupervisor::new();
+    let id = tasks.spawn(TaskClass::EventPublisher(tx), async {
+        std::future::pending::<()>().await;
+    });
+    assert_eq!(tasks.registered_count(), 1);
+
+    tasks.abort(id);
+    let (joined_id, class, exit) = tasks.join_next().await.expect("join after abort");
+    assert_eq!(joined_id, id);
+    assert!(matches!(class, TaskClass::EventPublisher(_)));
+    assert_eq!(exit, TaskExit::Cancelled);
+    assert!(tasks.is_empty());
+}
+
+/// §22.3: a yielding abortable future is aborted and joined.
+#[tokio::test(flavor = "current_thread")]
+async fn s22_3_yielding_abortable_aborted_and_joined() {
+    use super::task_supervisor::{TaskClass, TaskExit, TaskSupervisor};
+
+    let tx = TransactionId::generate();
+    let mut tasks = TaskSupervisor::new();
+    let id = tasks.spawn(TaskClass::LoopRuntime(tx), async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    // Let it yield at least once.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    tasks.abort(id);
+    let (joined_id, _, exit) = tasks.join_next().await.expect("join yielding abort");
+    assert_eq!(joined_id, id);
+    assert_eq!(exit, TaskExit::Cancelled);
+    assert_eq!(tasks.registered_count(), 0);
+}
+
+/// §22.3: abort_and_drain observes joins; counts return to zero (non-kill path).
+#[tokio::test(flavor = "current_thread")]
+async fn s22_3_abort_and_drain_counts_to_zero() {
+    use super::task_supervisor::{TaskClass, TaskSupervisor};
+
+    let tx = TransactionId::generate();
+    let mut tasks = TaskSupervisor::new();
+    for _ in 0..3 {
+        tasks.spawn(TaskClass::ConnectorOwner(tx, monoloop_contracts::ExchangeId::generate()), async {
+            std::future::pending::<()>().await;
+        });
+    }
+    assert_eq!(tasks.registered_count(), 3);
+    assert!(tasks.abort_and_drain().await);
+    assert!(tasks.is_empty());
+    assert_eq!(tasks.registered_count(), 0);
+    assert!(tasks.tasks_for(&tx).is_empty());
+}
+
+/// §22.3: runtime shutdown (normal path) leaves owned task count at zero.
+#[test]
+fn s22_3_runtime_normal_path_counts_to_zero() {
+    use crate::transaction::state::RuntimeState;
+
+    let started = start_runtime(2, 2);
+    let handle = started.handle.clone();
+    let (_r, recv) = submit(&handle, Some("own-ok")).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), recv.completion.recv()).await
+        })
+        .expect("completion timeout")
+        .expect("completion");
+    assert!(matches!(
+        completion.end.kind,
+        TransactionEndKind::Completed | TransactionEndKind::RuntimeShutdown
+    ));
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(r) => {
+            assert_eq!(r.completions_published, 1);
+            assert_eq!(owner.state(), RuntimeState::Stopped);
+            assert_eq!(owner.ledger_len(), 0);
+            assert_eq!(owner.owned_task_count(), 0);
+        }
+        other => panic!("expected Stopped with zero owned tasks, got {other:?}"),
+    }
+}
+
+/// §22.3: cancel path still drains owned tasks to zero before Stopped.
+#[test]
+fn s22_3_runtime_cancel_path_counts_to_zero() {
+    use crate::transaction::state::RuntimeState;
+
+    let started = start_runtime(2, 2);
+    let handle = started.handle.clone();
+    let (receipt, recv) = submit(&handle, Some("own-cancel")).unwrap();
+    let disp = handle.terminate(
+        TransactionSelector::Transaction(receipt.transaction_id),
+        TerminationMode::Cancel {
+            reason: CancellationReason {
+                code: CancellationReasonCode::CallerRequested,
+                detail: None,
+            },
+        },
+    );
+    assert!(matches!(
+        disp,
+        TerminationDisposition::Accepted | TerminationDisposition::AlreadyTerminal
+    ));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _ = rt.block_on(recv.completion.recv());
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(_) => {
+            assert_eq!(owner.state(), RuntimeState::Stopped);
+            assert_eq!(owner.ledger_len(), 0);
+            assert_eq!(owner.owned_task_count(), 0);
+        }
+        other => panic!("expected Stopped after cancel drain, got {other:?}"),
+    }
+}
+
+/// §22.3: coordinator panic / failure path still reaches zero owned tasks.
+#[test]
+fn s22_3_runtime_failure_path_counts_to_zero() {
+    use crate::transaction::state::RuntimeState;
+
+    // PanicEncoder forces coordinator failure → InvariantFailed completion.
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let mut binding = llm_binding("llm", 2);
+    binding.encoder = Arc::new(PanicEncoder);
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![binding]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (_r, recv) = submit(&handle, Some("own-fail")).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt.block_on(recv.completion.recv()).expect("completion");
+    assert_eq!(completion.end.kind, TransactionEndKind::InvariantFailed);
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(_) => {
+            assert_eq!(owner.state(), RuntimeState::Stopped);
+            assert_eq!(owner.ledger_len(), 0);
+            assert_eq!(owner.owned_task_count(), 0);
+        }
+        other => panic!("expected Stopped after failure drain, got {other:?}"),
+    }
+}
+
+/// §22.3: Connector/Interpreter pumps stay supervisor-owned (joined) — shutdown
+/// after a live exchange does not leave detached pump tasks.
+#[test]
+fn s22_3_exchange_pumps_joined_not_detached() {
+    // Hang keeps ConnectorOwner parked under TaskSupervisor while we shut down.
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (_r, _recv) = submit(&handle, Some("pump-own")).unwrap();
+    // Give Hang exchange time to register ConnectorOwner under the supervisor.
+    std::thread::sleep(Duration::from_millis(50));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(_) => {
+            assert_eq!(owner.ledger_len(), 0);
+            assert_eq!(
+                owner.owned_task_count(),
+                0,
+                "Connector/Interpreter pumps must be joined, not detached"
+            );
+        }
+        other => panic!("expected Stopped with joined pumps, got {other:?}"),
+    }
+    let _ = handle;
+}
+
 /// §22.2: every admission → exactly one completion send attempt.
 #[test]
 fn s22_2_one_completion_per_admission() {

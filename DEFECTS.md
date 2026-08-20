@@ -1801,9 +1801,12 @@ no event after Seal, failed enqueue consumes no sequence. **M6 still partial**
       ledger/completion (`s22_2_shutdown_between_seal_and_completion_keeps_completion`
       + `FinalizerHoldGate` + take `completion_tx` before Seal; hard-grace
       keeps Finalizer, aborts EventPublisher after grace)
-- [ ] §22.3 in-process ownership proofs before sacrificial subprocess
+- [x] §22.3 in-process ownership proofs: register-before-poll, abort-then-join,
+      yielding abortable, `abort_and_drain` → 0, runtime normal/cancel/failure
+      counts → 0, Hang exchange pumps joined not detached (`s22_3_*`)
 - [ ] §22.3 non-yielding future: sacrificial process + outer timeout;
       `TimedOut` + `Quiescing` + owned work; never false `Stopped`
+      (**still paused** — harness does not exist yet)
 
 **Advisor (2026-08-20, §22.3 vs pause):** **Pause the sacrificial
 non-yielding subprocess.** Do **not** pause the M6 kernel remainder.
@@ -1815,13 +1818,19 @@ Honesty cutover stays stopped; D-041 Fixed; §22.2 first slice stands.
 `TimedOut`/`Quiescing` (not false `Stopped`); release yields one completion.
 Join cancel path maps Tokio task id → `TaskId` so aborted joins cannot
 leak meta and strand ledger rows. Hard-grace uses
-`abort_transaction_except_finalizer`. **§22.2 matrix complete.** M6 still
-partial (§22.3–22.7 + MCP/non-empty tools). **Not** Golden / §25.
+`abort_transaction_except_finalizer`. **§22.2 matrix complete.**
 
-**Next pick:** **§22.3 in-process** ownership (register-before-poll,
-abort-then-join, yielding abortable, coordinator drop does not detach
-pumps, counts to zero on non-kill paths). Sacrificial non-yielding remains
-**paused** as a later 22.3 slice: short `wait_stopped` → `TimedOut`,
-`Quiescing`, owned work still registered; **never** `Stopped`. Outer
-harness kills the child. Do not treat process-kill (§22.4) or host
-adapters (§22.7) as substitutes.
+**§22.3 in-process (2026-08-20):** Landed `s22_3_spawn_registers_before_first_poll`,
+`s22_3_abort_then_observed_join`, `s22_3_yielding_abortable_aborted_and_joined`,
+`s22_3_abort_and_drain_counts_to_zero`, runtime normal/cancel/failure
+counts→0, Hang exchange pumps joined not detached. Sacrificial non-yielding
+subprocess **still paused** (no harness yet; fail-closed criteria only when
+started). M6 still partial (§22.3 sacrificial + §22.4–22.7 + MCP/non-empty
+tools). **Not** Golden / §25.
+
+**Next pick:** either remaining §22.3 sacrificial non-yielding (fail-closed
+only: short `wait_stopped` → `TimedOut`, `Quiescing`, owned work registered;
+**never** `Stopped`; outer harness kills child) **or** §22.4 / §22.5 remainder
+/ §22.6 — **not** host adapters (§22.7) as substitute. Prefer staying on
+kernel ownership before inventing the sacrificial harness if any in-process
+gap remains; otherwise sacrificial is the distinctive 22.3 negative proof.
