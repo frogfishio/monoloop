@@ -3,7 +3,46 @@
 use super::channel_registry::ChannelRegistry;
 use super::host_tools::HostToolRegistry;
 use monoloop_contracts::TransactionLimits;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
+
+/// Test/prod gate that defers the supervisor's `Stopped` transition until
+/// [`StoppedGate::release`] (v2 §22.5 TimedOut determinism).
+///
+/// Uses [`watch`] so a release that races ahead of the waiter is not lost
+/// (unlike `Notify`, which can miss a wakeup between check and await).
+#[derive(Debug)]
+pub struct StoppedGate {
+    tx: watch::Sender<bool>,
+    rx: watch::Receiver<bool>,
+}
+
+impl Default for StoppedGate {
+    fn default() -> Self {
+        let (tx, rx) = watch::channel(false);
+        Self { tx, rx }
+    }
+}
+
+impl StoppedGate {
+    /// New unreleased gate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allow the supervisor to enter `Stopped`.
+    pub fn release(&self) {
+        let _ = self.tx.send(true);
+    }
+
+    /// Wait until [`Self::release`] has been called.
+    pub async fn wait_released(&self) {
+        let mut rx = self.rx.clone();
+        // `wait_for` observes the current value first — no lost-wakeup race.
+        let _ = rx.wait_for(|released| *released).await;
+    }
+}
 
 /// Runtime-wide configuration validated at startup.
 #[derive(Clone, Debug)]
@@ -14,6 +53,9 @@ pub struct RuntimeConfig {
     pub enable_mcp_listener: bool,
     /// Maximum time to wait for graceful drain during shutdown when not specified.
     pub default_shutdown_deadline: Duration,
+    /// When `Some`, supervisor defers `Stopped` until the gate is released.
+    /// Production leaves this `None`; §22.5 TimedOut proofs set it.
+    pub block_stopped: Option<Arc<StoppedGate>>,
 }
 
 impl Default for RuntimeConfig {
@@ -23,6 +65,7 @@ impl Default for RuntimeConfig {
             // MCP deferred until M5 — default off so start succeeds.
             enable_mcp_listener: false,
             default_shutdown_deadline: Duration::from_secs(30),
+            block_stopped: None,
         }
     }
 }

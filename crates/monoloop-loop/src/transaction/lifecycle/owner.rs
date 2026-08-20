@@ -19,7 +19,7 @@ use monoloop_contracts::{
     TerminationDisposition, TerminationMode, TransactionSelector, TransactionSubmitRequest,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle as OsJoinHandle;
 use std::time::Duration;
@@ -59,11 +59,6 @@ impl StartedRuntime {
     /// Production start: owns a dedicated multi-thread Tokio executor.
     pub fn start(bootstrap: RuntimeBootstrap) -> Result<Self, StartupError> {
         bootstrap.config.validate()?;
-        if bootstrap.config.enable_mcp_listener {
-            return Err(StartupError::InvalidConfig(
-                "MCP listener deferred until M5; set enable_mcp_listener: false",
-            ));
-        }
 
         let mut live: HashMap<ChannelId, LiveChannel> = HashMap::new();
         let mut capacity_pairs: Vec<(ChannelId, usize)> = Vec::new();
@@ -148,6 +143,10 @@ impl StartedRuntime {
             completions_receiver_dropped: AtomicU64::new(0),
             completions_invariant_failed: AtomicU64::new(0),
             runtime_shutdown_terminals: AtomicU64::new(0),
+            owned_tasks: AtomicU32::new(0),
+            enable_mcp_listener: bootstrap.config.enable_mcp_listener,
+            mcp_listen_addr: Mutex::new(None),
+            block_stopped: bootstrap.config.block_stopped.clone(),
         });
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartupError>>();
@@ -167,6 +166,27 @@ impl StartedRuntime {
                         return;
                     }
                 };
+                // Bind MCP before Accepting so enable_mcp_listener fails closed (D-043).
+                let mcp_listener = if shared_thread.enable_mcp_listener {
+                    match std::net::TcpListener::bind("127.0.0.1:0") {
+                        Ok(l) => {
+                            if l.set_nonblocking(true).is_err() {
+                                let _ = ready_tx.send(Err(StartupError::InvalidConfig(
+                                    "MCP loopback set_nonblocking failed",
+                                )));
+                                return;
+                            }
+                            Some(l)
+                        }
+                        Err(_) => {
+                            let _ = ready_tx
+                                .send(Err(StartupError::InvalidConfig("MCP loopback bind failed")));
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
                 shared_thread.state.store(STATE_ACCEPTING, Ordering::SeqCst);
                 let _ = ready_tx.send(Ok(()));
                 rt.block_on(run_supervisor(
@@ -175,7 +195,11 @@ impl StartedRuntime {
                     control_rx,
                     worker_rx,
                     spawn_rx,
+                    mcp_listener,
                 ));
+                // Bounded executor teardown so Drop/join cannot strand on
+                // residual background work after the supervisor has returned.
+                rt.shutdown_timeout(Duration::from_secs(2));
             })
             .map_err(|_| StartupError::ExecutorUnavailable)?;
 
@@ -232,22 +256,35 @@ impl RuntimeOwner {
     /// observes `Quiescing` via an internal wake so a full control queue cannot
     /// strand the runtime.
     pub fn begin_shutdown(&self) -> ShutdownTicket {
+        // Move to Quiescing (idempotent).
         let _ = self.shared.state.compare_exchange(
             STATE_ACCEPTING,
             STATE_QUIESCING,
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
-        let generation = self
-            .shared
-            .shutdown_generation
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1);
+        let _ = self.shared.state.compare_exchange(
+            STATE_STARTING,
+            STATE_QUIESCING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        // CAS 0→1 elects a single announcer; losers observe the published
+        // generation immediately — no spin/yield race (§22.5).
+        let generation = match self.shared.shutdown_generation.compare_exchange(
+            0,
+            1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => 1,
+            Err(existing) => existing,
+        };
         let _ = self
             .shared
             .control_tx
             .try_send(ControlCommand::BeginShutdown);
-        self.shared.wake.notify_one();
+        self.shared.wake.notify_waiters();
         ShutdownTicket { generation }
     }
 
@@ -273,6 +310,10 @@ impl RuntimeOwner {
 
 impl Drop for RuntimeOwner {
     fn drop(&mut self) {
+        // Never strand Drop behind a test-only Stopped gate.
+        if let Some(gate) = self.shared.block_stopped.as_ref() {
+            gate.release();
+        }
         if self.shared.state.load(Ordering::SeqCst) != STATE_STOPPED {
             let _ = self.begin_shutdown();
             let _ = self

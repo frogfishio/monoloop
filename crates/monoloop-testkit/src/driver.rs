@@ -260,15 +260,17 @@ pub async fn run_bytes_pipeline_with_params(
         connection_id,
         None,
     );
-    let loop_handle = loop_rt
-        .start_empty(
+    // Testkit owns the JoinHandle (explicit spawn — not product ambient start).
+    let (loop_handle, loop_fut) = loop_rt
+        .prepare_empty(
             run_id.clone(),
             loop_id,
             scope,
             loop_sub,
             LoopLimits::default(),
         )
-        .expect("start loop");
+        .expect("prepare loop");
+    tokio::spawn(loop_fut);
 
     let sink = Arc::new(SyncMemorySink::new());
     let console_task = if params.render_console {
@@ -372,7 +374,7 @@ pub async fn run_bytes_pipeline_with_params(
 async fn collect_loop_output(handle: LoopHandle) -> (Vec<LoopOutputEvent>, LoopEnd) {
     let mut out = Vec::new();
     {
-        let mut rx = handle.output.lock().await;
+        let mut rx = handle.take_output().await;
         while let Some(ev) = rx.recv().await {
             let done = matches!(ev, LoopOutputEvent::LoopEnded(_));
             out.push(ev);

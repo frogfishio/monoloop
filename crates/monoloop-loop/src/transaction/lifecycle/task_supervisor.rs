@@ -32,6 +32,8 @@ pub enum TaskClass {
     LoopRuntime(TransactionId),
     /// MCP request task.
     McpRequest(TransactionId),
+    /// Post-terminal finalizer (Seal + completion publish) for one transaction.
+    Finalizer(TransactionId),
     /// Runtime-wide service (MCP listener, etc.).
     RuntimeService,
 }
@@ -46,7 +48,8 @@ impl TaskClass {
             | Self::InterpreterOwner(t, _)
             | Self::ToolWorker(t, _)
             | Self::LoopRuntime(t)
-            | Self::McpRequest(t) => Some(*t),
+            | Self::McpRequest(t)
+            | Self::Finalizer(t) => Some(*t),
             Self::RuntimeService => None,
         }
     }
@@ -167,6 +170,24 @@ impl TaskSupervisor {
         }
     }
 
+    /// Abort residual tx work but keep [`TaskClass::Finalizer`] and
+    /// [`TaskClass::EventPublisher`] alive so Seal + completion publication can
+    /// finish (one completion per admission).
+    pub fn abort_transaction_residuals(&mut self, tx: &TransactionId) {
+        let ids = self.tasks_for(tx);
+        for id in ids {
+            let keep = self.meta.get(&id).is_some_and(|m| {
+                matches!(
+                    m.class,
+                    TaskClass::Finalizer(_) | TaskClass::EventPublisher(_)
+                )
+            });
+            if !keep {
+                self.abort(id);
+            }
+        }
+    }
+
     /// Abort every registered task (shutdown).
     pub fn abort_all(&mut self) {
         let ids: Vec<_> = self.meta.keys().copied().collect();
@@ -176,11 +197,24 @@ impl TaskSupervisor {
     }
 
     /// Abort all tasks and observe joins until the set is empty.
-    pub async fn abort_and_drain(&mut self) {
+    ///
+    /// Returns `false` if joins do not complete within the bound — caller MUST
+    /// remain `Quiescing` (never report `Stopped` while owned work remains).
+    /// Live `JoinHandle`s are retained (§7.3 / §21: no drop on deadline).
+    pub async fn abort_and_drain(&mut self) -> bool {
         self.abort_all();
-        while self.join_next().await.is_some() {}
+        let drain = async {
+            while self.join_next().await.is_some() {}
+        };
+        if tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .is_err()
+        {
+            return false;
+        }
         self.meta.clear();
         self.by_transaction.clear();
+        true
     }
 
     /// Poll for the next finished task and deregister it.

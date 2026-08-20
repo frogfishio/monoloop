@@ -1,15 +1,14 @@
 # Transaction Runtime v2 Specification
 
-**Status:** Normative replacement specification; M0–M4 landed (D-003; D-042
-Fixed); **M5 in progress** — Ready units feed canonical `DefaultLoopRuntime`
-under `TaskClass::LoopRuntime` (EmptyToolRegistry / NoToolRuntime). Lifecycle
-cancel is `StickyCancel` on `ResourceControls` (flag before notify). Loop
-completion and output receivers are taken once (no mutex across await).
-`SpawnReject::Orphaned` fails closed (no dummy future). `ToolExecutionClass`
-replaced `ToolCancellationPolicy` (§14). `start` / `start_empty` deprecated.
-Remaining (D-043/D-044): `ProcessIsolated` OS boundary, MCP under
-`TaskSupervisor`, join-vault removal, Busy→supervisor preference, sessionless
-tool `SessionKey` policy.
+**Status:** Normative replacement specification; M0–M5 landed (D-003; D-042;
+D-043; D-044 Fixed) — Ready units feed canonical `DefaultLoopRuntime` under
+`TaskClass::LoopRuntime`; `StickyCancel`; oneshot take for completion/output;
+typed `try_new_process_isolated`; Busy supervisor retry; ambient `start`
+cfg-gated; MCP loopback listener as `RuntimeService`; sessionless DirectLlm
+tool envelopes use transaction-scoped `SessionKey` (DECISIONS D-004). **M6 partial:** short `wait_stopped` TimedOut→Quiescing then Stopped; Seal
+prefers authoritative session over synthetic. Remaining: full §22 adversarial
+matrix (subprocess barriers), full MCP gateway + non-empty tools (deferred),
+**M7** façade cutover.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

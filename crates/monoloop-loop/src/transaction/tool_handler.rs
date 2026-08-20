@@ -26,8 +26,17 @@ pub trait ToolHandler: Send + Sync {
     }
 
     /// Whether isolated kill after grace is available (D-024 / D-028).
-    /// Default **false** (fail-closed); requires a structural [`ToolKillHandle`].
+    /// Default **false** (fail-closed). For [`ToolExecutionClass::ProcessIsolated`],
+    /// registration also requires [`Self::os_process_isolated`].
     fn supports_isolated_kill(&self) -> bool {
+        false
+    }
+
+    /// Structural OS process isolation boundary (V2 §14.3).
+    ///
+    /// Default **false**. Only handlers that own a real child process (not a
+    /// Tokio task) may return true. Capability booleans alone are insufficient.
+    fn os_process_isolated(&self) -> bool {
         false
     }
 }
@@ -96,61 +105,116 @@ impl ToolExecutionCompletion {
     }
 }
 
-/// Force-stop + join handle for IsolatedKillable / Abortable workers (D-024).
+/// Force-stop + join for Abortable (Tokio) or ProcessIsolated (OS child) workers.
 ///
-/// Owns the worker `tokio::task::JoinHandle` so kill can be followed by a real
-/// join. Timed waits must not drop the handle on timeout (put-back) or the
-/// worker would detach while capacity is released.
+/// Timed waits must not drop the join on timeout (put-back) or the worker would
+/// detach while capacity is released. Process kill uses OS signals (D-043).
 #[derive(Clone, Debug)]
 pub struct ToolKillHandle {
-    abort: AbortHandle,
-    join: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    inner: Arc<KillInner>,
+}
+
+#[derive(Debug)]
+enum KillInner {
+    /// In-process Tokio task — abort at yield only (not ProcessIsolated).
+    Tokio {
+        abort: AbortHandle,
+        join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    },
+    /// OS child process — real kill boundary (V2 §14.3).
+    Process {
+        child: Arc<Mutex<Option<std::process::Child>>>,
+        join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    },
 }
 
 impl ToolKillHandle {
-    /// Take ownership of a worker task (abort + join).
+    /// Take ownership of a Tokio worker task (abort + join).
+    ///
+    /// This is **not** a ProcessIsolated boundary.
     pub fn new(join: tokio::task::JoinHandle<()>) -> Self {
         Self {
-            abort: join.abort_handle(),
-            join: Arc::new(Mutex::new(Some(join))),
+            inner: Arc::new(KillInner::Tokio {
+                abort: join.abort_handle(),
+                join: Mutex::new(Some(join)),
+            }),
         }
     }
 
-    /// Abort the isolated worker task (idempotent).
+    /// Own an OS [`std::process::Child`] plus a blocking wait task (D-043).
+    ///
+    /// `child` is shared with the wait task so kill and wait observe the same process.
+    pub(crate) fn from_process(
+        child: Arc<Mutex<Option<std::process::Child>>>,
+        join: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(KillInner::Process {
+                child,
+                join: Mutex::new(Some(join)),
+            }),
+        }
+    }
+
+    /// Abort Tokio task or OS-kill the child (idempotent).
     pub fn kill(&self) {
-        self.abort.abort();
+        match &*self.inner {
+            KillInner::Tokio { abort, .. } => abort.abort(),
+            KillInner::Process { child, .. } => {
+                if let Some(c) = child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    let _ = c.kill();
+                }
+            }
+        }
     }
 
     /// Await worker teardown. On timeout, restores the join handle so the
     /// worker is not detached; caller must keep capacity until a later join.
     pub async fn join_timeout(&self, budget: std::time::Duration) -> Result<(), ()> {
-        let handle = self.join.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let handle = match &*self.inner {
+            KillInner::Tokio { join, .. } | KillInner::Process { join, .. } => {
+                join.lock().unwrap_or_else(|e| e.into_inner()).take()
+            }
+        };
         let Some(mut handle) = handle else {
             return Ok(()); // already joined
         };
         match tokio::time::timeout(budget, &mut handle).await {
             Ok(_) => Ok(()),
             Err(_) => {
-                // Put back — do not detach on timeout.
-                *self.join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                match &*self.inner {
+                    KillInner::Tokio { join, .. } | KillInner::Process { join, .. } => {
+                        *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                    }
+                }
                 Err(())
             }
         }
     }
 
-    /// Take the join handle if still present (for TaskSupervisor registration — M5).
-    #[allow(dead_code)] // dispatcher deferred until M5
+    /// Take the join handle if still present (for TaskSupervisor registration).
+    #[allow(dead_code)]
     pub(crate) fn take_join(&self) -> Option<tokio::task::JoinHandle<()>> {
-        self.join.lock().unwrap_or_else(|e| e.into_inner()).take()
+        match &*self.inner {
+            KillInner::Tokio { join, .. } | KillInner::Process { join, .. } => {
+                join.lock().unwrap_or_else(|e| e.into_inner()).take()
+            }
+        }
     }
 
-    /// Whether a join handle is still owned (not yet completed/taken).
-    #[allow(dead_code)] // dispatcher deferred until M5
+    /// Whether a join handle is still owned.
+    #[allow(dead_code)]
     pub(crate) fn has_join(&self) -> bool {
-        self.join
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        match &*self.inner {
+            KillInner::Tokio { join, .. } | KillInner::Process { join, .. } => {
+                join.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+            }
+        }
+    }
+
+    /// True when this handle owns an OS process (ProcessIsolated).
+    pub fn is_process_isolated(&self) -> bool {
+        matches!(&*self.inner, KillInner::Process { .. })
     }
 }
 
@@ -261,7 +325,11 @@ where
     }
 }
 
-/// Isolated worker that ignores cooperative cancel until [`ToolKillHandle::kill`] (D-024 tests).
+/// Stubborn in-process worker for AbortableAtYield / legacy D-024 fixtures.
+///
+/// **Not** ProcessIsolated: kill is Tokio `abort` only (V2 §14.3 / D-043).
+/// [`Self::os_process_isolated`] is false — cannot register as ProcessIsolated.
+/// Prefer [`super::process_tool::ProcessIsolatedToolHandler`] for real OS kill.
 pub struct IsolatedKillableToolHandler<F> {
     f: F,
 }
@@ -302,12 +370,13 @@ where
     }
 
     fn supports_abort(&self) -> bool {
-        // Cooperative cancel alone does not stop this worker.
-        false
+        // Tokio abort at yield — not cooperative-only, not OS isolation.
+        true
     }
 
     fn supports_isolated_kill(&self) -> bool {
-        true
+        // D-043: Tokio abort must not satisfy ProcessIsolated registration.
+        false
     }
 }
 

@@ -64,12 +64,13 @@ pub async fn run_coordinator(params: CoordinatorParams) {
     let transaction_id = params.transaction_id;
     let worker_tx = params.worker_tx.clone();
     let proposal = execute(params).await;
-    let _ = worker_tx
-        .send(WorkerMessage::WorkerExited {
-            transaction_id,
-            proposal,
-        })
-        .await;
+    // Non-blocking: supervisor may be in abort_and_drain and not polling
+    // `worker_rx`. A lost message is recovered in `on_task_exit` for
+    // `TransactionCoordinator` so every admission still gets one terminal.
+    let _ = worker_tx.try_send(WorkerMessage::WorkerExited {
+        transaction_id,
+        proposal,
+    });
 }
 
 async fn execute(params: CoordinatorParams) -> TerminalProposal {

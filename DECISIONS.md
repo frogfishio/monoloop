@@ -4,6 +4,37 @@ Explicit project decisions that change contracts, MSRV, or delivery assumptions.
 Normative behavior still lives under `doc/`; this file records *why* a deliberate
 change was made.
 
+## D-004 — Sessionless DirectLlm tool envelope SessionKey (D-044)
+
+**Date:** 2026-08-20
+
+**Context:** Empty-tool Loop dispatch under Transaction Runtime v2 must emit
+`CanonicalToolResult` / tool lifecycle events that require a `SessionKey`.
+DirectLlm admissions often have no external session (no Grok `sessionId`).
+Inventing ambient “current session” would violate LAWS 5–7; omitting the field
+requires a contracts change to make `SessionKey` optional on tool results.
+
+**Decision:** For **sessionless DirectLlm** (and similar sessionless channels),
+tool envelopes MAY use an explicit **transaction-scoped** `SessionKey`:
+
+- `SessionId` = `tx-{transaction_id}` when that forms a valid id, else `direct`
+- `ChannelId` = the admitted channel
+
+This key is **not** an external resume identity and MUST NOT be used for
+`session/load` or most-recent heuristics. Grok Build and other sessionful
+profiles continue to use the authoritative external session id when claimed.
+
+Making `CanonicalToolResult.session_key` optional remains a future option if
+hosts prefer absence over a synthetic key; until then the transaction-scoped
+key is normative for sessionless paths.
+
+**Consequences:**
+
+- `loop_dispatch::session_key_for` is the intentional implementation of this
+  policy (DEFECTS D-044 Fixed).
+- Laws 5–7 remain: no ambient current session; no most-recent heuristic; Grok
+  correlation id unchanged when a real session exists.
+
 ## D-001 — Raise workspace MSRV to 1.88 (WP-00)
 
 **Date:** 2026-08-17

@@ -174,11 +174,10 @@ impl DefaultLoopRuntime {
         })
     }
 
-    /// Legacy ambient spawn — **not** for transaction composition.
+    /// Legacy ambient spawn — **not** compiled into production builds (D-043).
     ///
-    /// Residual for callers that have not yet switched to [`Self::prepare`].
-    /// Prefer [`Self::prepare`] / [`Self::prepare_empty`] and an explicit owner
-    /// (`TransactionTaskSpawner` in production, or a test-local `tokio::spawn`).
+    /// Prefer [`Self::prepare`] / [`Self::prepare_empty`] and an explicit owner.
+    #[cfg(any(test, feature = "legacy_runtime_tests"))]
     #[deprecated(
         note = "ambient tokio::spawn; use prepare()/prepare_empty() and an explicit owner (M5)"
     )]
@@ -188,7 +187,8 @@ impl DefaultLoopRuntime {
         Ok(handle)
     }
 
-    /// Legacy ambient empty-tool start — **not** for transaction composition.
+    /// Legacy ambient empty-tool start — **not** compiled into production builds (D-043).
+    #[cfg(any(test, feature = "legacy_runtime_tests"))]
     #[deprecated(note = "ambient tokio::spawn; use prepare_empty() and an explicit owner (M5)")]
     pub fn start_empty(
         &self,

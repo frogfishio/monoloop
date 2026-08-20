@@ -1579,40 +1579,67 @@ new/load/send workers were ambient if pending handles were dropped.
 ## D-043: M5 residuals — process isolation, MCP ownership, join vaults
 
 **Priority:** P2  
-**Status:** Open (accepted for M5 remainder; not claimed closed)  
+**Status:** Fixed  
 **Affected:**
-- Deferred `dispatcher.rs` / `IsolatedKillableToolHandler` (Tokio task ≠ process)
-- Deferred `mcp/` gateway ambient spawn
-- Deferred `tool_join_vault` / join vaults
-- Deprecated `DefaultLoopRuntime::start` / `start_empty` ambient spawn
-- Busy/Rejected Loop spawn still coordinator-owned join (not JoinSet)
+- `process_tool.rs` / `ToolKillHandle` process variant
+- `lifecycle/mcp_listener.rs` + `enable_mcp_listener`
+- Deferred `dispatcher.rs` (local vault stub; no `tool_join_vault` revival)
+- `DefaultLoopRuntime::start` / `start_empty` cfg-gated
+- Busy Loop spawn retries via `spawn_with_busy_retry`
 
-**Problem:** M5 EmptyToolRegistry under `TaskClass::LoopRuntime` and sticky
-cancel (LAW 21/25 on the supervised empty-tool path) are landed. Remaining
-v2 §14–§17 / M5 checklist items are not yet production-complete.
+**Problem:** M5 EmptyToolRegistry under `TaskClass::LoopRuntime` still left
+Tokio-abort “isolated kill”, ambient Loop `start`, Busy inline-first spawn,
+join-vault revival risk, and MCP deferred at startup.
 
-**Acceptance criteria (remaining):**
-- [ ] `ProcessIsolated` uses a real OS process (or equivalent) kill boundary
-- [ ] MCP listener/request tasks registered under `TaskSupervisor`
-- [ ] Join vaults removed; supervisor retains joins
-- [ ] Production paths do not call deprecated ambient `start`
-- [ ] Prefer supervisor-owned Loop even under Busy (or document Busy as
-      permanent coordinator-owned fallback)
+**Remediation:**
+- `ProcessIsolatedToolHandler` owns an OS child (`sleep` direct, no `sh -c`
+  grandchild); kill/join share one mutex with non-blocking `try_wait` (OS errors
+  fail closed; wait bounded by call deadline). Registration requires
+  `os_process_isolated()` **and** `supports_isolated_kill()` (structural, not
+  boolean-only). Tokio `IsolatedKillableToolHandler` cannot register as
+  ProcessIsolated.
+- MCP loopback bind at startup (fail-closed); listener as `RuntimeService`;
+  shutdown wakes + abort/joins before `Stopped`.
+- Join vault module stays deleted; deferred dispatcher uses a local no-op stub.
+- Ambient `start`/`start_empty` only under `cfg(test)` / `legacy_runtime_tests`;
+  testkit Driver uses `prepare_empty` + explicit spawn.
+- Busy: bounded supervisor retries, then coordinator-owned last resort.
+
+**Honesty residuals (not reopen):**
+- Full MCP gateway / non-empty dispatcher still deferred (empty-tool listener only).
+- `IsolatedKillableToolHandler` remains as AbortableAtYield/legacy fixture (not
+  ProcessIsolated).
+- `spawn_blocking` wait for process tools is not yet a `TaskClass::ToolWorker`
+  (handlers not on empty-tool M5 composition path).
+
+**Acceptance criteria:**
+- [x] `ProcessIsolated` uses a real OS process kill boundary
+- [x] MCP listener tasks registered under `TaskSupervisor` (empty-tool placeholder;
+      full MCP gateway/dispatcher still deferred)
+- [x] Join vaults not revived; supervisor retains joins
+- [x] Production builds do not compile ambient Loop `start`
+- [x] Busy Loop spawn prefers supervisor (retry) before inline last resort
+- [x] ProcessIsolated registration requires typed
+      `RegisteredTool::try_new_process_isolated(ProcessIsolatedToolHandler)`
+      (dyn boolean path rejected)
 
 ## D-044: Sessionless DirectLlm tool envelopes invent `SessionId`
 
 **Priority:** P2  
-**Status:** Open (documented residual)  
+**Status:** Fixed  
 **Affected:**
 - `crates/monoloop-loop/src/transaction/lifecycle/loop_dispatch.rs` (`session_key_for`)
+- `DECISIONS.md` D-004
 
-**Problem:** When admission has no session, empty-tool lifecycle events build
-`SessionKey` with `tx-{transaction_id}` / `direct`. That is explicit and not a
-most-recent heuristic, but it is not an external (e.g. Grok) session id
-(LAWS 5–7 tension until `CanonicalToolResult.session_key` is optional or
-sessionless DirectLlm forbids tools).
+**Problem:** When admission has no session, empty-tool lifecycle events need a
+`SessionKey` on `CanonicalToolResult`. Without a policy, this looked like ambient
+identity (LAWS 5–7).
+
+**Remediation:** Recorded **DECISIONS.md D-004**: transaction-scoped
+`SessionKey` (`tx-{transaction_id}` / `direct` + admitted `ChannelId`) is
+**normative** for sessionless DirectLlm tool envelopes; not a resume identity.
+Grok / claimed sessions still use the authoritative external id.
 
 **Acceptance criteria:**
-- [ ] Spec decides: optional `SessionKey` on tool results, or session required
-      before tool dispatch, or transaction-scoped key is normative for DirectLlm
-- [ ] Code and docs match that decision
+- [x] Spec/decision: transaction-scoped key normative for sessionless DirectLlm
+- [x] Code and docs match that decision (`session_key_for` + D-004)

@@ -44,13 +44,13 @@ impl ResolvedToolSet {
         let mut by_name = HashMap::new();
         let mut ordered = Vec::with_capacity(tools.len());
         for tool in tools {
-            by_name.insert(tool.spec.name.clone(), tool.spec.id.clone());
-            ordered.push(tool.spec.id.clone());
+            by_name.insert(tool.spec().name.clone(), tool.spec().id.clone());
+            ordered.push(tool.spec().id.clone());
             by_id.insert(
-                tool.spec.id.clone(),
+                tool.spec().id.clone(),
                 ResolvedTool {
-                    spec: tool.spec,
-                    handler: tool.handler,
+                    spec: tool.spec().clone(),
+                    handler: Arc::clone(tool.handler()),
                 },
             );
         }

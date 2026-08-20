@@ -56,10 +56,19 @@ impl TransactionTaskSpawner {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.spawn_boxed(class, Box::pin(future)).await
+    }
+
+    /// Same as [`Self::spawn`] with an already-boxed future (Busy retry).
+    pub async fn spawn_boxed(
+        &self,
+        class: TaskClass,
+        future: BoxFuture,
+    ) -> Result<TaskId, SpawnReject> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let req = SpawnRequest {
             class,
-            future: Box::pin(future),
+            future,
             reply: reply_tx,
         };
         match self.tx.try_send(req) {
@@ -70,6 +79,42 @@ impl TransactionTaskSpawner {
             },
             Err(TrySendError::Full(req)) => Err(SpawnReject::Busy { future: req.future }),
             Err(TrySendError::Closed(req)) => Err(SpawnReject::Rejected { future: req.future }),
+        }
+    }
+
+    /// Prefer supervisor ownership: bounded Busy retries, then return the last reject.
+    ///
+    /// Does not drive the future inline — caller decides fail-closed vs last-resort join.
+    pub async fn spawn_with_busy_retry<F, C>(
+        &self,
+        class: TaskClass,
+        future: F,
+        max_retries: u32,
+        mut is_cancelled: C,
+    ) -> Result<TaskId, SpawnReject>
+    where
+        F: Future<Output = ()> + Send + 'static,
+        C: FnMut() -> bool,
+    {
+        let mut future: BoxFuture = Box::pin(future);
+        let mut attempt = 0u32;
+        loop {
+            if is_cancelled() {
+                return Err(SpawnReject::Rejected { future });
+            }
+            match self.spawn_boxed(class.clone(), future).await {
+                Ok(id) => return Ok(id),
+                Err(SpawnReject::Busy { future: f }) => {
+                    future = f;
+                    if attempt >= max_retries {
+                        return Err(SpawnReject::Busy { future });
+                    }
+                    attempt = attempt.saturating_add(1);
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                Err(other) => return Err(other),
+            }
         }
     }
 }

@@ -3,7 +3,16 @@
 use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapacity};
 use super::tool_handler::{ToolExecutionControl, ToolKillHandle};
-use super::tool_join_vault::ToolJoinVault;
+
+/// D-043: join vaults retired. TaskSupervisor retains real worker joins.
+/// Local stub so this deferred file does not revive `tool_join_vault`.
+struct ToolJoinVault;
+impl ToolJoinVault {
+    fn new() -> Self { Self }
+    fn reap_finished(&self) {}
+    fn park_orphan_permit<T>(&self, _permit: T) {}
+}
+
 use super::validation::{
     validate_tool_completion, validate_tool_input, InputValidationFailure, DEFAULT_MAX_JSON_DEPTH,
 };
@@ -327,7 +336,10 @@ impl TransactionToolDispatcher {
         // missing kill capability cannot leave an ignoring worker running (D-028).
         let supports_required_termination = match &policy {
             ToolExecutionClass::AbortableAtYield { .. } => handler.supports_abort(),
-            ToolExecutionClass::ProcessIsolated { .. } => handler.supports_isolated_kill(),
+            // V2 §14.3: structural OS process claim, not boolean-only kill support.
+            ToolExecutionClass::ProcessIsolated { .. } => {
+                handler.os_process_isolated() && handler.supports_isolated_kill()
+            }
             ToolExecutionClass::CooperativeInProcess { .. } => true,
         };
         if !supports_required_termination {
@@ -390,10 +402,12 @@ impl TransactionToolDispatcher {
         let control = handle.control.clone();
         dispatch_guard.kill = handle.kill.clone();
         let kill = dispatch_guard.kill.clone();
-        // Post-start invariant: claimed Abortable/IsolatedKillable must return a kill handle.
+        // Post-start invariant: Abortable needs a kill handle; ProcessIsolated
+        // needs an OS-process kill handle (not Tokio abort).
         let kill_ok = match &policy {
-            ToolExecutionClass::AbortableAtYield { .. } | ToolExecutionClass::ProcessIsolated { .. } => {
-                kill.is_some()
+            ToolExecutionClass::AbortableAtYield { .. } => kill.is_some(),
+            ToolExecutionClass::ProcessIsolated { .. } => {
+                kill.as_ref().is_some_and(|k| k.is_process_isolated())
             }
             ToolExecutionClass::CooperativeInProcess { .. } => true,
         };

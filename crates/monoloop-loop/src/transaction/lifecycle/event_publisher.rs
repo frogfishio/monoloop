@@ -3,6 +3,7 @@
 //! Sole allocator of ordinary and terminal event sequences for one transaction.
 //! Waits for caller mailbox capacity here — never in the global supervisor loop.
 
+use super::session_identity::ensure_session;
 use monoloop_contracts::{
     ChannelId, EventEnqueueError, SessionId, TerminalEventDelivery, TransactionEndEvent,
     TransactionEvent, TransactionEventPayload, TransactionEventSender, TransactionId,
@@ -29,25 +30,6 @@ pub struct TerminalPublicationResult {
     pub delivery: TerminalEventDelivery,
     /// Last committed sequence (includes terminal if published).
     pub last_sequence: u64,
-}
-
-fn ensure_session(
-    session: &mut Option<SessionId>,
-    preferred: Option<SessionId>,
-    transaction_id: TransactionId,
-) -> SessionId {
-    if let Some(s) = session.clone() {
-        return s;
-    }
-    if let Some(s) = preferred {
-        *session = Some(s.clone());
-        return s;
-    }
-    let s = SessionId::try_new(format!("tx-{transaction_id}"))
-        .or_else(|_| SessionId::try_new("direct"))
-        .expect("session id");
-    *session = Some(s.clone());
-    s
 }
 
 /// Run the publisher until Seal completes (or the command channel closes).
@@ -107,9 +89,8 @@ pub async fn run_event_publisher(
                 let sid = ensure_session(&mut session, terminal.session_id.clone(), transaction_id);
                 let seq = next_seq;
                 terminal.emitted_events = seq;
-                if terminal.session_id.is_none() {
-                    terminal.session_id = Some(sid.clone());
-                }
+                // Envelope and EndedEvent payload must carry the same SessionId.
+                terminal.session_id = Some(sid.clone());
                 let event = TransactionEvent {
                     transaction_id,
                     channel_id: channel_id.clone(),

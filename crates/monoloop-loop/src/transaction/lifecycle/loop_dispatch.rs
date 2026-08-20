@@ -6,6 +6,7 @@
 //! `tool_unavailable` via Loop output mapped to transaction lifecycle events.
 
 use super::event_publisher::EventPublisherCommand;
+use super::session_identity::session_key_for;
 use super::task_spawner::{SpawnReject, TransactionTaskSpawner};
 use super::task_supervisor::TaskClass;
 use crate::registry::EmptyToolRegistry;
@@ -17,8 +18,7 @@ use monoloop_contracts::{
     CanonicalToolError, CanonicalToolResult, CanonicalToolResultOutcome, CanonicalUnit,
     CanonicalUnitEvent, ChannelId, ExchangeId, InterpreterOutputEvent, LoopEnd, LoopEndKind,
     LoopId, LoopLimits, LoopOutputEvent, LoopScope, MonoloopRunId, OutboundToolOutcome, SessionId,
-    SessionKey, ToolId, ToolLifecycleEvent, ToolRequestState, TransactionEventPayload,
-    TransactionId,
+    ToolId, ToolLifecycleEvent, ToolRequestState, TransactionEventPayload, TransactionId,
 };
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -43,21 +43,6 @@ pub enum LoopDispatchError {
     StartFailed,
     /// Loop ended with a non-drained failure kind.
     LoopFailed,
-}
-
-fn session_key_for(
-    channel_id: ChannelId,
-    session_id: Option<SessionId>,
-    transaction_id: TransactionId,
-) -> SessionKey {
-    // Sessionless DirectLlm: explicit transaction-scoped key for tool envelopes
-    // (not Grok resume identity; see DEFECTS residual if SessionKey becomes optional).
-    let sid = session_id.unwrap_or_else(|| {
-        SessionId::try_new(format!("tx-{transaction_id}"))
-            .or_else(|_| SessionId::try_new("direct"))
-            .expect("session id")
-    });
-    SessionKey::new(channel_id, sid)
 }
 
 /// True if any unit is Ready with name+payload.
@@ -130,8 +115,15 @@ pub async fn run_supervised_empty_loop(
         Ok(())
     };
 
+    // Prefer TaskSupervisor ownership (D-043): bounded Busy retries first.
+    const BUSY_RETRIES: u32 = 8;
     match tasks
-        .spawn(TaskClass::LoopRuntime(transaction_id), fut)
+        .spawn_with_busy_retry(
+            TaskClass::LoopRuntime(transaction_id),
+            fut,
+            BUSY_RETRIES,
+            || cancel.is_cancelled(),
+        )
         .await
     {
         Ok(_) => {
@@ -142,13 +134,23 @@ pub async fn run_supervised_empty_loop(
                 return Err(e);
             }
         }
-        Err(SpawnReject::Busy { future } | SpawnReject::Rejected { future }) => {
-            // Busy/Closed before accept: coordinator owns the future via join.
+        Err(SpawnReject::Busy { future }) => {
+            // Last resort after retries: coordinator-owned join (still owned, not ambient).
             if let Err(e) = drive_busy_loop(future, feed, &handle, &cancel).await {
                 handle.control.cancel();
                 let _ = await_loop_end(&handle, &cancel).await;
                 return Err(e);
             }
+        }
+        Err(SpawnReject::Rejected { future }) => {
+            // Supervisor closed, or cancel observed during Busy retry — do not drive.
+            drop(future);
+            handle.control.cancel();
+            return Err(if cancel.is_cancelled() {
+                LoopDispatchError::Cancelled
+            } else {
+                LoopDispatchError::StartFailed
+            });
         }
         Err(SpawnReject::Orphaned) => {
             // Future left this task; do not drive a substitute (Law 23/25).

@@ -35,14 +35,16 @@ Fake/HTTP/ACP `begin_open` paths. ACP ProcessInner pumps use `Weak`+JoinSet;
 Grok pending connect/session/exchange workers abort on Drop and join on `wait`;
 `GrokServerHandle::shutdown` / `ServerInner` Drop tear down `run_connection`.
 Deferred on-disk modules stay uncompiled until their stage. Legacy suites need
-`--features legacy_runtime_tests`. **M5 (partial):** Ready tool units run through
-canonical `DefaultLoopRuntime` under `TaskClass::LoopRuntime` (`prepare` +
-TaskSpawner; EmptyToolRegistry / NoToolRuntime). Lifecycle cancel is
-`StickyCancel`. Output/completion receivers are taken once (Law 21). Busy spawn
-falls back to coordinator-owned join. `ToolExecutionClass` names termination
-guarantees. `start` / `start_empty` deprecated. Remaining (D-043/D-044):
-process-isolated kill, MCP under TaskSupervisor, join-vault deletion,
-sessionless tool SessionKey policy.
+`--features legacy_runtime_tests`. **M5 (D-043/D-044 Fixed):** Ready tools via
+`DefaultLoopRuntime` + `TaskClass::LoopRuntime`; typed
+`try_new_process_isolated`; Busy supervisor retry; ambient `start` cfg-gated;
+MCP loopback `RuntimeService`; sessionless DirectLlm SessionKey = D-004.
+**M6 (partial, harden):** §22.5 generation CAS 0→1; `StoppedGate` / `block_stopped`;
+Finalizer tombstone (SessionKey until residual exit); WorkerExited `try_send` +
+coordinator `on_task_exit` terminal recovery; control/worker/start before
+`join_next` (Accepting not starved); `abort_and_drain` keeps joins (no false
+Stopped); grace abort without early SessionKey force-remove. Remaining: full
+adversarial §22 matrix, MCP gateway / non-empty tools (deferred), M7 façade.
 
 ## Agent assembly recipe (v2 / M2)
 

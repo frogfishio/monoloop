@@ -8,10 +8,10 @@ use monoloop_contracts::{
 };
 use monoloop_loop::{
     dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, EmptyToolRegistry, HostToolRegistry,
-    HostToolRuntime, ImmediateToolHandler, IsolatedKillableToolHandler, LostCompletionHandler,
-    PanicOnStartHandler, RegisteredTool, ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet,
-    SharedToolCapacity, StartFailHandler, StartToolExecution, ToolHandler, ToolRegistry,
-    ToolResolution, ToolRuntime, ToolUnavailableReason, TransactionToolDispatcher,
+    HostToolRuntime, ImmediateToolHandler, LostCompletionHandler, PanicOnStartHandler,
+    RegisteredTool, ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet, SharedToolCapacity,
+    StartFailHandler, StartToolExecution, ToolHandler, ToolRegistry, ToolResolution, ToolRuntime,
+    ToolUnavailableReason, TransactionToolDispatcher,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -643,11 +643,9 @@ async fn cancel_running_async_tool() {
     );
 }
 
-/// D-024: IsolatedKillable ignores cooperative cancel until kill; work stops after escalate.
+/// D-043: ProcessIsolated uses OS child; escalate kill stops work within deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn isolated_killable_escalates_after_grace_and_stops_work() {
-    let still_alive = Arc::new(AtomicBool::new(true));
-    let flag = Arc::clone(&still_alive);
+async fn process_isolated_escalates_after_grace_and_stops_work() {
     let spec = ToolSpec::try_new(
         ToolId::try_new("ik").unwrap(),
         ToolName::try_new("ik").unwrap(),
@@ -669,23 +667,9 @@ async fn isolated_killable_escalates_after_grace_and_stops_work() {
         },
     )
     .unwrap();
-    let host = HostToolRegistry::build(vec![RegisteredTool::try_new(
+    let host = HostToolRegistry::build(vec![RegisteredTool::try_new_process_isolated(
         spec,
-        Arc::new(IsolatedKillableToolHandler::new(move |_call, _ctx| {
-            let flag = Arc::clone(&flag);
-            Box::pin(async move {
-                // Ignore cancel: keep looping until the task is aborted by kill.
-                loop {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    if !flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-                }
-                ToolCompletion::Succeeded(CanonicalToolOutput::Json(
-                    serde_json::json!({"ok": true}),
-                ))
-            })
-        })) as Arc<dyn ToolHandler>,
+        monoloop_loop::ProcessIsolatedToolHandler::sleep_until_killed(3600),
     )
     .unwrap()])
     .unwrap();
@@ -718,14 +702,11 @@ async fn isolated_killable_escalates_after_grace_and_stops_work() {
         ),
         "expected terminate/deadline path, got {out:?}"
     );
-    // After kill+join, mark stopped so any leaked loop would exit; assert flag can be cleared.
-    still_alive.store(false, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-/// D-024: IsolatedKillable registration requires supports_isolated_kill.
+/// D-043: ProcessIsolated cannot register via dyn try_new (structural factory required).
 #[test]
-fn isolated_killable_requires_supports_isolated_kill() {
+fn process_isolated_requires_typed_factory() {
     let spec = ToolSpec::try_new(
         ToolId::try_new("bad").unwrap(),
         ToolName::try_new("bad").unwrap(),
@@ -747,13 +728,10 @@ fn isolated_killable_requires_supports_isolated_kill() {
         },
     )
     .unwrap();
-    // ImmediateToolHandler does not support isolated kill.
     let err = RegisteredTool::try_new(spec, ok_handler()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("ProcessIsolated")
-            || msg.contains("IsolatedKillable")
-            || msg.contains("supports_isolated_kill"),
+        msg.contains("try_new_process_isolated") || msg.contains("ProcessIsolated"),
         "got {msg}"
     );
 }

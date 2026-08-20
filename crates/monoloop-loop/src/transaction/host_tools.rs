@@ -6,12 +6,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Spec + linked handler pair registered at runtime startup.
+///
+/// Fields are private so callers cannot bypass [`Self::try_new`] /
+/// [`Self::try_new_process_isolated`] via struct literals (V2 §14.3 / D-043).
 #[derive(Clone)]
 pub struct RegisteredTool {
-    /// Canonical specification.
-    pub spec: ToolSpec,
-    /// Linked implementation.
-    pub handler: Arc<dyn ToolHandler>,
+    spec: ToolSpec,
+    handler: Arc<dyn ToolHandler>,
 }
 
 impl std::fmt::Debug for RegisteredTool {
@@ -24,14 +25,29 @@ impl std::fmt::Debug for RegisteredTool {
 }
 
 impl RegisteredTool {
+    /// Canonical specification.
+    pub fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    /// Linked implementation.
+    pub fn handler(&self) -> &Arc<dyn ToolHandler> {
+        &self.handler
+    }
+
     /// Construct a registered tool.
     ///
     /// Prefer [`Self::try_new`] so cancellation policy is checked against the handler.
+    /// Panics if the class/handler pair is invalid — use [`Self::try_new`] in fallible paths.
     pub fn new(spec: ToolSpec, handler: Arc<dyn ToolHandler>) -> Self {
         Self::try_new(spec, handler).expect("handler supports declared ToolExecutionClass")
     }
 
     /// Construct a registered tool, rejecting unstoppable / mismatched class (D-024).
+    ///
+    /// [`ToolExecutionClass::ProcessIsolated`] MUST use
+    /// [`Self::try_new_process_isolated`] with a concrete
+    /// [`super::process_tool::ProcessIsolatedToolHandler`] (V2 §14.3 structural factory).
     pub fn try_new(
         spec: ToolSpec,
         handler: Arc<dyn ToolHandler>,
@@ -46,11 +62,11 @@ impl RegisteredTool {
                 }
             }
             ToolExecutionClass::ProcessIsolated { .. } => {
-                if !handler.supports_isolated_kill() {
-                    return Err(super::StartupError::ToolRegistry(
-                        "ProcessIsolated tool requires supports_isolated_kill handler",
-                    ));
-                }
+                // Close the boolean-only gate: dyn handlers cannot self-assert
+                // ProcessIsolated. Use try_new_process_isolated.
+                return Err(super::StartupError::ToolRegistry(
+                    "ProcessIsolated requires try_new_process_isolated(ProcessIsolatedToolHandler)",
+                ));
             }
             ToolExecutionClass::CooperativeInProcess { .. } => {
                 // Cooperative cancel is best-effort. Sync/immediate handlers may
@@ -58,6 +74,34 @@ impl RegisteredTool {
             }
         }
         Ok(Self { spec, handler })
+    }
+
+    /// Structural ProcessIsolated registration (V2 §14.3 / D-043).
+    ///
+    /// Only a concrete [`super::process_tool::ProcessIsolatedToolHandler`] may
+    /// satisfy this class — capability booleans on `dyn ToolHandler` are rejected.
+    pub fn try_new_process_isolated(
+        spec: ToolSpec,
+        handler: super::process_tool::ProcessIsolatedToolHandler,
+    ) -> Result<Self, super::StartupError> {
+        use monoloop_contracts::ToolExecutionClass;
+        match &spec.execution_class {
+            ToolExecutionClass::ProcessIsolated { .. } => {}
+            _ => {
+                return Err(super::StartupError::ToolRegistry(
+                    "try_new_process_isolated requires ToolExecutionClass::ProcessIsolated",
+                ));
+            }
+        }
+        if !handler.os_process_isolated() || !handler.supports_isolated_kill() {
+            return Err(super::StartupError::ToolRegistry(
+                "ProcessIsolatedToolHandler must expose os_process_isolated + supports_isolated_kill",
+            ));
+        }
+        Ok(Self {
+            spec,
+            handler: Arc::new(handler),
+        })
     }
 }
 
@@ -76,13 +120,22 @@ impl HostToolRegistry {
 
     /// Build from registered tools; rejects duplicate ids/names.
     ///
-    /// Every entry already carries a [`monoloop_contracts::ToolExecutionClass`]
-    /// on its spec (validated by [`monoloop_contracts::ToolSpec::try_new`]);
-    /// unstoppable handlers are rejected by not offering that class.
+    /// Re-validates ProcessIsolated entries so a forged `RegisteredTool` cannot
+    /// enter the registry without an OS-process handler (D-043).
     pub fn build(tools: Vec<RegisteredTool>) -> Result<Self, super::StartupError> {
+        use monoloop_contracts::ToolExecutionClass;
         let mut by_id = HashMap::with_capacity(tools.len());
         let mut by_name = HashMap::with_capacity(tools.len());
         for tool in tools {
+            if matches!(
+                tool.spec.execution_class,
+                ToolExecutionClass::ProcessIsolated { .. }
+            ) && !tool.handler.os_process_isolated()
+            {
+                return Err(super::StartupError::ToolRegistry(
+                    "ProcessIsolated entry lacks os_process_isolated handler",
+                ));
+            }
             // Schema root object already enforced by JsonSchema::try_new.
             let schema_bytes = serde_json::to_vec(tool.spec.input_schema.as_value())
                 .map(|b| b.len())

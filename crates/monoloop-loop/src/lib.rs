@@ -37,13 +37,14 @@ pub use transaction::{
     HostCompletionAdapter, HostEventAdapter, HostToolRegistry, ImmediateToolHandler,
     InputValidationFailure, IsolatedKillableToolHandler, LedgerEntry, LifecycleLedger,
     LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler, OpenAiChatCompletionsEncoder,
-    OpenAiEncoderOptions, OutputValidationFailure, PanicOnStartHandler, RegisteredTool,
-    RejectEncoder, ReservationPool, ReservationPoolError, ResolvedTool, ResolvedToolSet,
-    RuntimeBootstrap, RuntimeConfig, RuntimeOwner, RuntimeState, SharedToolCapacity,
-    ShutdownTicket, StartFailHandler, StartedRuntime, StartupError, SupervisorCommand, TaskClass,
-    TaskExit, TaskId, TaskSupervisor, TerminalDecision, TerminalProposal, TestTextEncoder,
-    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionPhase,
-    TransactionReservations, TransactionRuntimeHandle, TransactionToolCapacity,
+    OpenAiEncoderOptions, OutputValidationFailure, PanicOnStartHandler, ProcessIsolatedToolHandler,
+    ProcessToolCommand, RegisteredTool, RejectEncoder, ReservationPool, ReservationPoolError,
+    ResolvedTool, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeOwner, RuntimeState,
+    SharedToolCapacity, ShutdownTicket, StartFailHandler, StartedRuntime, StartupError, StoppedGate,
+    SupervisorCommand, TaskClass, TaskExit, TaskId, TaskSupervisor, TerminalDecision,
+    TerminalProposal, TestTextEncoder, ToolExecutionCompletion, ToolExecutionControl, ToolHandler,
+    ToolKillHandle, TransactionPhase, TransactionReservations, TransactionRuntimeHandle,
+    TransactionToolCapacity,
 };
 
 pub use monoloop_contracts::{

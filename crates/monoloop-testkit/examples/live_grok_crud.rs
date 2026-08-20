@@ -165,8 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Bounded wait: real model + tools, but never hang an operator forever.
     let result =
-        match tokio::time::timeout(Duration::from_secs(prompt_timeout_secs), exchange.wait())
-            .await
+        match tokio::time::timeout(Duration::from_secs(prompt_timeout_secs), exchange.wait()).await
         {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(format!("session/prompt failed: {e}").into()),

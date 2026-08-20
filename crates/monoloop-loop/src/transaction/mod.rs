@@ -15,6 +15,7 @@ mod fake_support;
 mod host_tools;
 pub mod lifecycle;
 mod openai_encoder;
+mod process_tool;
 mod resolved_tools;
 mod state;
 mod sticky_cancel;
@@ -32,7 +33,7 @@ mod validation;
 // mod spawn_gate;
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
-pub use bootstrap::{RuntimeBootstrap, RuntimeConfig};
+pub use bootstrap::{RuntimeBootstrap, RuntimeConfig, StoppedGate};
 pub use capacity::CapacityManagers;
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
 pub use error::StartupError;
@@ -47,6 +48,7 @@ pub use lifecycle::{
 };
 
 pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};
+pub use process_tool::{ProcessIsolatedToolHandler, ProcessToolCommand};
 pub use resolved_tools::{ResolvedTool, ResolvedToolSet};
 pub use state::RuntimeState;
 pub use tool_capacity::{SharedToolCapacity, TransactionToolCapacity};
