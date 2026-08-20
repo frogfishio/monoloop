@@ -138,6 +138,23 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
     )
     .await;
 
+    // §22.6: establish external session before ordinary events when Connector
+    // returned an authoritative id (SessionEstablished at sequence 1).
+    if let Some(external) = outcome.external_session_id.clone() {
+        let send = publish_tx.send(EventPublisherCommand::EstablishExternal(external));
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return TerminalProposal::new(TransactionEndKind::Cancelled);
+            }
+            res = send => {
+                if res.is_err() {
+                    return TerminalProposal::new(TransactionEndKind::EventDeliveryFailed);
+                }
+            }
+        }
+    }
+
     // Publish complete units without silent drop (LAW 24).
     let mut terminal = outcome.terminal;
     for unit in &outcome.units {

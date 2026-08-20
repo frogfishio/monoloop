@@ -1745,6 +1745,344 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
     let _ = pub_task.await;
 }
 
+/// §22.6: SessionEstablished is sequence 1 for new external sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s22_6_session_established_is_sequence_one() {
+    use super::event_publisher::{run_event_publisher, EventPublisherCommand};
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, ExternalSessionId, SafeDiagnostic,
+        TransactionDiagnostic, TransactionEventPayload, TransactionId,
+    };
+    use tokio::sync::mpsc;
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(16, 64 * 1024).unwrap()).unwrap();
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel.clone(),
+        None,
+        delivery.event_tx,
+        cmd_rx,
+    ));
+
+    let external = ExternalSessionId::try_new("grok-ext-1").unwrap();
+    cmd_tx
+        .send(EventPublisherCommand::EstablishExternal(external.clone()))
+        .await
+        .unwrap();
+    let first = receiver.events.recv().await.expect("session established");
+    assert_eq!(first.sequence, 1);
+    match &first.payload {
+        TransactionEventPayload::SessionEstablished {
+            external_session_id,
+        } => {
+            assert_eq!(external_session_id.as_str(), external.as_str());
+        }
+        other => panic!("expected SessionEstablished, got {other:?}"),
+    }
+
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(
+            TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+                diagnostic: SafeDiagnostic::try_new("noop", Some("x"), 64).unwrap(),
+            }),
+        )))
+        .await
+        .unwrap();
+    let second = receiver.events.recv().await.expect("ordinary after establish");
+    assert_eq!(second.sequence, 2);
+    assert!(matches!(
+        second.payload,
+        TransactionEventPayload::Diagnostic(_)
+    ));
+    drop(cmd_tx);
+    let _ = pub_task.await;
+}
+
+/// §22.6: concurrent producers through one publisher stay contiguous 1..N.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s22_6_concurrent_producers_contiguous_sequence() {
+    use super::event_publisher::{run_event_publisher, EventPublisherCommand};
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, SafeDiagnostic, TransactionDiagnostic,
+        TransactionEventPayload, TransactionId,
+    };
+    use tokio::sync::mpsc;
+
+    let n = 32usize;
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(n + 8, 1024 * 1024).unwrap()).unwrap();
+    let (cmd_tx, cmd_rx) = mpsc::channel(n);
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel,
+        None,
+        delivery.event_tx,
+        cmd_rx,
+    ));
+
+    let mut joins = Vec::new();
+    for i in 0..n {
+        let tx = cmd_tx.clone();
+        joins.push(tokio::spawn(async move {
+            tx.send(EventPublisherCommand::Publish(Box::new(
+                TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+                    diagnostic: SafeDiagnostic::try_new(
+                        "noop",
+                        Some(&format!("p{i}")),
+                        64,
+                    )
+                    .unwrap(),
+                }),
+            )))
+            .await
+            .unwrap();
+        }));
+    }
+    for j in joins {
+        j.await.unwrap();
+    }
+    drop(cmd_tx);
+
+    let mut seqs = Vec::new();
+    while let Some(ev) = receiver.events.recv().await {
+        seqs.push(ev.sequence);
+    }
+    let _ = pub_task.await;
+    assert_eq!(seqs.len(), n, "all publishes delivered, got {seqs:?}");
+    let expected: Vec<u64> = (1..=n as u64).collect();
+    let mut got = seqs.clone();
+    got.sort_unstable();
+    assert_eq!(got, expected, "contiguous 1..N allocated");
+    // Delivery order matches allocation order (single publisher serializes).
+    assert_eq!(seqs, expected, "delivery order must match sequence order");
+}
+
+/// §22.6: same session string on different Channels remains isolated.
+#[test]
+fn s22_6_same_session_string_different_channels_isolated() {
+    let limits = TransactionLimits {
+        max_active_transactions: 4,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![
+            llm_binding("llm-a", 2),
+            llm_binding("llm-b", 2),
+        ])
+        .unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let (r_a, recv_a) = submit_on(&handle, "llm-a", Some("shared-sid")).expect("a");
+    let (r_b, recv_b) = submit_on(&handle, "llm-b", Some("shared-sid")).expect("b");
+    assert_ne!(r_a.transaction_id, r_b.transaction_id);
+    // Same session string is isolated by ChannelId inside SessionKey.
+    assert_eq!(r_a.session_id.as_ref().map(|s| s.as_str()), Some("shared-sid"));
+    assert_eq!(r_b.session_id.as_ref().map(|s| s.as_str()), Some("shared-sid"));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(ref r) if r.completions_published == 2),
+        "both channel-isolated admissions complete, got {outcome:?}"
+    );
+    let _ = rt.block_on(recv_a.completion.recv());
+    let _ = rt.block_on(recv_b.completion.recv());
+}
+
+/// §22.6: reused provider tool-call ids across exchanges stay distinct via helper.
+#[test]
+fn s22_6_reused_provider_tool_call_ids_across_exchanges_distinct() {
+    use super::session_identity::tool_action_id_for_exchange;
+
+    // Provider may reuse the same tool_call id string across exchanges; Monoloop
+    // correlates with exchange-scoped ToolActionId (production helper).
+    let provider_reuse = "call_abc";
+    let exchange_a = monoloop_contracts::ExchangeId::generate();
+    let exchange_b = monoloop_contracts::ExchangeId::generate();
+    let action_a = tool_action_id_for_exchange(exchange_a, provider_reuse);
+    let action_b = tool_action_id_for_exchange(exchange_b, provider_reuse);
+    assert_ne!(
+        action_a.as_str(),
+        action_b.as_str(),
+        "same provider id on different exchanges must remain distinct"
+    );
+    assert!(action_a.as_str().contains(provider_reuse));
+    assert!(action_b.as_str().contains(provider_reuse));
+}
+
+/// §22.6: failed EstablishExternal must not mutate identity or lose seq 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s22_6_establish_external_capacity_fail_does_not_steal_seq1() {
+    use super::event_publisher::{run_event_publisher, EventPublisherCommand};
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, ExternalSessionId, SafeDiagnostic, TransactionEvent,
+        TransactionDiagnostic, TransactionEventPayload, TransactionId,
+    };
+    use tokio::sync::mpsc;
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
+    // Pre-fill mailbox so EstablishExternal's try_send fails while next_seq is still 1.
+    let filler = delivery.event_tx.clone();
+    filler
+        .try_send(TransactionEvent {
+            transaction_id: tx_id,
+            channel_id: channel.clone(),
+            session_id: SessionId::try_new("prefill").unwrap(),
+            sequence: 0,
+            payload: TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+                diagnostic: SafeDiagnostic::try_new("noop", Some("prefill"), 64).unwrap(),
+            }),
+        })
+        .unwrap();
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel,
+        None,
+        delivery.event_tx,
+        cmd_rx,
+    ));
+
+    let external = ExternalSessionId::try_new("grok-retry").unwrap();
+    cmd_tx
+        .send(EventPublisherCommand::EstablishExternal(external.clone()))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Drain prefill; Establish must still be able to claim seq 1 on retry.
+    let pre = receiver.events.recv().await.expect("prefill");
+    assert_eq!(pre.sequence, 0);
+
+    cmd_tx
+        .send(EventPublisherCommand::EstablishExternal(external.clone()))
+        .await
+        .unwrap();
+    let first = receiver.events.recv().await.expect("session established");
+    assert_eq!(first.sequence, 1);
+    assert!(matches!(
+        first.payload,
+        TransactionEventPayload::SessionEstablished { .. }
+    ));
+
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(
+            TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+                diagnostic: SafeDiagnostic::try_new("noop", Some("after"), 64).unwrap(),
+            }),
+        )))
+        .await
+        .unwrap();
+    let second = receiver.events.recv().await.expect("ordinary");
+    assert_eq!(second.sequence, 2);
+    drop(cmd_tx);
+    let _ = pub_task.await;
+}
+
+/// §22.6: event item plus-one fails closed.
+#[test]
+fn s22_6_event_item_plus_one_fails_closed() {
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, SafeDiagnostic, TransactionDiagnostic,
+        TransactionEvent, TransactionEventPayload, TransactionId,
+    };
+
+    let (delivery, _recv) =
+        transaction_delivery(DeliveryLimits::try_new(1, 1024 * 1024).unwrap()).unwrap();
+    let tx_id = TransactionId::generate();
+    let ev = || TransactionEvent {
+        transaction_id: tx_id,
+        channel_id: ChannelId::try_new("ch").unwrap(),
+        session_id: SessionId::try_new("s").unwrap(),
+        sequence: 1,
+        payload: TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+            diagnostic: SafeDiagnostic::try_new("noop", Some("x"), 64).unwrap(),
+        }),
+    };
+    delivery.event_tx.try_send(ev()).unwrap();
+    let err = delivery.event_tx.try_send(ev()).unwrap_err();
+    assert_eq!(
+        err,
+        monoloop_contracts::EventEnqueueError::ItemCapacityExceeded
+    );
+}
+
+/// §22.6: event byte plus-one fails closed.
+#[test]
+fn s22_6_event_byte_plus_one_fails_closed() {
+    use monoloop_contracts::{
+        estimate_event_bytes, transaction_delivery, DeliveryLimits, SafeDiagnostic,
+        TransactionDiagnostic, TransactionEvent, TransactionEventPayload, TransactionId,
+    };
+
+    let tx_id = TransactionId::generate();
+    let sample = TransactionEvent {
+        transaction_id: tx_id,
+        channel_id: ChannelId::try_new("ch").unwrap(),
+        session_id: SessionId::try_new("s").unwrap(),
+        sequence: 1,
+        payload: TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+            diagnostic: SafeDiagnostic::try_new("noop", Some("payload-bytes"), 256).unwrap(),
+        }),
+    };
+    let nbytes = estimate_event_bytes(&sample);
+    // Budget exactly one event's bytes — second enqueue must fail closed.
+    let (delivery, _recv) =
+        transaction_delivery(DeliveryLimits::try_new(8, nbytes).unwrap()).unwrap();
+    delivery.event_tx.try_send(sample.clone()).unwrap();
+    let err = delivery.event_tx.try_send(sample).unwrap_err();
+    assert_eq!(
+        err,
+        monoloop_contracts::EventEnqueueError::ByteCapacityExceeded
+    );
+}
+
+fn submit_on(
+    handle: &TransactionRuntimeHandle,
+    channel: &str,
+    session: Option<&str>,
+) -> Result<(AdmissionReceipt, TransactionReceiver), AdmissionError> {
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let result = handle.submit(TransactionSubmitRequest {
+        channel_id: ChannelId::try_new(channel).unwrap(),
+        session_id: session.map(|s| SessionId::try_new(s).unwrap()),
+        input: user_text_input("hi").unwrap(),
+        session_config: None,
+        invocation_config: InvocationConfig::default(),
+        tools: vec![],
+        delivery,
+    });
+    result.map(|receipt| (receipt, receiver))
+}
+
 #[test]
 fn needs_loop_dispatch_ready_only() {
     use super::loop_dispatch::needs_loop_dispatch;

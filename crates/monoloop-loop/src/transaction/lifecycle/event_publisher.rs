@@ -1,17 +1,24 @@
-//! Per-transaction event publisher (v2 §12).
+//! Per-transaction event publisher (v2 §12 / §22.6).
 //!
 //! Sole allocator of ordinary and terminal event sequences for one transaction.
 //! Waits for caller mailbox capacity here — never in the global supervisor loop.
 
 use super::session_identity::ensure_session;
 use monoloop_contracts::{
-    ChannelId, EventEnqueueError, SessionId, TerminalEventDelivery, TransactionEndEvent,
-    TransactionEvent, TransactionEventPayload, TransactionEventSender, TransactionId,
+    ChannelId, EventEnqueueError, ExternalSessionId, SessionId, TerminalEventDelivery,
+    TransactionEndEvent, TransactionEvent, TransactionEventPayload, TransactionEventSender,
+    TransactionId,
 };
 use tokio::sync::{mpsc, oneshot};
 
 /// Commands from the coordinator (Publish) or supervisor (Seal).
 pub enum EventPublisherCommand {
+    /// Establish an external session before ordinary events (§22.6).
+    ///
+    /// When this is the first successful enqueue, publishes `SessionEstablished`
+    /// at sequence 1. Ignored if a session was already established or sequences
+    /// have already advanced (cannot satisfy seq-1).
+    EstablishExternal(ExternalSessionId),
     /// Publish one ordinary payload (sequence allocated after capacity reserved).
     Publish(Box<TransactionEventPayload>),
     /// Allocate terminal sequence, enqueue EndedEvent, reply with result.
@@ -44,9 +51,36 @@ pub async fn run_event_publisher(
     let mut last_committed: u64 = 0;
     let mut sealed = false;
     let mut session = session_id;
+    let mut session_established = false;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
+            EventPublisherCommand::EstablishExternal(external) if sealed => {}
+            EventPublisherCommand::EstablishExternal(external) => {
+                match try_establish_external(
+                    &event_tx,
+                    transaction_id,
+                    &channel_id,
+                    external,
+                    &mut session,
+                    &mut next_seq,
+                    &mut last_committed,
+                    &mut session_established,
+                ) {
+                    Ok(()) => {}
+                    Err(EventEnqueueError::Closed) => {
+                        return TerminalPublicationResult {
+                            delivery: TerminalEventDelivery::QueueClosed,
+                            last_sequence: last_committed,
+                        };
+                    }
+                    Err(EventEnqueueError::ItemCapacityExceeded)
+                    | Err(EventEnqueueError::ByteCapacityExceeded)
+                    | Err(EventEnqueueError::EventTooLarge) => {
+                        // Do not consume sequence.
+                    }
+                }
+            }
             EventPublisherCommand::Publish(_) if sealed => {}
             EventPublisherCommand::Publish(payload) => {
                 let payload = *payload;
@@ -121,5 +155,47 @@ pub async fn run_event_publisher(
     TerminalPublicationResult {
         delivery: TerminalEventDelivery::QueueClosed,
         last_sequence: last_committed,
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // publisher state machine locals
+fn try_establish_external(
+    event_tx: &TransactionEventSender,
+    transaction_id: TransactionId,
+    channel_id: &ChannelId,
+    external: ExternalSessionId,
+    session: &mut Option<SessionId>,
+    next_seq: &mut u64,
+    last_committed: &mut u64,
+    session_established: &mut bool,
+) -> Result<(), EventEnqueueError> {
+    if *session_established {
+        return Ok(());
+    }
+    // §22.6: SessionEstablished must be sequence 1 for new external sessions.
+    if *next_seq != 1 {
+        return Ok(());
+    }
+    // Commit identity only after enqueue succeeds (§22.6 fail-closed).
+    let sid = SessionId::from_external(&external);
+    let seq = *next_seq;
+    let event = TransactionEvent {
+        transaction_id,
+        channel_id: channel_id.clone(),
+        session_id: sid.clone(),
+        sequence: seq,
+        payload: TransactionEventPayload::SessionEstablished {
+            external_session_id: external,
+        },
+    };
+    match event_tx.try_send(event) {
+        Ok(()) => {
+            let _ = ensure_session(session, Some(sid), transaction_id);
+            *last_committed = seq;
+            *next_seq = seq.saturating_add(1);
+            *session_established = true;
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }

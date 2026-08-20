@@ -1,6 +1,20 @@
 //! Session identity helpers for lifecycle envelopes (DECISIONS D-004 / D-044).
 
-use monoloop_contracts::{ChannelId, SessionId, SessionKey, TransactionId};
+use monoloop_contracts::{
+    ChannelId, ExchangeId, SessionId, SessionKey, ToolActionId, TransactionId,
+};
+
+/// Exchange-scoped tool action id so reused provider call ids stay distinct (§22.6).
+///
+/// Used by §22.6 proofs today; interpreter/loop feed paths should adopt this
+/// when assigning action ids from provider tool-call ids.
+#[allow(dead_code)]
+pub(crate) fn tool_action_id_for_exchange(
+    exchange_id: ExchangeId,
+    provider_tool_call_id: &str,
+) -> ToolActionId {
+    ToolActionId::new(format!("{exchange_id}:{provider_tool_call_id}"))
+}
 
 /// Transaction-scoped SessionId for sessionless DirectLlm tool/event envelopes.
 ///

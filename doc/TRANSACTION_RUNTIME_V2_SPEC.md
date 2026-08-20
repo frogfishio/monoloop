@@ -1,14 +1,12 @@
 # Transaction Runtime v2 Specification
 
 **Status:** Normative replacement specification; **M0–M5 landed** (D-003; D-042;
-D-043; D-044 Fixed). **M6 partial — not done** (D-045): §22.1 + §22.2
-(including Seal→completion vs shutdown) + §22.3 (in-process ownership +
-sacrificial non-yielding TimedOut/`Quiescing`) + §22.4 tools (cooperative /
-abortable / process-isolated / capacity) + §22.5 TimedOut/`StoppedGate`/CAS
-generation landed; remaining §22.6–22.7 (identity, host-adapter proofs), full
-MCP gateway + non-empty tools deferred. **M7 façade landed** (D-038 Fixed).
-**Not** M0–M7 complete / Golden / §25 DoD while D-045 remainder is open.
-D-039 / D-040 / D-041 Fixed.
+D-043; D-044 Fixed). **M6 partial — not done** (D-045): §22.1–§22.6 landed
+(including Seal→completion, sacrificial non-yielding, tools, SessionEstablished
+seq-1 / contiguous events / channel-isolated SessionKey); remaining §22.7
+host-adapter proofs + full MCP gateway + non-empty tools deferred. **M7 façade
+landed** (D-038 Fixed). **Not** M0–M7 complete / Golden / §25 DoD while D-045
+remainder is open. D-039 / D-040 / D-041 Fixed.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

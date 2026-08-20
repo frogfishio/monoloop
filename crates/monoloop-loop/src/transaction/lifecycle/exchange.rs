@@ -30,6 +30,8 @@ pub struct DirectExchangeOutcome {
     pub terminal: TransactionEndKind,
     /// Exchange identity (empty-tool / Loop correlation).
     pub exchange_id: ExchangeId,
+    /// Authoritative external session when the Connector returned one (§22.6).
+    pub external_session_id: Option<monoloop_contracts::ExternalSessionId>,
 }
 
 /// Failure before a successful terminal mapping.
@@ -146,15 +148,17 @@ pub async fn run_direct_llm_exchange(
     )
     .await
     {
-        Ok(units) => DirectExchangeOutcome {
+        Ok((units, external_session_id)) => DirectExchangeOutcome {
             units,
             terminal: TransactionEndKind::Completed,
             exchange_id,
+            external_session_id,
         },
         Err(f) => DirectExchangeOutcome {
             units: vec![],
             terminal: f.to_terminal(),
             exchange_id,
+            external_session_id: None,
         },
     }
 }
@@ -177,7 +181,13 @@ async fn run_inner(
     max_encoded_exchange_bytes: usize,
     max_retained_unit_bytes: usize,
     max_remaining_provider_input_bytes: usize,
-) -> Result<Vec<CanonicalUnitEvent>, ExchangeFailure> {
+) -> Result<
+    (
+        Vec<CanonicalUnitEvent>,
+        Option<monoloop_contracts::ExternalSessionId>,
+    ),
+    ExchangeFailure,
+> {
     let encoded = encoder
         .encode_initial(monoloop_contracts::InitialEncodeRequest {
             transaction_id: &transaction_id,
@@ -462,9 +472,10 @@ async fn run_inner(
     // Always await supervised children concurrently within cleanup_deadline.
     children.wait(cleanup_deadline).await;
 
+    let external_session_id = opened.external_session_id.clone();
     result?;
     let collected = units.lock().await.clone();
-    Ok(collected)
+    Ok((collected, external_session_id))
 }
 
 async fn fail_cleanup(
@@ -472,7 +483,13 @@ async fn fail_cleanup(
     children: ChildJoins,
     grace: Duration,
     err: ExchangeFailure,
-) -> Result<Vec<CanonicalUnitEvent>, ExchangeFailure> {
+) -> Result<
+    (
+        Vec<CanonicalUnitEvent>,
+        Option<monoloop_contracts::ExternalSessionId>,
+    ),
+    ExchangeFailure,
+> {
     let _ = control.terminate(TerminationReason::CallerForced);
     children.wait(grace).await;
     Err(err)

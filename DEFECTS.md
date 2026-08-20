@@ -1812,7 +1812,10 @@ no event after Seal, failed enqueue consumes no sequence. **M6 still partial**
 - [x] §22.4 tools: cooperative ack/non-ack, abortable permit-until-join,
       capacity while owned, process-isolated kill+reap, structural class claim
       (`tests/s22_4_tools.rs`; dispatcher + ToolJoinVault restored)
-- [ ] §22.6 events/identity proofs
+- [x] §22.6 events/identity: `EstablishExternal` → `SessionEstablished` seq 1;
+      concurrent producers contiguous; same session string / different Channels
+      isolated; provider tool-call id reuse distinct via exchange-scoped action id;
+      item + byte plus-one fail closed (`s22_6_*`)
 - [ ] §22.7 host-adapter adversarial proofs (outside core; not next)
 
 **Advisor (2026-08-20, §22.3 vs pause):** **Pause the sacrificial
@@ -1846,6 +1849,17 @@ set — no `mem::forget`, no JoinOnly abort, no false capacity free). Landed
 `tests/s22_4_tools.rs` (6) + registered `linked_tools` (14). **§22.4 matrix
 complete** with residual: process-scoped pending is over-hold until process
 exit / future supervisor drain (not false free; not Stopped-linked yet).
-M6 still partial (§22.6–22.7 + MCP/non-empty tools). **Not** Golden / §25.
 
-**Next pick:** **§22.6** events/identity — **not** host adapters (§22.7).
+**§22.6 events/identity (2026-08-20):** `EventPublisherCommand::EstablishExternal`
+publishes `SessionEstablished` at sequence 1 (identity commit only after
+enqueue success; capacity-fail retry proof). Coordinator sends
+`EstablishExternal` when DirectLlm exchange returns `external_session_id`.
+Concurrent Publish contiguous 1..N; same session string / different Channels
+isolated; `tool_action_id_for_exchange` helper + proof; item/byte plus-one
+fail closed. Residual: Fake DirectLlm often returns no external id (no e2e
+SessionEstablished on echo path); helper not yet adopted by interpreter feed.
+**§22.6 closed enough for bar with residuals.** M6 still partial (§22.7 +
+MCP/non-empty tools). **Not** Golden / §25.
+
+**Next pick:** MCP/non-empty tools (kernel) **or** §22.7 host adapters
+(outside core) — do not promote M6/Golden/§25.

@@ -199,13 +199,16 @@ pub async fn run_supervised_empty_loop(
                     256,
                 )
                 .expect("static error");
+                // Preserve Loop's action id; keep provider correlation distinct
+                // from exchange-scoped construction helper (§22.6).
+                let provider_tool_call_id = r.tool_action_id.as_str().to_string();
                 let result = CanonicalToolResult {
                     transaction_id,
                     session_key: session_key.clone(),
                     exchange_id,
                     tool_action_id: r.tool_action_id.clone(),
                     tool_id,
-                    provider_tool_call_id: r.tool_action_id.as_str().to_string(),
+                    provider_tool_call_id,
                     request_ordinal: 0,
                     outcome: CanonicalToolResultOutcome::DomainFailed(err),
                 };

@@ -6,6 +6,7 @@
 
 use crate::transaction::{TransactionCompletion, TransactionEvent};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -60,11 +61,11 @@ pub enum CompletionPublishResult {
 }
 
 /// Runtime-held half of the event mailbox.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TransactionEventSender {
     tx: mpsc::Sender<TransactionEvent>,
     /// Approximate bytes currently queued (best-effort accounting).
-    queued_bytes: AtomicU64,
+    queued_bytes: Arc<AtomicU64>,
     max_event_bytes: usize,
 }
 
@@ -115,7 +116,7 @@ pub fn transaction_delivery(
         TransactionDelivery {
             event_tx: TransactionEventSender {
                 tx: event_tx,
-                queued_bytes: AtomicU64::new(0),
+                queued_bytes: Arc::new(AtomicU64::new(0)),
                 max_event_bytes: limits.max_event_bytes,
             },
             completion_tx: TransactionCompletionSender {
