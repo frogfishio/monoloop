@@ -1989,5 +1989,16 @@ Prior vault/Stopped/process-global **P1 closed**. M6 §22 closed-enough
 **still holds**. Handler-level `tokio::spawn` + M5.4 delete-vaults end state
 remain Golden blockers. Do **not** promote Golden / §25.
 
-**Next pick:** Route handler-internal spawns under TaskSupervisor **or**
-RuntimeOwner JoinOnly↔Stopped proof + remaining §23 extras.
+**JoinOnly↔Stopped RuntimeOwner proof (2026-08-20):** Closed the P2 coverage
+gap from the spill gate. Test-only `JoinOnlySpillInject` parks a cooperative
+JoinOnly join on `RuntimeShared.tool_spill` at supervisor start.
+`join_only_spill_blocks_stopped_until_released` proves short `wait_stopped` →
+`TimedOut` + `Quiescing` with `tool_spill_pending() >= 1`, then release →
+`Stopped` with spill empty. Production leaves inject `None`.
+
+**Expert + Advisor (2026-08-20, JoinOnly proof gate):** **PASS — Silver.**
+Spill-gate P2 coverage closed. M6 §22 closed-enough **still holds**. Handler
+ambient spawn + M5.4 remain Golden blockers. Do **not** promote Golden / §25.
+
+**Next pick:** Route handler-internal spawns under TaskSupervisor (M5.4) **or**
+remaining §23 extras. Do not promote Golden / §25.

@@ -125,6 +125,51 @@ impl FinalizerHoldGate {
     }
 }
 
+/// Test-only inject: park a JoinOnly tool join on the runtime spill (§22.4 / Law 23).
+///
+/// Proves `wait_stopped` stays Quiescing while cooperative JoinOnly work is
+/// parked, then reaches Stopped after [`JoinOnlySpillInject::release`].
+/// Production leaves [`RuntimeConfig::inject_join_only_spill`] as `None`.
+#[derive(Debug)]
+pub struct JoinOnlySpillInject {
+    entered: AtomicBool,
+    release: StoppedGate,
+}
+
+impl Default for JoinOnlySpillInject {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JoinOnlySpillInject {
+    /// New inject; JoinOnly wait starts blocked until [`Self::release`].
+    pub fn new() -> Self {
+        Self {
+            entered: AtomicBool::new(false),
+            release: StoppedGate::new(),
+        }
+    }
+
+    /// True once the supervisor has parked the JoinOnly join on the spill.
+    pub fn is_entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_entered(&self) {
+        self.entered.store(true, Ordering::SeqCst);
+    }
+
+    /// Allow the parked JoinOnly join to finish (unblocks Stopped).
+    pub fn release(&self) {
+        self.release.release();
+    }
+
+    pub(crate) async fn wait_released(&self) {
+        self.release.wait_released().await;
+    }
+}
+
 /// Runtime-wide configuration validated at startup.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -151,6 +196,9 @@ pub struct RuntimeConfig {
     /// stores `true` on this flag immediately before parking (§22.3 sacrificial).
     /// Production leaves this `None`.
     pub inject_non_yielding_service: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// When `Some`, supervisor parks a JoinOnly tool join on `tool_spill` at
+    /// start (Stopped-vs-spill proof). Production leaves this `None`.
+    pub inject_join_only_spill: Option<Arc<JoinOnlySpillInject>>,
 }
 
 impl Default for RuntimeConfig {
@@ -165,6 +213,7 @@ impl Default for RuntimeConfig {
             start_queue_capacity: None,
             hold_finalizer_after_seal: None,
             inject_non_yielding_service: None,
+            inject_join_only_spill: None,
         }
     }
 }

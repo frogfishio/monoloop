@@ -302,6 +302,11 @@ where
 type BoxFut = Pin<Box<dyn Future<Output = ToolCompletion> + Send>>;
 
 /// Handler that runs an async body with abortable cancellation.
+///
+/// Spawns a Tokio worker whose [`JoinHandle`] is retained on
+/// [`ToolKillHandle`] and, if unfinished at dispatch end, parked on the
+/// runtime [`super::dispatcher::RuntimeToolSpill`] (not fire-and-forget).
+/// Golden / M5.4 still wants that worker registered under `TaskSupervisor`.
 pub struct AsyncToolHandler<F> {
     f: F,
 }

@@ -32,7 +32,12 @@ impl RuntimeToolSpill {
     }
 
     /// Park a live worker join with its permit (released only after join finishes).
-    fn park(&self, join: tokio::task::JoinHandle<()>, permit: Option<ToolPermit>, may_abort: bool) {
+    pub(crate) fn park(
+        &self,
+        join: tokio::task::JoinHandle<()>,
+        permit: Option<ToolPermit>,
+        may_abort: bool,
+    ) {
         if join.is_finished() {
             drop(join);
             drop(permit);
@@ -104,7 +109,8 @@ impl RuntimeToolSpill {
         self.pending_count() == 0
     }
 
-    fn pending_count(&self) -> usize {
+    /// Number of parked entries (joins and orphans), including JoinOnly without permit.
+    pub fn pending_count(&self) -> usize {
         let parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         parked.len()
     }

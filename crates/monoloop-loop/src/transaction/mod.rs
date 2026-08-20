@@ -33,7 +33,8 @@ mod mcp;
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
 pub use bootstrap::{
-    FinalizerHoldGate, RuntimeBootstrap, RuntimeConfig, StartHoldGate, StoppedGate,
+    FinalizerHoldGate, JoinOnlySpillInject, RuntimeBootstrap, RuntimeConfig, StartHoldGate,
+    StoppedGate,
 };
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
 pub use dispatcher::{

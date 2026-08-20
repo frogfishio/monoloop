@@ -157,6 +157,7 @@ impl StartedRuntime {
             hold_start: bootstrap.config.hold_start.clone(),
             hold_finalizer_after_seal: bootstrap.config.hold_finalizer_after_seal.clone(),
             inject_non_yielding_service: bootstrap.config.inject_non_yielding_service,
+            inject_join_only_spill: bootstrap.config.inject_join_only_spill.clone(),
             tools_registry: bootstrap.tools.clone(),
             shared_tool_capacity: crate::transaction::tool_capacity::SharedToolCapacity::new(
                 bootstrap
@@ -300,6 +301,11 @@ impl RuntimeOwner {
         self.shared.owned_tasks.load(Ordering::SeqCst)
     }
 
+    /// Runtime-scoped tool spill pending count (joins + orphans; §22.4 / Stopped gate).
+    pub fn tool_spill_pending(&self) -> usize {
+        self.shared.tool_spill.pending_count()
+    }
+
     /// Global reservation count.
     pub fn global_reservations(&self) -> usize {
         self.pool.global_active()
@@ -396,6 +402,9 @@ impl Drop for RuntimeOwner {
         }
         if let Some(gate) = self.shared.hold_finalizer_after_seal.as_ref() {
             gate.release();
+        }
+        if let Some(inject) = self.shared.inject_join_only_spill.as_ref() {
+            inject.release();
         }
         if self.shared.state.load(Ordering::SeqCst) != STATE_STOPPED {
             let _ = self.begin_shutdown();

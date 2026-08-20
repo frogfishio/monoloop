@@ -10,7 +10,9 @@ use super::ledger::{LifecycleLedger, TransactionPhase};
 use super::task_spawner::{SpawnRequest, TransactionTaskSpawner};
 use super::task_supervisor::{TaskClass, TaskExit, TaskSupervisor};
 use super::terminal::{build_completion, end_event, TerminalDecision, TerminalProposal};
-use crate::transaction::bootstrap::{FinalizerHoldGate, StartHoldGate, StoppedGate};
+use crate::transaction::bootstrap::{
+    FinalizerHoldGate, JoinOnlySpillInject, StartHoldGate, StoppedGate,
+};
 use crate::transaction::channel_registry::LiveChannel;
 use crate::transaction::dispatcher::RuntimeToolSpill;
 use crate::transaction::host_tools::HostToolRegistry;
@@ -103,6 +105,8 @@ pub(crate) struct RuntimeShared {
     pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
     /// When `Some`, spawn a never-awaiting RuntimeService that signals before park.
     pub inject_non_yielding_service: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// When `Some`, park a JoinOnly tool join on `tool_spill` at supervisor start.
+    pub inject_join_only_spill: Option<Arc<JoinOnlySpillInject>>,
     /// Host tool definitions available to admission / coordinators.
     pub tools_registry: HostToolRegistry,
     /// Process-wide concurrent tool execution budget.
@@ -185,6 +189,18 @@ pub(crate) async fn run_supervisor(
                 std::thread::park();
             }
         });
+    }
+    // §22.4 / Law 23: JoinOnly parked on runtime spill must block Stopped
+    // (abort_abortables skips may_abort=false). Test-only inject.
+    if let Some(inject) = shared.inject_join_only_spill.clone() {
+        let spill = Arc::clone(&shared.tool_spill);
+        let inject_wait = Arc::clone(&inject);
+        let join = tokio::spawn(async move {
+            inject_wait.wait_released().await;
+        });
+        // may_abort=false ⇒ cooperative JoinOnly (not aborted at quiesce).
+        spill.park(join, None, false);
+        inject.mark_entered();
     }
     shared
         .owned_tasks

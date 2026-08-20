@@ -2,7 +2,8 @@
 
 use super::{StartedRuntime, TransactionRuntimeHandle};
 use crate::transaction::bootstrap::{
-    FinalizerHoldGate, RuntimeBootstrap, RuntimeConfig, StartHoldGate, StoppedGate,
+    FinalizerHoldGate, JoinOnlySpillInject, RuntimeBootstrap, RuntimeConfig, StartHoldGate,
+    StoppedGate,
 };
 use crate::transaction::channel_registry::{ChannelBinding, ChannelRegistry};
 use crate::transaction::fake_support::PanicEncoder;
@@ -846,6 +847,78 @@ fn wait_stopped_reannounce_while_quiescing_then_stopped() {
         matches!(second, ShutdownWaitOutcome::Stopped(_)),
         "expected Stopped after re-announce + release, got {second:?}"
     );
+}
+
+/// §22.4 / Law 23: JoinOnly parked on runtime spill blocks Stopped (not false Stopped).
+#[test]
+fn join_only_spill_blocks_stopped_until_released() {
+    use crate::transaction::state::RuntimeState;
+
+    let inject = Arc::new(JoinOnlySpillInject::new());
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            inject_join_only_spill: Some(Arc::clone(&inject)),
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Wait until supervisor parks the JoinOnly join on the runtime spill.
+    let entered = rt.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !inject.is_entered() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        inject.is_entered()
+    });
+    assert!(
+        entered,
+        "JoinOnly spill inject must park before shutdown proof"
+    );
+
+    let mut owner = started.owner;
+    assert!(
+        owner.tool_spill_pending() >= 1,
+        "spill must hold JoinOnly before begin_shutdown, pending={}",
+        owner.tool_spill_pending()
+    );
+    owner.begin_shutdown();
+    let mid = rt.block_on(owner.wait_stopped(Duration::from_millis(80)));
+    assert!(
+        matches!(mid, ShutdownWaitOutcome::TimedOut(_)),
+        "JoinOnly spill must keep Quiescing (not false Stopped), got {mid:?}"
+    );
+    assert_eq!(owner.state(), RuntimeState::Quiescing);
+    assert!(
+        owner.tool_spill_pending() >= 1,
+        "JoinOnly must remain on spill while Quiescing, pending={}",
+        owner.tool_spill_pending()
+    );
+
+    inject.release();
+    let outcome = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    match outcome {
+        ShutdownWaitOutcome::Stopped(_) => {
+            assert_eq!(owner.state(), RuntimeState::Stopped);
+            assert_eq!(owner.tool_spill_pending(), 0);
+            assert_eq!(owner.owned_task_count(), 0);
+        }
+        other => panic!("expected Stopped after JoinOnly release, got {other:?}"),
+    }
 }
 
 /// M6 §22.5: short wait may TimedOut while Quiescing; later wait reaches Stopped
