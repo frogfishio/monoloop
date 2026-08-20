@@ -102,6 +102,7 @@ impl ToolHandler for ProcessIsolatedToolHandler {
             control,
             completion: ToolExecutionCompletion::new(rx),
             kill: Some(kill),
+            drive: None,
         })
     }
 

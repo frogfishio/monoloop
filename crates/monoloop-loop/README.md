@@ -29,8 +29,10 @@ Do not recreate the deleted v1 files (`runtime`, `admission`, `actor`,
 `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`).
 Follow the seven-stage plan in the v2 spec. Runtime-scoped
 `RuntimeToolSpill` (in `dispatcher.rs`) is the interim honesty fix for
-parked tool joins — not a revived v1 vault module; M5 end state still
-deletes join vaults once handler workers are TaskSupervisor-owned.
+parked JoinOnly tool joins — not a revived v1 vault module.
+`AsyncToolHandler` / `IsolatedKillableToolHandler` drive inline on the
+dispatcher task (M5.4; no ambient spawn). Full delete-vaults remains once
+JoinOnly fixtures are also supervisor-owned.
 
 **M0–M5 landed** (D-042 / D-043 / D-044). **M6 §22 closed enough** (D-045):
 §22.1–§22.7 proofs landed (host-adapter proofs outside core);

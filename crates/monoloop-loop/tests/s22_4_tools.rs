@@ -97,6 +97,7 @@ impl ToolHandler for AckCancelCooperative {
             control,
             completion: ToolExecutionCompletion::new(rx),
             kill: Some(ToolKillHandle::join_only(join)),
+            drive: None,
         })
     }
 }
@@ -126,6 +127,7 @@ impl ToolHandler for IgnoreCancelCooperative {
             control: ToolExecutionControl::new(),
             completion: ToolExecutionCompletion::new(rx),
             kill: Some(ToolKillHandle::join_only(join)),
+            drive: None,
         })
     }
 }
@@ -474,6 +476,64 @@ async fn s22_4_process_isolated_killed_and_reaped() {
         ),
         "expected process kill/reap path, got {out:?}"
     );
+}
+
+/// M5.4: AsyncToolHandler drives inline (cancel_only + drive) — no ambient JoinHandle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s22_4_async_handler_drives_inline_no_ambient_join() {
+    let handler = AsyncToolHandler::new(|_c, _x, ctl| {
+        Box::pin(async move {
+            tokio::select! {
+                _ = ctl.cancelled() => ToolCompletion::RuntimeFailed(
+                    monoloop_contracts::ToolRuntimeError::TerminationFailed
+                ),
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    ToolCompletion::Succeeded(CanonicalToolOutput::Json(
+                        serde_json::json!({"ok": true}),
+                    ))
+                }
+            }
+        })
+    });
+    let handle = handler
+        .start(
+            ToolCall {
+                tool_name: ToolName::try_new("ab").unwrap(),
+                tool_id: ToolId::try_new("ab").unwrap(),
+                provider_tool_call_id: "p".into(),
+                arguments: serde_json::json!({"q":"x"}),
+                request_ordinal: 0,
+            },
+            ToolCallContext {
+                transaction_id: TransactionId::generate(),
+                session_key: session_key(),
+                exchange_id: Some(ExchangeId::generate()),
+                tool_action_id: ToolActionId::new("a"),
+                tool_id: ToolId::try_new("ab").unwrap(),
+                deadline: std::time::Instant::now() + Duration::from_secs(2),
+            },
+        )
+        .unwrap();
+    assert!(
+        handle.drive.is_some(),
+        "AsyncToolHandler must expose an inline drive future"
+    );
+    let kill = handle.kill.as_ref().expect("kill handle");
+    assert!(
+        kill.is_cancel_only(),
+        "AsyncToolHandler must use cancel_only (no nested JoinHandle)"
+    );
+    assert!(!kill.has_join(), "cancel_only must not own a JoinHandle");
+    // Drive to completion on this task — same shape as dispatcher M5.4 path.
+    let drive = handle.drive.unwrap();
+    let wait = handle.completion.wait();
+    tokio::pin!(drive);
+    tokio::pin!(wait);
+    let completion = tokio::select! {
+        c = &mut wait => c,
+        _ = &mut drive => wait.await,
+    };
+    assert!(matches!(completion, ToolCompletion::Succeeded(_)));
 }
 
 /// Law 8: unfinished tool work stays on a runtime-scoped spill — not a process-global set.

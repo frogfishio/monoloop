@@ -609,6 +609,7 @@ impl TransactionToolDispatcher {
                 lifecycle,
             };
         }
+        let mut drive = handle.drive;
         let wait = handle.completion.wait();
         tokio::pin!(wait);
         let cancel_fut = async {
@@ -618,14 +619,44 @@ impl TransactionToolDispatcher {
                 std::future::pending::<()>().await;
             }
         };
-        let completion = tokio::select! {
-            biased;
-            c = &mut wait => c,
-            _ = cancel_fut => {
-                await_tool_termination(&mut wait, &control, kill.as_ref(), &policy).await
+        let completion = if let Some(drive_fut) = drive.take() {
+            // M5.4: poll handler body on this task (supervised ToolWorker / test await).
+            tokio::pin!(drive_fut);
+            tokio::select! {
+                biased;
+                c = &mut wait => c,
+                _ = &mut drive_fut => wait.await,
+                _ = cancel_fut => {
+                    await_tool_termination_driven(
+                        &mut wait,
+                        &mut drive_fut,
+                        &control,
+                        kill.as_ref(),
+                        &policy,
+                    )
+                    .await
+                }
+                _ = tokio::time::sleep(deadline) => {
+                    await_tool_termination_driven(
+                        &mut wait,
+                        &mut drive_fut,
+                        &control,
+                        kill.as_ref(),
+                        &policy,
+                    )
+                    .await
+                }
             }
-            _ = tokio::time::sleep(deadline) => {
-                await_tool_termination(&mut wait, &control, kill.as_ref(), &policy).await
+        } else {
+            tokio::select! {
+                biased;
+                c = &mut wait => c,
+                _ = cancel_fut => {
+                    await_tool_termination(&mut wait, &control, kill.as_ref(), &policy).await
+                }
+                _ = tokio::time::sleep(deadline) => {
+                    await_tool_termination(&mut wait, &control, kill.as_ref(), &policy).await
+                }
             }
         };
         // Join worker within a short bound; if still pending, Drop parks join+permit.
@@ -775,6 +806,41 @@ async fn await_tool_termination(
                 }
             }
         },
+    }
+}
+
+/// Termination path when the handler body is driven inline on this task (M5.4).
+async fn await_tool_termination_driven(
+    wait: &mut Pin<&mut impl Future<Output = ToolCompletion>>,
+    drive: &mut Pin<&mut impl Future<Output = ()>>,
+    control: &ToolExecutionControl,
+    kill: Option<&ToolKillHandle>,
+    policy: &ToolExecutionClass,
+) -> ToolCompletion {
+    control.cancel();
+    if let Some(k) = kill {
+        k.kill();
+    }
+    let grace = match policy {
+        ToolExecutionClass::AbortableAtYield { grace } => *grace,
+        ToolExecutionClass::CooperativeInProcess { grace } => *grace,
+        ToolExecutionClass::ProcessIsolated { grace, .. } => *grace,
+    };
+    let join_grace = Duration::from_millis(200).max(grace);
+    // Keep polling drive so cancel_only bodies can observe cancel and complete.
+    tokio::select! {
+        biased;
+        c = &mut *wait => c,
+        _ = &mut *drive => wait.await,
+        _ = tokio::time::sleep(join_grace) => {
+            if let Some(k) = kill {
+                let _ = k.join_timeout(Duration::from_millis(50)).await;
+            }
+            // Dropping `drive` when this future returns stops inline work at the
+            // next .await (AbortableAtYield). JoinOnly/spawned workers keep their
+            // JoinHandle path via the non-driven termination helper.
+            ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded)
+        }
     }
 }
 

@@ -125,6 +125,11 @@ enum KillInner {
     JoinOnly {
         join: Mutex<Option<tokio::task::JoinHandle<()>>>,
     },
+    /// Inline AbortableAtYield body driven on the caller's task (M5.4 — no ambient spawn).
+    ///
+    /// `kill` cancels [`ToolExecutionControl`]; dropping the drive future stops
+    /// work at the next `.await`. No separate JoinHandle to park.
+    CancelOnly { control: ToolExecutionControl },
     /// OS child process — real kill boundary (V2 §14.3).
     Process {
         child: Arc<Mutex<Option<std::process::Child>>>,
@@ -157,6 +162,16 @@ impl ToolKillHandle {
         }
     }
 
+    /// AbortableAtYield without a nested Tokio task (M5.4).
+    ///
+    /// Caller drives [`LinkedToolExecutionHandle::drive`] on the supervised
+    /// dispatch task; `kill` requests cooperative cancel via `control`.
+    pub fn cancel_only(control: ToolExecutionControl) -> Self {
+        Self {
+            inner: Arc::new(KillInner::CancelOnly { control }),
+        }
+    }
+
     /// Own an OS [`std::process::Child`] plus a blocking wait task (D-043).
     ///
     /// `child` is shared with the wait task so kill and wait observe the same process.
@@ -175,10 +190,12 @@ impl ToolKillHandle {
     /// Abort Tokio task or OS-kill the child (idempotent).
     ///
     /// Join-only (cooperative) handles are a no-op — cancel via control only.
+    /// Cancel-only (inline Abortable) requests cooperative cancel.
     pub fn kill(&self) {
         match &*self.inner {
             KillInner::Tokio { abort, .. } => abort.abort(),
             KillInner::JoinOnly { .. } => {}
+            KillInner::CancelOnly { control } => control.cancel(),
             KillInner::Process { child, .. } => {
                 if let Some(c) = child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                     let _ = c.kill();
@@ -196,6 +213,10 @@ impl ToolKillHandle {
             | KillInner::Process { join, .. } => {
                 join.lock().unwrap_or_else(|e| e.into_inner()).take()
             }
+            KillInner::CancelOnly { .. } => {
+                // Inline drive: caller drops/polls the drive future; no join to await.
+                return Ok(());
+            }
         };
         let Some(mut handle) = handle else {
             return Ok(()); // already joined
@@ -209,6 +230,7 @@ impl ToolKillHandle {
                     | KillInner::Process { join, .. } => {
                         *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
                     }
+                    KillInner::CancelOnly { .. } => {}
                 }
                 Err(())
             }
@@ -224,18 +246,19 @@ impl ToolKillHandle {
             | KillInner::Process { join, .. } => {
                 join.lock().unwrap_or_else(|e| e.into_inner()).take()
             }
+            KillInner::CancelOnly { .. } => None,
         }
     }
 
     /// Whether a join handle is still owned.
-    #[allow(dead_code)]
-    pub(crate) fn has_join(&self) -> bool {
+    pub fn has_join(&self) -> bool {
         match &*self.inner {
             KillInner::Tokio { join, .. }
             | KillInner::JoinOnly { join }
             | KillInner::Process { join, .. } => {
                 join.lock().unwrap_or_else(|e| e.into_inner()).is_some()
             }
+            KillInner::CancelOnly { .. } => false,
         }
     }
 
@@ -248,10 +271,14 @@ impl ToolKillHandle {
     pub fn is_join_only(&self) -> bool {
         matches!(&*self.inner, KillInner::JoinOnly { .. })
     }
+
+    /// True when the body is driven inline on the caller task (no nested JoinHandle).
+    pub fn is_cancel_only(&self) -> bool {
+        matches!(&*self.inner, KillInner::CancelOnly { .. })
+    }
 }
 
 /// Handle returned from [`ToolHandler::start`].
-#[derive(Debug)]
 pub struct LinkedToolExecutionHandle {
     /// Stable execution id for this start.
     pub execution_id: ToolExecutionId,
@@ -261,6 +288,21 @@ pub struct LinkedToolExecutionHandle {
     pub completion: ToolExecutionCompletion,
     /// Optional kill handle for escalate-after-grace (D-024).
     pub kill: Option<ToolKillHandle>,
+    /// When `Some`, the dispatcher MUST poll this on the current task (M5.4).
+    /// Completes by sending on [`Self::completion`]. No ambient `tokio::spawn`.
+    pub drive: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+impl std::fmt::Debug for LinkedToolExecutionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkedToolExecutionHandle")
+            .field("execution_id", &self.execution_id)
+            .field("control", &self.control)
+            .field("completion", &self.completion)
+            .field("kill", &self.kill)
+            .field("drive", &self.drive.as_ref().map(|_| "<drive>"))
+            .finish()
+    }
 }
 
 /// Handler that completes immediately from a synchronous function.
@@ -295,6 +337,7 @@ where
             control: ToolExecutionControl::new(),
             completion: ToolExecutionCompletion::new(rx),
             kill: None,
+            drive: None,
         })
     }
 }
@@ -303,10 +346,9 @@ type BoxFut = Pin<Box<dyn Future<Output = ToolCompletion> + Send>>;
 
 /// Handler that runs an async body with abortable cancellation.
 ///
-/// Spawns a Tokio worker whose [`JoinHandle`] is retained on
-/// [`ToolKillHandle`] and, if unfinished at dispatch end, parked on the
-/// runtime [`super::dispatcher::RuntimeToolSpill`] (not fire-and-forget).
-/// Golden / M5.4 still wants that worker registered under `TaskSupervisor`.
+/// M5.4: body is returned as [`LinkedToolExecutionHandle::drive`] and polled on
+/// the caller's task (the supervised ToolWorker dispatch path). No ambient
+/// `tokio::spawn`. Cancel via [`ToolKillHandle::cancel_only`].
 pub struct AsyncToolHandler<F> {
     f: F,
 }
@@ -334,8 +376,8 @@ where
         let control_body = control.clone();
         let fut = (self.f)(call, context, control_body.clone());
         let (tx, rx) = oneshot::channel();
-        // Single owned worker: select cancel vs body (no detached watcher — LAW 23).
-        let join = tokio::spawn(async move {
+        // Drive inline on the dispatcher/ToolWorker task — Law 23 / M5.4.
+        let drive = Box::pin(async move {
             tokio::select! {
                 biased;
                 _ = control_body.cancelled() => {
@@ -348,12 +390,13 @@ where
                 }
             }
         });
-        let kill = ToolKillHandle::new(join);
+        let kill = ToolKillHandle::cancel_only(control.clone());
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
             control,
             completion: ToolExecutionCompletion::new(rx),
             kill: Some(kill),
+            drive: Some(drive),
         })
     }
 
@@ -364,8 +407,8 @@ where
 
 /// Stubborn in-process worker for AbortableAtYield / legacy D-024 fixtures.
 ///
-/// **Not** ProcessIsolated: kill is Tokio `abort` only (V2 §14.3 / D-043).
-/// [`Self::os_process_isolated`] is false — cannot register as ProcessIsolated.
+/// **Not** ProcessIsolated: termination is cancel + dropping the inline drive
+/// (abort-at-yield of the caller task). [`Self::os_process_isolated`] is false.
 /// Prefer [`super::process_tool::ProcessIsolatedToolHandler`] for real OS kill.
 pub struct IsolatedKillableToolHandler<F> {
     f: F,
@@ -391,23 +434,28 @@ where
         context: ToolCallContext,
     ) -> Result<LinkedToolExecutionHandle, ToolStartError> {
         let control = ToolExecutionControl::new();
+        let control_body = control.clone();
         let fut = (self.f)(call, context);
         let (tx, rx) = oneshot::channel();
-        let join = tokio::spawn(async move {
+        // Inline drive: ignores cooperative cancel unless the body polls it;
+        // deadline path drops this future (abort-at-yield of the caller task).
+        let drive = Box::pin(async move {
+            let _ = control_body;
             let result = fut.await;
             let _ = tx.send(result);
         });
-        let kill = ToolKillHandle::new(join);
+        let kill = ToolKillHandle::cancel_only(control.clone());
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
             control,
             completion: ToolExecutionCompletion::new(rx),
             kill: Some(kill),
+            drive: Some(drive),
         })
     }
 
     fn supports_abort(&self) -> bool {
-        // Tokio abort at yield — not cooperative-only, not OS isolation.
+        // Abort-at-yield of the caller/dispatch task — not OS isolation.
         true
     }
 
@@ -465,6 +513,7 @@ impl ToolHandler for LostCompletionHandler {
             control: ToolExecutionControl::new(),
             completion: ToolExecutionCompletion::new(rx),
             kill: None,
+            drive: None,
         })
     }
 }

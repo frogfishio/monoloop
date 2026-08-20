@@ -1951,13 +1951,12 @@ last-resort aborts when the runtime Arc is gone — no cross-runtime bleed.
 
 **Known residuals (honest — block Golden, not M6 §22 closed-enough):**
 - Ambient `tokio::spawn` remains on deprecated `DefaultLoopRuntime::start*`,
-  deprecated `HostToolRuntime::new`, `AsyncToolHandler` /
-  `IsolatedKillableToolHandler` worker bodies (JoinHandle retained → spill,
-  not fire-and-forget), sticky_cancel unit helper, and standalone
-  `McpGateway::bind_loopback`. Production RuntimeOwner / `with_spawner` /
-  `SupervisedMcpRequestOwner` avoid ambient spawn at the Loop edge.
-  Golden still wants handler-level spawn under TaskSupervisor (M5
-  delete-vaults end state / §21).
+  deprecated `HostToolRuntime::new`, Cooperative JoinOnly **test fixtures**,
+  `ProcessIsolated` wait tasks, sticky_cancel unit helper, and standalone
+  `McpGateway::bind_loopback`. Production `AsyncToolHandler` /
+  `IsolatedKillableToolHandler` drive inline (M5.4 note below). Golden still
+  wants JoinOnly + ProcessIsolated wait under TaskSupervisor (delete-vaults
+  end state / §21).
 
 **Advisor (2026-08-20, independent review — honesty residual slice):**
 
@@ -2000,5 +1999,22 @@ JoinOnly join on `RuntimeShared.tool_spill` at supervisor start.
 Spill-gate P2 coverage closed. M6 §22 closed-enough **still holds**. Handler
 ambient spawn + M5.4 remain Golden blockers. Do **not** promote Golden / §25.
 
-**Next pick:** Route handler-internal spawns under TaskSupervisor (M5.4) **or**
-remaining §23 extras. Do not promote Golden / §25.
+**M5.4 inline handler drive (2026-08-20):** `AsyncToolHandler` /
+`IsolatedKillableToolHandler` no longer `tokio::spawn`. Bodies return as
+`LinkedToolExecutionHandle::drive` and are polled on the dispatcher task
+(supervised `ToolWorker` under RuntimeOwner / `with_spawner`). Kill is
+`ToolKillHandle::cancel_only`. Proof:
+`s22_4_async_handler_drives_inline_no_ambient_join`. Cooperative JoinOnly
+fixtures and `ProcessIsolated` wait tasks may still spawn (test / OS wait).
+Spill remains for JoinOnly park; M5.4 “delete vaults” end state not claimed.
+Deprecated `HostToolRuntime::new` / `bind_loopback` residuals unchanged.
+
+**Expert + Advisor (2026-08-20, M5.4 inline drive gate):** **PASS — Silver.**
+Production Abortable-handler ambient-spawn residual closed. M6 §22
+closed-enough **still holds**. Delete-vaults / JoinOnly fixtures /
+ProcessIsolated wait / §23 extras remain Golden blockers. Do **not** promote
+Golden / §25.
+
+**Next pick:** remaining §23 extras **or** ProcessIsolated wait under
+TaskSupervisor / delete-vaults when JoinOnly also supervised. Do not promote
+Golden / §25.
