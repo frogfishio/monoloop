@@ -1865,9 +1865,17 @@ MCP/non-empty tools). **Not** Golden / §25.
 coordinator uses `HostToolRegistry` selected tools via `ResolvedToolRegistry` /
 `HostToolRuntime::with_spawner` (TaskSupervisor-owned tool workers, no ambient
 spawn on production path). Empty path unchanged. Proof:
-`supervised_non_empty_loop_dispatches_registered_tool`. Residual: full MCP
-gateway still deferred (`mod mcp` not compiled); Fake echo does not emit Ready
-tools end-to-end. M6 still partial (§22.7 + MCP gateway). **Not** Golden / §25.
+`supervised_non_empty_loop_dispatches_registered_tool`. Residual: Fake echo
+does not emit Ready tools end-to-end.
 
-**Next pick:** MCP gateway re-enable / loopback protocol **or** §22.7 host
-adapters (outside core) — do not promote M6/Golden/§25.
+**MCP gateway re-enable (2026-08-20):** Compiled `mod mcp`; capability HTTP
+services + request semaphore are **gateway-instance-owned** (no process-global
+service map — §17). Registered `tests/mcp_gateway.rs` (15): bind/shutdown,
+pending→active list/call, HTTP initialize/list/call, isolation, revoke 404,
+oversized body fail-closed. Residual: listener `tokio::spawn` is gateway
+JoinHandle-owned until RuntimeOwner `RuntimeService` integration; empty
+`mcp_listener` placeholder still used when `enable_mcp_listener` on
+StartedRuntime. M6 still partial (§22.7). **Not** Golden / §25.
+
+**Next pick:** Wire `McpGateway` into `RuntimeOwner` as `RuntimeService` **or**
+§22.7 host adapters (outside core) — do not promote M6/Golden/§25.

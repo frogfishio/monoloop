@@ -63,3 +63,7 @@ path = "tests/s22_4_tools.rs"
 [[test]]
 name = "linked_tools"
 path = "tests/linked_tools.rs"
+
+[[test]]
+name = "mcp_gateway"
+path = "tests/mcp_gateway.rs"

@@ -3,8 +3,7 @@
 //! Runtime v2 lifecycle lives in [`lifecycle`] (`doc/TRANSACTION_RUNTIME_V2_SPEC.md`).
 //! The deleted v1 files are **not** restored.
 //!
-//! Deferred on-disk modules (`dispatcher`, `exchange`, `mcp`, …) remain until
-//! their migration stage; they are not compiled yet.
+//! Deferred on-disk modules (`exchange`, …) remain until their migration stage.
 
 mod acp_encoder;
 mod bootstrap;
@@ -29,7 +28,7 @@ mod loop_adapters;
 // mod active_registry;
 // mod events;
 // mod exchange;
-// mod mcp;
+mod mcp;
 // mod spawn_gate;
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
@@ -45,6 +44,10 @@ pub use fake_support::{EmptyBytesEncoder, PanicEncoder, RejectEncoder, TestTextE
 pub use host_tools::{HostToolRegistry, RegisteredTool};
 pub use loop_adapters::{
     dispatch_ready_tool, dispatch_ready_tool_cancellable, HostToolRuntime, ResolvedToolRegistry,
+};
+pub use mcp::{
+    tool_definitions_from_resolved, CapabilityToken, McpBindingState, McpGateway, McpGatewayHandle,
+    McpInstallError, McpRouteTable, PendingMcpBinding, TransactionMcpHandler,
 };
 pub use lifecycle::{
     adapt_completion_callback, adapt_event_sink, build_completion, HostCompletionAdapter,

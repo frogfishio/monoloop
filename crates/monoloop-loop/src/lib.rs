@@ -47,6 +47,8 @@ pub use transaction::{
     TerminalProposal, TestTextEncoder, ToolExecutionCompletion, ToolExecutionControl, ToolHandler,
     ToolKillHandle, TransactionPhase, TransactionReservations, TransactionRuntimeHandle,
     TransactionTaskSpawner, TransactionToolCapacity, TransactionToolDispatcher,
+    tool_definitions_from_resolved, CapabilityToken, McpBindingState, McpGateway, McpGatewayHandle,
+    McpInstallError, McpRouteTable, PendingMcpBinding, TransactionMcpHandler,
 };
 
 pub use monoloop_contracts::{
