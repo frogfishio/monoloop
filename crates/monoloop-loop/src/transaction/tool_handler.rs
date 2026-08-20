@@ -172,17 +172,15 @@ impl ToolKillHandle {
         }
     }
 
-    /// Own an OS [`std::process::Child`] plus a blocking wait task (D-043).
+    /// Own an OS [`std::process::Child`] (D-043 / M5.4).
     ///
-    /// `child` is shared with the wait task so kill and wait observe the same process.
-    pub(crate) fn from_process(
-        child: Arc<Mutex<Option<std::process::Child>>>,
-        join: tokio::task::JoinHandle<()>,
-    ) -> Self {
+    /// Wait/poll runs on [`LinkedToolExecutionHandle::drive`] (no `spawn_blocking`).
+    /// `child` is shared so kill and the drive loop observe the same process.
+    pub(crate) fn from_process(child: Arc<Mutex<Option<std::process::Child>>>) -> Self {
         Self {
             inner: Arc::new(KillInner::Process {
                 child,
-                join: Mutex::new(Some(join)),
+                join: Mutex::new(None),
             }),
         }
     }
@@ -207,32 +205,58 @@ impl ToolKillHandle {
     /// Await worker teardown. On timeout, restores the join handle so the
     /// worker is not detached; caller must keep capacity until a later join.
     pub async fn join_timeout(&self, budget: std::time::Duration) -> Result<(), ()> {
-        let handle = match &*self.inner {
-            KillInner::Tokio { join, .. }
-            | KillInner::JoinOnly { join }
-            | KillInner::Process { join, .. } => {
-                join.lock().unwrap_or_else(|e| e.into_inner()).take()
-            }
+        match &*self.inner {
             KillInner::CancelOnly { .. } => {
                 // Inline drive: caller drops/polls the drive future; no join to await.
-                return Ok(());
+                Ok(())
             }
-        };
-        let Some(mut handle) = handle else {
-            return Ok(()); // already joined
-        };
-        match tokio::time::timeout(budget, &mut handle).await {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                match &*self.inner {
-                    KillInner::Tokio { join, .. }
-                    | KillInner::JoinOnly { join }
-                    | KillInner::Process { join, .. } => {
-                        *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-                    }
-                    KillInner::CancelOnly { .. } => {}
+            KillInner::Process { child, join } => {
+                let handle = join.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(mut handle) = handle {
+                    return match tokio::time::timeout(budget, &mut handle).await {
+                        Ok(_) => Ok(()),
+                        Err(_) => {
+                            *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                            Err(())
+                        }
+                    };
                 }
-                Err(())
+                // Drive-owned wait: poll try_wait until exit or budget (no mutex across await).
+                let deadline = std::time::Instant::now() + budget;
+                loop {
+                    let done = {
+                        let mut guard = child.lock().unwrap_or_else(|e| e.into_inner());
+                        match guard.as_mut() {
+                            Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                            None => true,
+                        }
+                    };
+                    if done {
+                        return Ok(());
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+            KillInner::Tokio { join, .. } | KillInner::JoinOnly { join } => {
+                let handle = join.lock().unwrap_or_else(|e| e.into_inner()).take();
+                let Some(mut handle) = handle else {
+                    return Ok(()); // already joined
+                };
+                match tokio::time::timeout(budget, &mut handle).await {
+                    Ok(_) => Ok(()),
+                    Err(_) => {
+                        match &*self.inner {
+                            KillInner::Tokio { join, .. } | KillInner::JoinOnly { join } => {
+                                *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+                            }
+                            _ => {}
+                        }
+                        Err(())
+                    }
+                }
             }
         }
     }
@@ -253,12 +277,33 @@ impl ToolKillHandle {
     /// Whether a join handle is still owned.
     pub fn has_join(&self) -> bool {
         match &*self.inner {
-            KillInner::Tokio { join, .. }
-            | KillInner::JoinOnly { join }
-            | KillInner::Process { join, .. } => {
+            KillInner::Tokio { join, .. } | KillInner::JoinOnly { join } => {
                 join.lock().unwrap_or_else(|e| e.into_inner()).is_some()
             }
+            KillInner::Process { child, join } => {
+                if join.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                    return true;
+                }
+                // Drive-owned wait: capacity stays held until the child is observed exited.
+                Self::process_still_alive(child)
+            }
             KillInner::CancelOnly { .. } => false,
+        }
+    }
+
+    fn process_still_alive(child: &Mutex<Option<std::process::Child>>) -> bool {
+        let mut guard = child.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_mut() {
+            Some(c) => match c.try_wait() {
+                Ok(None) => true,
+                Ok(Some(_)) => {
+                    // Reaped — drop the Child so Drop does not wait again.
+                    let _ = guard.take();
+                    false
+                }
+                Err(_) => true, // fail-closed: treat as still owned
+            },
+            None => false,
         }
     }
 

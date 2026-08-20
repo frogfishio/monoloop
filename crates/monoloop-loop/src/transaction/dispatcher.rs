@@ -818,28 +818,53 @@ async fn await_tool_termination_driven(
     policy: &ToolExecutionClass,
 ) -> ToolCompletion {
     control.cancel();
-    if let Some(k) = kill {
-        k.kill();
-    }
-    let grace = match policy {
-        ToolExecutionClass::AbortableAtYield { grace } => *grace,
-        ToolExecutionClass::CooperativeInProcess { grace } => *grace,
-        ToolExecutionClass::ProcessIsolated { grace, .. } => *grace,
-    };
-    let join_grace = Duration::from_millis(200).max(grace);
-    // Keep polling drive so cancel_only bodies can observe cancel and complete.
-    tokio::select! {
-        biased;
-        c = &mut *wait => c,
-        _ = &mut *drive => wait.await,
-        _ = tokio::time::sleep(join_grace) => {
-            if let Some(k) = kill {
-                let _ = k.join_timeout(Duration::from_millis(50)).await;
+    match policy {
+        ToolExecutionClass::ProcessIsolated {
+            grace,
+            kill_deadline,
+        } => {
+            // Cooperative cancel is best-effort; escalate to OS kill after grace.
+            tokio::select! {
+                biased;
+                c = &mut *wait => c,
+                _ = &mut *drive => wait.await,
+                _ = tokio::time::sleep(*grace) => {
+                    if let Some(k) = kill {
+                        k.kill();
+                    }
+                    tokio::select! {
+                        biased;
+                        c = &mut *wait => c,
+                        _ = &mut *drive => wait.await,
+                        _ = tokio::time::sleep(*kill_deadline) => {
+                            if let Some(k) = kill {
+                                let _ = k.join_timeout(Duration::from_millis(50)).await;
+                            }
+                            ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed)
+                        }
+                    }
+                }
             }
-            // Dropping `drive` when this future returns stops inline work at the
-            // next .await (AbortableAtYield). JoinOnly/spawned workers keep their
-            // JoinHandle path via the non-driven termination helper.
-            ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded)
+        }
+        ToolExecutionClass::AbortableAtYield { grace }
+        | ToolExecutionClass::CooperativeInProcess { grace } => {
+            if let Some(k) = kill {
+                k.kill();
+            }
+            let join_grace = Duration::from_millis(200).max(*grace);
+            // Keep polling drive so cancel_only bodies can observe cancel and complete.
+            tokio::select! {
+                biased;
+                c = &mut *wait => c,
+                _ = &mut *drive => wait.await,
+                _ = tokio::time::sleep(join_grace) => {
+                    if let Some(k) = kill {
+                        let _ = k.join_timeout(Duration::from_millis(50)).await;
+                    }
+                    // Dropping `drive` stops inline Abortable work at the next .await.
+                    ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded)
+                }
+            }
         }
     }
 }
@@ -868,13 +893,20 @@ impl Drop for DispatchGuard {
     fn drop(&mut self) {
         if let Some(k) = self.kill.take() {
             let may_abort = !k.is_join_only();
-            k.kill(); // no-op for JoinOnly cooperative
+            k.kill(); // no-op for JoinOnly cooperative; OS kill for ProcessIsolated
             if let Some(join) = k.take_join() {
                 if !join.is_finished() {
                     // Park the *real* worker join — never a completion waiter.
                     self.spill.park(join, self.permit.take(), may_abort);
                     return;
                 }
+            } else if k.is_process_isolated() && k.has_join() {
+                // Drive-owned ProcessIsolated: no JoinHandle to park, but child may
+                // still be exiting — hold capacity as an orphan until quiesce/reap.
+                if let Some(permit) = self.permit.take() {
+                    self.spill.park_orphan_permit(permit);
+                }
+                return;
             }
         }
         drop(self.permit.take());

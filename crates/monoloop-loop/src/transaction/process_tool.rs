@@ -2,8 +2,11 @@
 //!
 //! A Tokio task is **not** an isolation boundary. [`ProcessIsolatedToolHandler`]
 //! owns an OS child process. Hard stop uses OS `kill` + `try_wait` (mutex never
-//! held across a blocking wait). Cooperative cancel is best-effort only until
+//! held across an `.await`). Cooperative cancel is best-effort only until
 //! escalate-to-kill; it does not claim to stop the child by itself.
+//!
+//! M5.4: the wait/poll loop is returned as [`LinkedToolExecutionHandle::drive`]
+//! and polled on the dispatcher / ToolWorker task — no ambient `spawn_blocking`.
 
 use super::tool_handler::{
     LinkedToolExecutionHandle, ToolExecutionCompletion, ToolExecutionControl, ToolHandler,
@@ -13,7 +16,9 @@ use monoloop_contracts::{
     CanonicalToolOutput, ToolCall, ToolCallContext, ToolCompletion, ToolExecutionId,
     ToolRuntimeError, ToolStartError,
 };
+use std::future::Future;
 use std::io::Write;
+use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -95,14 +100,14 @@ impl ToolHandler for ProcessIsolatedToolHandler {
         }
 
         let (tx, rx) = oneshot::channel();
-        let kill = ToolKillHandle::from_child(child, tx, kill_deadline);
+        let (kill, drive) = ToolKillHandle::from_child_driven(child, tx, kill_deadline);
 
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
             control,
             completion: ToolExecutionCompletion::new(rx),
             kill: Some(kill),
-            drive: None,
+            drive: Some(drive),
         })
     }
 
@@ -120,16 +125,17 @@ impl ToolHandler for ProcessIsolatedToolHandler {
 }
 
 impl ToolKillHandle {
-    /// Own a [`Child`]: kill uses OS signals; join polls `try_wait` until exit or deadline.
-    pub fn from_child(
+    /// Own a [`Child`]: kill uses OS signals; wait/poll is an inline drive future (M5.4).
+    ///
+    /// Mutex is never held across `.await` — kill can interleave with the poll loop.
+    pub fn from_child_driven(
         child: Child,
         completion_tx: oneshot::Sender<ToolCompletion>,
         wait_deadline: Instant,
-    ) -> Self {
+    ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send>>) {
         let child_arc = Arc::new(Mutex::new(Some(child)));
         let child_for_wait = Arc::clone(&child_arc);
-        let join = tokio::task::spawn_blocking(move || {
-            // Never hold the mutex across a blocking wait — kill must interleave.
+        let drive = Box::pin(async move {
             let status = loop {
                 if Instant::now() >= wait_deadline {
                     // Fail closed: kill then one last poll.
@@ -166,7 +172,7 @@ impl ToolKillHandle {
                 if let Some(st) = polled {
                     break Some(st);
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                tokio::time::sleep(Duration::from_millis(5)).await;
             };
             let completion = match status {
                 Some(st) if st.success() => ToolCompletion::Succeeded(CanonicalToolOutput::Json(
@@ -177,7 +183,7 @@ impl ToolKillHandle {
             };
             let _ = completion_tx.send(completion);
         });
-        Self::from_process(child_arc, join)
+        (Self::from_process(child_arc), drive)
     }
 }
 
@@ -240,16 +246,32 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_isolated_kill_stops_sleeping_child() {
         let handler = ProcessIsolatedToolHandler::sleep_until_killed(3600);
-        let handle = handler.start(call(), ctx()).expect("start");
+        let mut handle = handler.start(call(), ctx()).expect("start");
         assert!(handle.kill.as_ref().unwrap().is_process_isolated());
+        assert!(
+            handle.drive.is_some(),
+            "ProcessIsolated wait must be an inline drive (no spawn_blocking)"
+        );
         let kill = handle.kill.expect("process kill handle");
         handle.control.cancel();
+        // Drive the wait loop while we escalate to OS kill.
+        let drive = handle.drive.take().unwrap();
+        let wait = handle.completion.wait();
+        tokio::pin!(drive);
+        tokio::pin!(wait);
         tokio::time::sleep(Duration::from_millis(20)).await;
         kill.kill();
-        kill.join_timeout(Duration::from_secs(2))
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut wait => {}
+                _ = &mut drive => { let _ = wait.await; }
+            }
+        })
+        .await
+        .expect("child joined after kill");
+        kill.join_timeout(Duration::from_secs(1))
             .await
-            .expect("child joined after kill");
-        let _ = handle.completion.wait().await;
+            .expect("process reaped");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

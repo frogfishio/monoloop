@@ -71,3 +71,7 @@ path = "tests/mcp_gateway.rs"
 [[test]]
 name = "s22_7_host_adapters"
 path = "tests/s22_7_host_adapters.rs"
+
+[[test]]
+name = "s23_forbidden_patterns"
+path = "tests/s23_forbidden_patterns.rs"

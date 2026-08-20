@@ -1952,11 +1952,11 @@ last-resort aborts when the runtime Arc is gone — no cross-runtime bleed.
 **Known residuals (honest — block Golden, not M6 §22 closed-enough):**
 - Ambient `tokio::spawn` remains on deprecated `DefaultLoopRuntime::start*`,
   deprecated `HostToolRuntime::new`, Cooperative JoinOnly **test fixtures**,
-  `ProcessIsolated` wait tasks, sticky_cancel unit helper, and standalone
-  `McpGateway::bind_loopback`. Production `AsyncToolHandler` /
-  `IsolatedKillableToolHandler` drive inline (M5.4 note below). Golden still
-  wants JoinOnly + ProcessIsolated wait under TaskSupervisor (delete-vaults
-  end state / §21).
+  sticky_cancel unit helper, standalone `McpGateway::bind_loopback`, and
+  test-only `JoinOnlySpillInject`. Production `AsyncToolHandler` /
+  `IsolatedKillableToolHandler` / `ProcessIsolatedToolHandler` drive inline
+  (M5.4 notes below). Golden still wants JoinOnly fixtures supervised +
+  delete-vaults end state / `owned_processes` snapshot honesty.
 
 **Advisor (2026-08-20, independent review — honesty residual slice):**
 
@@ -2015,6 +2015,23 @@ closed-enough **still holds**. Delete-vaults / JoinOnly fixtures /
 ProcessIsolated wait / §23 extras remain Golden blockers. Do **not** promote
 Golden / §25.
 
-**Next pick:** remaining §23 extras **or** ProcessIsolated wait under
-TaskSupervisor / delete-vaults when JoinOnly also supervised. Do not promote
-Golden / §25.
+**ProcessIsolated drive + §23 forbidden-pattern (2026-08-20):**
+`ProcessIsolatedToolHandler` wait loop is now
+`LinkedToolExecutionHandle::drive` (async `try_wait` + `tokio::time::sleep`;
+no `spawn_blocking`). Dispatcher `await_tool_termination_driven` escalates
+OS kill after ProcessIsolated grace. `has_join` / DispatchGuard Drop hold
+capacity (orphan park) until the child is observed exited. §23 gate:
+`tests/s23_forbidden_patterns.rs` (undocumented ambient spawn search with
+documented exceptions; §22.7 suite inventory). Still open: exact-limit
+plus-one audit completeness, isolated adversarial subprocess harness,
+`owned_processes` always 0, JoinOnly fixture spawn, delete-vaults.
+**Not** Golden / §25.
+
+**Expert + Advisor (2026-08-20, ProcessIsolated/§23 gate):** **PASS — Silver.**
+M6 §22 closed-enough **still holds**. Capacity-on-Drop honesty for driven
+ProcessIsolated addressed in-slice (orphan park while child alive). Do **not**
+promote Golden / §25.
+
+**Next pick:** exact-limit plus-one audit / adversarial subprocess inventory
+**or** JoinOnly fixture supervision + delete-vaults / `owned_processes`.
+Do not promote Golden / §25.
