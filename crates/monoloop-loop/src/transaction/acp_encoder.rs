@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn non_empty_tools_rejected_for_acp_prompt() {
         use monoloop_contracts::{
-            JsonSchema, ToolCancellationPolicy, ToolId, ToolLimits, ToolName, ToolOutputContract,
+            JsonSchema, ToolExecutionClass, ToolId, ToolLimits, ToolName, ToolOutputContract,
             ToolSpec, ToolSuccessContract,
         };
         let enc = AcpPromptEncoder::grok();
@@ -367,7 +367,9 @@ mod tests {
                 error_data_schema: None,
             },
             ToolLimits::default(),
-            ToolCancellationPolicy::Abortable,
+            ToolExecutionClass::AbortableAtYield {
+                grace: std::time::Duration::from_secs(1),
+            },
         )
         .unwrap();
         let err = enc

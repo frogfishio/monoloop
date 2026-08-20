@@ -321,7 +321,7 @@ fn accept_terminal(
             entry.terminal = Some(TerminalDecision::new(proposal.kind));
             entry.phase = TransactionPhase::Finalizing;
         }
-        entry.resources.cancel.notify_waiters();
+        entry.resources.cancel.cancel();
         let kind = entry
             .terminal
             .as_ref()
@@ -333,7 +333,7 @@ fn accept_terminal(
     // Wake coordinator; do not abort publisher until Seal is sent.
     if let Ok(mut ledger) = shared.ledger.lock() {
         if let Some(entry) = ledger.get_mut(&tx) {
-            entry.resources.cancel.notify_waiters();
+            entry.resources.cancel.cancel();
         }
     }
 
@@ -484,7 +484,7 @@ fn begin_shutdown_inner(
             // Ensure cancel wake + abort for residual work.
             if let Ok(mut ledger) = shared.ledger.lock() {
                 if let Some(entry) = ledger.get_mut(&tx) {
-                    entry.resources.cancel.notify_waiters();
+                    entry.resources.cancel.cancel();
                 }
             }
             tasks.abort_transaction(&tx);

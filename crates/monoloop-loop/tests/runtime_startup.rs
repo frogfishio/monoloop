@@ -5,9 +5,9 @@ use monoloop_contracts::{
     user_text_input, AdmissionErrorKind, CanonicalToolOutput, ChannelCapabilities, ChannelDefaults,
     ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy, DialectDescriptor, ExchangeMode,
     FnCompletionCallback, FnEventSink, InvocationConfig, JsonSchema, McpConfigurationCapability,
-    McpReachability, SessionMode, ToolCancellationPolicy, ToolCompletion, ToolExecutionMode,
-    ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract,
-    TransactionRequest, TransactionRuntime,
+    McpReachability, SessionMode, ToolCompletion, ToolExecutionClass, ToolExecutionMode, ToolId,
+    ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionRequest,
+    TransactionRuntime,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
@@ -170,7 +170,7 @@ fn duplicate_tool_ids_rejected() {
                 error_data_schema: None,
             },
             ToolLimits::default(),
-            ToolCancellationPolicy::Cooperative {
+            ToolExecutionClass::CooperativeInProcess {
                 grace: std::time::Duration::from_millis(50),
             },
         )
@@ -204,7 +204,7 @@ fn duplicate_tool_names_rejected() {
                 error_data_schema: None,
             },
             ToolLimits::default(),
-            ToolCancellationPolicy::Cooperative {
+            ToolExecutionClass::CooperativeInProcess {
                 grace: std::time::Duration::from_millis(50),
             },
         )

@@ -71,20 +71,29 @@ pub struct ToolOutputContract {
     pub error_data_schema: Option<JsonSchema>,
 }
 
-/// How a tool can be terminated.
+/// Structural execution / termination class for a registered tool (v2 §14).
+///
+/// Names describe real guarantees — not wishful “kill” labels on Tokio tasks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolCancellationPolicy {
-    /// Cooperative cancel with grace.
-    Cooperative {
-        /// Grace period.
+pub enum ToolExecutionClass {
+    /// Cooperative cancel token; runtime cannot force stop. Failure to join
+    /// leaves cleanup pending and can prevent `Stopped`.
+    CooperativeInProcess {
+        /// Grace period before cleanup-pending.
         grace: Duration,
     },
-    /// Abortable in-process.
-    Abortable,
-    /// Isolated killable worker with grace.
-    IsolatedKillable {
-        /// Grace period.
+    /// Runtime owns a join handle and may `abort` at an await yield only.
+    /// Not hard-killable.
+    AbortableAtYield {
+        /// Grace period before abort.
         grace: Duration,
+    },
+    /// Child process (or equivalent) isolation boundary with kill + wait.
+    ProcessIsolated {
+        /// Cooperative cancel grace before kill.
+        grace: Duration,
+        /// Hard cleanup deadline for kill/wait.
+        kill_deadline: Duration,
     },
 }
 
@@ -103,8 +112,8 @@ pub struct ToolSpec {
     pub output_contract: ToolOutputContract,
     /// Limits.
     pub limits: ToolLimits,
-    /// Cancellation policy.
-    pub cancellation: ToolCancellationPolicy,
+    /// Execution / termination class.
+    pub execution_class: ToolExecutionClass,
 }
 
 impl ToolSpec {
@@ -119,7 +128,7 @@ impl ToolSpec {
         input_schema: JsonSchema,
         output_contract: ToolOutputContract,
         limits: ToolLimits,
-        cancellation: ToolCancellationPolicy,
+        execution_class: ToolExecutionClass,
     ) -> Result<Self, ToolContractError> {
         let description = description.into();
         if description.len() > Self::MAX_DESCRIPTION_BYTES {
@@ -135,14 +144,21 @@ impl ToolSpec {
         {
             return Err(ToolContractError::InvalidLimits);
         }
-        match &cancellation {
-            ToolCancellationPolicy::Cooperative { grace }
-            | ToolCancellationPolicy::IsolatedKillable { grace } => {
+        match &execution_class {
+            ToolExecutionClass::CooperativeInProcess { grace }
+            | ToolExecutionClass::AbortableAtYield { grace } => {
                 if grace.is_zero() {
                     return Err(ToolContractError::InvalidCancellationGrace);
                 }
             }
-            ToolCancellationPolicy::Abortable => {}
+            ToolExecutionClass::ProcessIsolated {
+                grace,
+                kill_deadline,
+            } => {
+                if grace.is_zero() || kill_deadline.is_zero() {
+                    return Err(ToolContractError::InvalidCancellationGrace);
+                }
+            }
         }
         Ok(Self {
             id,
@@ -151,7 +167,7 @@ impl ToolSpec {
             input_schema,
             output_contract,
             limits,
-            cancellation,
+            execution_class,
         })
     }
 }
@@ -391,7 +407,9 @@ mod tests {
             schema,
             out,
             ToolLimits::default(),
-            ToolCancellationPolicy::Abortable,
+            ToolExecutionClass::AbortableAtYield {
+                grace: Duration::from_secs(1),
+            },
         )
         .unwrap();
         assert_eq!(spec.id.as_str(), "search");

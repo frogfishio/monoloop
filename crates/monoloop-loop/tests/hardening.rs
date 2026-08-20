@@ -878,7 +878,7 @@ async fn allowed_extension_admits_and_external_rejects_temperature() {
 #[test]
 fn abortable_requires_supports_abort_handler() {
     use monoloop_contracts::{
-        JsonSchema, ToolCall, ToolCallContext, ToolCancellationPolicy, ToolCompletion, ToolId,
+        JsonSchema, ToolCall, ToolCallContext, ToolCompletion, ToolExecutionClass, ToolId,
         ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolStartError, ToolSuccessContract,
     };
     use monoloop_loop::{RegisteredTool, ToolHandler};
@@ -912,7 +912,9 @@ fn abortable_requires_supports_abort_handler() {
             error_data_schema: None,
         },
         ToolLimits::default(),
-        ToolCancellationPolicy::Abortable,
+        ToolExecutionClass::AbortableAtYield {
+            grace: std::time::Duration::from_secs(1),
+        },
     )
     .unwrap();
     let err = RegisteredTool::try_new(spec, Arc::new(Unstoppable)).unwrap_err();
@@ -930,8 +932,8 @@ fn abortable_requires_supports_abort_handler() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tools_per_transaction_plus_one_rejected() {
     use monoloop_contracts::{
-        JsonSchema, ToolCancellationPolicy, ToolId, ToolLimits, ToolName, ToolOutputContract,
-        ToolSpec, ToolSuccessContract,
+        JsonSchema, ToolExecutionClass, ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec,
+        ToolSuccessContract,
     };
     use monoloop_loop::{HostToolRegistry, ImmediateToolHandler, RegisteredTool};
 
@@ -953,7 +955,7 @@ async fn tools_per_transaction_plus_one_rejected() {
                     error_data_schema: None,
                 },
                 ToolLimits::default(),
-                ToolCancellationPolicy::Cooperative {
+                ToolExecutionClass::CooperativeInProcess {
                     grace: std::time::Duration::from_millis(50),
                 },
             )
@@ -1078,9 +1080,9 @@ async fn max_input_bytes_plus_one_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_payload_transaction_cap_rejects() {
     use monoloop_contracts::{
-        ChannelId, ExchangeId, JsonSchema, SessionId, SessionKey, ToolActionId,
-        ToolCancellationPolicy, ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec,
-        ToolSuccessContract, TransactionId,
+        ChannelId, ExchangeId, JsonSchema, SessionId, SessionKey, ToolActionId, ToolExecutionClass,
+        ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract,
+        TransactionId,
     };
     use monoloop_loop::{
         DispatchOutcome, DispatchRequest, DispatcherLimits, HostToolRegistry, ImmediateToolHandler,
@@ -1117,7 +1119,7 @@ async fn tool_payload_transaction_cap_rejects() {
                 max_output_bytes: 1024,
                 execution_deadline: Duration::from_secs(5),
             },
-            ToolCancellationPolicy::Cooperative {
+            ToolExecutionClass::CooperativeInProcess {
                 grace: std::time::Duration::from_millis(50),
             },
         )

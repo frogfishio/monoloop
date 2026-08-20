@@ -1575,3 +1575,44 @@ new/load/send workers were ambient if pending handles were dropped.
 - [x] Grok session pending RPC/new/load spawns join-owned or fail-closed on drop.
 - [x] Spec status matches fixed D-042 (optional shared process-core helper remains
       a non-blocking cleanup, not a defect).
+
+## D-043: M5 residuals — process isolation, MCP ownership, join vaults
+
+**Priority:** P2  
+**Status:** Open (accepted for M5 remainder; not claimed closed)  
+**Affected:**
+- Deferred `dispatcher.rs` / `IsolatedKillableToolHandler` (Tokio task ≠ process)
+- Deferred `mcp/` gateway ambient spawn
+- Deferred `tool_join_vault` / join vaults
+- Deprecated `DefaultLoopRuntime::start` / `start_empty` ambient spawn
+- Busy/Rejected Loop spawn still coordinator-owned join (not JoinSet)
+
+**Problem:** M5 EmptyToolRegistry under `TaskClass::LoopRuntime` and sticky
+cancel (LAW 21/25 on the supervised empty-tool path) are landed. Remaining
+v2 §14–§17 / M5 checklist items are not yet production-complete.
+
+**Acceptance criteria (remaining):**
+- [ ] `ProcessIsolated` uses a real OS process (or equivalent) kill boundary
+- [ ] MCP listener/request tasks registered under `TaskSupervisor`
+- [ ] Join vaults removed; supervisor retains joins
+- [ ] Production paths do not call deprecated ambient `start`
+- [ ] Prefer supervisor-owned Loop even under Busy (or document Busy as
+      permanent coordinator-owned fallback)
+
+## D-044: Sessionless DirectLlm tool envelopes invent `SessionId`
+
+**Priority:** P2  
+**Status:** Open (documented residual)  
+**Affected:**
+- `crates/monoloop-loop/src/transaction/lifecycle/loop_dispatch.rs` (`session_key_for`)
+
+**Problem:** When admission has no session, empty-tool lifecycle events build
+`SessionKey` with `tx-{transaction_id}` / `direct`. That is explicit and not a
+most-recent heuristic, but it is not an external (e.g. Grok) session id
+(LAWS 5–7 tension until `CanonicalToolResult.session_key` is optional or
+sessionless DirectLlm forbids tools).
+
+**Acceptance criteria:**
+- [ ] Spec decides: optional `SessionKey` on tool results, or session required
+      before tool dispatch, or transaction-scoped key is normative for DirectLlm
+- [ ] Code and docs match that decision

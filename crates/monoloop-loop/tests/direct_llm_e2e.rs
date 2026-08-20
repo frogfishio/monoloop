@@ -17,8 +17,8 @@ use monoloop_contracts::{
     ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy, DialectBinding,
     DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink, InvocationConfig,
     JsonSchema, McpConfigurationCapability, McpReachability, SessionMode, ToolActionId,
-    ToolCancellationPolicy, ToolCompletion, ToolExecutionMode, ToolId, ToolLifecycleEvent,
-    ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEnd,
+    ToolCompletion, ToolExecutionClass, ToolExecutionMode, ToolId, ToolLifecycleEvent, ToolLimits,
+    ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEnd,
     TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionRequest,
     TransactionRuntime,
 };
@@ -164,7 +164,7 @@ fn echo_tool() -> RegisteredTool {
             error_data_schema: None,
         },
         ToolLimits::default(),
-        ToolCancellationPolicy::Cooperative {
+        ToolExecutionClass::CooperativeInProcess {
             grace: std::time::Duration::from_millis(50),
         },
     )

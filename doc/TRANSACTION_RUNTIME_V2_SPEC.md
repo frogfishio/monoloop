@@ -1,11 +1,15 @@
 # Transaction Runtime v2 Specification
 
 **Status:** Normative replacement specification; M0–M4 landed (D-003; D-042
-Fixed); **M5 first slice** landed — EmptyToolRegistry pass under
-`TaskSupervisor` (`ToolWorker`) after exchange, truthful `tool_unavailable`
-lifecycle events, `NoToolRuntime` never started. Remaining M5: execution
-classes, process isolation, MCP TaskSupervisor registration, remove join
-vaults / ambient `DefaultLoopRuntime` spawn.
+Fixed); **M5 in progress** — Ready units feed canonical `DefaultLoopRuntime`
+under `TaskClass::LoopRuntime` (EmptyToolRegistry / NoToolRuntime). Lifecycle
+cancel is `StickyCancel` on `ResourceControls` (flag before notify). Loop
+completion and output receivers are taken once (no mutex across await).
+`SpawnReject::Orphaned` fails closed (no dummy future). `ToolExecutionClass`
+replaced `ToolCancellationPolicy` (§14). `start` / `start_empty` deprecated.
+Remaining (D-043/D-044): `ProcessIsolated` OS boundary, MCP under
+`TaskSupervisor`, join-vault removal, Busy→supervisor preference, sessionless
+tool `SessionKey` policy.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

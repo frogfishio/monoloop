@@ -9,7 +9,7 @@ use super::validation::{
 };
 use monoloop_contracts::{
     CanonicalToolError, CanonicalToolOutput, CanonicalToolResult, CanonicalToolResultOutcome,
-    ExchangeId, SessionKey, ToolActionId, ToolCall, ToolCallContext, ToolCancellationPolicy,
+    ExchangeId, SessionKey, ToolActionId, ToolCall, ToolCallContext, ToolExecutionClass,
     ToolCompletion, ToolId, ToolLifecycleEvent, ToolName, ToolRuntimeError, ToolStartError,
     TransactionId,
 };
@@ -321,14 +321,14 @@ impl TransactionToolDispatcher {
 
         // Bounded execution: deadline / external cancel → grace → kill → join (D-024 / D-028).
         let deadline = spec.limits.execution_deadline;
-        let policy = spec.cancellation.clone();
+        let policy = spec.execution_class.clone();
 
         // Structural termination support must be confirmed *before* start so a
         // missing kill capability cannot leave an ignoring worker running (D-028).
         let supports_required_termination = match &policy {
-            ToolCancellationPolicy::Abortable => handler.supports_abort(),
-            ToolCancellationPolicy::IsolatedKillable { .. } => handler.supports_isolated_kill(),
-            ToolCancellationPolicy::Cooperative { .. } => true,
+            ToolExecutionClass::AbortableAtYield { .. } => handler.supports_abort(),
+            ToolExecutionClass::ProcessIsolated { .. } => handler.supports_isolated_kill(),
+            ToolExecutionClass::CooperativeInProcess { .. } => true,
         };
         if !supports_required_termination {
             drop(dispatch_guard);
@@ -392,10 +392,10 @@ impl TransactionToolDispatcher {
         let kill = dispatch_guard.kill.clone();
         // Post-start invariant: claimed Abortable/IsolatedKillable must return a kill handle.
         let kill_ok = match &policy {
-            ToolCancellationPolicy::Abortable | ToolCancellationPolicy::IsolatedKillable { .. } => {
+            ToolExecutionClass::AbortableAtYield { .. } | ToolExecutionClass::ProcessIsolated { .. } => {
                 kill.is_some()
             }
-            ToolCancellationPolicy::Cooperative { .. } => true,
+            ToolExecutionClass::CooperativeInProcess { .. } => true,
         };
         if !kill_ok {
             // Handler claimed abort/kill support but returned no ToolKillHandle —
@@ -541,12 +541,12 @@ async fn await_tool_termination(
     wait: &mut Pin<&mut impl Future<Output = ToolCompletion>>,
     control: &ToolExecutionControl,
     kill: Option<&ToolKillHandle>,
-    policy: &ToolCancellationPolicy,
+    policy: &ToolExecutionClass,
 ) -> ToolCompletion {
     control.cancel();
     let join_grace = Duration::from_millis(200);
     match policy {
-        ToolCancellationPolicy::Abortable => {
+        ToolExecutionClass::AbortableAtYield { .. } => {
             if let Some(k) = kill {
                 k.kill();
                 // Bounded join only — never await unboundedly here (actor cleanup
@@ -561,25 +561,28 @@ async fn await_tool_termination(
                 Err(_) => ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded),
             }
         }
-        ToolCancellationPolicy::Cooperative { grace } => {
+        ToolExecutionClass::CooperativeInProcess { grace } => {
             match tokio::time::timeout(*grace, &mut *wait).await {
                 Ok(c) => c,
                 Err(_) => ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded),
             }
         }
-        ToolCancellationPolicy::IsolatedKillable { grace } => {
+        ToolExecutionClass::ProcessIsolated {
+            grace,
+            kill_deadline,
+        } => {
             match tokio::time::timeout(*grace, &mut *wait).await {
                 Ok(c) => c,
                 Err(_) => {
                     if let Some(k) = kill {
                         k.kill();
-                        if k.join_timeout(join_grace).await.is_err() {
+                        if k.join_timeout(*kill_deadline).await.is_err() {
                             return ToolCompletion::RuntimeFailed(
                                 ToolRuntimeError::TerminationFailed,
                             );
                         }
                     }
-                    match tokio::time::timeout(join_grace, wait).await {
+                    match tokio::time::timeout(*kill_deadline, wait).await {
                         Ok(c) => c,
                         Err(_) => {
                             ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed)

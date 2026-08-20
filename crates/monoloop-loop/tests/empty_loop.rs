@@ -112,13 +112,14 @@ fn open_scope(run: MonoloopRunId, loop_id: LoopId) -> LoopScope {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn text_does_not_dispatch() {
-    let (pub_, sub) = SubscriptionPublisher::channel("loop", 16);
-    let run = MonoloopRunId::new("r1");
-    let loop_id = LoopId::new("l1");
-    let handle = DefaultLoopRuntime::new()
-        .start_empty(
+/// Standalone Loop qualification: test owns the JoinHandle (not transaction composition).
+fn prepare_empty_owned(
+    run: MonoloopRunId,
+    loop_id: LoopId,
+    sub: monoloop_loop::CanonicalEventSubscription,
+) -> monoloop_loop::LoopHandle {
+    let (handle, fut) = DefaultLoopRuntime::new()
+        .prepare_empty(
             run.clone(),
             loop_id.clone(),
             open_scope(run, loop_id),
@@ -126,6 +127,16 @@ async fn text_does_not_dispatch() {
             LoopLimits::default(),
         )
         .unwrap();
+    tokio::spawn(fut);
+    handle
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_does_not_dispatch() {
+    let (pub_, sub) = SubscriptionPublisher::channel("loop", 16);
+    let run = MonoloopRunId::new("r1");
+    let loop_id = LoopId::new("l1");
+    let handle = prepare_empty_owned(run, loop_id, sub);
 
     pub_.publish(text_event("i1", "Hello world."))
         .await
@@ -143,15 +154,7 @@ async fn empty_registry_unavailable_zero_effects() {
     let (pub_, sub) = SubscriptionPublisher::channel("loop", 16);
     let run = MonoloopRunId::new("r2");
     let loop_id = LoopId::new("l2");
-    let handle = DefaultLoopRuntime::new()
-        .start_empty(
-            run.clone(),
-            loop_id.clone(),
-            open_scope(run, loop_id),
-            sub,
-            LoopLimits::default(),
-        )
-        .unwrap();
+    let handle = prepare_empty_owned(run, loop_id, sub);
 
     pub_.publish(tool_waiting("i1", "t1", 1)).await.unwrap();
     pub_.publish(tool_ready("i1", "t1", "bash", r#"{"cmd":"ls"}"#, 2))
@@ -166,7 +169,7 @@ async fn empty_registry_unavailable_zero_effects() {
     let mut unavailable = 0;
     let mut outbound = 0;
     {
-        let mut rx = handle.output.lock().await;
+        let mut rx = handle.take_output().await;
         while let Some(ev) = rx.recv().await {
             match &ev {
                 LoopOutputEvent::ToolUnavailable { .. } => unavailable += 1,
@@ -193,15 +196,7 @@ async fn waiting_never_dispatches() {
     let (pub_, sub) = SubscriptionPublisher::channel("loop", 8);
     let run = MonoloopRunId::new("r3");
     let loop_id = LoopId::new("l3");
-    let handle = DefaultLoopRuntime::new()
-        .start_empty(
-            run.clone(),
-            loop_id.clone(),
-            open_scope(run, loop_id),
-            sub,
-            LoopLimits::default(),
-        )
-        .unwrap();
+    let handle = prepare_empty_owned(run, loop_id, sub);
 
     pub_.publish(tool_waiting("i1", "t9", 1)).await.unwrap();
     drop(pub_);
@@ -215,15 +210,7 @@ async fn cancel_stops_loop() {
     let (_pub_, sub) = SubscriptionPublisher::channel("loop", 8);
     let run = MonoloopRunId::new("r4");
     let loop_id = LoopId::new("l4");
-    let handle = DefaultLoopRuntime::new()
-        .start_empty(
-            run.clone(),
-            loop_id.clone(),
-            open_scope(run, loop_id),
-            sub,
-            LoopLimits::default(),
-        )
-        .unwrap();
+    let handle = prepare_empty_owned(run, loop_id, sub);
     handle.control.cancel();
     let end = handle.completion.wait().await;
     assert_eq!(end.kind, LoopEndKind::Cancelled);

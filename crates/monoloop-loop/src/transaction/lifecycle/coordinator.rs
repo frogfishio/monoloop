@@ -1,21 +1,21 @@
 //! Per-transaction coordinator (v2 §11) — supervised DirectLlm exchange + empty tools (M5).
 
-use super::empty_tools::{has_ready_tool_units, run_empty_tool_pass, EmptyToolPassError};
 use super::event_publisher::EventPublisherCommand;
 use super::exchange::run_direct_llm_exchange;
+use super::loop_dispatch::{needs_loop_dispatch, run_supervised_empty_loop, LoopDispatchError};
 use super::task_spawner::TransactionTaskSpawner;
-use super::task_supervisor::TaskClass;
 use super::terminal::TerminalProposal;
 use crate::transaction::channel_registry::LiveChannel;
+use crate::transaction::sticky_cancel::StickyCancel;
 use monoloop_contracts::{
     merge_effective_config, CanonicalInput, ChannelId, ChannelKind, ExtensionLimits,
-    InvocationConfig, SessionConfig, SessionId, ToolExecutionId, TransactionEndKind,
-    TransactionEventPayload, TransactionId,
+    InvocationConfig, SessionConfig, SessionId, TransactionEndKind, TransactionEventPayload,
+    TransactionId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::mpsc;
 
 /// Message from coordinator workers to the supervisor.
 #[derive(Debug)]
@@ -33,8 +33,8 @@ pub enum WorkerMessage {
 pub struct CoordinatorParams {
     /// Transaction id.
     pub transaction_id: TransactionId,
-    /// Cancel notify.
-    pub cancel: Arc<Notify>,
+    /// Sticky cancel (flag before notify).
+    pub cancel: Arc<StickyCancel>,
     /// Channel id.
     pub channel_id: ChannelId,
     /// Session id when known.
@@ -145,7 +145,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         )));
         tokio::select! {
             biased;
-            _ = cancel.notified() => {
+            _ = cancel.cancelled() => {
                 terminal = TransactionEndKind::Cancelled;
                 break;
             }
@@ -161,51 +161,29 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
     if matches!(
         terminal,
         TransactionEndKind::Completed | TransactionEndKind::ContinuationRequired
-    ) && has_ready_tool_units(&outcome.units)
+    ) && needs_loop_dispatch(&outcome.units)
     {
-        // M5: EmptyToolRegistry pass. Prefer TaskSupervisor ToolWorker; if the
-        // spawn mailbox rejects, await the returned future on this coordinator
-        // (already supervised) — never drop the work or invent a second machine.
-        let (done_tx, done_rx) = oneshot::channel();
-        let exec_id = ToolExecutionId::generate();
-        let units = outcome.units.clone();
-        let publish_tools = publish_tx.clone();
-        let cancel_tools = Arc::clone(&cancel);
-        let channel_tools = channel_id.clone();
-        let session_tools = session_id.clone();
-        let exchange_id = outcome.exchange_id;
-        let worker = async move {
-            let report = run_empty_tool_pass(
-                transaction_id,
-                channel_tools,
-                session_tools,
-                exchange_id,
-                &units,
-                publish_tools,
-                cancel_tools,
-            )
-            .await;
-            let _ = done_tx.send(report);
-        };
-        match tasks
-            .spawn(TaskClass::ToolWorker(transaction_id, exec_id), worker)
-            .await
+        // M5: single canonical Loop state machine under TaskSupervisor.
+        match run_supervised_empty_loop(
+            &tasks,
+            transaction_id,
+            channel_id,
+            session_id,
+            outcome.exchange_id,
+            outcome.units,
+            publish_tx,
+            cancel,
+        )
+        .await
         {
-            Ok(_) => {}
-            Err((_err, returned)) => {
-                // Busy/Closed: drive the same future on the coordinator task.
-                returned.await;
-            }
-        }
-        match done_rx.await {
-            Ok(Ok(_report)) => {}
-            Ok(Err(EmptyToolPassError::Cancelled)) => {
+            Ok(_report) => {}
+            Err(LoopDispatchError::Cancelled) => {
                 terminal = TransactionEndKind::Cancelled;
             }
-            Ok(Err(EmptyToolPassError::PublishFailed)) => {
+            Err(LoopDispatchError::PublishFailed) => {
                 terminal = TransactionEndKind::EventDeliveryFailed;
             }
-            Ok(Err(_)) | Err(_) => {
+            Err(_) => {
                 terminal = TransactionEndKind::InvariantFailed;
             }
         }

@@ -2,24 +2,25 @@
 
 use super::capacity::TransactionReservations;
 use super::terminal::TerminalDecision;
+use crate::transaction::sticky_cancel::StickyCancel;
 use monoloop_contracts::{
     CanonicalInput, ChannelId, InvocationConfig, SessionConfig, SessionKey, ToolId,
     TransactionCompletionSender, TransactionDelivery, TransactionId, TransactionUsage,
 };
 use std::collections::HashMap;
-use tokio::sync::Notify;
+use std::sync::Arc;
 
 /// Resource controls for cooperative cancel / shutdown wakeups.
 #[derive(Debug, Clone)]
 pub struct ResourceControls {
-    /// Sticky cancel / shutdown signal for the coordinator.
-    pub cancel: std::sync::Arc<Notify>,
+    /// Sticky cancel / shutdown signal for the coordinator (flag before notify).
+    pub cancel: Arc<StickyCancel>,
 }
 
 impl Default for ResourceControls {
     fn default() -> Self {
         Self {
-            cancel: std::sync::Arc::new(Notify::new()),
+            cancel: Arc::new(StickyCancel::new()),
         }
     }
 }

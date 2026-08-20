@@ -286,7 +286,7 @@ mod tests {
     use monoloop_contracts::merge_effective_config;
     use monoloop_contracts::{
         user_text_input, CanonicalInput, ChannelDefaults, EffectiveConfig, ExchangeId,
-        InvocationConfig, JsonSchema, ToolCancellationPolicy, ToolId, ToolLimits, ToolName,
+        InvocationConfig, JsonSchema, ToolExecutionClass, ToolId, ToolLimits, ToolName,
         ToolOutputContract, ToolSuccessContract, TransactionId,
     };
     use monoloop_contracts::{ExtensionLimits, OptionPolicy};
@@ -366,7 +366,9 @@ mod tests {
                 error_data_schema: None,
             },
             ToolLimits::default(),
-            ToolCancellationPolicy::Abortable,
+            ToolExecutionClass::AbortableAtYield {
+                grace: std::time::Duration::from_secs(1),
+            },
         )
         .unwrap();
         let input = user_text_input("q").unwrap();

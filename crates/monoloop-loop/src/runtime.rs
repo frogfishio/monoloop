@@ -45,7 +45,18 @@ pub struct LoopHandle {
     /// Completion.
     pub completion: LoopCompletion,
     /// Output events (independent of Interpreter stream).
-    pub output: Mutex<mpsc::Receiver<LoopOutputEvent>>,
+    ///
+    /// Prefer [`Self::take_output`] so callers do not hold a mutex across await
+    /// (Law 21). Direct locking remains for legacy unit tests.
+    pub output: Mutex<Option<mpsc::Receiver<LoopOutputEvent>>>,
+}
+
+impl LoopHandle {
+    /// Take the output receiver once (Law 21: no guard held across await).
+    pub async fn take_output(&self) -> mpsc::Receiver<LoopOutputEvent> {
+        let mut guard = self.output.lock().await;
+        guard.take().expect("LoopHandle output taken twice")
+    }
 }
 
 /// Cancellation control.
@@ -89,10 +100,25 @@ pub struct LoopCompletion {
 }
 
 impl LoopCompletion {
-    /// Wait for exactly one LoopEnd.
+    /// Wait for exactly one LoopEnd (consumes the handle).
     pub async fn wait(self) -> LoopEnd {
+        let rx = self.take_receiver().await;
+        Self::recv_end(rx).await
+    }
+
+    /// Take the oneshot receiver once (Law 21: no guard held across await).
+    pub async fn take_receiver(&self) -> oneshot::Receiver<LoopEnd> {
         let mut guard = self.rx.lock().await;
-        let rx = guard.take().expect("LoopCompletion polled twice");
+        guard.take().expect("LoopCompletion polled twice")
+    }
+
+    /// Wait for exactly one LoopEnd without moving `self` (still one-shot).
+    pub async fn wait_ref(&self) -> LoopEnd {
+        let rx = self.take_receiver().await;
+        Self::recv_end(rx).await
+    }
+
+    async fn recv_end(rx: oneshot::Receiver<LoopEnd>) -> LoopEnd {
         rx.await.unwrap_or(LoopEnd {
             monoloop_run_id: MonoloopRunId::new("unknown"),
             loop_id: LoopId::new("unknown"),
@@ -106,6 +132,9 @@ impl LoopCompletion {
     }
 }
 
+/// Owned Loop run future for TaskSupervisor registration.
+pub type LoopRunFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 /// Default runtime factory.
 #[derive(Clone, Debug, Default)]
 pub struct DefaultLoopRuntime;
@@ -116,21 +145,24 @@ impl DefaultLoopRuntime {
         Self
     }
 
-    /// Start a loop with EmptyToolRegistry + NoToolRuntime defaults available via helpers.
-    pub fn start(&self, request: StartLoop) -> Result<LoopHandle, LoopError> {
-        spawn_loop(request)
+    /// Build handle + owned run future without spawning (TaskSupervisor path).
+    ///
+    /// Production transaction composition MUST spawn the future via
+    /// `TransactionTaskSpawner` / `TaskClass::LoopRuntime` (M5).
+    pub fn prepare(&self, request: StartLoop) -> Result<(LoopHandle, LoopRunFuture), LoopError> {
+        prepare_loop(request)
     }
 
-    /// Convenience: empty-tool composition.
-    pub fn start_empty(
+    /// Convenience: empty-tool prepare (no spawn).
+    pub fn prepare_empty(
         &self,
         monoloop_run_id: MonoloopRunId,
         loop_id: LoopId,
         scope: LoopScope,
         subscription: CanonicalEventSubscription,
         limits: LoopLimits,
-    ) -> Result<LoopHandle, LoopError> {
-        self.start(StartLoop {
+    ) -> Result<(LoopHandle, LoopRunFuture), LoopError> {
+        self.prepare(StartLoop {
             monoloop_run_id,
             loop_id,
             scope,
@@ -141,9 +173,39 @@ impl DefaultLoopRuntime {
             limits,
         })
     }
+
+    /// Legacy ambient spawn — **not** for transaction composition.
+    ///
+    /// Residual for callers that have not yet switched to [`Self::prepare`].
+    /// Prefer [`Self::prepare`] / [`Self::prepare_empty`] and an explicit owner
+    /// (`TransactionTaskSpawner` in production, or a test-local `tokio::spawn`).
+    #[deprecated(
+        note = "ambient tokio::spawn; use prepare()/prepare_empty() and an explicit owner (M5)"
+    )]
+    pub fn start(&self, request: StartLoop) -> Result<LoopHandle, LoopError> {
+        let (handle, fut) = self.prepare(request)?;
+        tokio::spawn(fut);
+        Ok(handle)
+    }
+
+    /// Legacy ambient empty-tool start — **not** for transaction composition.
+    #[deprecated(note = "ambient tokio::spawn; use prepare_empty() and an explicit owner (M5)")]
+    pub fn start_empty(
+        &self,
+        monoloop_run_id: MonoloopRunId,
+        loop_id: LoopId,
+        scope: LoopScope,
+        subscription: CanonicalEventSubscription,
+        limits: LoopLimits,
+    ) -> Result<LoopHandle, LoopError> {
+        let (handle, fut) =
+            self.prepare_empty(monoloop_run_id, loop_id, scope, subscription, limits)?;
+        tokio::spawn(fut);
+        Ok(handle)
+    }
 }
 
-fn spawn_loop(request: StartLoop) -> Result<LoopHandle, LoopError> {
+fn prepare_loop(request: StartLoop) -> Result<(LoopHandle, LoopRunFuture), LoopError> {
     let control = LoopControl::new();
     let health = LoopHealth::default();
     let (out_tx, out_rx) = mpsc::channel(request.output_capacity.max(1));
@@ -153,7 +215,7 @@ fn spawn_loop(request: StartLoop) -> Result<LoopHandle, LoopError> {
     let control_task = control.clone();
     let health_task = health.clone();
 
-    tokio::spawn(async move {
+    let fut = Box::pin(async move {
         let mut owner = LoopOwner {
             monoloop_run_id: request.monoloop_run_id,
             loop_id: request.loop_id,
@@ -177,15 +239,18 @@ fn spawn_loop(request: StartLoop) -> Result<LoopHandle, LoopError> {
         owner.run(request.subscription, end_tx).await;
     });
 
-    Ok(LoopHandle {
-        loop_id,
-        control,
-        health,
-        completion: LoopCompletion {
-            rx: Mutex::new(Some(end_rx)),
+    Ok((
+        LoopHandle {
+            loop_id,
+            control,
+            health,
+            completion: LoopCompletion {
+                rx: Mutex::new(Some(end_rx)),
+            },
+            output: Mutex::new(Some(out_rx)),
         },
-        output: Mutex::new(out_rx),
-    })
+        fut,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

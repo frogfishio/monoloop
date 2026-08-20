@@ -3,7 +3,7 @@
 use monoloop_contracts::OutboundToolOutcome;
 use monoloop_contracts::{
     CanonicalToolError, CanonicalToolOutput, ChannelId, ExchangeId, JsonSchema, SessionId,
-    SessionKey, ToolActionId, ToolCancellationPolicy, ToolCompletion, ToolId, ToolLimits, ToolName,
+    SessionKey, ToolActionId, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName,
     ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionId,
 };
 use monoloop_loop::{
@@ -57,7 +57,7 @@ fn make_spec(id: &str, name: &str) -> ToolSpec {
             max_output_bytes: 1024,
             execution_deadline: Duration::from_secs(5),
         },
-        ToolCancellationPolicy::Cooperative {
+        ToolExecutionClass::CooperativeInProcess {
             grace: std::time::Duration::from_millis(50),
         },
     )
@@ -603,7 +603,9 @@ async fn cancel_running_async_tool() {
     // Short deadline forces timeout cancel path while the handler still runs.
     // Abortable + AsyncToolHandler (supports_abort + kill handle) is the structural pair.
     let mut spec = make_spec("c", "cancel_me");
-    spec.cancellation = ToolCancellationPolicy::Abortable;
+    spec.execution_class = ToolExecutionClass::AbortableAtYield {
+        grace: std::time::Duration::from_secs(1),
+    };
     spec.limits.execution_deadline = Duration::from_millis(50);
     let host = HostToolRegistry::build(vec![RegisteredTool::new(
         spec,
@@ -661,8 +663,9 @@ async fn isolated_killable_escalates_after_grace_and_stops_work() {
             max_output_bytes: 1024,
             execution_deadline: Duration::from_millis(40),
         },
-        ToolCancellationPolicy::IsolatedKillable {
+        ToolExecutionClass::ProcessIsolated {
             grace: Duration::from_millis(30),
+            kill_deadline: Duration::from_millis(200),
         },
     )
     .unwrap();
@@ -738,8 +741,9 @@ fn isolated_killable_requires_supports_isolated_kill() {
             max_output_bytes: 1024,
             execution_deadline: Duration::from_secs(1),
         },
-        ToolCancellationPolicy::IsolatedKillable {
+        ToolExecutionClass::ProcessIsolated {
             grace: Duration::from_millis(50),
+            kill_deadline: Duration::from_millis(200),
         },
     )
     .unwrap();
@@ -747,7 +751,9 @@ fn isolated_killable_requires_supports_isolated_kill() {
     let err = RegisteredTool::try_new(spec, ok_handler()).unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("IsolatedKillable") || msg.contains("supports_isolated_kill"),
+        msg.contains("ProcessIsolated")
+            || msg.contains("IsolatedKillable")
+            || msg.contains("supports_isolated_kill"),
         "got {msg}"
     );
 }

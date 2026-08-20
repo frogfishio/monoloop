@@ -19,7 +19,8 @@ pub use registry::{
     ToolResolution,
 };
 pub use runtime::{
-    DefaultLoopRuntime, LoopCompletion, LoopControl, LoopHandle, LoopHealth, StartLoop,
+    DefaultLoopRuntime, LoopCompletion, LoopControl, LoopHandle, LoopHealth, LoopRunFuture,
+    StartLoop,
 };
 pub use subscription::{
     CanonicalEventSubscription, DeliveredEvent, SubscriberId, SubscriptionGap,

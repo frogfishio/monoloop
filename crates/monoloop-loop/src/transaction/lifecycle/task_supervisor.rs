@@ -28,6 +28,8 @@ pub enum TaskClass {
     InterpreterOwner(TransactionId, ExchangeId),
     /// Tool worker.
     ToolWorker(TransactionId, ToolExecutionId),
+    /// Inner LoopRuntime owner for one transaction (M5).
+    LoopRuntime(TransactionId),
     /// MCP request task.
     McpRequest(TransactionId),
     /// Runtime-wide service (MCP listener, etc.).
@@ -43,6 +45,7 @@ impl TaskClass {
             | Self::ConnectorOwner(t, _)
             | Self::InterpreterOwner(t, _)
             | Self::ToolWorker(t, _)
+            | Self::LoopRuntime(t)
             | Self::McpRequest(t) => Some(*t),
             Self::RuntimeService => None,
         }

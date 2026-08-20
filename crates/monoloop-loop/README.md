@@ -35,11 +35,14 @@ Fake/HTTP/ACP `begin_open` paths. ACP ProcessInner pumps use `Weak`+JoinSet;
 Grok pending connect/session/exchange workers abort on Drop and join on `wait`;
 `GrokServerHandle::shutdown` / `ServerInner` Drop tear down `run_connection`.
 Deferred on-disk modules stay uncompiled until their stage. Legacy suites need
-`--features legacy_runtime_tests`. **M5 (partial):** EmptyToolRegistry pass runs as a supervised `ToolWorker`
-only when Ready tool units are present (zero effects / `tool_unavailable`
-lifecycle); Busy spawn falls back to coordinator-owned await of the same
-future. MCP, process isolation, and TaskSupervisor-owned `DefaultLoopRuntime`
-still ahead.
+`--features legacy_runtime_tests`. **M5 (partial):** Ready tool units run through
+canonical `DefaultLoopRuntime` under `TaskClass::LoopRuntime` (`prepare` +
+TaskSpawner; EmptyToolRegistry / NoToolRuntime). Lifecycle cancel is
+`StickyCancel`. Output/completion receivers are taken once (Law 21). Busy spawn
+falls back to coordinator-owned join. `ToolExecutionClass` names termination
+guarantees. `start` / `start_empty` deprecated. Remaining (D-043/D-044):
+process-isolated kill, MCP under TaskSupervisor, join-vault deletion,
+sessionless tool SessionKey policy.
 
 ## Agent assembly recipe (v2 / M2)
 

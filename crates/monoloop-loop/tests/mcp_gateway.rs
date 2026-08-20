@@ -2,8 +2,8 @@
 
 use monoloop_contracts::{
     CanonicalToolOutput, ChannelId, ExchangeId, JsonSchema, SessionId, SessionKey, ToolActionId,
-    ToolCancellationPolicy, ToolCompletion, ToolId, ToolLimits, ToolName, ToolOutputContract,
-    ToolSpec, ToolSuccessContract, TransactionId,
+    ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec,
+    ToolSuccessContract, TransactionId,
 };
 use monoloop_loop::{
     dispatch_ready_tool, tool_definitions_from_resolved, CapabilityToken, DispatchOutcome,
@@ -49,7 +49,7 @@ fn make_spec(id: &str, name: &str) -> ToolSpec {
             max_output_bytes: 1024,
             execution_deadline: Duration::from_secs(5),
         },
-        ToolCancellationPolicy::Cooperative {
+        ToolExecutionClass::CooperativeInProcess {
             grace: std::time::Duration::from_millis(50),
         },
     )

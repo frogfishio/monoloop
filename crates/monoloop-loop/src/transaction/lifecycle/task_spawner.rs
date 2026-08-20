@@ -21,13 +21,22 @@ pub struct TransactionTaskSpawner {
     tx: mpsc::Sender<SpawnRequest>,
 }
 
-/// Spawn rejected because the supervisor queue closed, is full, or reply lost.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpawnError {
-    /// Supervisor is gone / not accepting spawns.
-    Closed,
-    /// Spawn mailbox at capacity (fail closed; do not block the worker).
-    Busy,
+/// Why [`TransactionTaskSpawner::spawn`] rejected or could not confirm ownership.
+pub enum SpawnReject {
+    /// Mailbox full before accept; caller still owns the future (drive or drop).
+    Busy {
+        /// Unspawned future.
+        future: BoxFuture,
+    },
+    /// Channel closed before accept; caller still owns the future.
+    Rejected {
+        /// Unspawned future.
+        future: BoxFuture,
+    },
+    /// `try_send` succeeded but TaskId reply was lost (e.g. shutdown drained the
+    /// request without spawning, or reply send failed). The future is **not**
+    /// returned — caller MUST NOT drive a substitute (Law 23 / 25). Fail closed.
+    Orphaned,
 }
 
 impl TransactionTaskSpawner {
@@ -40,19 +49,10 @@ impl TransactionTaskSpawner {
     /// Register then spawn `future` under `class`.
     ///
     /// Uses `try_send` so workers never block forever on a full mailbox while the
-    /// supervisor is in `abort_and_drain`. On `Busy`/`Closed` before accept, the
-    /// boxed future is returned so the caller can drive cleanup inline.
-    pub async fn spawn<F>(
-        &self,
-        class: TaskClass,
-        future: F,
-    ) -> Result<
-        TaskId,
-        (
-            SpawnError,
-            Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
-        ),
-    >
+    /// supervisor is in `abort_and_drain`. On Busy/Rejected before accept, the
+    /// boxed future is returned so the caller can drive cleanup inline. On
+    /// [`SpawnReject::Orphaned`], the future is gone from the caller — fail closed.
+    pub async fn spawn<F>(&self, class: TaskClass, future: F) -> Result<TaskId, SpawnReject>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -63,14 +63,13 @@ impl TransactionTaskSpawner {
             reply: reply_tx,
         };
         match self.tx.try_send(req) {
-            Ok(()) => reply_rx.await.map_err(|_| {
-                (
-                    SpawnError::Closed,
-                    Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
-                )
-            }),
-            Err(TrySendError::Full(req)) => Err((SpawnError::Busy, req.future)),
-            Err(TrySendError::Closed(req)) => Err((SpawnError::Closed, req.future)),
+            Ok(()) => match reply_rx.await {
+                Ok(id) => Ok(id),
+                // Accepted into mailbox; do not invent a dummy future (Law 23/25).
+                Err(_) => Err(SpawnReject::Orphaned),
+            },
+            Err(TrySendError::Full(req)) => Err(SpawnReject::Busy { future: req.future }),
+            Err(TrySendError::Closed(req)) => Err(SpawnReject::Rejected { future: req.future }),
         }
     }
 }

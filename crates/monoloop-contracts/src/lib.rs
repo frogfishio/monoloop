@@ -74,9 +74,9 @@ pub use loop_types::{
 pub use safe::{DiagnosticCode, SafeDiagnostic, SafeDiagnosticError};
 pub use tool::{
     CanonicalToolError, CanonicalToolOutput, CanonicalToolResult, CanonicalToolResultOutcome,
-    JsonSchema, ToolCall, ToolCallContext, ToolCancellationPolicy, ToolCompletion,
-    ToolContractError, ToolLifecycleEvent, ToolOutputContract, ToolRuntimeError, ToolSpec,
-    ToolStartError, ToolSuccessContract,
+    JsonSchema, ToolCall, ToolCallContext, ToolCompletion, ToolContractError, ToolExecutionClass,
+    ToolLifecycleEvent, ToolOutputContract, ToolRuntimeError, ToolSpec, ToolStartError,
+    ToolSuccessContract,
 };
 pub use transaction::{
     AdmissionError, AdmissionErrorKind, AdmissionReceipt, CancellationReason,

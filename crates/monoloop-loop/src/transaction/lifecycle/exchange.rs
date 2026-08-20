@@ -5,8 +5,9 @@
 //! After any child is registered, failure paths terminate the connection and
 //! await those children within `cleanup_deadline` (no orphan owners).
 
-use super::task_spawner::TransactionTaskSpawner;
+use super::task_spawner::{SpawnReject, TransactionTaskSpawner};
 use super::task_supervisor::TaskClass;
+use crate::transaction::sticky_cancel::StickyCancel;
 use monoloop_connector::{
     ConnectionControlHandle, ConnectionEnd, ConnectionEndKind, Connector, OpenConnection,
     TerminationReason,
@@ -19,7 +20,7 @@ use monoloop_contracts::{
 use monoloop_interpreter::{InterpreterFactory, StartInterpretation};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::sync::{oneshot, Mutex};
 
 /// Outcome of one supervised exchange.
 pub struct DirectExchangeOutcome {
@@ -117,7 +118,7 @@ pub async fn run_direct_llm_exchange(
     credential_ref: Option<&str>,
     input: &monoloop_contracts::CanonicalInput,
     config: &EffectiveConfig,
-    cancel: Arc<Notify>,
+    cancel: Arc<StickyCancel>,
     deadline: Duration,
     cleanup_deadline: Duration,
     max_encoded_exchange_bytes: usize,
@@ -170,7 +171,7 @@ async fn run_inner(
     credential_ref: Option<&str>,
     input: &monoloop_contracts::CanonicalInput,
     config: &EffectiveConfig,
-    cancel: Arc<Notify>,
+    cancel: Arc<StickyCancel>,
     deadline: Duration,
     cleanup_deadline: Duration,
     max_encoded_exchange_bytes: usize,
@@ -207,7 +208,7 @@ async fn run_inner(
 
     let mut opened = tokio::select! {
         biased;
-        _ = cancel.notified() => {
+        _ = cancel.cancelled() => {
             let _ = control.terminate(TerminationReason::CallerForced);
             return Err(ExchangeFailure::Cancelled);
         }
@@ -247,10 +248,16 @@ async fn run_inner(
         Ok(_) => {
             children.owner = Some(owner_done_rx);
         }
-        Err((_err, returned)) => {
+        Err(SpawnReject::Busy { future } | SpawnReject::Rejected { future }) => {
             // Spawner rejected before accept: drive owner inline after terminate.
             let _ = open_control.terminate(TerminationReason::CallerForced);
-            let _ = tokio::time::timeout(cleanup_deadline, returned).await;
+            let _ = tokio::time::timeout(cleanup_deadline, future).await;
+            return Err(ExchangeFailure::SpawnFailed);
+        }
+        Err(SpawnReject::Orphaned) => {
+            // Future left the caller; fail closed (Law 23/25).
+            let _ = open_control.terminate(TerminationReason::CallerForced);
+            children.wait(cleanup_deadline).await;
             return Err(ExchangeFailure::SpawnFailed);
         }
     }
@@ -315,8 +322,18 @@ async fn run_inner(
         Ok(_) => {
             children.pump = Some(pump_done_rx);
         }
-        Err((_err, _returned)) => {
-            // Pump never started; terminate + join owner already registered.
+        Err(SpawnReject::Busy { future } | SpawnReject::Rejected { future }) => {
+            // Pump rejected before accept; drop unspawned work, join owner.
+            drop(future);
+            return fail_cleanup(
+                &open_control,
+                children,
+                cleanup_deadline,
+                ExchangeFailure::SpawnFailed,
+            )
+            .await;
+        }
+        Err(SpawnReject::Orphaned) => {
             return fail_cleanup(
                 &open_control,
                 children,
@@ -390,7 +407,17 @@ async fn run_inner(
         Ok(_) => {
             children.units = Some(units_done_rx);
         }
-        Err((_err, _returned)) => {
+        Err(SpawnReject::Busy { future } | SpawnReject::Rejected { future }) => {
+            drop(future);
+            return fail_cleanup(
+                &open_control,
+                children,
+                cleanup_deadline,
+                ExchangeFailure::SpawnFailed,
+            )
+            .await;
+        }
+        Err(SpawnReject::Orphaned) => {
             return fail_cleanup(
                 &open_control,
                 children,
@@ -406,7 +433,7 @@ async fn run_inner(
 
     let result = tokio::select! {
         biased;
-        _ = cancel.notified() => {
+        _ = cancel.cancelled() => {
             let _ = open_control.terminate(TerminationReason::CallerForced);
             Err(ExchangeFailure::Cancelled)
         }

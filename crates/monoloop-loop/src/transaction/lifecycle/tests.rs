@@ -363,20 +363,15 @@ fn short_wait_may_timeout_while_quiescing_then_complete() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_tool_pass_unavailable_zero_effects() {
-    use super::empty_tools::run_empty_tool_pass;
-    use super::event_publisher::EventPublisherCommand;
+#[test]
+fn needs_loop_dispatch_ready_only() {
+    use super::loop_dispatch::needs_loop_dispatch;
     use monoloop_contracts::{
-        CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, ConnectionId, ExchangeId, FlowId,
+        CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, ConnectionId, FlowId,
         InterpretationId, LaneId, ToolActionEvent, ToolActionId, ToolExecutionState,
-        ToolLifecycleEvent, ToolRequestState, ToolResultState, TransactionEventPayload,
-        TransactionId, UnitId, UnitState,
+        ToolRequestState, ToolResultState, UnitId, UnitState,
     };
-    use tokio::sync::{mpsc, Notify};
 
-    let (tx, mut rx) = mpsc::channel::<EventPublisherCommand>(8);
-    let cancel = Arc::new(Notify::new());
     let ready = CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
         unit_id: UnitId::new("tool-1"),
         unit_generation: 1,
@@ -396,10 +391,10 @@ async fn empty_tool_pass_unavailable_zero_effects() {
             request_state: ToolRequestState::Ready,
             execution_state: ToolExecutionState::Waiting,
             result_state: ToolResultState::Absent,
-            request_payload: Some(r#"{"cmd":"ls"}"#.into()),
+            request_payload: Some("{}".into()),
             result_payload: None,
             terminal_outcome: None,
-            waiting_for: Some("external".into()),
+            waiting_for: None,
         }),
     });
     let waiting = CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
@@ -427,39 +422,240 @@ async fn empty_tool_pass_unavailable_zero_effects() {
             waiting_for: Some("args".into()),
         }),
     });
+    assert!(needs_loop_dispatch(std::slice::from_ref(&ready)));
+    assert!(!needs_loop_dispatch(std::slice::from_ref(&waiting)));
+    assert!(needs_loop_dispatch(&[waiting, ready]));
+}
 
-    let report = run_empty_tool_pass(
-        TransactionId::generate(),
-        ChannelId::try_new("llm").unwrap(),
-        Some(SessionId::try_new("s1").unwrap()),
-        ExchangeId::generate(),
-        &[ready, waiting],
-        tx,
-        cancel,
-    )
-    .await
-    .expect("empty tool pass");
-    assert_eq!(report.ready_seen, 1);
-    assert_eq!(report.unavailable_published, 1);
-    assert_eq!(report.non_ready_ignored, 1);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_loop_no_ambient_spawn_unavailable() {
+    use crate::registry::EmptyToolRegistry;
+    use crate::runtime::{DefaultLoopRuntime, StartLoop};
+    use crate::subscription::SubscriptionPublisher;
+    use crate::tools::NoToolRuntime;
+    use monoloop_contracts::{
+        CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, ConnectionId, FlowId,
+        InterpretationId, InterpreterOutputEvent, LaneId, LoopEndKind, LoopId, LoopLimits,
+        LoopOutputEvent, LoopScope, MonoloopRunId, OutboundToolOutcome, ToolActionEvent,
+        ToolActionId, ToolExecutionState, ToolRequestState, ToolResultState, UnitId, UnitState,
+    };
 
-    let mut saw_unavailable = false;
-    while let Ok(cmd) = rx.try_recv() {
-        if let EventPublisherCommand::Publish(payload) = cmd {
-            if let TransactionEventPayload::ToolLifecycle(ToolLifecycleEvent::Completed {
-                result,
-            }) = *payload
-            {
-                assert!(matches!(
-                    result.outcome,
-                    monoloop_contracts::CanonicalToolResultOutcome::DomainFailed(_)
-                ));
-                saw_unavailable = true;
+    let (pub_, sub) = SubscriptionPublisher::channel("prep", 16);
+    let run = MonoloopRunId::new("r-prep");
+    let loop_id = LoopId::new("l-prep");
+    let scope = LoopScope {
+        monoloop_run_id: run.clone(),
+        loop_id: loop_id.clone(),
+        accepted_interpretation_ids: vec![],
+        accepted_connection_ids: vec![],
+        accepted_external_session_ids: vec![],
+        accept_all_in_run: true,
+    };
+    let limits = LoopLimits::default();
+    let (handle, fut) = DefaultLoopRuntime::new()
+        .prepare(StartLoop {
+            monoloop_run_id: run,
+            loop_id,
+            scope,
+            subscription: sub,
+            tool_registry: Arc::new(EmptyToolRegistry::new()),
+            tool_runtime: Arc::new(NoToolRuntime::new()),
+            output_capacity: 16,
+            limits,
+        })
+        .expect("prepare");
+
+    let ready = InterpreterOutputEvent::Unit(Box::new(CanonicalUnitEvent::Created(
+        CanonicalUnitSnapshot {
+            unit_id: UnitId::new("tool-1"),
+            unit_generation: 1,
+            unit_state: UnitState::Waiting,
+            interpretation_id: InterpretationId::new("i1"),
+            connection_id: ConnectionId::new("c1"),
+            external_session_id: None,
+            flow_id: FlowId::main(),
+            lane_id: LaneId::tool(),
+            lane_ordinal: 1,
+            causal_parent_id: None,
+            source_time: None,
+            source_step: None,
+            unit: CanonicalUnit::Tool(ToolActionEvent {
+                tool_action_id: ToolActionId::new("a1"),
+                tool_name: Some("bash".into()),
+                request_state: ToolRequestState::Ready,
+                execution_state: ToolExecutionState::Waiting,
+                result_state: ToolResultState::Absent,
+                request_payload: Some(r#"{"cmd":"ls"}"#.into()),
+                result_payload: None,
+                terminal_outcome: None,
+                waiting_for: Some("external".into()),
+            }),
+        },
+    )));
+
+    let feed = async {
+        pub_.publish(ready).await.unwrap();
+        drop(pub_);
+    };
+    tokio::join!(fut, feed);
+
+    let mut unavailable = 0;
+    let mut outbound = 0;
+    {
+        let mut rx = handle.take_output().await;
+        while let Some(ev) = rx.recv().await {
+            match &ev {
+                LoopOutputEvent::ToolUnavailable { .. } => unavailable += 1,
+                LoopOutputEvent::OutboundToolResult(r) => {
+                    assert_eq!(r.outcome, OutboundToolOutcome::ToolUnavailable);
+                    assert!(r.tool_execution_id.is_none());
+                    outbound += 1;
+                }
+                LoopOutputEvent::LoopEnded(_) => break,
+                _ => {}
             }
         }
     }
-    assert!(
-        saw_unavailable,
-        "expected ToolLifecycle Completed unavailable"
-    );
+    assert_eq!(unavailable, 1);
+    assert_eq!(outbound, 1);
+    let end = handle.completion.wait().await;
+    assert_eq!(end.kind, LoopEndKind::Drained);
+    assert_eq!(end.tools_unavailable, 1);
+}
+
+fn ready_tool_unit() -> monoloop_contracts::CanonicalUnitEvent {
+    use monoloop_contracts::{
+        CanonicalUnit, CanonicalUnitEvent, CanonicalUnitSnapshot, ConnectionId, FlowId,
+        InterpretationId, LaneId, ToolActionEvent, ToolActionId, ToolExecutionState,
+        ToolRequestState, ToolResultState, UnitId, UnitState,
+    };
+    CanonicalUnitEvent::Created(CanonicalUnitSnapshot {
+        unit_id: UnitId::new("tool-1"),
+        unit_generation: 1,
+        unit_state: UnitState::Waiting,
+        interpretation_id: InterpretationId::new("i1"),
+        connection_id: ConnectionId::new("c1"),
+        external_session_id: None,
+        flow_id: FlowId::main(),
+        lane_id: LaneId::tool(),
+        lane_ordinal: 1,
+        causal_parent_id: None,
+        source_time: None,
+        source_step: None,
+        unit: CanonicalUnit::Tool(ToolActionEvent {
+            tool_action_id: ToolActionId::new("a1"),
+            tool_name: Some("bash".into()),
+            request_state: ToolRequestState::Ready,
+            execution_state: ToolExecutionState::Waiting,
+            result_state: ToolResultState::Absent,
+            request_payload: Some(r#"{"cmd":"ls"}"#.into()),
+            result_payload: None,
+            terminal_outcome: None,
+            waiting_for: None,
+        }),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_empty_loop_ready_under_task_spawner() {
+    use super::event_publisher::EventPublisherCommand;
+    use super::loop_dispatch::run_supervised_empty_loop;
+    use super::task_spawner::TransactionTaskSpawner;
+    use super::task_supervisor::TaskSupervisor;
+    use crate::transaction::sticky_cancel::StickyCancel;
+    use monoloop_contracts::{ChannelId, ExchangeId, TransactionEventPayload, TransactionId};
+    use tokio::sync::mpsc;
+
+    let (spawner, mut spawn_rx) = TransactionTaskSpawner::channel(8);
+    let pump = tokio::spawn(async move {
+        let mut tasks = TaskSupervisor::new();
+        while let Some(req) = spawn_rx.recv().await {
+            let id = tasks.spawn(req.class, req.future);
+            let _ = req.reply.send(id);
+        }
+        tasks.abort_and_drain().await;
+    });
+
+    let (publish_tx, mut publish_rx) = mpsc::channel::<EventPublisherCommand>(16);
+    let collector = tokio::spawn(async move {
+        let mut tool_lifecycle = 0u32;
+        while let Some(cmd) = publish_rx.recv().await {
+            if let EventPublisherCommand::Publish(payload) = cmd {
+                if matches!(payload.as_ref(), TransactionEventPayload::ToolLifecycle(_)) {
+                    tool_lifecycle = tool_lifecycle.saturating_add(1);
+                }
+            }
+        }
+        tool_lifecycle
+    });
+
+    let cancel = Arc::new(StickyCancel::new());
+    let report = run_supervised_empty_loop(
+        &spawner,
+        TransactionId::generate(),
+        ChannelId::try_new("llm").unwrap(),
+        None,
+        ExchangeId::generate(),
+        vec![ready_tool_unit()],
+        publish_tx,
+        cancel,
+    )
+    .await
+    .expect("supervised empty loop");
+
+    assert_eq!(report.tools_unavailable, 1);
+    assert_eq!(report.outbound_results, 1);
+
+    drop(spawner);
+    let lifecycle_count = collector.await.expect("collector");
+    assert_eq!(lifecycle_count, 1);
+    pump.await.expect("spawn pump");
+}
+
+/// LAW 25: cancel before any Loop waiter must not report success/Drained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_empty_loop_cancel_before_waiter_is_cancelled() {
+    use super::event_publisher::EventPublisherCommand;
+    use super::loop_dispatch::{run_supervised_empty_loop, LoopDispatchError};
+    use super::task_spawner::TransactionTaskSpawner;
+    use super::task_supervisor::TaskSupervisor;
+    use crate::transaction::sticky_cancel::StickyCancel;
+    use monoloop_contracts::{ChannelId, ExchangeId, TransactionId};
+    use tokio::sync::mpsc;
+
+    let (spawner, mut spawn_rx) = TransactionTaskSpawner::channel(8);
+    let pump = tokio::spawn(async move {
+        let mut tasks = TaskSupervisor::new();
+        while let Some(req) = spawn_rx.recv().await {
+            let id = tasks.spawn(req.class, req.future);
+            let _ = req.reply.send(id);
+        }
+        tasks.abort_and_drain().await;
+    });
+
+    let (publish_tx, mut publish_rx) = mpsc::channel::<EventPublisherCommand>(8);
+    let drain_pub = tokio::spawn(async move { while publish_rx.recv().await.is_some() {} });
+
+    let cancel = Arc::new(StickyCancel::new());
+    // Fire before run_supervised_empty_loop installs waiters.
+    cancel.cancel();
+
+    let err = run_supervised_empty_loop(
+        &spawner,
+        TransactionId::generate(),
+        ChannelId::try_new("llm").unwrap(),
+        None,
+        ExchangeId::generate(),
+        vec![ready_tool_unit()],
+        publish_tx,
+        Arc::clone(&cancel),
+    )
+    .await
+    .expect_err("pre-cancel must not succeed");
+
+    assert_eq!(err, LoopDispatchError::Cancelled);
+
+    drop(spawner);
+    let _ = drain_pub.await;
+    pump.await.expect("spawn pump");
 }
