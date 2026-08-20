@@ -3,16 +3,17 @@
 //! Feeds complete exchange units into the canonical Loop state machine under
 //! [`TaskClass::LoopRuntime`]. Empty-registry composition uses
 //! [`EmptyToolRegistry`] + [`NoToolRuntime`] — zero effects, truthful
-//! `tool_unavailable` via Loop output mapped to transaction lifecycle events.
+//! `tool_unavailable`. Non-empty composition uses [`ResolvedToolRegistry`] +
+//! [`HostToolRuntime`] (supervisor-owned tool workers).
 
 use super::event_publisher::EventPublisherCommand;
 use super::session_identity::session_key_for;
 use super::task_spawner::{SpawnReject, TransactionTaskSpawner};
 use super::task_supervisor::TaskClass;
-use crate::registry::EmptyToolRegistry;
+use crate::registry::{EmptyToolRegistry, ToolRegistry};
 use crate::runtime::{DefaultLoopRuntime, StartLoop};
 use crate::subscription::SubscriptionPublisher;
-use crate::tools::NoToolRuntime;
+use crate::tools::{NoToolRuntime, ToolRuntime};
 use crate::transaction::sticky_cancel::StickyCancel;
 use monoloop_contracts::{
     CanonicalToolError, CanonicalToolResult, CanonicalToolResultOutcome, CanonicalUnit,
@@ -26,10 +27,12 @@ use tokio::sync::mpsc;
 /// Report from one supervised Loop pass over exchange units.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoopDispatchReport {
-    /// Tools resolved unavailable by EmptyToolRegistry.
+    /// Tools resolved unavailable (empty registry or unknown name).
     pub tools_unavailable: u32,
     /// OutboundToolResult events observed.
     pub outbound_results: u32,
+    /// Successful tool completions published as lifecycle events.
+    pub tools_completed: u32,
 }
 
 /// Error driving the supervised Loop.
@@ -71,6 +74,63 @@ pub async fn run_supervised_empty_loop(
     publish_tx: mpsc::Sender<EventPublisherCommand>,
     cancel: Arc<StickyCancel>,
 ) -> Result<LoopDispatchReport, LoopDispatchError> {
+    run_supervised_loop(
+        tasks,
+        transaction_id,
+        channel_id,
+        session_id,
+        exchange_id,
+        units,
+        publish_tx,
+        cancel,
+        Arc::new(EmptyToolRegistry::new()),
+        Arc::new(NoToolRuntime::new()),
+    )
+    .await
+}
+
+/// Run Loop with a non-empty resolved registry + host tool runtime.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_supervised_tool_loop(
+    tasks: &TransactionTaskSpawner,
+    transaction_id: TransactionId,
+    channel_id: ChannelId,
+    session_id: Option<SessionId>,
+    exchange_id: ExchangeId,
+    units: Vec<CanonicalUnitEvent>,
+    publish_tx: mpsc::Sender<EventPublisherCommand>,
+    cancel: Arc<StickyCancel>,
+    tool_registry: Arc<dyn ToolRegistry>,
+    tool_runtime: Arc<dyn ToolRuntime>,
+) -> Result<LoopDispatchReport, LoopDispatchError> {
+    run_supervised_loop(
+        tasks,
+        transaction_id,
+        channel_id,
+        session_id,
+        exchange_id,
+        units,
+        publish_tx,
+        cancel,
+        tool_registry,
+        tool_runtime,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_supervised_loop(
+    tasks: &TransactionTaskSpawner,
+    transaction_id: TransactionId,
+    channel_id: ChannelId,
+    session_id: Option<SessionId>,
+    exchange_id: ExchangeId,
+    units: Vec<CanonicalUnitEvent>,
+    publish_tx: mpsc::Sender<EventPublisherCommand>,
+    cancel: Arc<StickyCancel>,
+    tool_registry: Arc<dyn ToolRegistry>,
+    tool_runtime: Arc<dyn ToolRuntime>,
+) -> Result<LoopDispatchReport, LoopDispatchError> {
     let (pub_, sub) = SubscriptionPublisher::channel(format!("tx-{transaction_id}"), 64);
     let limits = LoopLimits::default();
     let run_id = MonoloopRunId::new(format!("tx-{transaction_id}"));
@@ -89,8 +149,8 @@ pub async fn run_supervised_empty_loop(
             loop_id,
             scope,
             subscription: sub,
-            tool_registry: Arc::new(EmptyToolRegistry::new()),
-            tool_runtime: Arc::new(NoToolRuntime::new()),
+            tool_registry,
+            tool_runtime,
             output_capacity: limits.max_output_queue.max(16),
             limits,
         })
@@ -188,29 +248,122 @@ pub async fn run_supervised_empty_loop(
             }
             LoopOutputEvent::OutboundToolResult(r) => {
                 report.outbound_results = report.outbound_results.saturating_add(1);
-                if r.outcome != OutboundToolOutcome::ToolUnavailable {
-                    continue;
-                }
-                let tool_id = ToolId::try_new("unavailable").expect("static");
-                let err = CanonicalToolError::try_new(
-                    "tool_unavailable",
-                    "no_registered_tool",
-                    None,
-                    256,
-                )
-                .expect("static error");
-                // Preserve Loop's action id; keep provider correlation distinct
-                // from exchange-scoped construction helper (§22.6).
                 let provider_tool_call_id = r.tool_action_id.as_str().to_string();
-                let result = CanonicalToolResult {
-                    transaction_id,
-                    session_key: session_key.clone(),
-                    exchange_id,
-                    tool_action_id: r.tool_action_id.clone(),
-                    tool_id,
-                    provider_tool_call_id,
-                    request_ordinal: 0,
-                    outcome: CanonicalToolResultOutcome::DomainFailed(err),
+                let result = match r.outcome {
+                    OutboundToolOutcome::ToolUnavailable => {
+                        let tool_id = ToolId::try_new("unavailable").expect("static");
+                        let err = CanonicalToolError::try_new(
+                            "tool_unavailable",
+                            "no_registered_tool",
+                            None,
+                            256,
+                        )
+                        .expect("static error");
+                        CanonicalToolResult {
+                            transaction_id,
+                            session_key: session_key.clone(),
+                            exchange_id,
+                            tool_action_id: r.tool_action_id.clone(),
+                            tool_id,
+                            provider_tool_call_id,
+                            request_ordinal: 0,
+                            outcome: CanonicalToolResultOutcome::DomainFailed(err),
+                        }
+                    }
+                    OutboundToolOutcome::Success | OutboundToolOutcome::ExecutionFailed => {
+                        // Prefer round-tripped CanonicalToolResult from HostToolRuntime.
+                        if let Ok(mut decoded) =
+                            serde_json::from_str::<CanonicalToolResult>(&r.payload)
+                        {
+                            if matches!(
+                                decoded.outcome,
+                                CanonicalToolResultOutcome::Succeeded(_)
+                            ) {
+                                report.tools_completed =
+                                    report.tools_completed.saturating_add(1);
+                            }
+                            // Keep envelope identities consistent with this Loop pass.
+                            decoded.transaction_id = transaction_id;
+                            decoded.session_key = session_key.clone();
+                            decoded.exchange_id = exchange_id;
+                            decoded
+                        } else if matches!(r.outcome, OutboundToolOutcome::Success) {
+                            report.tools_completed = report.tools_completed.saturating_add(1);
+                            let output = match serde_json::from_str::<serde_json::Value>(&r.payload)
+                            {
+                                Ok(v) => monoloop_contracts::CanonicalToolOutput::Json(v),
+                                Err(_) => monoloop_contracts::CanonicalToolOutput::Text(
+                                    r.payload.clone(),
+                                ),
+                            };
+                            CanonicalToolResult {
+                                transaction_id,
+                                session_key: session_key.clone(),
+                                exchange_id,
+                                tool_action_id: r.tool_action_id.clone(),
+                                tool_id: ToolId::try_new("completed").unwrap_or_else(|_| {
+                                    ToolId::try_new("unavailable").expect("static")
+                                }),
+                                provider_tool_call_id,
+                                request_ordinal: 0,
+                                outcome: CanonicalToolResultOutcome::Succeeded(output),
+                            }
+                        } else {
+                            let err = CanonicalToolError::try_new(
+                                "tool_execution_failed",
+                                r.payload.chars().take(128).collect::<String>(),
+                                None,
+                                256,
+                            )
+                            .unwrap_or_else(|_| {
+                                CanonicalToolError::try_new(
+                                    "tool_execution_failed",
+                                    "failed",
+                                    None,
+                                    64,
+                                )
+                                .expect("static")
+                            });
+                            CanonicalToolResult {
+                                transaction_id,
+                                session_key: session_key.clone(),
+                                exchange_id,
+                                tool_action_id: r.tool_action_id.clone(),
+                                tool_id: ToolId::try_new("failed").unwrap_or_else(|_| {
+                                    ToolId::try_new("unavailable").expect("static")
+                                }),
+                                provider_tool_call_id,
+                                request_ordinal: 0,
+                                outcome: CanonicalToolResultOutcome::DomainFailed(err),
+                            }
+                        }
+                    }
+                    OutboundToolOutcome::DispatchRejected
+                    | OutboundToolOutcome::Cancelled
+                    | OutboundToolOutcome::ExecutionLost => {
+                        let err = CanonicalToolError::try_new(
+                            "tool_execution_failed",
+                            r.payload.chars().take(128).collect::<String>(),
+                            None,
+                            256,
+                        )
+                        .unwrap_or_else(|_| {
+                            CanonicalToolError::try_new("tool_execution_failed", "failed", None, 64)
+                                .expect("static")
+                        });
+                        CanonicalToolResult {
+                            transaction_id,
+                            session_key: session_key.clone(),
+                            exchange_id,
+                            tool_action_id: r.tool_action_id.clone(),
+                            tool_id: ToolId::try_new("failed").unwrap_or_else(|_| {
+                                ToolId::try_new("unavailable").expect("static")
+                            }),
+                            provider_tool_call_id,
+                            request_ordinal: 0,
+                            outcome: CanonicalToolResultOutcome::DomainFailed(err),
+                        }
+                    }
                 };
                 let send = publish_tx.send(EventPublisherCommand::Publish(Box::new(
                     TransactionEventPayload::ToolLifecycle(ToolLifecycleEvent::Completed {

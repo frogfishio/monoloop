@@ -2332,6 +2332,147 @@ async fn supervised_empty_loop_ready_under_task_spawner() {
     pump.await.expect("spawn pump");
 }
 
+/// Non-empty HostToolRegistry: Ready tool completes via supervised HostToolRuntime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_non_empty_loop_dispatches_registered_tool() {
+    use super::event_publisher::EventPublisherCommand;
+    use super::loop_dispatch::run_supervised_tool_loop;
+    use super::task_spawner::TransactionTaskSpawner;
+    use super::task_supervisor::TaskSupervisor;
+    use crate::transaction::dispatcher::TransactionToolDispatcher;
+    use crate::transaction::host_tools::RegisteredTool;
+    use crate::transaction::loop_adapters::{HostToolRuntime, ResolvedToolRegistry};
+    use crate::transaction::resolved_tools::ResolvedToolSet;
+    use crate::transaction::sticky_cancel::StickyCancel;
+    use crate::transaction::tool_capacity::SharedToolCapacity;
+    use crate::transaction::tool_handler::ImmediateToolHandler;
+    use monoloop_contracts::{
+        ChannelId, ExchangeId, JsonSchema, SessionKey, ToolCompletion, ToolExecutionClass, ToolId,
+        ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract,
+        TransactionEventPayload, TransactionId,
+    };
+    use tokio::sync::mpsc;
+
+    let schema = JsonSchema::try_new(serde_json::json!({
+        "type": "object",
+        "properties": { "cmd": { "type": "string" } },
+        "required": ["cmd"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let out_schema = JsonSchema::try_new(serde_json::json!({
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" } },
+        "required": ["ok"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("bash").unwrap(),
+        ToolName::try_new("bash").unwrap(),
+        "bash tool",
+        schema,
+        ToolOutputContract {
+            success: ToolSuccessContract::json(out_schema),
+            error_data_schema: None,
+        },
+        ToolLimits {
+            max_concurrent: 2,
+            max_input_bytes: 1024,
+            max_output_bytes: 1024,
+            execution_deadline: Duration::from_secs(2),
+        },
+        ToolExecutionClass::CooperativeInProcess {
+            grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    let registered = RegisteredTool::new(
+        spec,
+        Arc::new(ImmediateToolHandler::new(|_c, _x| {
+            Ok(ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({"ok": true})),
+            ))
+        })),
+    );
+    let resolved = ResolvedToolSet::from_registered(vec![registered]);
+    let tx_id = TransactionId::generate();
+    let exchange_id = ExchangeId::generate();
+    let dispatcher = TransactionToolDispatcher::new(
+        tx_id,
+        SessionKey::new(
+            ChannelId::try_new("llm").unwrap(),
+            SessionId::try_new("s1").unwrap(),
+        ),
+        resolved.clone(),
+        SharedToolCapacity::unlimited(),
+        8,
+        16,
+    );
+
+    let (spawner, mut spawn_rx) = TransactionTaskSpawner::channel(16);
+    let pump = tokio::spawn(async move {
+        let mut tasks = TaskSupervisor::new();
+        while let Some(req) = spawn_rx.recv().await {
+            let id = tasks.spawn(req.class, req.future);
+            let _ = req.reply.send(id);
+        }
+        let _ = tasks.abort_and_drain().await;
+    });
+
+    let (publish_tx, mut publish_rx) = mpsc::channel::<EventPublisherCommand>(16);
+    let collector = tokio::spawn(async move {
+        let mut completed_ok = 0u32;
+        while let Some(cmd) = publish_rx.recv().await {
+            if let EventPublisherCommand::Publish(payload) = cmd {
+                if let TransactionEventPayload::ToolLifecycle(
+                    monoloop_contracts::ToolLifecycleEvent::Completed { result },
+                ) = payload.as_ref()
+                {
+                    if matches!(
+                        result.outcome,
+                        monoloop_contracts::CanonicalToolResultOutcome::Succeeded(_)
+                    ) {
+                        completed_ok = completed_ok.saturating_add(1);
+                    }
+                }
+            }
+        }
+        completed_ok
+    });
+
+    let runtime = HostToolRuntime::with_spawner(
+        Arc::clone(&dispatcher),
+        exchange_id,
+        tx_id,
+        spawner.clone(),
+    );
+    let cancel = Arc::new(StickyCancel::new());
+    let report = run_supervised_tool_loop(
+        &spawner,
+        tx_id,
+        ChannelId::try_new("llm").unwrap(),
+        Some(SessionId::try_new("s1").unwrap()),
+        exchange_id,
+        vec![ready_tool_unit()],
+        publish_tx,
+        cancel,
+        Arc::new(ResolvedToolRegistry::new(resolved)),
+        Arc::new(runtime),
+    )
+    .await
+    .expect("supervised non-empty loop");
+
+    assert_eq!(report.tools_unavailable, 0, "registered tool must resolve");
+    assert!(report.outbound_results >= 1);
+    assert_eq!(report.tools_completed, 1);
+
+    drop(spawner);
+    let ok_count = collector.await.expect("collector");
+    assert_eq!(ok_count, 1);
+    pump.await.expect("spawn pump");
+}
+
 /// LAW 25: cancel before any Loop waiter must not report success/Drained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_empty_loop_cancel_before_waiter_is_cancelled() {

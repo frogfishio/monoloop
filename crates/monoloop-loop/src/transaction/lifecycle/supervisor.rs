@@ -12,6 +12,8 @@ use super::task_supervisor::{TaskClass, TaskExit, TaskSupervisor};
 use super::terminal::{build_completion, end_event, TerminalDecision, TerminalProposal};
 use crate::transaction::bootstrap::{FinalizerHoldGate, StartHoldGate, StoppedGate};
 use crate::transaction::channel_registry::LiveChannel;
+use crate::transaction::host_tools::HostToolRegistry;
+use crate::transaction::tool_capacity::SharedToolCapacity;
 use monoloop_contracts::{
     ChannelId, CleanupStatus, CompletionPublishResult, ShutdownReport, ShutdownSnapshot,
     TerminalEventDelivery, TransactionEndKind, TransactionId,
@@ -94,6 +96,10 @@ pub(crate) struct RuntimeShared {
     pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
     /// When `Some`, spawn a never-awaiting RuntimeService that signals before park.
     pub inject_non_yielding_service: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Host tool definitions available to admission / coordinators.
+    pub tools_registry: HostToolRegistry,
+    /// Process-wide concurrent tool execution budget.
+    pub shared_tool_capacity: Arc<SharedToolCapacity>,
 }
 
 impl RuntimeShared {
@@ -450,6 +456,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         session_config,
         event_tx,
         deadline,
+        selected_tools,
     ) = {
         let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = ledger.get_mut(&tx) else {
@@ -464,6 +471,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         entry.completion_tx = Some(delivery.completion_tx);
         entry.phase = TransactionPhase::Running;
         let session_id = entry.session_key.as_ref().map(|k| k.session_id.clone());
+        let selected_tools = entry.tools.clone();
         (
             Arc::clone(&entry.resources.cancel),
             entry.channel_id.clone(),
@@ -473,6 +481,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
             entry.session_config.clone(),
             delivery.event_tx,
             shared.default_deadline,
+            selected_tools,
         )
     };
 
@@ -506,6 +515,9 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         tasks: shared.task_spawner.clone(),
         deadline,
         cleanup_deadline: shared.cleanup_deadline,
+        selected_tools,
+        tools_registry: shared.tools_registry.clone(),
+        shared_tool_capacity: Arc::clone(&shared.shared_tool_capacity),
     };
     tasks.spawn(TaskClass::TransactionCoordinator(tx), async move {
         run_coordinator(params).await;

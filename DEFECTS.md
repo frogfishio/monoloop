@@ -1861,5 +1861,13 @@ SessionEstablished on echo path); helper not yet adopted by interpreter feed.
 **§22.6 closed enough for bar with residuals.** M6 still partial (§22.7 +
 MCP/non-empty tools). **Not** Golden / §25.
 
-**Next pick:** MCP/non-empty tools (kernel) **or** §22.7 host adapters
-(outside core) — do not promote M6/Golden/§25.
+**Non-empty tools Loop path (2026-08-20):** `run_supervised_tool_loop` +
+coordinator uses `HostToolRegistry` selected tools via `ResolvedToolRegistry` /
+`HostToolRuntime::with_spawner` (TaskSupervisor-owned tool workers, no ambient
+spawn on production path). Empty path unchanged. Proof:
+`supervised_non_empty_loop_dispatches_registered_tool`. Residual: full MCP
+gateway still deferred (`mod mcp` not compiled); Fake echo does not emit Ready
+tools end-to-end. M6 still partial (§22.7 + MCP gateway). **Not** Golden / §25.
+
+**Next pick:** MCP gateway re-enable / loopback protocol **or** §22.7 host
+adapters (outside core) — do not promote M6/Golden/§25.

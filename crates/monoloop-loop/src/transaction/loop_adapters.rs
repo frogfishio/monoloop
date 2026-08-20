@@ -1,6 +1,7 @@
 //! ToolRegistry / ToolRuntime adapters that delegate to TransactionToolDispatcher.
 
 use super::dispatcher::{DispatchOutcome, DispatchRequest, TransactionToolDispatcher};
+use super::lifecycle::{TaskClass, TransactionTaskSpawner};
 use crate::registry::{
     ResolveToolRequest, ToolDescriptorRef, ToolRegistry, ToolRegistryError, ToolResolution,
 };
@@ -8,7 +9,7 @@ use crate::tools::{
     StartToolExecution, ToolExecutionHandle, ToolRuntime, ToolRuntimeError, ToolRuntimeTerminal,
 };
 use monoloop_contracts::{
-    ExchangeId, OutboundToolOutcome, ToolActionId, ToolName, ToolUnavailableReason,
+    ExchangeId, OutboundToolOutcome, ToolActionId, ToolName, ToolUnavailableReason, TransactionId,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -60,14 +61,34 @@ impl ToolRegistry for ResolvedToolRegistry {
 pub struct HostToolRuntime {
     dispatcher: Arc<TransactionToolDispatcher>,
     exchange_id: ExchangeId,
+    /// When set, tool workers register under TaskSupervisor (Law 23).
+    spawner: Option<TransactionTaskSpawner>,
+    transaction_id: Option<TransactionId>,
 }
 
 impl HostToolRuntime {
-    /// Construct for one transaction / exchange scope.
+    /// Construct for one transaction / exchange scope (unit tests may omit spawner).
     pub fn new(dispatcher: Arc<TransactionToolDispatcher>, exchange_id: ExchangeId) -> Self {
         Self {
             dispatcher,
             exchange_id,
+            spawner: None,
+            transaction_id: None,
+        }
+    }
+
+    /// Production path: supervisor-owned tool workers (no ambient `tokio::spawn`).
+    pub fn with_spawner(
+        dispatcher: Arc<TransactionToolDispatcher>,
+        exchange_id: ExchangeId,
+        transaction_id: TransactionId,
+        spawner: TransactionTaskSpawner,
+    ) -> Self {
+        Self {
+            dispatcher,
+            exchange_id,
+            spawner: Some(spawner),
+            transaction_id: Some(transaction_id),
         }
     }
 }
@@ -82,8 +103,9 @@ impl ToolRuntime for HostToolRuntime {
         let payload = request.request_payload;
         let provider_id = request.execution_id.as_str().to_string();
         let ordinal = request.request_generation as u32;
+        let execution_id = request.execution_id.clone();
         let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
+        let work = async move {
             let outcome = dispatcher
                 .dispatch(DispatchRequest {
                     exchange_id,
@@ -95,7 +117,18 @@ impl ToolRuntime for HostToolRuntime {
                 })
                 .await;
             let _ = tx.send(map_outcome(outcome));
-        });
+        };
+
+        if let (Some(spawner), Some(tx_id)) = (self.spawner.as_ref(), self.transaction_id) {
+            let class = TaskClass::ToolWorker(tx_id, execution_id.clone());
+            spawner
+                .try_spawn_owned(class, work)
+                .map_err(|_| ToolRuntimeError("tool worker spawn capacity exceeded".into()))?;
+        } else {
+            // Unit-test path without a supervisor (linked_tools). Production uses
+            // [`Self::with_spawner`].
+            tokio::spawn(work);
+        }
 
         Ok(ToolExecutionHandle {
             execution_id: request.execution_id,
@@ -107,13 +140,19 @@ impl ToolRuntime for HostToolRuntime {
 fn map_outcome(outcome: DispatchOutcome) -> ToolRuntimeTerminal {
     match outcome {
         DispatchOutcome::Canonical { result, .. } => {
-            let payload = serde_json::to_string(&result.outcome)
+            // Round-trip the full CanonicalToolResult so lifecycle publish preserves
+            // Succeeded vs DomainFailed (and tool_id / ordinal).
+            let payload = serde_json::to_string(&result)
                 .unwrap_or_else(|_| "{\"error\":\"encode\"}".into());
-            // Success and domain failure are both valid tool results for the model.
-            ToolRuntimeTerminal {
-                outcome: OutboundToolOutcome::Success,
-                payload,
-            }
+            let outcome = match &result.outcome {
+                monoloop_contracts::CanonicalToolResultOutcome::Succeeded(_) => {
+                    OutboundToolOutcome::Success
+                }
+                monoloop_contracts::CanonicalToolResultOutcome::DomainFailed(_) => {
+                    OutboundToolOutcome::ExecutionFailed
+                }
+            };
+            ToolRuntimeTerminal { outcome, payload }
         }
         DispatchOutcome::Rejected { code, message, .. } => ToolRuntimeTerminal {
             outcome: OutboundToolOutcome::DispatchRejected,

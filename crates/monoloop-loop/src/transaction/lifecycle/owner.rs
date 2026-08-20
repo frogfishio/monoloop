@@ -152,6 +152,15 @@ impl StartedRuntime {
             hold_start: bootstrap.config.hold_start.clone(),
             hold_finalizer_after_seal: bootstrap.config.hold_finalizer_after_seal.clone(),
             inject_non_yielding_service: bootstrap.config.inject_non_yielding_service,
+            tools_registry: bootstrap.tools.clone(),
+            shared_tool_capacity: crate::transaction::tool_capacity::SharedToolCapacity::new(
+                bootstrap
+                    .config
+                    .transaction_limits
+                    .max_active_transactions
+                    .saturating_mul(4)
+                    .max(8),
+            ),
         });
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartupError>>();

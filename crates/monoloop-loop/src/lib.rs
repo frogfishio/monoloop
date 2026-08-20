@@ -46,7 +46,7 @@ pub use transaction::{
     SupervisorCommand, TaskClass, TaskExit, TaskId, TaskSupervisor, TerminalDecision,
     TerminalProposal, TestTextEncoder, ToolExecutionCompletion, ToolExecutionControl, ToolHandler,
     ToolKillHandle, TransactionPhase, TransactionReservations, TransactionRuntimeHandle,
-    TransactionToolCapacity, TransactionToolDispatcher,
+    TransactionTaskSpawner, TransactionToolCapacity, TransactionToolDispatcher,
 };
 
 pub use monoloop_contracts::{

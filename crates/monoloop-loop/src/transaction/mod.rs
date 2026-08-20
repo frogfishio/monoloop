@@ -51,7 +51,7 @@ pub use lifecycle::{
     HostEventAdapter, LedgerEntry, LifecycleLedger, ReservationPool, ReservationPoolError,
     RuntimeOwner, ShutdownTicket, StartedRuntime, SupervisorCommand, TaskClass, TaskExit, TaskId,
     TaskSupervisor, TerminalDecision, TerminalProposal, TransactionPhase, TransactionReservations,
-    TransactionRuntimeHandle,
+    TransactionRuntimeHandle, TransactionTaskSpawner,
 };
 
 pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};

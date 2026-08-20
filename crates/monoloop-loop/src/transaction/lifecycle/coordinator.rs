@@ -2,15 +2,23 @@
 
 use super::event_publisher::EventPublisherCommand;
 use super::exchange::run_direct_llm_exchange;
-use super::loop_dispatch::{needs_loop_dispatch, run_supervised_empty_loop, LoopDispatchError};
+use super::loop_dispatch::{
+    needs_loop_dispatch, run_supervised_empty_loop, run_supervised_tool_loop, LoopDispatchError,
+};
+use super::session_identity::session_key_for;
 use super::task_spawner::TransactionTaskSpawner;
 use super::terminal::TerminalProposal;
 use crate::transaction::channel_registry::LiveChannel;
+use crate::transaction::dispatcher::TransactionToolDispatcher;
+use crate::transaction::host_tools::HostToolRegistry;
+use crate::transaction::loop_adapters::{HostToolRuntime, ResolvedToolRegistry};
+use crate::transaction::resolved_tools::ResolvedToolSet;
 use crate::transaction::sticky_cancel::StickyCancel;
+use crate::transaction::tool_capacity::SharedToolCapacity;
 use monoloop_contracts::{
     merge_effective_config, CanonicalInput, ChannelId, ChannelKind, ExtensionLimits,
-    InvocationConfig, SessionConfig, SessionId, TransactionEndKind, TransactionEventPayload,
-    TransactionId,
+    InvocationConfig, SessionConfig, SessionId, ToolId, TransactionEndKind,
+    TransactionEventPayload, TransactionId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,6 +65,12 @@ pub struct CoordinatorParams {
     pub deadline: Duration,
     /// Cleanup join grace for exchange children.
     pub cleanup_deadline: Duration,
+    /// Admitted tool ids for this transaction.
+    pub selected_tools: Vec<ToolId>,
+    /// Host tool registry (read-only clone).
+    pub tools_registry: HostToolRegistry,
+    /// Shared tool concurrency budget.
+    pub shared_tool_capacity: Arc<SharedToolCapacity>,
 }
 
 /// Run the coordinator to a terminal proposal and report `WorkerExited`.
@@ -88,6 +102,9 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         tasks,
         deadline,
         cleanup_deadline,
+        selected_tools,
+        tools_registry,
+        shared_tool_capacity,
     } = params;
 
     let Some(live) = channels.get(&channel_id) else {
@@ -182,18 +199,53 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
     ) && needs_loop_dispatch(&outcome.units)
     {
         // M5: single canonical Loop state machine under TaskSupervisor.
-        match run_supervised_empty_loop(
-            &tasks,
-            transaction_id,
-            channel_id,
-            session_id,
-            outcome.exchange_id,
-            outcome.units,
-            publish_tx,
-            cancel,
-        )
-        .await
-        {
+        let loop_result = if selected_tools.is_empty() {
+            run_supervised_empty_loop(
+                &tasks,
+                transaction_id,
+                channel_id,
+                session_id,
+                outcome.exchange_id,
+                outcome.units,
+                publish_tx,
+                cancel,
+            )
+            .await
+        } else {
+            let registered: Vec<_> = selected_tools
+                .iter()
+                .filter_map(|id| tools_registry.get(id).cloned())
+                .collect();
+            let resolved = ResolvedToolSet::from_registered(registered);
+            let dispatcher = TransactionToolDispatcher::new(
+                transaction_id,
+                session_key_for(channel_id.clone(), session_id.clone(), transaction_id),
+                resolved.clone(),
+                shared_tool_capacity,
+                8,
+                16,
+            );
+            let runtime = HostToolRuntime::with_spawner(
+                Arc::clone(&dispatcher),
+                outcome.exchange_id,
+                transaction_id,
+                tasks.clone(),
+            );
+            run_supervised_tool_loop(
+                &tasks,
+                transaction_id,
+                channel_id,
+                session_id,
+                outcome.exchange_id,
+                outcome.units,
+                publish_tx,
+                cancel,
+                Arc::new(ResolvedToolRegistry::new(resolved)),
+                Arc::new(runtime),
+            )
+            .await
+        };
+        match loop_result {
             Ok(_report) => {}
             Err(LoopDispatchError::Cancelled) => {
                 terminal = TransactionEndKind::Cancelled;

@@ -82,6 +82,27 @@ impl TransactionTaskSpawner {
         }
     }
 
+    /// Sync try-spawn for `ToolRuntime::start` (no await). On success the supervisor
+    /// owns the future; `TaskId` reply may be dropped (caller does not need it).
+    pub fn try_spawn_owned<F>(&self, class: TaskClass, future: F) -> Result<(), SpawnReject>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        // Drop receiver: we only need ownership registration, not the TaskId.
+        drop(reply_rx);
+        let req = SpawnRequest {
+            class,
+            future: Box::pin(future),
+            reply: reply_tx,
+        };
+        match self.tx.try_send(req) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(req)) => Err(SpawnReject::Busy { future: req.future }),
+            Err(TrySendError::Closed(req)) => Err(SpawnReject::Rejected { future: req.future }),
+        }
+    }
+
     /// Prefer supervisor ownership: bounded Busy retries, then return the last reject.
     ///
     /// Does not drive the future inline — caller decides fail-closed vs last-resort join.

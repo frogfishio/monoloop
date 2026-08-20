@@ -33,6 +33,7 @@ pub use ledger::{LedgerEntry, LifecycleLedger, TransactionPhase};
 pub use owner::{RuntimeOwner, StartedRuntime, TransactionRuntimeHandle};
 pub use shutdown::ShutdownTicket;
 pub use supervisor::SupervisorCommand;
+pub use task_spawner::TransactionTaskSpawner;
 pub use task_supervisor::{TaskClass, TaskExit, TaskId, TaskSupervisor};
 pub use terminal::{build_completion, TerminalDecision, TerminalProposal};
 
