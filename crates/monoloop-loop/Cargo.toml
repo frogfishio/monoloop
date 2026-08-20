@@ -51,3 +51,15 @@ path = "tests/empty_loop.rs"
 [[test]]
 name = "rmcp_loopback_spike"
 path = "tests/rmcp_loopback_spike.rs"
+
+[[test]]
+name = "s22_3_non_yielding_sacrificial"
+path = "tests/s22_3_non_yielding_sacrificial.rs"
+
+[[test]]
+name = "s22_4_tools"
+path = "tests/s22_4_tools.rs"
+
+[[test]]
+name = "linked_tools"
+path = "tests/linked_tools.rs"

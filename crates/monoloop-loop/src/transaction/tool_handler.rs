@@ -121,6 +121,10 @@ enum KillInner {
         abort: AbortHandle,
         join: Mutex<Option<tokio::task::JoinHandle<()>>>,
     },
+    /// Join ownership without abort (CooperativeInProcess — §14.1 / §22.4).
+    JoinOnly {
+        join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    },
     /// OS child process — real kill boundary (V2 §14.3).
     Process {
         child: Arc<Mutex<Option<std::process::Child>>>,
@@ -136,6 +140,18 @@ impl ToolKillHandle {
         Self {
             inner: Arc::new(KillInner::Tokio {
                 abort: join.abort_handle(),
+                join: Mutex::new(Some(join)),
+            }),
+        }
+    }
+
+    /// Own a cooperative worker join without hard abort (§22.4).
+    ///
+    /// `kill` is a no-op; cancel remains on [`ToolExecutionControl`]. Permit stays
+    /// held until [`Self::join_timeout`] / vault reap observes the join.
+    pub fn join_only(join: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            inner: Arc::new(KillInner::JoinOnly {
                 join: Mutex::new(Some(join)),
             }),
         }
@@ -157,9 +173,12 @@ impl ToolKillHandle {
     }
 
     /// Abort Tokio task or OS-kill the child (idempotent).
+    ///
+    /// [`KillInner::JoinOnly`] is a no-op (cooperative — cancel via control only).
     pub fn kill(&self) {
         match &*self.inner {
             KillInner::Tokio { abort, .. } => abort.abort(),
+            KillInner::JoinOnly { .. } => {}
             KillInner::Process { child, .. } => {
                 if let Some(c) = child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                     let _ = c.kill();
@@ -172,7 +191,9 @@ impl ToolKillHandle {
     /// worker is not detached; caller must keep capacity until a later join.
     pub async fn join_timeout(&self, budget: std::time::Duration) -> Result<(), ()> {
         let handle = match &*self.inner {
-            KillInner::Tokio { join, .. } | KillInner::Process { join, .. } => {
+            KillInner::Tokio { join, .. }
+            | KillInner::JoinOnly { join }
+            | KillInner::Process { join, .. } => {
                 join.lock().unwrap_or_else(|e| e.into_inner()).take()
             }
         };
@@ -183,7 +204,9 @@ impl ToolKillHandle {
             Ok(_) => Ok(()),
             Err(_) => {
                 match &*self.inner {
-                    KillInner::Tokio { join, .. } | KillInner::Process { join, .. } => {
+                    KillInner::Tokio { join, .. }
+                    | KillInner::JoinOnly { join }
+                    | KillInner::Process { join, .. } => {
                         *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
                     }
                 }
@@ -196,7 +219,9 @@ impl ToolKillHandle {
     #[allow(dead_code)]
     pub(crate) fn take_join(&self) -> Option<tokio::task::JoinHandle<()>> {
         match &*self.inner {
-            KillInner::Tokio { join, .. } | KillInner::Process { join, .. } => {
+            KillInner::Tokio { join, .. }
+            | KillInner::JoinOnly { join }
+            | KillInner::Process { join, .. } => {
                 join.lock().unwrap_or_else(|e| e.into_inner()).take()
             }
         }
@@ -206,7 +231,9 @@ impl ToolKillHandle {
     #[allow(dead_code)]
     pub(crate) fn has_join(&self) -> bool {
         match &*self.inner {
-            KillInner::Tokio { join, .. } | KillInner::Process { join, .. } => {
+            KillInner::Tokio { join, .. }
+            | KillInner::JoinOnly { join }
+            | KillInner::Process { join, .. } => {
                 join.lock().unwrap_or_else(|e| e.into_inner()).is_some()
             }
         }
@@ -215,6 +242,11 @@ impl ToolKillHandle {
     /// True when this handle owns an OS process (ProcessIsolated).
     pub fn is_process_isolated(&self) -> bool {
         matches!(&*self.inner, KillInner::Process { .. })
+    }
+
+    /// True when this is cooperative join-only ownership (no hard abort).
+    pub fn is_join_only(&self) -> bool {
+        matches!(&*self.inner, KillInner::JoinOnly { .. })
     }
 }
 

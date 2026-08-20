@@ -22,12 +22,13 @@ mod tool_capacity;
 mod tool_handler;
 mod validation;
 
+mod dispatcher;
+mod loop_adapters;
+
 // Deferred until later migration stages (kept on disk, not compiled):
 // mod active_registry;
-// mod dispatcher;
 // mod events;
 // mod exchange;
-// mod loop_adapters;
 // mod mcp;
 // mod spawn_gate;
 
@@ -36,9 +37,15 @@ pub use bootstrap::{
     FinalizerHoldGate, RuntimeBootstrap, RuntimeConfig, StartHoldGate, StoppedGate,
 };
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
+pub use dispatcher::{
+    DispatchOutcome, DispatchRequest, DispatcherLimits, TransactionToolDispatcher,
+};
 pub use error::StartupError;
 pub use fake_support::{EmptyBytesEncoder, PanicEncoder, RejectEncoder, TestTextEncoder};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
+pub use loop_adapters::{
+    dispatch_ready_tool, dispatch_ready_tool_cancellable, HostToolRuntime, ResolvedToolRegistry,
+};
 pub use lifecycle::{
     adapt_completion_callback, adapt_event_sink, build_completion, HostCompletionAdapter,
     HostEventAdapter, LedgerEntry, LifecycleLedger, ReservationPool, ReservationPoolError,

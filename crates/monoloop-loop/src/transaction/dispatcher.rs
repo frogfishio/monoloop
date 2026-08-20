@@ -4,13 +4,107 @@ use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapacity};
 use super::tool_handler::{ToolExecutionControl, ToolKillHandle};
 
-/// D-043: join vaults retired. TaskSupervisor retains real worker joins.
-/// Local stub so this deferred file does not revive `tool_join_vault`.
-struct ToolJoinVault;
+/// Holds unfinished tool worker joins and/or orphaned permits (§22.4 / D-028).
+///
+/// Permits stay acquired until the corresponding join is observed finished (or
+/// until an orphaned cooperative permit is explicitly reaped at shutdown).
+struct ToolJoinVault {
+    parked: std::sync::Mutex<Vec<ParkedToolWork>>,
+}
+
+struct ParkedToolWork {
+    join: Option<tokio::task::JoinHandle<()>>,
+    permit: Option<ToolPermit>,
+    /// When true, a future supervisor drain may abort (AbortableAtYield).
+    /// Cooperative `JoinOnly` stays false — cancel is best-effort only (§14.1).
+    /// Retained on parked work for shutdown integration (not read on Drop transfer).
+    #[allow(dead_code)]
+    may_abort: bool,
+}
+
 impl ToolJoinVault {
-    fn new() -> Self { Self }
-    fn reap_finished(&self) {}
-    fn park_orphan_permit<T>(&self, _permit: T) {}
+    fn new() -> Self {
+        Self {
+            parked: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Park a live worker join with its permit (released only after join finishes).
+    fn park(
+        &self,
+        join: tokio::task::JoinHandle<()>,
+        permit: Option<ToolPermit>,
+        may_abort: bool,
+    ) {
+        if join.is_finished() {
+            // Finished: drop handle (safe) and release permit immediately.
+            drop(join);
+            drop(permit);
+            return;
+        }
+        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        parked.push(ParkedToolWork {
+            join: Some(join),
+            permit,
+            may_abort,
+        });
+    }
+
+    /// Hold a permit with no killable join (missing kill fallback).
+    fn park_orphan_permit(&self, permit: ToolPermit) {
+        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        parked.push(ParkedToolWork {
+            join: None,
+            permit: Some(permit),
+            may_abort: false,
+        });
+    }
+
+    /// Drop finished joins and release their permits. Orphan permits are retained.
+    fn reap_finished(&self) {
+        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        parked.retain(|entry| match &entry.join {
+            Some(join) => !join.is_finished(),
+            None => true, // orphan permit — keep capacity held
+        });
+    }
+
+    /// Number of permits still held by the vault (joins + orphans).
+    fn pending_permits(&self) -> usize {
+        let parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
+        parked.iter().filter(|e| e.permit.is_some()).count()
+    }
+}
+
+/// Process-scoped pending tool work transferred from a dropped vault (§22.4).
+///
+/// Keeps joins + permits owned without aborting cooperative work, without
+/// `mem::forget`, and without unbounded Drop waits. Slots stay unavailable
+/// until process exit or an explicit reap of this set (cleanup-pending).
+fn process_pending_tool_work() -> &'static std::sync::Mutex<Vec<ParkedToolWork>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<Vec<ParkedToolWork>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+impl Drop for ToolJoinVault {
+    fn drop(&mut self) {
+        let mut parked = std::mem::take(self.parked.get_mut().unwrap_or_else(|e| e.into_inner()));
+        if parked.is_empty() {
+            return;
+        }
+        // Transfer ownership out of this Drop — do not abort JoinOnly, detach,
+        // or release permits here. Fail-closed: capacity remains held.
+        if let Ok(mut global) = process_pending_tool_work().lock() {
+            global.append(&mut parked);
+        } else {
+            // Poisoned mutex: still do not free capacity / detach joins.
+            let mut guard = process_pending_tool_work()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.append(&mut parked);
+        }
+    }
 }
 
 use super::validation::{
@@ -163,7 +257,7 @@ impl TransactionToolDispatcher {
     }
 
     /// Build with an explicit runtime-scoped tool join vault (D-028).
-    pub fn with_limits_and_vault(
+    fn with_limits_and_vault(
         transaction_id: TransactionId,
         session_key: SessionKey,
         tools: ResolvedToolSet,
@@ -213,6 +307,16 @@ impl TransactionToolDispatcher {
     /// Replace provisional create key with the claimed authoritative key (D-026).
     pub fn rebind_session(&self, session_key: SessionKey) {
         *self.session_key.lock().unwrap_or_else(|e| e.into_inner()) = session_key;
+    }
+
+    /// Permits held by unfinished/orphaned tool workers (§22.4 observability).
+    pub fn vault_pending_permits(&self) -> usize {
+        self.tool_join_vault.pending_permits()
+    }
+
+    /// Reap finished parked joins so capacity can recover.
+    pub fn reap_vault(&self) {
+        self.tool_join_vault.reap_finished();
     }
 
     /// Dispatch one call end-to-end.
@@ -466,6 +570,17 @@ impl TransactionToolDispatcher {
         // Join worker within a short bound; if still pending, Drop parks join+permit.
         if let Some(ref k) = dispatch_guard.kill {
             let _ = k.join_timeout(Duration::from_millis(50)).await;
+        } else if matches!(policy, ToolExecutionClass::CooperativeInProcess { .. })
+            && matches!(
+                &completion,
+                ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded)
+            )
+        {
+            // §22.4: cooperative non-ack (grace elapsed, no completion) — keep
+            // capacity held. Acknowledged cancel that joins must not orphan.
+            if let Some(permit) = dispatch_guard.permit.take() {
+                self.tool_join_vault.park_orphan_permit(permit);
+            }
         }
         dispatch_guard.release_if_idle();
 
@@ -631,11 +746,12 @@ impl DispatchGuard {
 impl Drop for DispatchGuard {
     fn drop(&mut self) {
         if let Some(k) = self.kill.take() {
-            k.kill();
+            let may_abort = !k.is_join_only();
+            k.kill(); // no-op for JoinOnly cooperative
             if let Some(join) = k.take_join() {
                 if !join.is_finished() {
                     // Park the *real* worker join — never a completion waiter.
-                    self.vault.park(join, self.permit.take());
+                    self.vault.park(join, self.permit.take(), may_abort);
                     return;
                 }
             }

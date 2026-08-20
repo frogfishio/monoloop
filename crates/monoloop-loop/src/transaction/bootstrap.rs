@@ -147,6 +147,10 @@ pub struct RuntimeConfig {
     /// When `Some`, Finalizer waits after Seal before completion send (§22.2).
     /// Production leaves this `None`.
     pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
+    /// When `Some`, supervisor registers a never-awaiting `RuntimeService` that
+    /// stores `true` on this flag immediately before parking (§22.3 sacrificial).
+    /// Production leaves this `None`.
+    pub inject_non_yielding_service: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for RuntimeConfig {
@@ -160,6 +164,7 @@ impl Default for RuntimeConfig {
             hold_start: None,
             start_queue_capacity: None,
             hold_finalizer_after_seal: None,
+            inject_non_yielding_service: None,
         }
     }
 }

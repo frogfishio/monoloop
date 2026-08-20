@@ -13,7 +13,7 @@ use monoloop_loop::{
     StartFailHandler, StartToolExecution, ToolHandler, ToolRegistry, ToolResolution, ToolRuntime,
     ToolUnavailableReason, TransactionToolDispatcher,
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 

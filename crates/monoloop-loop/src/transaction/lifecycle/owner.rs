@@ -151,6 +151,7 @@ impl StartedRuntime {
             block_stopped: bootstrap.config.block_stopped.clone(),
             hold_start: bootstrap.config.hold_start.clone(),
             hold_finalizer_after_seal: bootstrap.config.hold_finalizer_after_seal.clone(),
+            inject_non_yielding_service: bootstrap.config.inject_non_yielding_service,
         });
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartupError>>();

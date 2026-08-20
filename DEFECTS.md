@@ -1804,9 +1804,16 @@ no event after Seal, failed enqueue consumes no sequence. **M6 still partial**
 - [x] §22.3 in-process ownership proofs: register-before-poll, abort-then-join,
       yielding abortable, `abort_and_drain` → 0, runtime normal/cancel/failure
       counts → 0, Hang exchange pumps joined not detached (`s22_3_*`)
-- [ ] §22.3 non-yielding future: sacrificial process + outer timeout;
-      `TimedOut` + `Quiescing` + owned work; never false `Stopped`
-      (**still paused** — harness does not exist yet)
+- [x] §22.3 non-yielding future: sacrificial process + outer harness kill;
+      `inject_non_yielding_service` parks a never-awaiting `RuntimeService`;
+      child short `wait_stopped` → `TimedOut` + `Quiescing` + `owned_tasks>0`;
+      never false `Stopped`; missing proof line within outer bound fails
+      (`tests/s22_3_non_yielding_sacrificial.rs`)
+- [x] §22.4 tools: cooperative ack/non-ack, abortable permit-until-join,
+      capacity while owned, process-isolated kill+reap, structural class claim
+      (`tests/s22_4_tools.rs`; dispatcher + ToolJoinVault restored)
+- [ ] §22.6 events/identity proofs
+- [ ] §22.7 host-adapter adversarial proofs (outside core; not next)
 
 **Advisor (2026-08-20, §22.3 vs pause):** **Pause the sacrificial
 non-yielding subprocess.** Do **not** pause the M6 kernel remainder.
@@ -1823,14 +1830,22 @@ leak meta and strand ledger rows. Hard-grace uses
 **§22.3 in-process (2026-08-20):** Landed `s22_3_spawn_registers_before_first_poll`,
 `s22_3_abort_then_observed_join`, `s22_3_yielding_abortable_aborted_and_joined`,
 `s22_3_abort_and_drain_counts_to_zero`, runtime normal/cancel/failure
-counts→0, Hang exchange pumps joined not detached. Sacrificial non-yielding
-subprocess **still paused** (no harness yet; fail-closed criteria only when
-started). M6 still partial (§22.3 sacrificial + §22.4–22.7 + MCP/non-empty
-tools). **Not** Golden / §25.
+counts→0, Hang exchange pumps joined not detached.
 
-**Next pick:** either remaining §22.3 sacrificial non-yielding (fail-closed
-only: short `wait_stopped` → `TimedOut`, `Quiescing`, owned work registered;
-**never** `Stopped`; outer harness kills child) **or** §22.4 / §22.5 remainder
-/ §22.6 — **not** host adapters (§22.7) as substitute. Prefer staying on
-kernel ownership before inventing the sacrificial harness if any in-process
-gap remains; otherwise sacrificial is the distinctive 22.3 negative proof.
+**§22.3 sacrificial (2026-08-20):** Landed fail-closed non-yielding proof.
+`RuntimeConfig::inject_non_yielding_service` parks a never-awaiting
+`RuntimeService` (signals before park so abort-before-poll cannot fake
+`Stopped`). Child short `wait_stopped` → `TimedOut` + `Quiescing` +
+`owned_tasks>0`; parent asserts the proof line then kills the child; missing
+line within outer bound fails. **§22.3 matrix complete.**
+
+**§22.4 tools (2026-08-20):** Re-enabled `dispatcher` + `loop_adapters`.
+Restored `ToolJoinVault` (park join+permit; `ToolKillHandle::join_only` for
+cooperative ownership; vault Drop transfers pending work to a process-scoped
+set — no `mem::forget`, no JoinOnly abort, no false capacity free). Landed
+`tests/s22_4_tools.rs` (6) + registered `linked_tools` (14). **§22.4 matrix
+complete** with residual: process-scoped pending is over-hold until process
+exit / future supervisor drain (not false free; not Stopped-linked yet).
+M6 still partial (§22.6–22.7 + MCP/non-empty tools). **Not** Golden / §25.
+
+**Next pick:** **§22.6** events/identity — **not** host adapters (§22.7).

@@ -92,6 +92,8 @@ pub(crate) struct RuntimeShared {
     pub hold_start: Option<Arc<StartHoldGate>>,
     /// When `Some`, Finalizer waits after Seal before completion send (§22.2).
     pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
+    /// When `Some`, spawn a never-awaiting RuntimeService that signals before park.
+    pub inject_non_yielding_service: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RuntimeShared {
@@ -149,6 +151,21 @@ pub(crate) async fn run_supervisor(
             TaskClass::RuntimeService,
             super::mcp_listener::run_loopback_mcp_listener(mcp_shared, std_listener),
         );
+    }
+    // §22.3 sacrificial: never-awaiting future pins one worker; abort cannot
+    // join it, so shutdown must stay Quiescing (never false Stopped).
+    if let Some(entered) = shared.inject_non_yielding_service.clone() {
+        tasks.spawn(TaskClass::RuntimeService, async move {
+            // Signal before park so the harness does not shut down while the
+            // task is still only registered (abort-before-poll would join cleanly
+            // and falsely allow Stopped).
+            entered.store(true, Ordering::SeqCst);
+            // Park the worker thread with no `.await` — Tokio abort cannot stop
+            // this task (spin would burn a core for the same proof).
+            loop {
+                std::thread::park();
+            }
+        });
     }
     shared
         .owned_tasks
