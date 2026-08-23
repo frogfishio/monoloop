@@ -200,6 +200,7 @@ pub(crate) fn admit(
         delivery: Some(request.delivery),
         completion_tx: None,
         publisher_cmd_tx: None,
+        publisher_seal_tx: None,
         input: request.input,
         invocation_config: request.invocation_config,
         session_config: request.session_config,

@@ -44,9 +44,11 @@ pub struct LedgerEntry {
     pub delivery: Option<TransactionDelivery>,
     /// Completion sender retained until Seal + publish.
     pub completion_tx: Option<TransactionCompletionSender>,
-    /// Command sender to this transaction's event publisher (for Seal).
+    /// Ordinary Publish/Establish sender to this transaction's event publisher.
     pub publisher_cmd_tx:
         Option<tokio::sync::mpsc::Sender<super::event_publisher::EventPublisherCommand>>,
+    /// Dedicated Seal sender (D-047 priority path; capacity 1).
+    pub publisher_seal_tx: Option<tokio::sync::mpsc::Sender<super::event_publisher::SealCommand>>,
     /// Canonical input captured at admission.
     pub input: CanonicalInput,
     /// Invocation configuration.

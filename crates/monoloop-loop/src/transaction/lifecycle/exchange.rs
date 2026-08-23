@@ -263,9 +263,11 @@ async fn run_inner(
             children.owner = Some(owner_done_rx);
         }
         Err(SpawnReject::Busy { future } | SpawnReject::Rejected { future }) => {
-            // Spawner rejected before accept: drive owner inline after terminate.
+            // D-051: never poll unregistered owner work — that would start open
+            // I/O under the coordinator and defeat §15 ownership-before-I/O.
+            // Drop the future (no I/O has begun: open_owned only constructs it).
             let _ = control.terminate(TerminationReason::CallerForced);
-            let _ = tokio::time::timeout(cleanup_deadline, future).await;
+            drop(future);
             return Err(ExchangeFailure::SpawnFailed);
         }
         Err(SpawnReject::Orphaned) => {

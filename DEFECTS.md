@@ -3094,6 +3094,12 @@ contiguous numbering but not lossless delivery.
 - Proofs: `s22_2_failed_enqueue_consumes_no_sequence` (wait+drain lossless),
   `d047_full_queue_seal_reports_deadline_not_published`.
 
+**Reopen + close (independent review `b82c763`, 2026-08-23):** Seal priority
+criterion was still unchecked. Dedicated `SealCommand` mpsc (cap 1) + biased
+select / preempt during ordinary host-capacity wait; publisher no longer retains
+a Sender to its own ordinary channel. Proof:
+`d047_seal_priority_when_ordinary_cmd_queue_full`.
+
 **Acceptance criteria:**
 - [x] A temporarily full but draining host queue loses no ordinary events before
   the transaction deadline (`s22_2_failed_enqueue_consumes_no_sequence`).
@@ -3102,9 +3108,9 @@ contiguous numbering but not lossless delivery.
   finalizer kind upgrade).
 - [x] `SessionEstablished` publication failure becomes sticky and blocks further
   ordinary publishes (same sticky_fail path).
-- [ ] Seal racing a full command queue permits no event after terminal attempt
-  (dedicated seal priority channel still residual — finalizer still `try_send`
-  Seal onto the command mpsc).
+- [x] Seal racing a full ordinary command queue permits no event after terminal
+  attempt (`d047_seal_priority_when_ordinary_cmd_queue_full`; dedicated seal
+  channel + preempt).
 - [x] Tests assert delivered sequences after wait/drain (contiguous + count).
 
 ## D-048: Process-isolated tool handles are discarded before wait/reap
@@ -3140,6 +3146,12 @@ lease was dropped rather than because the child was reaped. This violates v2
   and tasks.
 - Snapshot `owned_processes` prefers registry `live_count`.
 
+**Reopen + close (independent review `b82c763`):** `ProcessIsolatedToolHandler`
+no longer blocks `start` on `stdin.write_all`. Kill handle / Child ownership
+exist before stdin; stdin is delivered on the owned drive via bounded
+`spawn_blocking`. Proof:
+`process_isolated_program_owns_before_stdin_and_is_killable`.
+
 **Acceptance criteria:**
 - [ ] Abort the supervising `ToolWorker` immediately after process spawn;
   sacrificial end-to-end PID proof still residual (unit registry proof landed).
@@ -3147,6 +3159,9 @@ lease was dropped rather than because the child was reaped. This violates v2
   Stopped blocked while `live_count > 0`.
 - [x] Later reap empties the registry (`registry_retains_until_reap_then_empties`).
 - [x] `Stopped` asserts process registry empty, not merely counter zero.
+- [x] Process ownership precedes stdin delivery; `start` returns a killable
+  handle before any blocking stdin write
+  (`process_isolated_program_owns_before_stdin_and_is_killable`).
 - [ ] Sacrificial PID-not-waitable proof still residual (next hardening optional).
 
 ## D-049: `wait_stopped` deadline excludes executor-thread join
@@ -3269,11 +3284,18 @@ post-open transport work.
 - Proofs: `d051_pending_exposes_owner_before_open_poll`,
   `d051_cancel_during_delayed_open_joins_owner`, plus migrated connector suites.
 
+**Reopen + close (independent review `b82c763`):** Busy/Rejected spawn path
+no longer polls the unregistered owner future inline (would start open I/O
+under the coordinator). Future is dropped after terminate; returns
+`SpawnFailed`. Named poll-detector:
+`d051_busy_rejected_drops_unregistered_owner_without_poll`.
+
 **Acceptance criteria:**
 - [x] `PendingRawConnection` transfers owner work/identity before open I/O can
   start.
 - [x] `ConnectorOwner` registration precedes first poll of the entire open and
-  transport owner operation.
+  transport owner operation (including: never poll Busy/Rejected unregistered
+  owner work — `d051_busy_rejected_drops_unregistered_owner_without_poll`).
 - [x] Cancel/terminate during a non-yielding or delayed open retains an observable
   owner join and never fabricates teardown.
 - [x] No profile retains the temporary `owner_work: None` migration option.
@@ -3379,9 +3401,15 @@ excluded unless explicitly registered.
   drain events concurrent with completion (workspace `--all-targets` + 30×
   stress of the named test: 0 failures on this tree).
 
+**Honesty follow-up (independent review `b82c763`):** DirectLlm replacement
+map **narrowed** — Fake echo + empty_loop are smoke only; HTTP/OpenAI SSE
+composition, continuation, tool second-exchange, call-ID reuse, and
+concurrency remain an open Golden residual (not claimed covered).
+
 **Acceptance criteria:**
 - [x] Port every retained integration suite to the v2 public API and register it,
-  or delete it with an explicit coverage replacement map.
+  or delete it with an explicit coverage replacement map (**honest** map: DirectLlm
+  vertical e2e not equivalently replaced).
 - [x] Register/enable package examples so `--all-targets` compiles them.
 - [x] `cargo test --workspace --all-targets --all-features` demonstrably includes
   the full intended suite rather than a curated subset hidden by autodiscovery
@@ -3602,6 +3630,43 @@ commands green.
 work (exhaustive public-limit / race-load / live Grok; breaking alias
 cut). Agents must not self-sign. Do **not** promote Golden / §25 / D-025.
 
+## Independent Transaction Runtime v2 acceptance verdict — 2026-08-23 (re-review)
+
+**Reviewed commit:** `b82c763`
+
+**Result:** **REJECT — not §25 / Golden / D-025**
+
+Findings (remediated same day; still no Golden claim):
+1. **P1 D-047** Seal lost on full ordinary cmd queue → dedicated `SealCommand`
+   channel + preempt; proof `d047_seal_priority_when_ordinary_cmd_queue_full`.
+2. **P1 D-048** ProcessIsolated blocked `start` on stdin → own-before-stdin +
+   bounded `spawn_blocking`; proof
+   `process_isolated_program_owns_before_stdin_and_is_killable`.
+3. **P2 D-051** Busy/Rejected owner polled inline → drop unregistered future.
+4. **P2 D-053** DirectLlm coverage map overstated → narrowed to smoke + Golden
+   residual for HTTP/OpenAI vertical e2e.
+
+Sacrificial PID residual under D-048 remains. Do **not** self-sign.
+
+**Expert + Advisor (2026-08-23, re-review findings Silver bar):** **PASS — Silver**
+for the named `b82c763` reopen slice only. Remediations are uncommitted on
+top of `b82c763` until landed; proofs below were re-run on this tree.
+
+| Finding | Proof |
+|---|---|
+| P1 D-047 Seal lost on full ordinary cmd queue | Dedicated `SealCommand` mpsc (cap 1) + biased select / `wait_send_or_seal` preempt; publisher does not retain a Sender to its own ordinary channel; Finalizer `try_send`s Seal on the taken seal sender. Named test `d047_seal_priority_when_ordinary_cmd_queue_full` **passed** on this tree. |
+| P1 D-048 `start` blocked on stdin | Kill handle + `Child` exist before any stdin write; stdin is bounded `spawn_blocking` on the owned drive. Named test `process_isolated_program_owns_before_stdin_and_is_killable` **passed** on this tree. |
+| P2 D-051 Busy/Rejected owner polled inline | `exchange.rs` drops the unregistered owner future after `terminate` (no inline poll). `open_owned` constructs a lazy owner; first poll of `open_and_own` is what starts I/O. Named proofs: `d051_pending_exposes_owner_before_open_poll`, `d051_cancel_during_delayed_open_joins_owner`, and `d051_busy_rejected_drops_unregistered_owner_without_poll` (PanicOnPoll fixture for Busy + Rejected) **passed**. |
+| P2 D-053 DirectLlm map overstated | `doc/D053_COVERAGE_REPLACEMENT.md` **Not equivalently replaced** for HTTP/OpenAI SSE composition / continuation / tool second-exchange / call-ID reuse / concurrency. Retained smoke only (`fake_echo_exchange_emits_canonical_text_unit`, `empty_loop`, `examples/fake_echo.rs`). |
+
+DirectLlm vertical e2e through `StartedRuntime` is an **explicit Golden residual**. Spec header, Loop README, D-054 Golden boxes, and `doc/SECURITY_REVIEW_CHECKLIST.md` Sign-off remain unsigned. **Not** Golden / §25 / D-025.
+
+Declared residuals that do **not** demote this slice: D-048 sacrificial abort-after-spawn PID-not-waitable proof; `spawn_blocking` stdin offload is not `TaskClass::ToolWorker` (D-043 class leftover).
+
+Three-component shape holds for this slice (Loop + Connector ownership seams; no testkit product dep). Chronological D-047 notes below that still call Seal-priority an open residual are **historical** and superseded by the dedicated channel + named test.
+
+**Next pick:** independent human re-review of this Silver remediation slice / D-025 sign-off **or** named Golden work (DirectLlm `StartedRuntime` vertical e2e, exhaustive public-limit / race-load / live Grok, alias breaking cut). Agents must not self-sign. Do **not** promote Golden / §25 / D-025.
+
 ## Independent Transaction Runtime v2 acceptance verdict — 2026-08-23
 
 **Reviewed commit:** `fb0371b`
@@ -3628,10 +3693,13 @@ complete while any of these records remain open.
 
 **Remediation progress (2026-08-23):** D-046–D-054 Fixed for their named Silver
 slices (see each defect). D-054 honesty/deletion + WP-12/D-003 retarget:
-Expert **PASS — Silver**; Advisor **PASS — Silver** (this record). Seal-priority residual remains
-under D-047; sacrificial PID residual under D-048. **Next pick:**
-independent acceptance / D-025 sign-off or named Golden residuals — agents
-must not self-sign. Do **not** promote Golden / §25 / D-025.
+Expert **PASS — Silver**; Advisor **PASS — Silver** (this record).
+**Re-review `b82c763` named P1/P2:** Expert + Advisor **PASS — Silver** (see
+re-review section). Seal-priority is closed (dedicated channel + named test);
+D-051 Busy/Rejected poll-detector landed; sacrificial PID residual remains
+under D-048. **Next pick:** independent human re-review / D-025 sign-off or
+named Golden residuals — agents must not self-sign. Do **not** promote
+Golden / §25 / D-025.
 
 **Expert + Advisor (2026-08-23, D-046 Fixed):** **PASS — Silver** for this
 slice only.
@@ -3640,13 +3708,16 @@ slice only.
 deadline (not cancel — cancel is set before Seal). Seal uses deadline-only
 wait. Sticky fail → Seal reports Deadline/Limit/QueueClosed; finalizer
 upgrades Completed → EventDeliveryFailed. Residual: dedicated Seal priority
-channel when command mpsc is Full.
+channel when command mpsc is Full. **Superseded same day:** dedicated
+`SealCommand` channel + `d047_seal_priority_when_ordinary_cmd_queue_full`
+(see re-review Advisor stamp).
 
 **Expert + Advisor (2026-08-23, D-047 Fixed):** **PASS — Silver** for this
 slice only. Wait-for-capacity ordinary publish + sticky fail → Seal delivery
 + finalizer `EventDeliveryFailed` upgrade meet the checked acceptance boxes.
-Residual Seal-priority on full publisher-command mpsc remains open under
-D-047 (unchecked criterion). Do **not** promote Golden / §25 / D-025.
+Residual Seal-priority on full publisher-command mpsc was **closed** in the
+`b82c763` re-review slice (dedicated channel + named test). Do **not**
+promote Golden / §25 / D-025.
 
 **Remediation progress:** D-046 Fixed; D-047 Fixed; D-048 Fixed
 (`OwnedProcessRegistry` + Stopped gate). Sacrificial abort-after-spawn PID

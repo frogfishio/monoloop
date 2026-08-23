@@ -3,6 +3,9 @@
 //! Sole allocator of ordinary and terminal event sequences for one transaction.
 //! Waits for caller mailbox capacity under the transaction deadline — never
 //! silently drops ordinary events after the coordinator has handed them off.
+//!
+//! Terminal Seal uses a **dedicated** channel so a full ordinary-command queue
+//! cannot discard Seal or allow ordinary delivery after finalization (D-047).
 
 use super::session_identity::ensure_session;
 use crate::transaction::sticky_cancel::StickyCancel;
@@ -16,23 +19,20 @@ use std::time::Instant as StdInstant;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
-/// Commands from the coordinator (Publish) or supervisor (Seal).
+/// Ordinary / establish commands from the coordinator (not Seal).
 pub enum EventPublisherCommand {
     /// Establish an external session before ordinary events (§22.6).
-    ///
-    /// When this is the first successful enqueue, publishes `SessionEstablished`
-    /// at sequence 1. Ignored if a session was already established or sequences
-    /// have already advanced (cannot satisfy seq-1).
     EstablishExternal(ExternalSessionId),
     /// Publish one ordinary payload (sequence allocated after capacity reserved).
     Publish(Box<TransactionEventPayload>),
-    /// Allocate terminal sequence, enqueue EndedEvent, reply with result.
-    Seal {
-        /// Terminal event body (emitted_events filled by publisher).
-        terminal: TransactionEndEvent,
-        /// Reply with publication result + last committed sequence.
-        reply: oneshot::Sender<TerminalPublicationResult>,
-    },
+}
+
+/// Terminal Seal on the dedicated priority channel (D-047).
+pub struct SealCommand {
+    /// Terminal event body (emitted_events filled by publisher).
+    pub terminal: TransactionEndEvent,
+    /// Reply with publication result + last committed sequence.
+    pub reply: oneshot::Sender<TerminalPublicationResult>,
 }
 
 /// Result of Seal.
@@ -44,18 +44,19 @@ pub struct TerminalPublicationResult {
     pub last_sequence: u64,
 }
 
-/// Run the publisher until Seal completes (or the command channel closes).
+/// Run the publisher until Seal completes (or both channels close).
 ///
-/// Ordinary / establish publishes wait for host mailbox capacity until `cancel`
-/// or `deadline`. Failures are sticky: later ordinary events are refused, and
-/// Seal reports the sticky failure instead of inventing `Published` for a
-/// silently truncated stream (D-047).
+/// Seal on `seal_rx` is preferred (biased) over ordinary `cmd_rx`. While an
+/// ordinary publish waits for host mailbox capacity, an arriving Seal preempts
+/// that wait so no ordinary event can publish after finalization begins.
+#[allow(clippy::too_many_arguments)] // publisher state machine ports
 pub async fn run_event_publisher(
     transaction_id: TransactionId,
     channel_id: ChannelId,
     session_id: Option<SessionId>,
     event_tx: TransactionEventSender,
     mut cmd_rx: mpsc::Receiver<EventPublisherCommand>,
+    mut seal_rx: mpsc::Receiver<SealCommand>,
     _cancel: Arc<StickyCancel>,
     deadline: StdInstant,
 ) -> TerminalPublicationResult {
@@ -63,110 +64,194 @@ pub async fn run_event_publisher(
     let mut last_committed: u64 = 0;
     let mut session = session_id;
     let mut session_established = false;
-    // Sticky ordinary/establish publication failure (D-047).
     let mut sticky_fail: Option<TerminalEventDelivery> = None;
+    let mut cmd_closed = false;
+    let mut seal_closed = false;
 
-    while let Some(cmd) = cmd_rx.recv().await {
-        match cmd {
-            EventPublisherCommand::EstablishExternal(_) if sticky_fail.is_some() => {}
-            EventPublisherCommand::EstablishExternal(external) => match establish_external_waiting(
-                &event_tx,
-                transaction_id,
-                &channel_id,
-                external,
-                &mut session,
-                &mut next_seq,
-                &mut last_committed,
-                &mut session_established,
-                deadline,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(fail) => {
-                    sticky_fail = Some(fail);
-                }
-            },
-            EventPublisherCommand::Publish(_) if sticky_fail.is_some() => {
-                // Refuse ordinary events after a sticky publish failure so Seal
-                // cannot paper over a truncated stream with Completed.
-            }
-            EventPublisherCommand::Publish(payload) => {
-                // §22.6: if EstablishExternal was required but never committed
-                // seq 1, do not publish ordinary events afterward.
-                // (Only applies when establish was attempted and sticky-failed;
-                // DirectLlm paths never send EstablishExternal.)
-                let payload = *payload;
-                let sid = ensure_session(&mut session, None, transaction_id);
-                let seq = next_seq;
-                let event = TransactionEvent {
-                    transaction_id,
-                    channel_id: channel_id.clone(),
-                    session_id: sid,
-                    sequence: seq,
-                    payload,
-                };
-                match enqueue_waiting(&event_tx, event, deadline).await {
-                    Ok(()) => {
-                        last_committed = seq;
-                        next_seq = seq.saturating_add(1);
-                    }
-                    Err(EnqueueWaitError::Failed(fail)) => {
-                        sticky_fail = Some(fail);
-                    }
-                }
-            }
-            EventPublisherCommand::Seal {
-                mut terminal,
-                reply,
-            } => {
-                if let Some(fail) = sticky_fail {
-                    let result = TerminalPublicationResult {
-                        delivery: fail,
-                        last_sequence: last_committed,
-                    };
-                    let _ = reply.send(result.clone());
-                    return result;
-                }
-                let sid = ensure_session(&mut session, terminal.session_id.clone(), transaction_id);
-                let seq = next_seq;
-                terminal.emitted_events = seq;
-                terminal.session_id = Some(sid.clone());
-                let event = TransactionEvent {
-                    transaction_id,
-                    channel_id: channel_id.clone(),
-                    session_id: sid,
-                    sequence: seq,
-                    payload: TransactionEventPayload::EndedEvent(terminal),
-                };
-                // Terminal: cancel is already set by accept_terminal before Seal.
-                // Do not treat cancel as publication failure — wait only on
-                // deadline / mailbox capacity (D-047).
-                let delivery = match enqueue_seal(&event_tx, event, deadline).await {
-                    Ok(()) => {
-                        last_committed = seq;
-                        TerminalEventDelivery::Published
-                    }
-                    Err(fail) => fail,
-                };
-                let result = TerminalPublicationResult {
-                    delivery,
+    loop {
+        if let Some(fail) = sticky_fail {
+            return match seal_rx.recv().await {
+                Some(cmd) => reply_sticky(cmd, fail, last_committed),
+                None => TerminalPublicationResult {
+                    delivery: fail,
                     last_sequence: last_committed,
-                };
-                let _ = reply.send(result.clone());
-                return result;
+                },
+            };
+        }
+
+        tokio::select! {
+            biased;
+            seal = seal_rx.recv(), if !seal_closed => {
+                match seal {
+                    Some(cmd) => {
+                        return finish_seal(
+                            cmd,
+                            transaction_id,
+                            &channel_id,
+                            &event_tx,
+                            &mut session,
+                            &mut next_seq,
+                            &mut last_committed,
+                            None,
+                            deadline,
+                        )
+                        .await;
+                    }
+                    None => {
+                        seal_closed = true;
+                        if cmd_closed {
+                            return TerminalPublicationResult {
+                                delivery: TerminalEventDelivery::QueueClosed,
+                                last_sequence: last_committed,
+                            };
+                        }
+                    }
+                }
+            }
+            cmd = cmd_rx.recv(), if !cmd_closed => {
+                match cmd {
+                    Some(EventPublisherCommand::EstablishExternal(external)) => {
+                        match establish_external(
+                            &event_tx,
+                            transaction_id,
+                            &channel_id,
+                            external,
+                            &mut session,
+                            &mut next_seq,
+                            &mut last_committed,
+                            &mut session_established,
+                            deadline,
+                            &mut seal_rx,
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(WaitEnd::Sealed(cmd)) => {
+                                return finish_seal(
+                                    cmd,
+                                    transaction_id,
+                                    &channel_id,
+                                    &event_tx,
+                                    &mut session,
+                                    &mut next_seq,
+                                    &mut last_committed,
+                                    None,
+                                    deadline,
+                                )
+                                .await;
+                            }
+                            Err(WaitEnd::Failed(fail)) => sticky_fail = Some(fail),
+                        }
+                    }
+                    Some(EventPublisherCommand::Publish(payload)) => {
+                        let payload = *payload;
+                        let sid = ensure_session(&mut session, None, transaction_id);
+                        let seq = next_seq;
+                        let event = TransactionEvent {
+                            transaction_id,
+                            channel_id: channel_id.clone(),
+                            session_id: sid,
+                            sequence: seq,
+                            payload,
+                        };
+                        match wait_send_or_seal(&event_tx, event, deadline, &mut seal_rx).await {
+                            Ok(()) => {
+                                last_committed = seq;
+                                next_seq = seq.saturating_add(1);
+                            }
+                            Err(WaitEnd::Sealed(cmd)) => {
+                                return finish_seal(
+                                    cmd,
+                                    transaction_id,
+                                    &channel_id,
+                                    &event_tx,
+                                    &mut session,
+                                    &mut next_seq,
+                                    &mut last_committed,
+                                    None,
+                                    deadline,
+                                )
+                                .await;
+                            }
+                            Err(WaitEnd::Failed(fail)) => sticky_fail = Some(fail),
+                        }
+                    }
+                    None => {
+                        cmd_closed = true;
+                        if seal_closed {
+                            return TerminalPublicationResult {
+                                delivery: TerminalEventDelivery::QueueClosed,
+                                last_sequence: last_committed,
+                            };
+                        }
+                    }
+                }
             }
         }
     }
-
-    TerminalPublicationResult {
-        delivery: sticky_fail.unwrap_or(TerminalEventDelivery::QueueClosed),
-        last_sequence: last_committed,
-    }
 }
 
-enum EnqueueWaitError {
+enum WaitEnd {
+    Sealed(SealCommand),
     Failed(TerminalEventDelivery),
+}
+
+fn reply_sticky(
+    cmd: SealCommand,
+    fail: TerminalEventDelivery,
+    last_committed: u64,
+) -> TerminalPublicationResult {
+    let result = TerminalPublicationResult {
+        delivery: fail,
+        last_sequence: last_committed,
+    };
+    let _ = cmd.reply.send(result.clone());
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // publisher locals
+async fn finish_seal(
+    cmd: SealCommand,
+    transaction_id: TransactionId,
+    channel_id: &ChannelId,
+    event_tx: &TransactionEventSender,
+    session: &mut Option<SessionId>,
+    next_seq: &mut u64,
+    last_committed: &mut u64,
+    sticky_fail: Option<TerminalEventDelivery>,
+    deadline: StdInstant,
+) -> TerminalPublicationResult {
+    if let Some(fail) = sticky_fail {
+        return reply_sticky(cmd, fail, *last_committed);
+    }
+    let SealCommand {
+        mut terminal,
+        reply,
+    } = cmd;
+    let sid = ensure_session(session, terminal.session_id.clone(), transaction_id);
+    let seq = *next_seq;
+    terminal.emitted_events = seq;
+    terminal.session_id = Some(sid.clone());
+    let event = TransactionEvent {
+        transaction_id,
+        channel_id: channel_id.clone(),
+        session_id: sid,
+        sequence: seq,
+        payload: TransactionEventPayload::EndedEvent(terminal),
+    };
+    let delivery = match enqueue_seal(event_tx, event, deadline).await {
+        Ok(()) => {
+            *last_committed = seq;
+            TerminalEventDelivery::Published
+        }
+        Err(fail) => fail,
+    };
+    let result = TerminalPublicationResult {
+        delivery,
+        last_sequence: *last_committed,
+    };
+    let _ = reply.send(result.clone());
+    result
 }
 
 fn tokio_deadline_from(deadline: StdInstant) -> TokioInstant {
@@ -187,48 +272,43 @@ fn map_send_err(err: EventEnqueueError) -> TerminalEventDelivery {
     }
 }
 
-/// Wait for mailbox capacity under the transaction deadline.
-///
-/// Does **not** abort on StickyCancel: accept_terminal cancels before Seal, and
-/// pending ordinary `Publish` commands already accepted onto the publisher
-/// command queue must still be delivered (D-047 lossless).
-async fn enqueue_waiting(
+/// Ordinary enqueue; a real Seal preempts without committing the event.
+/// Closing the seal channel without a Seal does **not** fail the ordinary wait
+/// (tests may drop the seal sender after draining ordinary commands).
+async fn wait_send_or_seal(
     event_tx: &TransactionEventSender,
     event: TransactionEvent,
     deadline: StdInstant,
-) -> Result<(), EnqueueWaitError> {
+    seal_rx: &mut mpsc::Receiver<SealCommand>,
+) -> Result<(), WaitEnd> {
     let tokio_deadline = tokio_deadline_from(deadline);
-    tokio::select! {
-        biased;
-        _ = sleep_until(tokio_deadline) => Err(EnqueueWaitError::Failed(
-            TerminalEventDelivery::DeadlineExceeded,
-        )),
-        res = event_tx.send(event) => match res {
-            Ok(()) => Ok(()),
-            Err(e) => Err(EnqueueWaitError::Failed(map_send_err(e))),
-        },
+    let send_fut = event_tx.send(event);
+    tokio::pin!(send_fut);
+    let mut seal_alive = true;
+    loop {
+        tokio::select! {
+            biased;
+            seal = seal_rx.recv(), if seal_alive => match seal {
+                Some(cmd) => return Err(WaitEnd::Sealed(cmd)),
+                None => {
+                    seal_alive = false;
+                }
+            },
+            _ = sleep_until(tokio_deadline) => {
+                return Err(WaitEnd::Failed(TerminalEventDelivery::DeadlineExceeded));
+            }
+            res = &mut send_fut => {
+                return match res {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(WaitEnd::Failed(map_send_err(e))),
+                };
+            }
+        }
     }
 }
 
-/// Seal publication: ignore cancel (already set) and wait under deadline only.
-async fn enqueue_seal(
-    event_tx: &TransactionEventSender,
-    event: TransactionEvent,
-    deadline: StdInstant,
-) -> Result<(), TerminalEventDelivery> {
-    let tokio_deadline = tokio_deadline_from(deadline);
-    tokio::select! {
-        biased;
-        _ = sleep_until(tokio_deadline) => Err(TerminalEventDelivery::DeadlineExceeded),
-        res = event_tx.send(event) => match res {
-            Ok(()) => Ok(()),
-            Err(e) => Err(map_send_err(e)),
-        },
-    }
-}
-
-#[allow(clippy::too_many_arguments)] // publisher state machine locals
-async fn establish_external_waiting(
+#[allow(clippy::too_many_arguments)]
+async fn establish_external(
     event_tx: &TransactionEventSender,
     transaction_id: TransactionId,
     channel_id: &ChannelId,
@@ -238,12 +318,9 @@ async fn establish_external_waiting(
     last_committed: &mut u64,
     session_established: &mut bool,
     deadline: StdInstant,
-) -> Result<(), TerminalEventDelivery> {
-    if *session_established {
-        return Ok(());
-    }
-    // §22.6: SessionEstablished must be sequence 1 for new external sessions.
-    if *next_seq != 1 {
+    seal_rx: &mut mpsc::Receiver<SealCommand>,
+) -> Result<(), WaitEnd> {
+    if *session_established || *next_seq != 1 {
         return Ok(());
     }
     let sid = SessionId::from_external(&external);
@@ -257,7 +334,7 @@ async fn establish_external_waiting(
             external_session_id: external,
         },
     };
-    match enqueue_waiting(event_tx, event, deadline).await {
+    match wait_send_or_seal(event_tx, event, deadline, seal_rx).await {
         Ok(()) => {
             let _ = ensure_session(session, Some(sid), transaction_id);
             *last_committed = seq;
@@ -265,6 +342,24 @@ async fn establish_external_waiting(
             *session_established = true;
             Ok(())
         }
-        Err(EnqueueWaitError::Failed(fail)) => Err(fail),
+        Err(WaitEnd::Sealed(cmd)) => Err(WaitEnd::Sealed(cmd)),
+        Err(WaitEnd::Failed(fail)) => Err(WaitEnd::Failed(fail)),
+    }
+}
+
+/// Seal publication: wait under deadline only.
+async fn enqueue_seal(
+    event_tx: &TransactionEventSender,
+    event: TransactionEvent,
+    deadline: StdInstant,
+) -> Result<(), TerminalEventDelivery> {
+    let tokio_deadline = tokio_deadline_from(deadline);
+    tokio::select! {
+        biased;
+        _ = sleep_until(tokio_deadline) => Err(TerminalEventDelivery::DeadlineExceeded),
+        res = event_tx.send(event) => match res {
+            Ok(()) => Ok(()),
+            Err(e) => Err(map_send_err(e)),
+        },
     }
 }

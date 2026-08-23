@@ -89,18 +89,22 @@ impl ToolHandler for ProcessIsolatedToolHandler {
                 .map_err(|_| ToolStartError::Rejected("process spawn failed"))?,
         };
 
-        if matches!(self.command, ProcessToolCommand::Program { .. }) {
-            if let Some(mut stdin) = child.stdin.take() {
-                // Blocking write on the calling thread — ToolHandler::start is sync.
-                // Hosts must not call start on an async worker without offload.
-                let payload = serde_json::to_vec(&call.arguments).unwrap_or_default();
-                let _ = stdin.write_all(&payload);
-                drop(stdin);
-            }
-        }
+        // D-048: take stdin before ownership; never block `start` on write_all.
+        let stdin = if matches!(self.command, ProcessToolCommand::Program { .. }) {
+            child.stdin.take()
+        } else {
+            None
+        };
+        let payload = if stdin.is_some() {
+            serde_json::to_vec(&call.arguments).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let (tx, rx) = oneshot::channel();
-        let (kill, drive) = ToolKillHandle::from_child_driven(child, tx, kill_deadline);
+        // Kill handle + Child ownership exist before any stdin delivery (D-048).
+        let (kill, drive) =
+            ToolKillHandle::from_child_driven_with_stdin(child, stdin, payload, tx, kill_deadline);
 
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
@@ -133,14 +137,52 @@ impl ToolKillHandle {
         completion_tx: oneshot::Sender<ToolCompletion>,
         wait_deadline: Instant,
     ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send>>) {
+        Self::from_child_driven_with_stdin(child, None, Vec::new(), completion_tx, wait_deadline)
+    }
+
+    /// Own a [`Child`] immediately; optional stdin is written on the owned drive
+    /// path with a bounded blocking offload (D-048 — never block `ToolHandler::start`).
+    pub fn from_child_driven_with_stdin(
+        child: Child,
+        stdin: Option<std::process::ChildStdin>,
+        payload: Vec<u8>,
+        completion_tx: oneshot::Sender<ToolCompletion>,
+        wait_deadline: Instant,
+    ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send>>) {
         let child_arc = Arc::new(Mutex::new(Some(child)));
         let child_for_wait = Arc::clone(&child_arc);
         let kill = Self::from_process(Arc::clone(&child_arc));
         let kill_for_drive = kill.clone();
         let drive = Box::pin(async move {
+            // Bounded stdin delivery under ownership (D-048).
+            if let Some(mut stdin) = stdin {
+                let write = tokio::task::spawn_blocking(move || {
+                    let _ = stdin.write_all(&payload);
+                    drop(stdin);
+                });
+                let remaining = wait_deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, write).await {
+                    Ok(Ok(())) => {}
+                    _ => {
+                        // Timeout / join fail: kill child and fail closed.
+                        if let Some(c) = child_for_wait
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_mut()
+                        {
+                            let _ = c.kill();
+                        }
+                        kill_for_drive.note_process_reaped();
+                        let _ = completion_tx.send(ToolCompletion::RuntimeFailed(
+                            ToolRuntimeError::DeadlineExceeded,
+                        ));
+                        return;
+                    }
+                }
+            }
+
             let status = loop {
                 if Instant::now() >= wait_deadline {
-                    // Fail closed: kill then one last poll.
                     if let Some(c) = child_for_wait
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -165,7 +207,6 @@ impl ToolKillHandle {
                     match guard.as_mut() {
                         Some(c) => match c.try_wait() {
                             Ok(s) => s,
-                            // Transient OS error → fail closed (do not spin forever).
                             Err(_) => break None,
                         },
                         None => break None,
@@ -312,6 +353,29 @@ mod tests {
         assert!(handler.os_process_isolated());
         assert!(handler.supports_isolated_kill());
         assert!(!handler.supports_abort());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_isolated_program_owns_before_stdin_and_is_killable() {
+        // Child that never reads stdin — previously blocked start() on write_all.
+        let handler = ProcessIsolatedToolHandler::new(ProcessToolCommand::Program {
+            program: "sleep".into(),
+            args: vec!["30".into()],
+        });
+        let mut big = call();
+        big.arguments = serde_json::json!({"pad": "x".repeat(64 * 1024)});
+        let mut handle = handler
+            .start(big, ctx())
+            .expect("start must return before stdin completes");
+        assert!(handle.kill.as_ref().unwrap().is_process_isolated());
+        let kill = handle.kill.clone().expect("kill");
+        let drive = handle.drive.take().unwrap();
+        // Kill while stdin may still be draining — ownership must already exist.
+        kill.kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), drive).await;
+        kill.join_timeout(Duration::from_secs(1))
+            .await
+            .expect("child reaped after kill");
     }
 
     #[test]

@@ -560,18 +560,22 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
     };
 
     let (pub_tx, pub_rx) = mpsc::channel::<EventPublisherCommand>(64);
+    // D-047: Seal never shares the ordinary command queue — capacity 1 priority path.
+    let (seal_tx, seal_rx) = mpsc::channel::<super::event_publisher::SealCommand>(1);
     {
         let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = ledger.get_mut(&tx) {
             entry.publisher_cmd_tx = Some(pub_tx.clone());
+            entry.publisher_seal_tx = Some(seal_tx);
         }
     }
 
-    let pub_tx_task = pub_tx.clone();
     let channel_id_pub = channel_id.clone();
     let session_id_pub = session_id.clone();
     let cancel_pub = Arc::clone(&cancel);
     let deadline_pub = std::time::Instant::now() + deadline;
+    // Do not retain a Sender inside the publisher task — that prevented natural
+    // channel closure after Finalizer took the seal sender (D-047).
     tasks.spawn(TaskClass::EventPublisher(tx), async move {
         let _ = run_event_publisher(
             tx,
@@ -579,11 +583,11 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
             session_id_pub,
             event_tx,
             pub_rx,
+            seal_rx,
             cancel_pub,
             deadline_pub,
         )
         .await;
-        let _ = pub_tx_task;
     });
 
     let mcp_gateway = shared.mcp_gateway.lock().ok().and_then(|g| g.clone());
@@ -622,7 +626,7 @@ fn accept_terminal(
     proposal: TerminalProposal,
     force_upgrade: bool,
 ) {
-    let (first_decision, pub_cmd, kind) = {
+    let (first_decision, seal_tx, kind) = {
         let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = ledger.get_mut(&tx) else {
             return;
@@ -645,7 +649,8 @@ fn accept_terminal(
             .as_ref()
             .map(|t| t.kind)
             .unwrap_or(proposal.kind);
-        (first, entry.publisher_cmd_tx.clone(), kind)
+        // Take Seal sender so Finalizer owns the only remaining publisher control.
+        (first, entry.publisher_seal_tx.take(), kind)
     };
 
     // Wake coordinator; do not abort publisher until Seal is sent.
@@ -661,7 +666,7 @@ fn accept_terminal(
         // Kind is re-read at Seal time so Cancel→Terminated upgrade can win (§22.2).
         let _ = kind;
         tasks.spawn(TaskClass::Finalizer(tx), async move {
-            finalize_after_terminal(shared2, tx, pub_cmd).await;
+            finalize_after_terminal(shared2, tx, seal_tx).await;
         });
     }
 }
@@ -669,7 +674,7 @@ fn accept_terminal(
 async fn finalize_after_terminal(
     shared: Arc<RuntimeShared>,
     tx: TransactionId,
-    pub_cmd: Option<mpsc::Sender<EventPublisherCommand>>,
+    seal_tx: Option<mpsc::Sender<super::event_publisher::SealCommand>>,
 ) {
     // Brief yield so a racing ForceTerminate can upgrade Cancelled → Terminated
     // in the ledger before we snapshot the kind (§22.2).
@@ -706,17 +711,17 @@ async fn finalize_after_terminal(
     let mut terminal_delivery = TerminalEventDelivery::NotAttempted;
     let mut last_seq = 0u64;
     let mut kind = kind;
-    if let Some(cmd_tx) = pub_cmd {
+    if let Some(seal_tx) = seal_tx {
         let (reply_tx, reply_rx) = oneshot::channel();
         let terminal = end_event(tx, channel_id.clone(), session_id.clone(), kind, 0);
-        // try_send: never block Finalizer on a non-polling publisher (abort races).
-        match cmd_tx.try_send(EventPublisherCommand::Seal {
+        // Dedicated seal channel (cap 1): not blocked by a full ordinary cmd queue.
+        match seal_tx.try_send(super::event_publisher::SealCommand {
             terminal,
             reply: reply_tx,
         }) {
             Ok(()) => {
-                // Publisher may still be draining an ordinary wait; allow up to
-                // cleanup budget rather than a fixed 200ms (D-047).
+                // Publisher may still be draining an ordinary wait; Seal preempts
+                // that wait. Allow up to cleanup budget for the reply (D-047).
                 let seal_wait = shared.cleanup_deadline.max(Duration::from_millis(200));
                 if let Ok(Ok(res)) = tokio::time::timeout(seal_wait, reply_rx).await {
                     terminal_delivery = res.delivery;
@@ -729,6 +734,7 @@ async fn finalize_after_terminal(
                 terminal_delivery = TerminalEventDelivery::QueueClosed;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Prior Seal already in flight (should not happen with take()).
                 terminal_delivery = TerminalEventDelivery::DeadlineExceeded;
             }
         }
