@@ -61,26 +61,12 @@ impl ToolRegistry for ResolvedToolRegistry {
 pub struct HostToolRuntime {
     dispatcher: Arc<TransactionToolDispatcher>,
     exchange_id: ExchangeId,
-    /// When set, tool workers register under TaskSupervisor (Law 23).
-    spawner: Option<TransactionTaskSpawner>,
-    transaction_id: Option<TransactionId>,
+    spawner: TransactionTaskSpawner,
+    transaction_id: TransactionId,
 }
 
 impl HostToolRuntime {
-    /// Unit-test path without a supervisor (ambient `tokio::spawn`).
-    ///
-    /// Prefer [`Self::with_spawner`] — production RuntimeOwner always supplies one.
-    #[deprecated(note = "ambient tokio::spawn; use with_spawner() under TaskSupervisor (Law 23)")]
-    pub fn new(dispatcher: Arc<TransactionToolDispatcher>, exchange_id: ExchangeId) -> Self {
-        Self {
-            dispatcher,
-            exchange_id,
-            spawner: None,
-            transaction_id: None,
-        }
-    }
-
-    /// Production path: supervisor-owned tool workers (no ambient `tokio::spawn`).
+    /// Supervisor-owned tool workers (no ambient `tokio::spawn`; Law 23).
     pub fn with_spawner(
         dispatcher: Arc<TransactionToolDispatcher>,
         exchange_id: ExchangeId,
@@ -90,8 +76,8 @@ impl HostToolRuntime {
         Self {
             dispatcher,
             exchange_id,
-            spawner: Some(spawner),
-            transaction_id: Some(transaction_id),
+            spawner,
+            transaction_id,
         }
     }
 }
@@ -122,16 +108,10 @@ impl ToolRuntime for HostToolRuntime {
             let _ = tx.send(map_outcome(outcome));
         };
 
-        if let (Some(spawner), Some(tx_id)) = (self.spawner.as_ref(), self.transaction_id) {
-            let class = TaskClass::ToolWorker(tx_id, execution_id.clone());
-            spawner
-                .try_spawn_owned(class, work)
-                .map_err(|_| ToolRuntimeError("tool worker spawn capacity exceeded".into()))?;
-        } else {
-            // Unit-test path without a supervisor (linked_tools). Production uses
-            // [`Self::with_spawner`].
-            tokio::spawn(work);
-        }
+        let class = TaskClass::ToolWorker(self.transaction_id, execution_id.clone());
+        self.spawner
+            .try_spawn_owned(class, work)
+            .map_err(|_| ToolRuntimeError("tool worker spawn capacity exceeded".into()))?;
 
         Ok(ToolExecutionHandle {
             execution_id: request.execution_id,

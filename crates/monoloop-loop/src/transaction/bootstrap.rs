@@ -125,15 +125,21 @@ impl FinalizerHoldGate {
     }
 }
 
-/// Test-only inject: park a JoinOnly tool join on the runtime spill (§22.4 / Law 23).
+/// Test-only inject: TaskSupervisor-owned JoinOnly-style work (§22.4 / Law 23 / M5.4).
 ///
-/// Proves `wait_stopped` stays Quiescing while cooperative JoinOnly work is
-/// parked, then reaches Stopped after [`JoinOnlySpillInject::release`].
+/// Registers a `RuntimeService` that parks the worker thread until
+/// [`JoinOnlySpillInject::release`] (abort cannot join a non-awaiting park —
+/// same shape as the §22.3 sacrificial). Proves `wait_stopped` stays Quiescing
+/// with `owned_tasks > 0`, then reaches Stopped after release.
 /// Production leaves [`RuntimeConfig::inject_join_only_spill`] as `None`.
+///
+/// Name retains “Spill” for API stability; ownership is TaskSupervisor, not
+/// [`crate::transaction::dispatcher::OrphanToolPermitSet`].
 #[derive(Debug)]
 pub struct JoinOnlySpillInject {
     entered: AtomicBool,
-    release: StoppedGate,
+    released: AtomicBool,
+    parked_thread: std::sync::Mutex<Option<std::thread::Thread>>,
 }
 
 impl Default for JoinOnlySpillInject {
@@ -147,26 +153,39 @@ impl JoinOnlySpillInject {
     pub fn new() -> Self {
         Self {
             entered: AtomicBool::new(false),
-            release: StoppedGate::new(),
+            released: AtomicBool::new(false),
+            parked_thread: std::sync::Mutex::new(None),
         }
     }
 
-    /// True once the supervisor has parked the JoinOnly join on the spill.
+    /// True once the supervised task has entered its park loop.
     pub fn is_entered(&self) -> bool {
         self.entered.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_released(&self) -> bool {
+        self.released.load(Ordering::SeqCst)
     }
 
     pub(crate) fn mark_entered(&self) {
         self.entered.store(true, Ordering::SeqCst);
     }
 
-    /// Allow the parked JoinOnly join to finish (unblocks Stopped).
-    pub fn release(&self) {
-        self.release.release();
+    pub(crate) fn store_parked_thread(&self, thread: std::thread::Thread) {
+        *self.parked_thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread);
     }
 
-    pub(crate) async fn wait_released(&self) {
-        self.release.wait_released().await;
+    /// Allow the supervised JoinOnly task to finish (unblocks Stopped).
+    pub fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        if let Some(thread) = self
+            .parked_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            thread.unpark();
+        }
     }
 }
 
@@ -196,8 +215,8 @@ pub struct RuntimeConfig {
     /// stores `true` on this flag immediately before parking (§22.3 sacrificial).
     /// Production leaves this `None`.
     pub inject_non_yielding_service: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// When `Some`, supervisor parks a JoinOnly tool join on `tool_spill` at
-    /// start (Stopped-vs-spill proof). Production leaves this `None`.
+    /// When `Some`, supervisor registers TaskSupervisor-owned JoinOnly-style
+    /// work at start (Stopped-vs-owned-task proof). Production leaves this `None`.
     pub inject_join_only_spill: Option<Arc<JoinOnlySpillInject>>,
 }
 

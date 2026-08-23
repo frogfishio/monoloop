@@ -4,6 +4,38 @@ Explicit project decisions that change contracts, MSRV, or delivery assumptions.
 Normative behavior still lives under `doc/`; this file records *why* a deliberate
 change was made.
 
+## D-042 — Refreshable MCP deferred; CreationOnly is the declared initial posture
+
+**Date:** 2026-08-23
+
+**Context:** Contracts and delivery plans include
+`McpConfigurationCapability::Refreshable` (rotate tools across transactions on
+one retained external session). WP-12 acceptance still lists Refreshable as an
+open item. Initial ExternalAgent profiles (Grok, Cursor, Codex, agy) ship
+`CreationOnly`; headless CLI profiles ship `None`. Implementing Refreshable
+without a vendor-proven session refresh path would invent authority and expand
+scope past the empty-tool / CreationOnly qualification bar.
+
+**Decision:** For the **initial** shipped profile set, Refreshable MCP is
+**explicitly deferred**:
+
+- ExternalAgent MCP profiles **MUST** declare `CreationOnly` (or `None`).
+- No shipped profile **MAY** declare `Refreshable` until a dedicated decision
+  revises this entry with vendor evidence and proofs.
+- `Refreshable` remains a valid contracts enum variant for future profiles.
+- Tool-enabled reuse of an existing external session on CreationOnly continues
+  to fail closed at admission (existing D-014 / CreationOnly gate).
+
+**Consequences:**
+
+- WP-12 “Refreshable MCP” is a **declared limitation**, not an accidental gap
+  (`doc/WP12_CURRENT_LIMITATIONS.md`, capability report).
+- Qualification proof: `six_profile_bindings_register_and_validate` asserts no
+  profile uses `Refreshable`.
+- Promoting Refreshable requires: vendor session refresh contract, Loop
+  install/refresh ownership under TaskSupervisor, exact-limit proofs, and a
+  new DECISIONS entry superseding this one.
+
 ## D-041 — Never-attempted terminal delivery is `NotAttempted`
 
 **Date:** 2026-08-20

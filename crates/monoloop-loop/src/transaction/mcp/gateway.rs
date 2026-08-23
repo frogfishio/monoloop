@@ -17,12 +17,11 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// Runs one MCP HTTP request under TaskSupervisor as `TaskClass::McpRequest` (§17).
 ///
-/// Injected by RuntimeOwner; standalone `bind_loopback` tests leave this unset
+/// Injected by RuntimeOwner; standalone prepare+serve tests leave this unset
 /// and execute request work inline.
 pub trait McpRequestOwner: Send + Sync {
     /// Own `work` for `transaction_id` and return its response.
@@ -33,6 +32,42 @@ pub trait McpRequestOwner: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Response<Body>> + Send>>;
 }
 
+/// Bounded MCP request concurrency and duration (D-034 / Law 22).
+///
+/// Production defaults match the historical constants. Tests inject smaller
+/// budgets for exact-limit and plus-one proofs without multi-second waits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpGatewayLimits {
+    /// Gateway-wide concurrent in-flight MCP HTTP requests.
+    pub max_global_requests: usize,
+    /// Per-capability concurrent in-flight MCP HTTP requests.
+    pub max_per_capability_requests: usize,
+    /// Absolute wall budget for body read + Streamable HTTP handle.
+    pub request_duration: std::time::Duration,
+}
+
+impl Default for McpGatewayLimits {
+    fn default() -> Self {
+        Self {
+            max_global_requests: DEFAULT_MAX_GLOBAL_MCP_REQUESTS,
+            max_per_capability_requests: DEFAULT_MAX_PER_CAPABILITY_MCP_REQUESTS,
+            request_duration: DEFAULT_MCP_REQUEST_DURATION,
+        }
+    }
+}
+
+impl McpGatewayLimits {
+    fn validated(self) -> Result<Self, McpInstallError> {
+        if self.max_global_requests == 0
+            || self.max_per_capability_requests == 0
+            || self.request_duration.is_zero()
+        {
+            return Err(McpInstallError::InvalidDescriptor);
+        }
+        Ok(self)
+    }
+}
+
 /// Axum state: routes + gateway-owned capability services (not process-global — §17).
 #[derive(Clone)]
 struct GatewayState {
@@ -40,6 +75,8 @@ struct GatewayState {
     services: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<CapabilityHttpService>>>>,
     request_permits: Arc<tokio::sync::Semaphore>,
     request_owner: Option<Arc<dyn McpRequestOwner>>,
+    max_per_capability_requests: usize,
+    request_duration: std::time::Duration,
 }
 
 /// Cloneable handle for install/activate/revoke without owning the listener.
@@ -147,46 +184,37 @@ impl PreparedMcpGateway {
     }
 }
 
-/// Production MCP gateway: one loopback listener, many capability routes.
+/// MCP gateway constructors (no ambient spawn — Law 23).
 ///
-/// Standalone helper for unit tests (`bind_loopback` + owned JoinHandle).
-/// Production RuntimeOwner path uses [`PreparedMcpGateway`] under
-/// `TaskClass::RuntimeService` (no ambient spawn).
-pub struct McpGateway {
-    handle: McpGatewayHandle,
-    cancel: CancellationToken,
-    join: JoinHandle<()>,
-}
+/// Production RuntimeOwner uses [`PreparedMcpGateway`] under
+/// `TaskClass::RuntimeService`. Standalone tests prepare + spawn explicitly.
+pub struct McpGateway;
 
 impl McpGateway {
-    /// Bind `127.0.0.1:0`, serve Streamable HTTP, fail closed if not loopback.
-    ///
-    /// Spawns an owned listener task for standalone tests. Prefer
-    /// [`Self::prepare_from_std_listener`] + TaskSupervisor in RuntimeOwner.
-    pub async fn bind_loopback(max_routes: usize) -> Result<Self, McpInstallError> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|_| McpInstallError::InvalidDescriptor)?;
-        let prepared = Self::prepare_from_tokio_listener(listener, max_routes, None)?;
-        let handle = prepared.handle();
-        let cancel = prepared.cancel_token();
-        let join = tokio::spawn(prepared.serve());
-        Ok(Self {
-            handle,
-            cancel,
-            join,
-        })
-    }
-
     /// Build from a pre-bound non-blocking std listener (fail-closed startup bind).
     pub fn prepare_from_std_listener(
         std_listener: std::net::TcpListener,
         max_routes: usize,
         request_owner: Option<Arc<dyn McpRequestOwner>>,
     ) -> Result<PreparedMcpGateway, McpInstallError> {
+        Self::prepare_from_std_listener_with_limits(
+            std_listener,
+            max_routes,
+            request_owner,
+            McpGatewayLimits::default(),
+        )
+    }
+
+    /// [`Self::prepare_from_std_listener`] with explicit concurrency/duration limits.
+    pub fn prepare_from_std_listener_with_limits(
+        std_listener: std::net::TcpListener,
+        max_routes: usize,
+        request_owner: Option<Arc<dyn McpRequestOwner>>,
+        limits: McpGatewayLimits,
+    ) -> Result<PreparedMcpGateway, McpInstallError> {
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(|_| McpInstallError::InvalidDescriptor)?;
-        Self::prepare_from_tokio_listener(listener, max_routes, request_owner)
+        Self::prepare_from_tokio_listener_with_limits(listener, max_routes, request_owner, limits)
     }
 
     /// Build from an already-bound Tokio loopback listener (no spawn).
@@ -195,6 +223,22 @@ impl McpGateway {
         max_routes: usize,
         request_owner: Option<Arc<dyn McpRequestOwner>>,
     ) -> Result<PreparedMcpGateway, McpInstallError> {
+        Self::prepare_from_tokio_listener_with_limits(
+            listener,
+            max_routes,
+            request_owner,
+            McpGatewayLimits::default(),
+        )
+    }
+
+    /// [`Self::prepare_from_tokio_listener`] with explicit concurrency/duration limits.
+    pub fn prepare_from_tokio_listener_with_limits(
+        listener: tokio::net::TcpListener,
+        max_routes: usize,
+        request_owner: Option<Arc<dyn McpRequestOwner>>,
+        limits: McpGatewayLimits,
+    ) -> Result<PreparedMcpGateway, McpInstallError> {
+        let limits = limits.validated()?;
         let local_addr = listener
             .local_addr()
             .map_err(|_| McpInstallError::InvalidDescriptor)?;
@@ -204,7 +248,8 @@ impl McpGateway {
 
         let routes = McpRouteTable::new(max_routes);
         let services = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let request_permits = Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_MCP_REQUESTS));
+        let request_permits =
+            Arc::new(tokio::sync::Semaphore::new(limits.max_global_requests));
         let base_url = format!("http://{}", local_addr);
         let cancel = CancellationToken::new();
         let state = GatewayState {
@@ -212,6 +257,8 @@ impl McpGateway {
             services: Arc::clone(&services),
             request_permits: Arc::clone(&request_permits),
             request_owner,
+            max_per_capability_requests: limits.max_per_capability_requests,
+            request_duration: limits.request_duration,
         };
 
         let app = Router::new()
@@ -231,55 +278,6 @@ impl McpGateway {
             listener,
             app,
         })
-    }
-
-    /// Cloneable handle for actors and admission.
-    pub fn handle(&self) -> McpGatewayHandle {
-        self.handle.clone()
-    }
-
-    /// Bound loopback address.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.handle.local_addr()
-    }
-
-    /// Base URL.
-    pub fn base_url(&self) -> &str {
-        self.handle.base_url()
-    }
-
-    /// Shared route table.
-    pub fn routes(&self) -> &Arc<McpRouteTable> {
-        self.handle.routes()
-    }
-
-    /// Install a pending capability for a transaction.
-    pub fn install_pending(
-        &self,
-        transaction_id: TransactionId,
-        tools: ResolvedToolSet,
-        dispatcher: Arc<TransactionToolDispatcher>,
-        exchange_id: ExchangeId,
-    ) -> Result<PendingMcpBinding, McpInstallError> {
-        self.handle
-            .install_pending(transaction_id, tools, dispatcher, exchange_id)
-    }
-
-    /// Activate a pending capability.
-    pub fn activate(&self, token: &CapabilityToken) -> Result<(), McpInstallError> {
-        self.handle.activate(token)
-    }
-
-    /// Revoke one capability (idempotent).
-    pub fn revoke(&self, token: &CapabilityToken) -> bool {
-        self.handle.revoke(token)
-    }
-
-    /// Shutdown: revoke this gateway's routes, cancel their MCP services, stop listener.
-    pub async fn shutdown(self) {
-        self.handle.revoke_all_services();
-        self.cancel.cancel();
-        let _ = self.join.await;
     }
 }
 
@@ -307,9 +305,9 @@ struct CapabilityHttpService {
     permits: Arc<tokio::sync::Semaphore>,
 }
 
-const MAX_GLOBAL_MCP_REQUESTS: usize = 64;
-const MAX_PER_CAPABILITY_MCP_REQUESTS: usize = 8;
-const MCP_REQUEST_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+const DEFAULT_MAX_GLOBAL_MCP_REQUESTS: usize = 64;
+const DEFAULT_MAX_PER_CAPABILITY_MCP_REQUESTS: usize = 8;
+const DEFAULT_MCP_REQUEST_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Drop and cancel the per-token Streamable HTTP service for this gateway (D-018).
 fn drop_capability_service(
@@ -379,6 +377,7 @@ async fn execute_mcp_request(
             .unwrap_or_else(|_| Response::new(Body::empty()));
     };
 
+    let max_per_capability = state.max_per_capability_requests;
     let service = {
         let mut map = state.services.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(canonical.clone())
@@ -397,7 +396,7 @@ async fn execute_mcp_request(
                         config,
                     ),
                     cancel,
-                    permits: Arc::new(tokio::sync::Semaphore::new(MAX_PER_CAPABILITY_MCP_REQUESTS)),
+                    permits: Arc::new(tokio::sync::Semaphore::new(max_per_capability)),
                 })
             })
             .clone()
@@ -410,7 +409,7 @@ async fn execute_mcp_request(
             .unwrap_or_else(|_| Response::new(Body::empty()));
     };
 
-    let deadline_at = tokio::time::Instant::now() + MCP_REQUEST_DURATION;
+    let deadline_at = tokio::time::Instant::now() + state.request_duration;
     let (parts, body) = req.into_parts();
     let body_budget = deadline_at.saturating_duration_since(tokio::time::Instant::now());
     let collected =

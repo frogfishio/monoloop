@@ -4,8 +4,9 @@ use super::capacity::ReservationPool;
 use super::ledger::{LedgerEntry, LedgerInsertError, ResourceControls, TransactionPhase};
 use super::supervisor::{RuntimeShared, StartCommand, STATE_ACCEPTING};
 use monoloop_contracts::{
-    AdmissionError, AdmissionErrorKind, AdmissionReceipt, ChannelId, McpConfigurationCapability,
-    SessionKey, ToolExecutionMode, TransactionId, TransactionSubmitRequest, TransactionUsage,
+    estimate_canonical_input_bytes, AdmissionError, AdmissionErrorKind, AdmissionReceipt,
+    CanonicalMessage, ChannelId, McpConfigurationCapability, SessionKey, ToolExecutionMode,
+    TransactionId, TransactionSubmitRequest, TransactionUsage,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -59,12 +60,51 @@ pub(crate) fn admit(
         ));
     }
 
-    // 2. Validate channel + tools (input already constructed via CanonicalInput::try_new).
+    // 2. Validate channel + tools + input bounds (D-035).
+    // CanonicalInput::try_new already applied InputLimits; TransactionLimits are
+    // enforced here so hosts cannot bypass max_input_bytes with roomy construction.
     if !channels.contains(&request.channel_id) {
         return Err(AdmissionError::new(
             AdmissionErrorKind::UnknownChannel,
             "unknown channel",
         ));
+    }
+    let limits = &shared.transaction_limits;
+    let messages = request.input.messages();
+    if messages.len() > limits.max_messages {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::InvalidInput,
+            "message count exceeds max_messages",
+        ));
+    }
+    for msg in messages {
+        let parts = match msg {
+            CanonicalMessage::System { content, .. }
+            | CanonicalMessage::User { content, .. }
+            | CanonicalMessage::Assistant { content, .. }
+            | CanonicalMessage::Tool { content, .. } => content.len(),
+        };
+        if parts > limits.max_content_parts {
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::InvalidInput,
+                "content parts exceed max_content_parts",
+            ));
+        }
+    }
+    match estimate_canonical_input_bytes(&request.input) {
+        Ok(bytes) if bytes > limits.max_input_bytes => {
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::InvalidInput,
+                "canonical input exceeds max_input_bytes",
+            ));
+        }
+        Ok(_) => {}
+        Err(_) => {
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::InvalidInput,
+                "canonical input byte estimate failed",
+            ));
+        }
     }
     if request.tools.len() > max_tools {
         return Err(AdmissionError::new(

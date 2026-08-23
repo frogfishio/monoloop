@@ -8,7 +8,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Notify};
-use tokio::task::AbortHandle;
 
 /// RAII decrement for [`ShutdownSnapshot::owned_processes`] (§18.2 honesty).
 #[derive(Debug)]
@@ -135,15 +134,6 @@ pub struct ToolKillHandle {
 
 #[derive(Debug)]
 enum KillInner {
-    /// In-process Tokio task — abort at yield only (not ProcessIsolated).
-    Tokio {
-        abort: AbortHandle,
-        join: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    },
-    /// Join ownership without abort (CooperativeInProcess — §14.1 / §22.4).
-    JoinOnly {
-        join: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    },
     /// Inline AbortableAtYield body driven on the caller's task (M5.4 — no ambient spawn).
     ///
     /// `kill` cancels [`ToolExecutionControl`]; dropping the drive future stops
@@ -152,37 +142,12 @@ enum KillInner {
     /// OS child process — real kill boundary (V2 §14.3).
     Process {
         child: Arc<Mutex<Option<std::process::Child>>>,
-        join: Mutex<Option<tokio::task::JoinHandle<()>>>,
         /// Live until the child is observed reaped (or spill/Drop releases).
         owned_slot: Mutex<Option<OwnedProcessLease>>,
     },
 }
 
 impl ToolKillHandle {
-    /// Take ownership of a Tokio worker task (abort + join).
-    ///
-    /// This is **not** a ProcessIsolated boundary.
-    pub fn new(join: tokio::task::JoinHandle<()>) -> Self {
-        Self {
-            inner: Arc::new(KillInner::Tokio {
-                abort: join.abort_handle(),
-                join: Mutex::new(Some(join)),
-            }),
-        }
-    }
-
-    /// Own a cooperative worker join without hard abort (§22.4).
-    ///
-    /// `kill` is a no-op; cancel remains on [`ToolExecutionControl`]. Permit stays
-    /// held until [`Self::join_timeout`] / vault reap observes the join.
-    pub fn join_only(join: tokio::task::JoinHandle<()>) -> Self {
-        Self {
-            inner: Arc::new(KillInner::JoinOnly {
-                join: Mutex::new(Some(join)),
-            }),
-        }
-    }
-
     /// AbortableAtYield without a nested Tokio task (M5.4).
     ///
     /// Caller drives [`LinkedToolExecutionHandle::drive`] on the supervised
@@ -201,7 +166,6 @@ impl ToolKillHandle {
         Self {
             inner: Arc::new(KillInner::Process {
                 child,
-                join: Mutex::new(None),
                 owned_slot: Mutex::new(None),
             }),
         }
@@ -236,14 +200,9 @@ impl ToolKillHandle {
         owned_slot.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
-    /// Abort Tokio task or OS-kill the child (idempotent).
-    ///
-    /// Join-only (cooperative) handles are a no-op — cancel via control only.
-    /// Cancel-only (inline Abortable) requests cooperative cancel.
+    /// Request cancel (CancelOnly) or OS-kill the child (ProcessIsolated). Idempotent.
     pub fn kill(&self) {
         match &*self.inner {
-            KillInner::Tokio { abort, .. } => abort.abort(),
-            KillInner::JoinOnly { .. } => {}
             KillInner::CancelOnly { control } => control.cancel(),
             KillInner::Process { child, .. } => {
                 if let Some(c) = child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -253,32 +212,15 @@ impl ToolKillHandle {
         }
     }
 
-    /// Await worker teardown. On timeout, restores the join handle so the
-    /// worker is not detached; caller must keep capacity until a later join.
+    /// Await worker teardown. On timeout, ProcessIsolated leaves the child owned
+    /// so capacity stays held; caller must keep joining or park an orphan permit.
     pub async fn join_timeout(&self, budget: std::time::Duration) -> Result<(), ()> {
         match &*self.inner {
             KillInner::CancelOnly { .. } => {
                 // Inline drive: caller drops/polls the drive future; no join to await.
                 Ok(())
             }
-            KillInner::Process {
-                child,
-                join,
-                owned_slot,
-            } => {
-                let handle = join.lock().unwrap_or_else(|e| e.into_inner()).take();
-                if let Some(mut handle) = handle {
-                    return match tokio::time::timeout(budget, &mut handle).await {
-                        Ok(_) => {
-                            let _ = owned_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
-                            Ok(())
-                        }
-                        Err(_) => {
-                            *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-                            Err(())
-                        }
-                    };
-                }
+            KillInner::Process { child, owned_slot } => {
                 // Drive-owned wait: poll try_wait until exit or budget (no mutex across await).
                 let deadline = std::time::Instant::now() + budget;
                 loop {
@@ -306,54 +248,13 @@ impl ToolKillHandle {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
             }
-            KillInner::Tokio { join, .. } | KillInner::JoinOnly { join } => {
-                let handle = join.lock().unwrap_or_else(|e| e.into_inner()).take();
-                let Some(mut handle) = handle else {
-                    return Ok(()); // already joined
-                };
-                match tokio::time::timeout(budget, &mut handle).await {
-                    Ok(_) => Ok(()),
-                    Err(_) => {
-                        match &*self.inner {
-                            KillInner::Tokio { join, .. } | KillInner::JoinOnly { join } => {
-                                *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-                            }
-                            _ => {}
-                        }
-                        Err(())
-                    }
-                }
-            }
         }
     }
 
-    /// Take the join handle if still present (for TaskSupervisor registration).
-    #[allow(dead_code)]
-    pub(crate) fn take_join(&self) -> Option<tokio::task::JoinHandle<()>> {
-        match &*self.inner {
-            KillInner::Tokio { join, .. }
-            | KillInner::JoinOnly { join }
-            | KillInner::Process { join, .. } => {
-                join.lock().unwrap_or_else(|e| e.into_inner()).take()
-            }
-            KillInner::CancelOnly { .. } => None,
-        }
-    }
-
-    /// Whether a join handle is still owned.
+    /// Whether unfinished ProcessIsolated work is still owned (capacity hold).
     pub fn has_join(&self) -> bool {
         match &*self.inner {
-            KillInner::Tokio { join, .. } | KillInner::JoinOnly { join } => {
-                join.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-            }
-            KillInner::Process {
-                child,
-                join,
-                owned_slot,
-            } => {
-                if join.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-                    return true;
-                }
+            KillInner::Process { child, owned_slot } => {
                 // Drive-owned wait: capacity stays held until the child is observed exited.
                 if Self::process_still_alive(child) {
                     true
@@ -385,11 +286,6 @@ impl ToolKillHandle {
     /// True when this handle owns an OS process (ProcessIsolated).
     pub fn is_process_isolated(&self) -> bool {
         matches!(&*self.inner, KillInner::Process { .. })
-    }
-
-    /// True when this is cooperative join-only ownership (no hard abort).
-    pub fn is_join_only(&self) -> bool {
-        matches!(&*self.inner, KillInner::JoinOnly { .. })
     }
 
     /// True when the body is driven inline on the caller task (no nested JoinHandle).

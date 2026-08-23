@@ -10,7 +10,7 @@ use super::supervisor::RuntimeShared;
 use super::task_spawner::TransactionTaskSpawner;
 use super::terminal::TerminalProposal;
 use crate::transaction::channel_registry::LiveChannel;
-use crate::transaction::dispatcher::{RuntimeToolSpill, TransactionToolDispatcher};
+use crate::transaction::dispatcher::{OrphanToolPermitSet, TransactionToolDispatcher};
 use crate::transaction::host_tools::HostToolRegistry;
 use crate::transaction::loop_adapters::{HostToolRuntime, ResolvedToolRegistry};
 use crate::transaction::mcp::{CapabilityToken, McpGatewayHandle};
@@ -75,7 +75,7 @@ pub struct CoordinatorParams {
     /// Shared tool concurrency budget.
     pub shared_tool_capacity: Arc<SharedToolCapacity>,
     /// Runtime-scoped tool join spill (shared with supervisor Stopped proof).
-    pub tool_spill: Arc<RuntimeToolSpill>,
+    pub tool_spill: Arc<OrphanToolPermitSet>,
     /// Runtime-scoped live ProcessIsolated child count.
     pub owned_processes: Arc<std::sync::atomic::AtomicU32>,
     /// Runtime MCP gateway when `enable_mcp_listener` (CreationOnly install).
@@ -425,7 +425,7 @@ async fn finish_after_exchange(
     selected_tools: Vec<ToolId>,
     tools_registry: HostToolRegistry,
     shared_tool_capacity: Arc<SharedToolCapacity>,
-    tool_spill: Arc<RuntimeToolSpill>,
+    tool_spill: Arc<OrphanToolPermitSet>,
     owned_processes: Arc<std::sync::atomic::AtomicU32>,
 ) -> TerminalProposal {
     // §22.6: establish external session before ordinary events when not done

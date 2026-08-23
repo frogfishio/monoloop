@@ -38,8 +38,11 @@ pub use bootstrap::{
 };
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
 pub use dispatcher::{
-    DispatchOutcome, DispatchRequest, DispatcherLimits, RuntimeToolSpill, TransactionToolDispatcher,
+    DispatchOutcome, DispatchRequest, DispatcherLimits, OrphanToolPermitSet,
+    TransactionToolDispatcher,
 };
+#[allow(deprecated)]
+pub use dispatcher::RuntimeToolSpill;
 pub use error::StartupError;
 pub use fake_support::{EmptyBytesEncoder, PanicEncoder, RejectEncoder, TestTextEncoder};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
@@ -55,7 +58,8 @@ pub use loop_adapters::{
 };
 pub use mcp::{
     tool_definitions_from_resolved, CapabilityToken, McpBindingState, McpGateway, McpGatewayHandle,
-    McpInstallError, McpRequestOwner, McpRouteTable, PendingMcpBinding, PreparedMcpGateway,
+    McpGatewayLimits, McpInstallError, McpRequestOwner, McpRouteTable, PendingMcpBinding,
+    PreparedMcpGateway,
     TransactionMcpHandler,
 };
 

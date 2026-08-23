@@ -60,8 +60,8 @@ pub use id::{
     ToolName, TransactionId, MAX_IDENTITY_BYTES,
 };
 pub use input::{
-    user_text_input, CanonicalAssistantToolCall, CanonicalInput, CanonicalMessage,
-    InputValidationError, TextPart,
+    estimate_canonical_input_bytes, user_text_input, CanonicalAssistantToolCall, CanonicalInput,
+    CanonicalMessage, InputValidationError, TextPart,
 };
 pub use limits::{
     ChannelLimits, ConnectorLimits, ExtensionLimits, InputLimits, InterpretationLimits,

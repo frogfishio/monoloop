@@ -39,18 +39,22 @@ pub use transaction::{
     HostEventAdapter, HostToolRegistry, HostToolRuntime, ImmediateToolHandler,
     InputValidationFailure, IsolatedKillableToolHandler, JoinOnlySpillInject, LedgerEntry,
     LifecycleLedger, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
-    McpBindingState, McpGateway, McpGatewayHandle, McpInstallError, McpRequestOwner, McpRouteTable,
-    OpenAiChatCompletionsEncoder, OpenAiEncoderOptions, OutputValidationFailure, PanicEncoder,
-    PanicOnStartHandler, PendingMcpBinding, PreparedMcpGateway, ProcessIsolatedToolHandler,
-    ProcessToolCommand, RegisteredTool, RejectEncoder, ReservationPool, ReservationPoolError,
-    ResolvedTool, ResolvedToolRegistry, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig,
-    RuntimeOwner, RuntimeState, RuntimeToolSpill, SharedToolCapacity, ShutdownTicket, SpawnReject,
-    StartFailHandler, StartHoldGate, StartedRuntime, StartupError, StoppedGate, SupervisorCommand,
-    TaskClass, TaskExit, TaskId, TaskSupervisor, TerminalDecision, TerminalProposal,
-    TestTextEncoder, ToolExecutionCompletion, ToolExecutionControl, ToolHandler, ToolKillHandle,
-    TransactionMcpHandler, TransactionPhase, TransactionReservations, TransactionRuntimeHandle,
-    TransactionTaskSpawner, TransactionToolCapacity, TransactionToolDispatcher,
+    McpBindingState, McpGateway, McpGatewayHandle, McpGatewayLimits, McpInstallError, McpRequestOwner,
+    McpRouteTable,
+    OpenAiChatCompletionsEncoder, OpenAiEncoderOptions, OrphanToolPermitSet,
+    OutputValidationFailure, PanicEncoder, PanicOnStartHandler, PendingMcpBinding,
+    PreparedMcpGateway, ProcessIsolatedToolHandler, ProcessToolCommand, RegisteredTool,
+    RejectEncoder, ReservationPool, ReservationPoolError, ResolvedTool, ResolvedToolRegistry,
+    ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeOwner, RuntimeState,
+    SharedToolCapacity, ShutdownTicket, SpawnReject, StartFailHandler, StartHoldGate,
+    StartedRuntime, StartupError, StoppedGate, SupervisorCommand, TaskClass, TaskExit, TaskId,
+    TaskSupervisor, TerminalDecision, TerminalProposal, TestTextEncoder, ToolExecutionCompletion,
+    ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionMcpHandler, TransactionPhase,
+    TransactionReservations, TransactionRuntimeHandle, TransactionTaskSpawner,
+    TransactionToolCapacity, TransactionToolDispatcher,
 };
+#[allow(deprecated)]
+pub use transaction::RuntimeToolSpill;
 
 pub use monoloop_contracts::{
     estimate_event_bytes, transaction_delivery, AdmissionError, AdmissionErrorKind,

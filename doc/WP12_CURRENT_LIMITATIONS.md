@@ -34,7 +34,7 @@ path”; it records what is proven, partial, or out of scope.
 | Area | Limitation |
 |---|---|
 | External agent live multi-exchange | SendAndRetain against real Grok/Cursor/Codex/agy is qualification (testkit examples), not a deterministic acceptance gate |
-| MCP Refreshable | Not declared; CreationOnly only for external agents |
+| MCP Refreshable | **Deferred by DECISIONS D-042**; CreationOnly only for external agents until a superseding decision + vendor proofs |
 | Inline continuation + MCP | Explicitly unsupported (CallerControlled only for gateway profiles) |
 | Headless CLI argv prompts | Z.ai/Claude vendor CLIs require prompt on argv; LAW 16 clarified in `DECISIONS.md` D-002; secrets must not be on argv |
 | Headless CLI in-CLI tools | Tools may run inside the spawned CLI; Monoloop EmptyToolRegistry is observational for those Channels |

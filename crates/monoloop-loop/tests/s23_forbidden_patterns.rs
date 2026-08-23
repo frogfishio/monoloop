@@ -41,24 +41,8 @@ fn is_documented_exception(rel: &str, line: &str) -> bool {
     if is_prose_mention(line) {
         return true;
     }
-    // Deprecated ambient Loop start (cfg/test or deprecated API).
-    if rel.contains("runtime.rs") && line.contains("tokio::spawn(fut)") {
-        return true;
-    }
-    // Deprecated HostToolRuntime::new unit-test path.
-    if rel.contains("loop_adapters.rs") && line.contains("tokio::spawn(work)") {
-        return true;
-    }
-    // Standalone McpGateway::bind_loopback (tests); RuntimeOwner uses TaskSupervisor.
-    if rel.contains("mcp/gateway.rs") && line.contains("tokio::spawn(prepared.serve())") {
-        return true;
-    }
-    // sticky_cancel unit tests only.
+    // sticky_cancel unit tests only (`#[cfg(test)]` module).
     if rel.contains("sticky_cancel.rs") {
-        return true;
-    }
-    // Test-only JoinOnlySpillInject parks a JoinOnly on the spill (harness).
-    if rel.contains("lifecycle/supervisor.rs") && line.contains("tokio::spawn(async move") {
         return true;
     }
     false
@@ -105,14 +89,26 @@ fn s23_no_undocumented_ambient_tokio_spawn_in_production_src() {
 /// §23 exact-limit / plus-one inventory (documentation gate — not exhaustive codegen).
 ///
 /// Lists high-value public limits that already have exact/plus-one proofs in-tree.
-/// Gaps remain documented in DEFECTS (MCP concurrency/duration, some canonical
-/// message variants). This test fails if a listed proof file disappears.
+/// Remaining gaps are documented in DEFECTS (optional exhaustive D-035 variant
+/// matrix). This test fails if a listed proof file disappears.
 #[test]
 fn s23_exact_limit_plus_one_inventory_present() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let required = [
         ("tests/linked_tools.rs", "capacity_limit_plus_one_rejects"),
         ("tests/mcp_gateway.rs", "http_oversized_body_fails_closed"),
+        (
+            "tests/mcp_gateway.rs",
+            "mcp_per_capability_concurrency_plus_one_rejects",
+        ),
+        (
+            "tests/mcp_gateway.rs",
+            "mcp_global_concurrency_plus_one_rejects",
+        ),
+        (
+            "tests/mcp_gateway.rs",
+            "mcp_request_duration_plus_one_fails_closed",
+        ),
         (
             "src/transaction/lifecycle/tests.rs",
             "s22_6_event_byte_plus_one_fails_closed",
@@ -127,7 +123,85 @@ fn s23_exact_limit_plus_one_inventory_present() {
         ),
         (
             "src/transaction/lifecycle/tests.rs",
+            "concurrent_global_capacity_exhaustion_admits_exactly_max",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "concurrent_per_channel_capacity_exhaustion_admits_exactly_channel_max",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
             "start_queue_full_rolls_back_all_permits",
+        ),
+        // D-033 lives in monoloop-connector (sibling crate).
+        (
+            "../monoloop-connector/tests/streaming_http.rs",
+            "absolute_request_deadline_covers_header_and_body_delay",
+        ),
+        (
+            "../monoloop-connector/tests/streaming_http.rs",
+            "full_output_queue_terminates_at_overall_deadline",
+        ),
+        (
+            "../monoloop-connector/tests/streaming_http.rs",
+            "max_queued_output_bytes_plus_one_fails_closed",
+        ),
+        (
+            "../monoloop-connector/tests/streaming_http.rs",
+            "blocked_enqueue_honors_idle_before_overall_deadline",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "max_messages_plus_one_rejected_at_admit",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "max_messages_exact_admits_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "submit_versus_shutdown_barrier_race_two_outcomes",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "submit_versus_shutdown_hang_barrier_both_outcomes",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "max_input_bytes_plus_one_rejected_at_admit",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "max_content_parts_plus_one_rejected_at_admit",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "max_input_bytes_exact_admits_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "large_tool_arguments_counted_toward_max_input_bytes",
+        ),
+        (
+            "../monoloop-contracts/src/input.rs",
+            "estimate_counts_names_ids_and_tool_arguments",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "runtime_owner_drop_joins_executor_thread_reaches_stopped",
+        ),
+        (
+            "../monoloop-connector/tests/streaming_http.rs",
+            "cancel_interrupts_blocked_output_enqueue",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "s22_6_concurrent_producers_contiguous_sequence",
+        ),
+        // D-042: Refreshable deferred — profile gate must keep asserting it.
+        (
+            "../monoloop-testkit/tests/profile_bindings.rs",
+            "MUST NOT declare Refreshable",
         ),
     ];
     for (rel, needle) in required {
@@ -169,6 +243,19 @@ fn s23_adversarial_host_adapter_suite_present() {
 #[test]
 fn s23_adversarial_lifecycle_subprocess_harness_inventory() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // JoinOnly harness must assert TaskSupervisor ownership (not spill_pending).
+    {
+        let path = root.join("tests/s22_4_join_only_spill_sacrificial.rs");
+        let text = fs::read_to_string(&path).expect("read join_only sacrificial");
+        assert!(
+            text.contains("owned_tasks"),
+            "JoinOnly sacrificial must assert TaskSupervisor owned_tasks"
+        );
+        assert!(
+            !text.contains("spill_pending="),
+            "JoinOnly sacrificial must not require spill_pending (M5.4 delete-vaults)"
+        );
+    }
     let harnesses = [
         (
             "tests/s22_3_non_yielding_sacrificial.rs",

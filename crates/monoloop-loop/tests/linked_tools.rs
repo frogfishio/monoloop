@@ -1,6 +1,5 @@
 //! WP-06: linked tools — registry, dispatcher validation, Loop adapters.
 
-use monoloop_contracts::OutboundToolOutcome;
 use monoloop_contracts::{
     CanonicalToolError, CanonicalToolOutput, ChannelId, ExchangeId, JsonSchema, SessionId,
     SessionKey, ToolActionId, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName,
@@ -8,10 +7,9 @@ use monoloop_contracts::{
 };
 use monoloop_loop::{
     dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, EmptyToolRegistry, HostToolRegistry,
-    HostToolRuntime, ImmediateToolHandler, LostCompletionHandler, PanicOnStartHandler,
-    RegisteredTool, ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet, SharedToolCapacity,
-    StartFailHandler, StartToolExecution, ToolHandler, ToolRegistry, ToolResolution, ToolRuntime,
-    ToolUnavailableReason, TransactionToolDispatcher,
+    ImmediateToolHandler, LostCompletionHandler, PanicOnStartHandler, RegisteredTool,
+    ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet, SharedToolCapacity, StartFailHandler,
+    ToolHandler, ToolRegistry, ToolResolution, ToolUnavailableReason, TransactionToolDispatcher,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -543,6 +541,8 @@ async fn simultaneous_transactions_different_tools() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loop_adapters_available_not_dispatch_rejected_placeholder() {
+    // Registry Available + dispatcher Success. HostToolRuntime::with_spawner is
+    // covered under TaskSupervisor in lifecycle unit tests (Law 23; no ambient new()).
     let host = build_registry(vec![("echo", "echo", ok_handler())]);
     let tools = vec![host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone()];
     let resolved = ResolvedToolSet::from_registered(tools);
@@ -555,8 +555,6 @@ async fn loop_adapters_available_not_dispatch_rejected_placeholder() {
         8,
         16,
     );
-    #[allow(deprecated)]
-    let runtime = HostToolRuntime::new(d, ExchangeId::generate());
 
     let resolution = reg
         .resolve(ResolveToolRequest {
@@ -568,18 +566,25 @@ async fn loop_adapters_available_not_dispatch_rejected_placeholder() {
         .unwrap();
     assert!(matches!(resolution, ToolResolution::Available(_)));
 
-    let handle = runtime
-        .start(StartToolExecution {
-            execution_id: monoloop_contracts::ToolExecutionId::generate(),
-            tool_action_id: "a1".into(),
-            tool_name: "echo".into(),
-            request_payload: r#"{"q":"hi"}"#.into(),
-            request_generation: 1,
-        })
-        .unwrap();
-    let terminal = handle.completion.unwrap().await.unwrap();
-    assert_eq!(terminal.outcome, OutboundToolOutcome::Success);
-    assert!(!terminal.payload.contains("deferred"));
+    let out = dispatch_ready_tool(
+        &d,
+        ExchangeId::generate(),
+        ToolActionId::new("a1"),
+        "echo",
+        "p1",
+        1,
+        r#"{"q":"hi"}"#,
+    )
+    .await;
+    match out {
+        DispatchOutcome::Canonical { result, .. } => {
+            assert!(matches!(
+                result.outcome,
+                monoloop_contracts::CanonicalToolResultOutcome::Succeeded(_)
+            ));
+        }
+        other => panic!("expected Canonical success, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

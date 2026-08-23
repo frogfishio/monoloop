@@ -183,7 +183,7 @@ impl SessionAdapter for GrokSessionAdapter {
         if attachment.owner != self.owner {
             return Err(SessionConfigurationError::OwnerMismatch);
         }
-        // CreationOnly: refresh unsupported (provisional until Refreshable proven).
+        // CreationOnly: Refreshable deferred (DECISIONS D-042) until vendor-proven.
         Err(SessionConfigurationError::Unsupported)
     }
 }

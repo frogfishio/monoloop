@@ -5,59 +5,42 @@ use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapaci
 use super::tool_handler::{OwnedProcessLease, ToolExecutionControl, ToolKillHandle};
 use std::sync::atomic::AtomicU32;
 
-/// Runtime-scoped unfinished tool joins and/or orphaned permits (§22.4 / D-028).
+/// Runtime-scoped orphaned tool permits (§22.4 capacity honesty / M5.4).
 ///
 /// Shared across dispatchers of one runtime (Law 8 — not process-global).
-/// Permits stay acquired until the corresponding join is observed finished, or
-/// until supervisor quiesce aborts AbortableAtYield work. Cooperative JoinOnly
-/// / orphan permits block `Stopped` until the join finishes (or spill Drop as
-/// last-resort abort when the runtime Arc is gone).
-pub struct RuntimeToolSpill {
-    parked: std::sync::Mutex<Vec<ParkedToolWork>>,
+/// **Not a join vault:** `TaskSupervisor` owns joins. This set only holds
+/// `ToolPermit`s (and optional ProcessIsolated leases) after cooperative
+/// non-ack / missing-kill / mid-drop ProcessIsolated paths. Quiesce releases
+/// all orphans so `Stopped` is not permanently blocked.
+///
+pub struct OrphanToolPermitSet {
+    orphans: std::sync::Mutex<Vec<OrphanPermit>>,
 }
 
-struct ParkedToolWork {
-    join: Option<tokio::task::JoinHandle<()>>,
-    permit: Option<ToolPermit>,
-    /// When true, supervisor quiesce may abort (AbortableAtYield).
-    /// Cooperative `JoinOnly` stays false — cancel is best-effort only (§14.1).
-    may_abort: bool,
-    /// Keeps `owned_processes` honest while a ProcessIsolated orphan is parked.
-    /// Read via `Drop` of [`OwnedProcessLease`] when this entry is released.
+struct OrphanPermit {
+    /// Held until entry Drop / quiesce clear — releases SharedToolCapacity.
+    #[allow(dead_code)]
+    permit: ToolPermit,
+    /// Keeps `owned_processes` honest while a ProcessIsolated child may still exit.
     #[allow(dead_code)]
     process_lease: Option<OwnedProcessLease>,
 }
 
-impl RuntimeToolSpill {
-    /// Create an empty runtime-scoped spill.
+/// Deprecated name for [`OrphanToolPermitSet`] (M5.4 delete-vaults).
+///
+/// This is **not** a join vault. Prefer [`OrphanToolPermitSet`].
+#[deprecated(note = "M5.4: use OrphanToolPermitSet — not a join vault")]
+pub type RuntimeToolSpill = OrphanToolPermitSet;
+
+impl OrphanToolPermitSet {
+    /// Create an empty orphan-permit set.
     pub fn new() -> Self {
         Self {
-            parked: std::sync::Mutex::new(Vec::new()),
+            orphans: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    /// Park a live worker join with its permit (released only after join finishes).
-    pub(crate) fn park(
-        &self,
-        join: tokio::task::JoinHandle<()>,
-        permit: Option<ToolPermit>,
-        may_abort: bool,
-    ) {
-        if join.is_finished() {
-            drop(join);
-            drop(permit);
-            return;
-        }
-        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-        parked.push(ParkedToolWork {
-            join: Some(join),
-            permit,
-            may_abort,
-            process_lease: None,
-        });
-    }
-
-    /// Hold a permit with no killable join (missing kill fallback).
+    /// Hold a permit with no killable join (missing kill / cooperative non-ack).
     fn park_orphan_permit(&self, permit: ToolPermit) {
         self.park_orphan_permit_with_lease(permit, None);
     }
@@ -68,89 +51,51 @@ impl RuntimeToolSpill {
         permit: ToolPermit,
         process_lease: Option<OwnedProcessLease>,
     ) {
-        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-        parked.push(ParkedToolWork {
-            join: None,
-            permit: Some(permit),
-            may_abort: false,
+        let mut orphans = self.orphans.lock().unwrap_or_else(|e| e.into_inner());
+        orphans.push(OrphanPermit {
+            permit,
             process_lease,
         });
     }
 
-    /// Drop finished joins and release their permits. Orphan permits are retained.
-    pub fn reap_finished(&self) {
-        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-        parked.retain(|entry| match &entry.join {
-            Some(join) => !join.is_finished(),
-            None => true, // orphan permit — keep capacity held
-        });
-    }
+    /// No-op retained for call-site compatibility (`reap_vault`); orphans have no joins.
+    pub fn reap_finished(&self) {}
 
-    /// Abort AbortableAtYield parked joins; JoinOnly / orphans remain.
+    /// Quiesce step: release all orphan permits (capacity + process leases).
     ///
-    /// Call from supervisor quiesce. Finished joins release permits via reap.
-    pub fn abort_abortables(&self) {
-        let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-        for entry in parked.iter_mut() {
-            if entry.may_abort {
-                if let Some(join) = entry.join.as_ref() {
-                    join.abort();
-                }
-            }
-        }
-    }
-
-    /// Quiesce step: abort AbortableAtYield, release join-less orphans, reap
-    /// finished joins. Remaining JoinOnly work blocks `Stopped` until joined.
+    /// Returns `0` — orphans never block `Stopped` after quiesce (M5.4).
     pub fn shutdown_progress(&self) -> usize {
-        self.abort_abortables();
-        // Orphan permits have no join to observe — release at quiesce so Stopped
-        // cannot be permanently blocked by missing-kill fallbacks.
-        {
-            let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-            parked.retain(|entry| entry.join.is_some());
-        }
-        self.reap_finished();
-        self.pending_count()
+        let mut orphans = self.orphans.lock().unwrap_or_else(|e| e.into_inner());
+        orphans.clear();
+        0
     }
 
-    /// Number of permits still held (joins + orphans).
+    /// Number of orphan permits still held.
     pub fn pending_permits(&self) -> usize {
-        let parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-        parked.iter().filter(|e| e.permit.is_some()).count()
+        self.orphans.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// True when no parked joins or orphan permits remain.
+    /// True when no orphan permits remain.
     pub fn is_empty(&self) -> bool {
         self.pending_count() == 0
     }
 
-    /// Number of parked entries (joins and orphans), including JoinOnly without permit.
+    /// Number of orphan permit entries.
     pub fn pending_count(&self) -> usize {
-        let parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
-        parked.len()
+        self.pending_permits()
     }
 }
 
-impl Default for RuntimeToolSpill {
+impl Default for OrphanToolPermitSet {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for RuntimeToolSpill {
+impl Drop for OrphanToolPermitSet {
     fn drop(&mut self) {
-        // Last Arc gone (runtime/test ended): fail-closed abort of remaining
-        // joins — including JoinOnly — then release permits. No process-global
-        // transfer (Law 8 / 22 / 23).
-        let mut parked = std::mem::take(self.parked.get_mut().unwrap_or_else(|e| e.into_inner()));
-        for entry in parked.drain(..) {
-            if let Some(join) = entry.join {
-                join.abort();
-                drop(join);
-            }
-            drop(entry.permit);
-        }
+        // Release remaining orphans with this Arc (no process-global transfer).
+        let _ = std::mem::take(self.orphans.get_mut().unwrap_or_else(|e| e.into_inner()));
     }
 }
 
@@ -252,7 +197,7 @@ pub struct TransactionToolDispatcher {
     tools: ResolvedToolSet,
     capacity: Arc<TransactionToolCapacity>,
     /// Runtime-scoped spill for unfinished joins (D-028 / Law 8).
-    tool_spill: Arc<RuntimeToolSpill>,
+    tool_spill: Arc<OrphanToolPermitSet>,
     /// Runtime-scoped live ProcessIsolated child count (§18.2 snapshot).
     owned_processes: Arc<AtomicU32>,
     /// Transaction-wide payload cap (D-015); applied as min with per-tool limit.
@@ -301,7 +246,7 @@ impl TransactionToolDispatcher {
             tools,
             shared_capacity,
             limits,
-            Arc::new(RuntimeToolSpill::new()),
+            Arc::new(OrphanToolPermitSet::new()),
             Arc::new(AtomicU32::new(0)),
         )
     }
@@ -312,7 +257,7 @@ impl TransactionToolDispatcher {
         session_key: SessionKey,
         tools: ResolvedToolSet,
         shared_capacity: Arc<SharedToolCapacity>,
-        tool_spill: Arc<RuntimeToolSpill>,
+        tool_spill: Arc<OrphanToolPermitSet>,
         max_concurrent_tools: usize,
         max_queued_tools: usize,
     ) -> Arc<Self> {
@@ -335,7 +280,7 @@ impl TransactionToolDispatcher {
         session_key: SessionKey,
         tools: ResolvedToolSet,
         shared_capacity: Arc<SharedToolCapacity>,
-        tool_spill: Arc<RuntimeToolSpill>,
+        tool_spill: Arc<OrphanToolPermitSet>,
         owned_processes: Arc<AtomicU32>,
         max_concurrent_tools: usize,
         max_queued_tools: usize,
@@ -363,7 +308,7 @@ impl TransactionToolDispatcher {
         tools: ResolvedToolSet,
         shared_capacity: Arc<SharedToolCapacity>,
         limits: DispatcherLimits,
-        tool_spill: Arc<RuntimeToolSpill>,
+        tool_spill: Arc<OrphanToolPermitSet>,
         owned_processes: Arc<AtomicU32>,
     ) -> Arc<Self> {
         let capacity = TransactionToolCapacity::new(
@@ -417,7 +362,7 @@ impl TransactionToolDispatcher {
     }
 
     /// Runtime-scoped spill shared with the supervisor (when wired).
-    pub fn tool_spill(&self) -> &Arc<RuntimeToolSpill> {
+    pub fn tool_spill(&self) -> &Arc<OrphanToolPermitSet> {
         &self.tool_spill
     }
 
@@ -505,10 +450,10 @@ impl TransactionToolDispatcher {
                 }
             }
         };
-        // Reap completed parked workers so prior cancels cannot permanently starve capacity.
+        // Orphan permits have no joins to reap; retained for call-site compatibility.
         self.tool_spill.reap_finished();
 
-        // RAII: if this future is dropped mid-join, park worker+permit in the spill.
+        // RAII: mid-drop parks orphan capacity (not JoinHandles — M5.4).
         let mut dispatch_guard = DispatchGuard {
             permit: Some(permit),
             kill: None,
@@ -711,17 +656,24 @@ impl TransactionToolDispatcher {
                 }
             }
         };
-        // Join worker within a short bound; if still pending, Drop parks join+permit.
+        // Join worker within a short bound; if still pending, Drop parks orphan permit.
+        // §22.4 cooperative non-ack: keep capacity held for cancel_only inline drive
+        // that timed out without completion.
+        let cooperative_deadline =
+            matches!(policy, ToolExecutionClass::CooperativeInProcess { .. })
+                && matches!(
+                    &completion,
+                    ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded)
+                );
         if let Some(ref k) = dispatch_guard.kill {
             let _ = k.join_timeout(Duration::from_millis(50)).await;
-        } else if matches!(policy, ToolExecutionClass::CooperativeInProcess { .. })
-            && matches!(
-                &completion,
-                ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded)
-            )
-        {
-            // §22.4: cooperative non-ack (grace elapsed, no completion) — keep
-            // capacity held. Acknowledged cancel that joins must not orphan.
+            if cooperative_deadline && k.is_cancel_only() {
+                // Non-ack cancel_only/drive has no join — orphan the permit explicitly.
+                if let Some(permit) = dispatch_guard.permit.take() {
+                    self.tool_spill.park_orphan_permit(permit);
+                }
+            }
+        } else if cooperative_deadline {
             if let Some(permit) = dispatch_guard.permit.take() {
                 self.tool_spill.park_orphan_permit(permit);
             }
@@ -922,12 +874,12 @@ async fn await_tool_termination_driven(
 }
 
 /// Holds the tool permit and optional kill handle for the duration of dispatch.
-/// On drop (including actor cleanup cancelling this future), unfinished workers
-/// are parked in the runtime tool spill together with the permit.
+/// On drop, unfinished ProcessIsolated / cooperative non-ack capacity is parked
+/// as orphan permits (M5.4: joins are not vaulted — TaskSupervisor owns them).
 struct DispatchGuard {
     permit: Option<ToolPermit>,
     kill: Option<ToolKillHandle>,
-    spill: Arc<RuntimeToolSpill>,
+    spill: Arc<OrphanToolPermitSet>,
 }
 
 impl DispatchGuard {
@@ -944,17 +896,9 @@ impl DispatchGuard {
 impl Drop for DispatchGuard {
     fn drop(&mut self) {
         if let Some(k) = self.kill.take() {
-            let may_abort = !k.is_join_only();
-            k.kill(); // no-op for JoinOnly cooperative; OS kill for ProcessIsolated
-            if let Some(join) = k.take_join() {
-                if !join.is_finished() {
-                    // Park the *real* worker join — never a completion waiter.
-                    self.spill.park(join, self.permit.take(), may_abort);
-                    return;
-                }
-            } else if k.is_process_isolated() && k.has_join() {
-                // Drive-owned ProcessIsolated: no JoinHandle to park, but child may
-                // still be exiting — hold capacity + owned_processes lease.
+            k.kill(); // cancel_only / OS kill
+            if k.is_process_isolated() && k.has_join() {
+                // Drive-owned ProcessIsolated: child may still be exiting.
                 let lease = k.take_process_lease();
                 if let Some(permit) = self.permit.take() {
                     self.spill.park_orphan_permit_with_lease(permit, lease);

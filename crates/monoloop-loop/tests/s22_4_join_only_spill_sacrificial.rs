@@ -1,10 +1,10 @@
-//! §22.4 / §23 JoinOnly spill sacrificial subprocess (fail-closed only).
+//! §22.4 / §23 JoinOnly owned-task sacrificial subprocess (fail-closed only).
 //!
-//! A cooperative JoinOnly join parked on the runtime spill cannot be aborted at
-//! quiesce. Short `wait_stopped` MUST return `TimedOut` while state stays
-//! `Quiescing` with `tool_spill_pending > 0` — never false `Stopped`.
+//! TaskSupervisor-owned JoinOnly-style work (non-awaiting park) cannot be joined
+//! after abort. Short `wait_stopped` MUST return `TimedOut` while state stays
+//! `Quiescing` with `owned_tasks > 0` — never false `Stopped`.
 //!
-//! The JoinOnly wait runs in a child process; the parent asserts the child's
+//! The parked worker runs in a child process; the parent asserts the child's
 //! machine-readable line, then kills the child (outer harness bound). Timing
 //! out without the TimedOut line is a failure (no shaped green).
 
@@ -59,7 +59,7 @@ fn llm_binding() -> ChannelBinding {
     }
 }
 
-/// Child body: inject JoinOnly spill, shut down, print fail-closed proof.
+/// Child body: inject JoinOnly owned task, shut down, print fail-closed proof.
 fn run_child() {
     let inject = Arc::new(JoinOnlySpillInject::new());
     let limits = TransactionLimits {
@@ -80,20 +80,20 @@ fn run_child() {
     })
     .expect("start child runtime");
 
-    // Wait until the JoinOnly join is parked on the runtime spill.
+    // Wait until the supervised JoinOnly-style task has entered park.
     let arm = Instant::now();
     while !inject.is_entered() {
         assert!(
             arm.elapsed() < Duration::from_secs(2),
-            "JoinOnly spill inject never entered"
+            "JoinOnly owned-task inject never entered"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
 
     let mut owner = started.owner;
     assert!(
-        owner.tool_spill_pending() >= 1,
-        "spill must hold JoinOnly before shutdown"
+        owner.owned_task_count() >= 1,
+        "TaskSupervisor must own JoinOnly work before shutdown"
     );
     owner.begin_shutdown();
     let outcome = {
@@ -105,19 +105,21 @@ fn run_child() {
     };
 
     match outcome {
-        ShutdownWaitOutcome::TimedOut(_snap) => {
+        ShutdownWaitOutcome::TimedOut(snap) => {
             let state = owner.state();
             assert_eq!(
                 state,
                 RuntimeState::Quiescing,
-                "JoinOnly spill must leave Quiescing, got {state:?}"
+                "JoinOnly owned task must leave Quiescing, got {state:?}"
             );
-            let pending = owner.tool_spill_pending();
             assert!(
-                pending >= 1,
-                "JoinOnly must remain on spill, pending={pending}"
+                snap.owned_tasks > 0,
+                "owned work must remain registered, snap={snap:?}"
             );
-            println!("{RESULT_PREFIX}ok TimedOut Quiescing spill_pending={pending}");
+            println!(
+                "{RESULT_PREFIX}ok TimedOut Quiescing owned_tasks={}",
+                snap.owned_tasks
+            );
             // Keep the process alive until the outer harness kills it.
             // Do not release the inject — that would allow false Stopped.
             loop {
@@ -150,7 +152,7 @@ fn s22_4_join_only_spill_sacrificial_never_false_stopped() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn JoinOnly spill sacrificial child");
+        .expect("spawn JoinOnly owned-task sacrificial child");
 
     let stdout = child.stdout.take().expect("child stdout");
     let outer = Duration::from_secs(8);
@@ -187,7 +189,7 @@ fn s22_4_join_only_spill_sacrificial_never_false_stopped() {
             let _ = child.wait();
             let _ = reader.join();
             panic!(
-                "§22.4 JoinOnly spill sacrificial: child did not emit TimedOut proof \
+                "§22.4 JoinOnly owned-task sacrificial: child did not emit TimedOut proof \
                  within {outer:?} (timeout must not be shaped into a green pass)"
             );
         }
@@ -198,13 +200,13 @@ fn s22_4_join_only_spill_sacrificial_never_false_stopped() {
     let _ = reader.join();
 
     assert!(
-        proof.starts_with("ok TimedOut Quiescing spill_pending="),
-        "expected fail-closed TimedOut/Quiescing with spill pending, got {proof:?}"
+        proof.starts_with("ok TimedOut Quiescing owned_tasks="),
+        "expected fail-closed TimedOut/Quiescing with owned work, got {proof:?}"
     );
-    let pending: u32 = proof
+    let owned: u32 = proof
         .rsplit('=')
         .next()
         .and_then(|s| s.parse().ok())
-        .expect("spill_pending parse");
-    assert!(pending >= 1, "spill_pending must be >= 1, proof={proof}");
+        .expect("owned_tasks parse");
+    assert!(owned > 0, "owned_tasks must be > 0, proof={proof}");
 }

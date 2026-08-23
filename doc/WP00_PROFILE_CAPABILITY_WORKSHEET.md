@@ -30,10 +30,10 @@ session cannot claim multi-exchange continuation on one external ID.
 
 | Profile | Session create | Explicit session load/reuse | MCP | Loopback MCP reachability | Exchange mode | Continuation |
 |---|---|---|---|---|---|---|
-| Grok Build | Yes (`session/new`) | Yes (`session/load`, explicit id) | **CreationOnly** (provisional) | Yes (WS loopback default) | Bidirectional / **SendAndRetain** | `inline` + `caller_controlled` candidates |
-| Cursor | Yes (`session/new`) | Yes (`session/load`) | **CreationOnly** (provisional) | Agent process local; MCP URL must be loopback-reachable from agent | Bidirectional / **SendAndRetain** | same |
-| Antigravity (agy) | Yes (`session/new`) | Yes (`session/load`) | **CreationOnly** (provisional) | Same as Cursor (stdio agent) | Bidirectional / **SendAndRetain** | same |
-| Codex | Yes (`session/new`) | Yes (`session/load`) | **CreationOnly** (provisional) | Same as Cursor (stdio adapter) | Bidirectional / **SendAndRetain** | same |
+| Grok Build | Yes (`session/new`) | Yes (`session/load`, explicit id) | **CreationOnly** (DECISIONS D-042) | Yes (WS loopback default) | Bidirectional / **SendAndRetain** | `inline` + `caller_controlled` candidates |
+| Cursor | Yes (`session/new`) | Yes (`session/load`) | **CreationOnly** (DECISIONS D-042) | Agent process local; MCP URL must be loopback-reachable from agent | Bidirectional / **SendAndRetain** | same |
+| Antigravity (agy) | Yes (`session/new`) | Yes (`session/load`) | **CreationOnly** (DECISIONS D-042) | Same as Cursor (stdio agent) | Bidirectional / **SendAndRetain** | same |
+| Codex | Yes (`session/new`) | Yes (`session/load`) | **CreationOnly** (DECISIONS D-042) | Same as Cursor (stdio adapter) | Bidirectional / **SendAndRetain** | same |
 | Z.ai CLI | Synthetic per run only | **No** durable load | **None** | N/A (no Monoloop MCP attach) | **SendAndFinish** only | single-shot; no external-session continuation |
 | Claude Code | Synthetic / stream `session_id` observational | **No** Monoloop `session/load` | **None** | N/A | **SendAndFinish** only | single-shot |
 
@@ -61,7 +61,7 @@ work in **WP-05** (exchange driver) and its **WP-11** profile PR:
 |---|---|---|
 | Session create | Yes | `doc/GROK_BUILD_CONNECTOR.md` § session/new; `GrokSessionManager::begin_new` |
 | Explicit load | Yes | `session/load` with explicit `sessionId`; no most-recent heuristic |
-| MCP | CreationOnly provisional | No Monoloop MCP wiring yet; ACP session may accept tool/server config only at create — treat as CreationOnly until WP-11 proves Refreshable |
+| MCP | CreationOnly | Superseded for shipped profiles by **DECISIONS D-042** (Refreshable deferred; CreationOnly until a superseding decision + vendor proofs). Historical WP-00 note kept for worksheet chronology. |
 | Loopback | Fail-closed non-loopback by default | `allow_non_loopback` default false; tests `non_loopback_without_opt_in_fails_closed` |
 | Exchange | Bidirectional | Long-lived server; many sessions; multi-prompt per session with prompt lock |
 | Continuation | Both candidates | Session retained across prompts; runtime policies land in WP-04/05 |
@@ -72,7 +72,7 @@ work in **WP-05** (exchange driver) and its **WP-11** profile PR:
 |---|---|---|
 | Session create | Yes | `session/new` after `initialize` / `authenticate` |
 | Explicit load | Yes | `session/load` when `OpenConnection.external_session_id` set |
-| MCP | CreationOnly provisional | Not wired; agent-local MCP config typically at session create |
+| MCP | CreationOnly | **DECISIONS D-042** for shipped profiles; Refreshable deferred |
 | Loopback MCP | Conditional | Stdio agent on host must reach `127.0.0.1` Monoloop MCP URL |
 | Exchange | Bidirectional | `session/prompt` + retain process/session until shutdown |
 | Continuation | Both candidates | Same external `sessionId` |
@@ -80,12 +80,14 @@ work in **WP-05** (exchange driver) and its **WP-11** profile PR:
 ### Antigravity / agy (`monoloop-connector-agy`)
 
 Same shape as Cursor (ACP NDJSON stdio). Source-step ordering via `_meta.stepIdx` /
-`messageId` is observational only. MCP provisional **CreationOnly**.
+`messageId` is observational only. MCP **CreationOnly** (**DECISIONS D-042**;
+Refreshable deferred).
 
 ### Codex (`monoloop-connector-codex`)
 
 ACP via `@agentclientprotocol/codex-acp`. Session create/load same family.
-MCP provisional **CreationOnly**. Exchange Bidirectional / SendAndRetain.
+MCP **CreationOnly** (**DECISIONS D-042**; Refreshable deferred). Exchange
+Bidirectional / SendAndRetain.
 
 ### Z.ai CLI (`monoloop-connector-zai`)
 

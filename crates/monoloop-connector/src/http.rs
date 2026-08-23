@@ -555,8 +555,8 @@ async fn run_http_owner(
                         total_response += chunk.len();
                         let len = chunk.len() as u64;
                         // D-033: blocked enqueue selects cancel, idle, and overall deadline.
-                        let enqueue_budget = deadline.saturating_duration_since(Instant::now());
-                        if enqueue_budget.is_zero() {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
                             owner.finish(
                                 ConnectionEndKind::TransportFailure,
                                 EndInitiator::LocalTransport,
@@ -564,6 +564,7 @@ async fn run_http_owner(
                             );
                             return;
                         }
+                        let enqueue_budget = config.idle_timeout.min(remaining);
                         tokio::select! {
                             biased;
                             _ = wait_control(&control) => {
@@ -576,10 +577,15 @@ async fn run_http_owner(
                                 return;
                             }
                             _ = tokio::time::sleep(enqueue_budget) => {
+                                let msg = if Instant::now() >= deadline {
+                                    "http overall response deadline exceeded"
+                                } else {
+                                    "http idle timeout"
+                                };
                                 owner.finish(
                                     ConnectionEndKind::TransportFailure,
                                     EndInitiator::LocalTransport,
-                                    Some("http overall response deadline exceeded".into()),
+                                    Some(msg.into()),
                                 );
                                 return;
                             }

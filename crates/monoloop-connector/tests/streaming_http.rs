@@ -450,3 +450,272 @@ async fn health_get_unused() {
     assert_eq!(r.status(), StatusCode::OK);
     join.abort();
 }
+
+/// D-033: header delay + body delay share one absolute request_timeout (never reset).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absolute_request_deadline_covers_header_and_body_delay() {
+    let app = Router::new().route(
+        "/slow",
+        post(|| async {
+            // Header phase delay.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let stream = futures_util::stream::once(async {
+                // Body phase delay — under a reset-per-phase budget this would still fit.
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok::<_, std::io::Error>(Bytes::from_static(b"ok"))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let (addr, _join) = bind_router(app).await;
+    let config = StreamingHttpConfig {
+        request_timeout: Duration::from_millis(120),
+        idle_timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let c = connector(Arc::new(MapCredentialResolver::empty()), config);
+    let limits = ConnectorLimits {
+        connect_deadline: Duration::from_secs(5),
+        ..ConnectorLimits::default()
+    };
+    let opened = open_and_send(
+        &c,
+        format!("http://{addr}/slow"),
+        b"{}",
+        None,
+        limits,
+    )
+    .await;
+    let end = opened.completion.wait().await;
+    assert_eq!(end.kind, ConnectionEndKind::TransportFailure);
+    let msg = end.safe_transport_error.unwrap_or_default();
+    assert!(
+        msg.contains("deadline") || msg.contains("idle"),
+        "expected absolute deadline fail-closed, got {msg:?}"
+    );
+}
+
+/// D-033: full output queue blocks enqueue until overall deadline (host not receiving).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_output_queue_terminates_at_overall_deadline() {
+    let app = Router::new().route(
+        "/flood",
+        post(|| async {
+            // Four 8-byte chunks: capacity is 2 (16/8), so enqueue blocks on the third.
+            let chunks = vec![
+                Bytes::from_static(b"01234567"),
+                Bytes::from_static(b"abcdefgh"),
+                Bytes::from_static(b"ijklmnop"),
+                Bytes::from_static(b"qrstuvwx"),
+            ];
+            let stream = futures_util::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::io::Error>),
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let (addr, _join) = bind_router(app).await;
+    let config = StreamingHttpConfig {
+        request_timeout: Duration::from_millis(150),
+        idle_timeout: Duration::from_secs(5),
+        max_chunk_bytes: 8,
+        max_response_bytes: 1024,
+        ..Default::default()
+    };
+    let c = connector(Arc::new(MapCredentialResolver::empty()), config);
+    let limits = ConnectorLimits {
+        connect_deadline: Duration::from_secs(5),
+        buffers: TransportBufferLimits {
+            max_queued_input_bytes: 1024,
+            max_queued_output_bytes: 16, // / max_chunk 8 → capacity 2
+            max_chunk_bytes: 8,
+        },
+        ..ConnectorLimits::default()
+    };
+    let opened = open_and_send(
+        &c,
+        format!("http://{addr}/flood"),
+        b"{}",
+        None,
+        limits,
+    )
+    .await;
+    // Deliberately do not receive — output queue must fill and deadline must fire.
+    let end = opened.completion.wait().await;
+    assert_eq!(end.kind, ConnectionEndKind::TransportFailure);
+    let msg = end.safe_transport_error.unwrap_or_default();
+    assert!(
+        msg.contains("deadline"),
+        "expected overall deadline on blocked enqueue, got {msg:?}"
+    );
+}
+
+/// D-019: cancellation interrupts a blocked output enqueue (full queue, host not receiving).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_interrupts_blocked_output_enqueue() {
+    let app = Router::new().route(
+        "/block-cancel",
+        post(|| async {
+            // Two chunks with capacity 1 → second send blocks on full out_tx.
+            let chunks = vec![
+                Bytes::from_static(b"01234567"),
+                Bytes::from_static(b"abcdefgh"),
+            ];
+            let stream =
+                futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let (addr, _join) = bind_router(app).await;
+    let config = StreamingHttpConfig {
+        // Keep idle/overall long so cancel wins the blocked-enqueue select.
+        request_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_secs(5),
+        max_chunk_bytes: 8,
+        max_response_bytes: 1024,
+        ..Default::default()
+    };
+    let c = connector(Arc::new(MapCredentialResolver::empty()), config);
+    let mut open = OpenConnection::new(ConnectionId::generate(), format!("http://{addr}/block-cancel"));
+    open.limits = ConnectorLimits {
+        connect_deadline: Duration::from_secs(5),
+        buffers: TransportBufferLimits {
+            max_queued_input_bytes: 1024,
+            max_queued_output_bytes: 8, // capacity 1
+            max_chunk_bytes: 8,
+        },
+        ..ConnectorLimits::default()
+    };
+    let pending = c.begin_open(open);
+    let control = pending.control.clone();
+    let mut opened = pending.opened.await.unwrap();
+    drive_owner(&mut opened);
+    opened.input.send(Bytes::from_static(b"{}")).await.unwrap();
+    opened.input.finish().await.unwrap();
+    // Allow first chunk to fill the queue and second enqueue to block.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    control.cancel(CancellationReason::CallerRequested);
+    let end = opened.completion.wait().await;
+    assert_eq!(
+        end.kind,
+        ConnectionEndKind::Cancelled,
+        "D-019: cancel must interrupt blocked enqueue, got {:?}",
+        end.kind
+    );
+}
+
+/// D-033: when idle < overall remaining, blocked enqueue fails closed on idle (not overall).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_enqueue_honors_idle_before_overall_deadline() {
+    let app = Router::new().route(
+        "/idle-block",
+        post(|| async {
+            let chunks = vec![
+                Bytes::from_static(b"01234567"),
+                Bytes::from_static(b"abcdefgh"),
+            ];
+            let stream =
+                futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let (addr, _join) = bind_router(app).await;
+    let config = StreamingHttpConfig {
+        // Idle must win: blocked second enqueue waits idle, not the long overall budget.
+        request_timeout: Duration::from_secs(5),
+        idle_timeout: Duration::from_millis(80),
+        max_chunk_bytes: 8,
+        max_response_bytes: 1024,
+        ..Default::default()
+    };
+    let c = connector(Arc::new(MapCredentialResolver::empty()), config);
+    let limits = ConnectorLimits {
+        connect_deadline: Duration::from_secs(5),
+        buffers: TransportBufferLimits {
+            max_queued_input_bytes: 1024,
+            max_queued_output_bytes: 8, // capacity 1 → second chunk blocks
+            max_chunk_bytes: 8,
+        },
+        ..ConnectorLimits::default()
+    };
+    let opened = open_and_send(
+        &c,
+        format!("http://{addr}/idle-block"),
+        b"{}",
+        None,
+        limits,
+    )
+    .await;
+    let end = opened.completion.wait().await;
+    assert_eq!(end.kind, ConnectionEndKind::TransportFailure);
+    let msg = end.safe_transport_error.unwrap_or_default();
+    assert!(
+        msg.contains("idle"),
+        "expected idle timeout on blocked enqueue when idle < overall, got {msg:?}"
+    );
+    assert!(
+        !msg.contains("overall"),
+        "must not report overall deadline when idle fires first, got {msg:?}"
+    );
+}
+
+/// D-033: output-queue capacity is derived from max_queued_output_bytes; plus-one blocks fail-closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_queued_output_bytes_plus_one_fails_closed() {
+    // Exact capacity: 8 bytes budget / 8 chunk = 1 slot. Plus-one chunk cannot enqueue
+    // without host receive and must fail closed under the absolute request deadline.
+    let app = Router::new().route(
+        "/two",
+        post(|| async {
+            let chunks = vec![
+                Bytes::from_static(b"01234567"),
+                Bytes::from_static(b"abcdefgh"),
+            ];
+            let stream = futures_util::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::io::Error>),
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let (addr, _join) = bind_router(app).await;
+    let config = StreamingHttpConfig {
+        request_timeout: Duration::from_millis(150),
+        idle_timeout: Duration::from_secs(5),
+        max_chunk_bytes: 8,
+        max_response_bytes: 1024,
+        ..Default::default()
+    };
+    let c = connector(Arc::new(MapCredentialResolver::empty()), config);
+    let limits = ConnectorLimits {
+        connect_deadline: Duration::from_secs(5),
+        buffers: TransportBufferLimits {
+            max_queued_input_bytes: 1024,
+            max_queued_output_bytes: 8,
+            max_chunk_bytes: 8,
+        },
+        ..ConnectorLimits::default()
+    };
+    let opened = open_and_send(&c, format!("http://{addr}/two"), b"{}", None, limits).await;
+    let end = opened.completion.wait().await;
+    assert_eq!(end.kind, ConnectionEndKind::TransportFailure);
+    let msg = end.safe_transport_error.unwrap_or_default();
+    assert!(
+        msg.contains("deadline"),
+        "expected output capacity plus-one fail-closed via deadline, got {msg:?}"
+    );
+}

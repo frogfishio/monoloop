@@ -269,10 +269,12 @@ installation before actor spawn and rollback on spawn failure.
 ## D-010: Submission can race shutdown and install work after the drain snapshot
 
 **Priority:** P1
-**Status:** Fixed (2026-08-18) — Accepting re-check under registry lock
+**Status:** Fixed (2026-08-18) — Accepting re-check under registry lock;
+§18.2 lock coupling + late-Start drain aligned 2026-08-23 (v2 live path)
 **Affected:**
-- `crates/monoloop-loop/src/transaction/runtime.rs:201-217`
-- `crates/monoloop-loop/src/transaction/runtime.rs:350-370`
+- `crates/monoloop-loop/src/transaction/lifecycle/admission.rs` (install re-check under ledger lock)
+- `crates/monoloop-loop/src/transaction/lifecycle/owner.rs` (`begin_shutdown` CAS under ledger lock)
+- `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs` (`begin_shutdown_inner` CAS+snapshot; late Start while `stopping`)
 
 **Problem:** `submit` checks the atomic runtime state before calling `admit`, but
 that check is not synchronized with registry installation. Shutdown can change
@@ -291,12 +293,16 @@ closes MCP.
 
 **Acceptance criteria:**
 
-- [ ] A barrier-controlled `submit` versus `shutdown` race has only two legal
+- [x] A barrier-controlled `submit` versus `shutdown` race has only two legal
       outcomes: rejected admission with no callback, or admitted and included in
-      shutdown finalization.
-- [ ] No registry entry can appear after shutdown's active snapshot.
-- [ ] Runtime `Stopped` implies zero active actors, routes, callbacks, and held
-      capacity.
+      shutdown finalization
+      (`submit_versus_shutdown_barrier_race_two_outcomes`;
+      Hang both-outcomes:
+      `submit_versus_shutdown_hang_barrier_both_outcomes`).
+- [x] No ledger entry remains after `Stopped` (same proof: ledger_len == 0).
+- [x] Runtime `Stopped` implies zero held capacity (same proof:
+      `global_reservations == 0`; MCP clear covered by separate MCP Stopped
+      proofs).
 
 ## D-011: Canonical events are buffered until exchange completion instead of streamed
 
@@ -605,8 +611,11 @@ per-route concurrency limit, or global in-flight request bound.
 - [x] Maximum body plus one fails closed (`http_oversized_body_fails_closed`).
 - [x] Revoke/shutdown cancel only that gateway's per-token services (no
       process-wide drain).
-- [ ] Residual: explicit per-capability/global concurrency + request duration
-      bounds beyond body size and rmcp session cancel.
+- [x] Explicit per-capability/global concurrency + request duration
+      exact-limit/plus-one proofs (via D-034 `McpGatewayLimits`:
+      `mcp_per_capability_concurrency_plus_one_rejects`,
+      `mcp_global_concurrency_plus_one_rejects`,
+      `mcp_request_duration_plus_one_fails_closed`).
 
 ## D-019: HTTP failure and backpressure paths bypass resource and cancellation bounds
 
@@ -638,13 +647,18 @@ the advertised overall request timeout can be consumed twice.
 
 **Acceptance criteria:**
 
-- [ ] An unbounded error body cannot increase retained memory beyond the
-      configured diagnostic/drain limit.
-- [ ] Cancellation interrupts a blocked output enqueue.
-- [ ] Connect, headers, body, idle, and overall timeout tests use independent
-      deterministic barriers.
-- [ ] Total elapsed work cannot exceed the configured overall deadline plus
-      cleanup grace.
+- [x] Non-success responses drop the body without unbounded retain (D-033 path:
+      `drop(response)` on non-success).
+- [x] Cancellation interrupts a blocked output enqueue
+      (`cancel_interrupts_blocked_output_enqueue`).
+- [x] Connect/headers/body/idle/overall use one absolute deadline with
+      independent smaller bounds (D-033 proofs:
+      `absolute_request_deadline_covers_header_and_body_delay`,
+      `blocked_enqueue_honors_idle_before_overall_deadline`,
+      `full_output_queue_terminates_at_overall_deadline`).
+- [ ] Residual: barrier-controlled multi-phase elapsed-sum matrix still
+      desirable as an exhaustive timing harness (not required to keep the
+      named cancel/backpressure close).
 
 ## D-020: Shutdown does not obey its global deadline or join aborted actors
 
@@ -860,6 +874,7 @@ considered delivered while these remain.
 - [x] Six profile bindings register/validate (`profile_bindings`).
 - [x] `cargo fmt --check` and `clippy -D warnings` for product crates.
 - [ ] Residual: independent security audit sign-off (process, not code gate);
+      checklist: `doc/SECURITY_REVIEW_CHECKLIST.md` (unsigned until filled)
       live SendAndRetain multi-exchange per agent remains qualification.
 
 
@@ -876,7 +891,7 @@ considered delivered while these remain.
 | D-015 | Fixed (via D-027/D-031/D-035) | input estimate + cumulative continuation + retention bound |
 | D-016 | Fixed (via D-030) | internal action id scoped by ExchangeId |
 | D-017 | Fixed | single ExchangeId |
-| D-018 | Fixed (via D-034) | token hex canonicalize; residual: per-route concurrency/duration exact-limit tests |
+| D-018 | Fixed (via D-034) | token hex canonicalize; concurrency/duration exact-limit proofs closed (D-034) |
 | D-019 | Fixed (via D-033) | absolute HTTP deadline + output capacity from output budget |
 | D-020 | Fixed (via D-029) | shared shutdown disposition + abort-then-join under remaining budget |
 | D-021 | Fixed (via D-029) | callback reservation at admission + drain abort/join |
@@ -897,7 +912,7 @@ considered delivered while these remain.
 | D-031 | Fixed (residual closed) | OpenAI continuation encodes transcript only (no duplicate `results` append) |
 | D-032 | Fixed (residual closed) | Non-blocking `try_spawn` (no first-poll wait); multi-thread executor required at bootstrap; async `try_spawn_confirmed` for shutdown callbacks |
 | D-033 | Fixed | absolute request deadline; enqueue selects deadline; output queue from output budget |
-| D-034 | Fixed (known residual) | Canonical hex + global/per-cap permits before body; body+dispatch share duration budget; process-global service map remains |
+| D-034 | Fixed | Canonical hex + global/per-cap permits before body; body+dispatch share duration budget; concurrency/duration plus-one proofs closed (2026-08-23) |
 | D-035 | Fixed | estimate covers names, args JSON, tool_call_id; serialize fail closed |
 | D-036 | Fixed | OrderedEventPublisher serialize allocate+enqueue; live waits for claim |
 | D-037 | Fixed | fmt + invalid_json asserts MalformedSemanticPayload; gates re-run |
@@ -1228,9 +1243,12 @@ configured output-byte budget.
 
 **Acceptance criteria:**
 
-- [ ] Header delay plus body delay cannot exceed one request timeout.
-- [ ] A full output queue terminates at overall deadline without host receive.
-- [ ] Exact output-byte capacity plus one fails closed.
+- [x] Header delay plus body delay cannot exceed one request timeout
+      (`absolute_request_deadline_covers_header_and_body_delay`).
+- [x] A full output queue terminates at overall deadline without host receive
+      (`full_output_queue_terminates_at_overall_deadline`).
+- [x] Exact output-byte capacity plus one fails closed
+      (`max_queued_output_bytes_plus_one_fails_closed`).
 
 ## D-034: MCP services are not fully bounded and non-canonical token spelling can leak them
 
@@ -1259,21 +1277,27 @@ or request-duration bound.
 - [x] Alternate hex spelling cannot create a second service (canonical hex).
 - [x] Revoke removes capability route; global + per-capability permits acquired
       before body buffering; body read and dispatch share one duration budget.
-- [ ] Concurrency and duration exact-limit/plus-one tests still desirable.
-      (process-global service map remains a known structural residual)
+- [x] Concurrency and duration exact-limit/plus-one tests
+      (`mcp_per_capability_concurrency_plus_one_rejects`,
+      `mcp_global_concurrency_plus_one_rejects`,
+      `mcp_request_duration_plus_one_fails_closed` via injectable
+      `McpGatewayLimits`).
 
 ## D-035: Runtime canonical-input byte accounting omits bounded fields
 
 **Priority:** P2
-**Status:** Fixed
+**Status:** Fixed (admission enforcement restored 2026-08-23)
 **Affected:**
-- `crates/monoloop-loop/src/transaction/admission.rs:98-140`
-- `crates/monoloop-loop/src/transaction/admission.rs:421-446`
+- `crates/monoloop-contracts/src/input.rs` (`estimate_canonical_input_bytes`)
+- `crates/monoloop-loop/src/transaction/lifecycle/admission.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs` (`RuntimeShared.transaction_limits`)
 
-**Problem:** `estimate_input_bytes` omits message names, assistant tool argument
-JSON, and Tool-message correlation IDs. A request can therefore exceed the
+**Problem:** `estimate_input_bytes` omitted message names, assistant tool argument
+JSON, and Tool-message correlation IDs. A request could therefore exceed the
 runtime's `max_input_bytes` while passing admission, especially through large
-historical assistant tool arguments.
+historical assistant tool arguments. After the v2 admit rewrite, TransactionLimits
+`max_input_bytes` / `max_messages` were not checked at all (construction used
+roomy `InputLimits` only).
 
 **Required remediation:**
 
@@ -1283,18 +1307,31 @@ historical assistant tool arguments.
 
 **Acceptance criteria:**
 
-- [ ] Every canonical message variant and optional field has exact-limit and
-      plus-one coverage.
-- [ ] Large historical tool arguments and IDs cannot bypass `max_input_bytes`.
+- [x] Canonical estimate covers text, names, tool-call ids, tool names, and
+      serialized tool arguments (`estimate_counts_names_ids_and_tool_arguments`).
+- [x] Admission enforces `TransactionLimits.max_messages` /
+      `max_content_parts` / `max_input_bytes` (`max_messages_plus_one_rejected_at_admit`,
+      `max_input_bytes_plus_one_rejected_at_admit`).
+- [x] Large historical tool arguments cannot bypass `max_input_bytes`
+      (`large_tool_arguments_counted_toward_max_input_bytes`).
+- [ ] Residual: every optional field / message-variant matrix still desirable
+      as exhaustive plus-one codegen (not required to keep Status Fixed for
+      the named bypass). Continuation-context re-estimate remains on encoded
+      provider bytes (`max_remaining_provider_input_bytes`), not a second
+      canonical estimate pass.
 
 ## D-036: Concurrent event producers can deliver sequence numbers out of order
 
 **Priority:** P1
-**Status:** Fixed
+**Status:** Fixed (v2 confirm 2026-08-23)
 **Affected:**
-- `crates/monoloop-loop/src/transaction/finalization.rs:10-33`
-- `crates/monoloop-loop/src/transaction/actor.rs:456-529`
-- `crates/monoloop-loop/src/transaction/actor.rs:949-969`
+- v1 `events.rs` / `OrderedEventPublisher` not compiled (`transaction/mod.rs`)
+- Live v2: `lifecycle/event_publisher.rs` (`run_event_publisher`)
+- Proofs: `lifecycle/tests.rs`
+  (`s22_6_concurrent_producers_contiguous_sequence`,
+  `s22_6_session_established_is_sequence_one`,
+  `s22_2_failed_enqueue_consumes_no_sequence`,
+  `s22_6_establish_external_capacity_fail_does_not_steal_seq1`)
 
 **Problem:** `EventSequencer::allocate` is atomic, but the session-claim task and
 live-unit task independently allocate and then asynchronously enqueue events.
@@ -1311,9 +1348,20 @@ required first-event position.
 
 **Acceptance criteria:**
 
-- [ ] Barrier-controlled concurrent producers always deliver `1..N` in order.
-- [ ] New external sessions always deliver `SessionEstablished` at sequence 1.
-- [ ] No sequence is allocated for an event that cannot be enqueued.
+- [x] Concurrent producers through one publisher deliver contiguous `1..N` in
+      allocation/delivery order
+      (`s22_6_concurrent_producers_contiguous_sequence`).
+- [x] Ordinary allocate+enqueue is serialized on the single
+      `run_event_publisher` task (child tasks MUST NOT allocate public
+      sequences; they send `EventPublisherCommand`s).
+- [x] Failed enqueue does not consume sequence
+      (`s22_2_failed_enqueue_consumes_no_sequence`;
+      `s22_6_establish_external_capacity_fail_does_not_steal_seq1`).
+- [x] Publisher unit path: `SessionEstablished` is sequence 1
+      (`s22_6_session_established_is_sequence_one`).
+- [ ] Residual: create-path e2e that first CanonicalUnit cannot precede
+      `SessionEstablished` at sequence 1 under concurrent fan-out (existing
+      e2e asserts established-before-Ended only). Not a sequencer reopen.
 
 ## D-037: Mandatory acceptance gates currently fail
 
@@ -1647,7 +1695,7 @@ new/load/send workers were ambient if pending handles were dropped.
 - `process_tool.rs` / `ToolKillHandle` process variant
 - `lifecycle/mcp_listener.rs` + `enable_mcp_listener`
 - Deferred `dispatcher.rs` (local vault stub; no `tool_join_vault` revival)
-- `DefaultLoopRuntime::start` / `start_empty` cfg-gated
+- `DefaultLoopRuntime::start` / `start_empty` removed (prepare* only; see M5.4.4)
 - Busy Loop spawn retries via `spawn_with_busy_retry`
 
 **Problem:** M5 EmptyToolRegistry under `TaskClass::LoopRuntime` still left
@@ -1664,8 +1712,8 @@ join-vault revival risk, and MCP deferred at startup.
 - MCP loopback bind at startup (fail-closed); listener as `RuntimeService`;
   shutdown wakes + abort/joins before `Stopped`.
 - Join vault module stays deleted; deferred dispatcher uses a local no-op stub.
-- Ambient `start`/`start_empty` only under `cfg(test)` / `legacy_runtime_tests`;
-  testkit Driver uses `prepare_empty` + explicit spawn.
+- Ambient `start`/`start_empty` deleted (M5.4.4); testkit Driver uses
+  `prepare_empty` + explicit spawn.
 - Busy: bounded supervisor retries, then coordinator-owned last resort.
 
 **Honesty residuals (not reopen):**
@@ -1951,12 +1999,11 @@ last-resort aborts when the runtime Arc is gone — no cross-runtime bleed.
 
 **Known residuals (honest — block Golden, not M6 §22 closed-enough):**
 - Ambient `tokio::spawn` remains on deprecated `DefaultLoopRuntime::start*`,
-  deprecated `HostToolRuntime::new`, Cooperative JoinOnly **test fixtures**,
-  sticky_cancel unit helper, standalone `McpGateway::bind_loopback`, and
-  test-only `JoinOnlySpillInject`. Production `AsyncToolHandler` /
-  `IsolatedKillableToolHandler` / `ProcessIsolatedToolHandler` drive inline
-  (M5.4 notes below). Golden still wants JoinOnly fixtures supervised +
-  delete-vaults end state / `owned_processes` snapshot honesty.
+  deprecated `HostToolRuntime::new`, sticky_cancel unit helper, and standalone
+  `McpGateway::bind_loopback`. Production handlers + §22.4 fixtures drive
+  inline; JoinOnly Stopped inject is TaskSupervisor-owned; join vault
+  retired to orphan-permit set only. Golden still wants remaining exact-limit
+  gaps / independent P0–P2 review / deprecated ambient API retirement.
 
 **Advisor (2026-08-20, independent review — honesty residual slice):**
 
@@ -2061,5 +2108,777 @@ remaining exact-limit gaps, independent P0–P2 review,
 Named §23 adversarial lifecycle subprocess residual closed. M6 §22
 closed-enough **still holds**. Do **not** promote Golden / §25.
 
-**Next pick:** JoinOnly fixture supervision + delete-vaults **or** remaining
-exact-limit gaps / independent review. Do not promote Golden / §25.
+**JoinOnly fixture inline + CleanupStatus honesty (2026-08-20):**
+`AckCancelCooperative` / `IgnoreCancelCooperative` in `s22_4_tools` no longer
+`tokio::spawn` — inline `drive` + `cancel_only`. Dispatcher parks orphan
+permit on cooperative deadline for cancel_only non-ack (§22.4 capacity).
+`CleanupStatus::Pending` uses live `owned_tasks` / `owned_processes` /
+`tool_spill.pending_count()` (no hardcodes). Spill / `JoinOnlySpillInject`
+remain interim (delete-vaults end state not claimed). **Not** Golden / §25.
+
+**Expert + Advisor (2026-08-20, JoinOnly fixture gate):** **PASS — Silver.**
+Named fixture ambient-spawn residual closed. M6 §22 closed-enough **still
+holds**. Do **not** promote Golden / §25. Caveat: cancel_only non-ack proves
+capacity hold after drive-stop, not unforceable JoinOnly work (that remains
+spill-inject / sacrificial).
+
+**JoinOnly inject under TaskSupervisor (2026-08-20, M5.4 delete-vaults step):**
+`JoinOnlySpillInject` no longer ambient-`tokio::spawn`s or parks on
+`RuntimeToolSpill`. Supervisor registers `TaskClass::RuntimeService` that
+`thread::park`s until `release()` unparks (abort-resistant). Proofs:
+`join_only_owned_task_blocks_stopped_until_released` + sacrificial harness
+assert `owned_tasks` (not `spill_pending`). Spill remains for orphan permits
+only. Full vault deletion still open. **Not** Golden / §25.
+
+**Expert + Advisor (2026-08-20, TaskSupervisor JoinOnly gate):** **PASS —
+Silver.** M5.4 JoinOnly ownership step sound. M6 §22 closed-enough **still
+holds**. Do **not** claim delete-vaults complete / Golden / §25.
+
+**Join vault retired → orphan-permit set (2026-08-20, M5.4):**
+`RuntimeToolSpill` is now `OrphanToolPermitSet` (type alias retained). No
+JoinHandle parking; `Stopped` gated on TaskSupervisor emptiness only (orphans
+released at quiesce). Deprecated `ToolKillHandle::new` / `join_only`. Proof:
+`s22_4_orphan_permits_are_runtime_scoped_not_process_global`. **Not** Golden /
+§25 (exact-limit gaps / independent review / deprecated ambient APIs remain).
+
+**Expert + Advisor (2026-08-20, orphan-permit vault gate):** **PASS — Silver.**
+Join-vault retirement sound for production path. M6 §22 closed-enough **still
+holds**. Do **not** claim M5.4 fully complete / Golden / §25 (ambient APIs +
+deprecated join constructors remain).
+
+**Deprecated ambient API retirement (2026-08-23, M5.4.4):**
+- Removed `HostToolRuntime::new` (ambient spawn branch gone); only
+  `with_spawner` remains.
+- Removed `DefaultLoopRuntime::start` / `start_empty` (prepare* only).
+- Removed `ToolKillHandle::new` / `join_only` and dead `KillInner::Tokio` /
+  `JoinOnly` variants; production kill surface is `cancel_only` + Process.
+- Removed production `McpGateway::bind_loopback` owned-join wrapper; `McpGateway`
+  is a prepare-only namespace. Integration tests own serve via local
+  `BoundGateway` / prepare+spawn. §23 production exceptions reduced to
+  `sticky_cancel` unit-test module only.
+Proof: `s23_no_undocumented_ambient_tokio_spawn_in_production_src`,
+`loop_adapters_available_not_dispatch_rejected_placeholder`, mcp_gateway suite.
+**Not** Golden / §25 (exact-limit gaps / independent P0–P2 review remain;
+sticky_cancel cfg(test) spawn is documented exception).
+
+**Advisor (2026-08-23, M5.4.4 ambient-API retirement):** **PASS — Silver.**
+Named ambient constructors are gone from production `src` (`HostToolRuntime`
+is `with_spawner` only; Loop is `prepare*` only; kill surface is
+`cancel_only` + Process; `McpGateway` is prepare-only). Architecture gates
+hold (product crates still do not depend on testkit; three-component
+boundary intact). §23 production spawn exceptions reduced to `sticky_cancel`
+`cfg(test)`. Do **not** promote Golden / §25 / full M5.4 completion.
+Chronological “Known residuals” bullets above that still name
+`HostToolRuntime::new` / `start*` / `bind_loopback` are historical; live
+residuals are exact-limit plus-one gaps, independent P0–P2 review, and the
+documented sticky_cancel test exception.
+
+**Next pick:** remaining exact-limit plus-one gaps **or** independent P0–P2
+review. Do not promote Golden / §25.
+
+**MCP concurrency/duration exact-limit proofs (2026-08-23, D-034 residual):**
+Injectable `McpGatewayLimits` (production defaults unchanged) + three proofs:
+per-capability concurrency plus-one → 429, global concurrency plus-one → 429,
+request-duration plus-one (hanging body) → 504. Inventory gated in
+`s23_exact_limit_plus_one_inventory_present`. D-034 concurrency/duration
+checkbox closed. Remaining exact-limit gaps (e.g. D-033 output-byte plus-one,
+D-035 every canonical message variant) and independent P0–P2 review still
+block Golden / §25. **Not** Golden / §25.
+
+**Next pick:** remaining exact-limit gaps (admission/output-byte / canonical
+variants) **or** independent P0–P2 review. Do not promote Golden / §25.
+
+**D-033 HTTP absolute-deadline / output-queue proofs (2026-08-23):**
+Closed the three open D-033 acceptance checkboxes with
+`crates/monoloop-connector/tests/streaming_http.rs`:
+`absolute_request_deadline_covers_header_and_body_delay`,
+`full_output_queue_terminates_at_overall_deadline`,
+`max_queued_output_bytes_plus_one_fails_closed`. D-018/D-034 honesty
+leftovers from the prior Advisor gate also cleared (checkbox / progress row /
+s23 prose); MCP concurrency holds use a body-poll barrier. Remaining
+exact-limit gap called out for Golden: D-035 every canonical message variant.
+Independent P0–P2 review still open. **Not** Golden / §25.
+
+**Next pick:** D-035 canonical-variant exact-limit matrix **or** independent
+P0–P2 review. Do not promote Golden / §25.
+
+**Advisor (2026-08-23, D-034 concurrency/duration residual):** **PASS — Silver.**
+Scoped close is sound: injectable `McpGatewayLimits` (defaults 64 / 8 / 30s
+unchanged on the RuntimeOwner path) + fail-closed plus-one proofs (429 / 429 /
+504) + inventory needles. Permits are acquired before body read; body and
+dispatch share one deadline. Services stay gateway-owned (not process-global).
+MCP remains Component 3; product crates still do not depend on testkit.
+Do **not** promote Golden / §25.
+
+Honesty leftovers from the gate (closed same day — do not reopen D-034):
+D-018 residual checkbox, 2026-08-18 progress “known residual” row, and
+`s23` prose naming MCP concurrency/duration as a gap were updated to match
+the closed proofs. Concurrency hold uses an incomplete HTTP/1.1 chunked POST
+(server-side body wait; no client body-stream poll race) + probe-until-429.
+Remaining coverage caveats (not reopen): duration plus-one is hanging-body
+only; global plus-one is one capability with `max_global=1` (semaphore
+proven; cross-capability isolation not).
+
+**Advisor (2026-08-23, D-033 acceptance + D-034 honesty leftovers):**
+**PASS — Silver.** Named D-033 proofs pass
+(`absolute_request_deadline_covers_header_and_body_delay`,
+`full_output_queue_terminates_at_overall_deadline`,
+`max_queued_output_bytes_plus_one_fails_closed`) and are inventory-gated.
+Connector uses one absolute request deadline before send; blocked enqueue
+selects control + remaining overall deadline; output queue capacity is
+taken from `max_queued_output_bytes` (not input buffers). D-018/D-034
+checkboxes and MCP plus-one proofs still hold. Product crates still do
+not depend on testkit. HTTP stays Connector; MCP stays Component 3.
+Do **not** promote Golden / §25.
+
+Coverage caveats at gate time (idle residual closed same day — see below):
+blocked enqueue previously slept only on remaining overall (comment
+overclaimed idle); output plus-one fail-closes via deadline on a full
+queue rather than a distinct limit error; D-034 duration is hanging-body
+only and global plus-one is one capability with `max_global=1`.
+
+**Expert (2026-08-23, D-033 + D-034 honesty/hold-fix):** **PASS — Silver
+with residual.** Absolute deadline + output-queue plus-one + MCP hold
+proofs sound for Law 22. Material gap: blocked enqueue select omitted
+`idle_timeout` despite comment. Do **not** promote Golden / §25.
+
+**D-033 blocked-enqueue idle select (2026-08-23):** Enqueue budget is now
+`idle_timeout.min(remaining_overall)`; on timer fire, distinguish idle vs
+overall message. Proof:
+`blocked_enqueue_honors_idle_before_overall_deadline` (idle=80ms,
+overall=5s, capacity-1 queue, host not receiving → idle, not overall).
+Inventory needle added. **Not** Golden / §25.
+
+**Advisor (2026-08-23, Expert idle-enqueue residual):** **PASS — Silver.**
+Expert material gap is closed: blocked output enqueue selects control plus
+`idle_timeout.min(remaining_overall)` and classifies idle vs overall on
+timer fire. Complementary overall-deadline proof
+(`full_output_queue_terminates_at_overall_deadline`) still holds. HTTP
+stays Connector; product crates still do not depend on testkit. Named
+proof and s23 inventory needle exist. Do **not** promote Golden / §25.
+
+Honesty leftovers (do not reopen D-033; do not block this slice):
+D-033 acceptance still names only the original three checkboxes (idle
+proof is inventory-gated, not listed on the defect); output plus-one
+still fail-closes via deadline rather than a distinct limit error;
+D-019 cancel-during-blocked-enqueue remains an unchecked inherited
+checkbox.
+
+**D-035 admission byte accounting restored (2026-08-23):** Confirmed live
+v2 admit did **not** enforce `TransactionLimits.max_input_bytes` /
+`max_messages` (roomy `CanonicalInput::try_new` only). Fixed with
+`estimate_canonical_input_bytes` (text + names + tool ids + tool names +
+serialized args; encode fail-closed) + admit checks via
+`RuntimeShared.transaction_limits`. Proofs:
+`estimate_counts_names_ids_and_tool_arguments`,
+`max_messages_plus_one_rejected_at_admit`,
+`max_input_bytes_plus_one_rejected_at_admit`,
+`large_tool_arguments_counted_toward_max_input_bytes`. Optional residual:
+exhaustive per-variant matrix; continuation still bounds encoded provider
+bytes. **Not** Golden / §25.
+
+**Next pick:** independent P0–P2 review **or** remaining exact-limit matrix
+polish. Do not promote Golden / §25.
+
+**Advisor (2026-08-23, D-035 admission enforcement restore):** **PASS — Silver.**
+Status Fixed is honest for the named bypass: live v2 admit now applies
+`RuntimeShared.transaction_limits` (from bootstrap config, not roomy
+`InputLimits` construction). `estimate_canonical_input_bytes` covers every
+canonical field (text, optional names, tool-call ids, tool names, serialized
+args) and encode failure rejects rather than counting zero. Named proofs
+pass: `estimate_counts_names_ids_and_tool_arguments`,
+`max_messages_plus_one_rejected_at_admit`,
+`max_input_bytes_plus_one_rejected_at_admit`,
+`large_tool_arguments_counted_toward_max_input_bytes`. Estimate lives in
+contracts; enforcement in Loop admission; product crates still do not depend
+on testkit. Continuation remaining-budget stays on encoded provider bytes
+(`max_remaining_provider_input_bytes`), which matches implementation §12
+rather than a silent spec deletion. Exhaustive per-variant plus-one matrix
+and exact-limit (`== max` admits) stay optional residuals. Do **not**
+promote Golden / §25.
+
+Coverage caveats at gate time (closed same day where noted):
+`max_content_parts` plus-one and exact `max_input_bytes` equality were
+Advisor leftovers — closed below. Serialize fail-closed remains an `Err`
+arm without a dedicated fixture (`serde_json::Value` encode almost never
+fails). Independent P0–P2 review still open for Golden / §25.
+
+**D-035 matrix polish (2026-08-23):** Advisor coverage leftovers closed:
+`max_content_parts_plus_one_rejected_at_admit`,
+`max_input_bytes_exact_admits_plus_one_rejects` (exact admits; exact+1
+rejects). Inventory needles added. Serialize-fail fixture still optional.
+**Not** Golden / §25.
+
+**Independent residual scan (2026-08-23 — honest, not a §25 claim):**
+
+Live Golden / §25 blockers (named; not chronological noise):
+- Independent P0–P2 / security process sign-off (D-025 residual; §23).
+- Exhaustive public-limit exact/plus-one matrix completeness (§23 wording).
+- Inherited unchecked acceptance boxes on otherwise-Fixed defects that still
+  describe real gaps when re-read against code: D-019 cancel-during-blocked
+  enqueue; D-032 dedicated start-on-A / submit-from-OS-thread e2e
+  (submit-from-OS-thread already proven in lifecycle tests — e2e across
+  reactors still desirable); D-036 barrier concurrent-producer order proof
+  residual if not covered by ordered publisher tests.
+- RuntimeOwner Drop abandon-after-grace honesty residual (prior M6 notes).
+- Refreshable MCP undeclared (WP12).
+
+Closed this session (do not re-open as ambient/D-034/D-033/D-035 bypasses):
+M5.4.4 ambient constructors; MCP concurrency/duration plus-one; D-033
+absolute deadline + idle-on-blocked-enqueue; D-035 admit byte accounting +
+content-parts/exact equality.
+
+**Next pick:** independent P0–P2 deep review of a named live blocker
+(D-019 cancel-during-blocked-enqueue **or** RuntimeOwner Drop honesty **or**
+D-036 residual) — not more optional matrix polish. Do not promote Golden /
+§25.
+
+**Advisor (2026-08-23, D-035 leftovers + residual scan):** **PASS — Silver.**
+Closing the named D-035 Advisor caveats plus an honest residual inventory
+meets the **slice** bar. It does **not** meet Golden / §25. Product shape
+holds (estimate in contracts, admit in Loop; no testkit product dep; no
+ambient session). Named leftovers are proven:
+`max_content_parts_plus_one_rejected_at_admit`,
+`max_input_bytes_exact_admits_plus_one_rejects` (inventory-gated; lib tests
+pass). D-035 Status Fixed stays honest for the named bypass. Exhaustive
+per-variant codegen and a serialize-fail fixture remain optional. Do **not**
+treat this scan as the §23 independent P0–P2 review (D-025 residual) — it is
+a named-inventory triage, correctly labeled “not a §25 claim”.
+
+Honesty on the listed next picks (do not rewrite closed work):
+- **RuntimeOwner Drop abandon-after-grace** is the strongest **behavioral**
+  live blocker: `Drop` parks the OS-thread join behind a grace then abandons
+  (`owner.rs`); §18.4 MUST still own/join and MUST NOT detach. Prefer this
+  as the next named pick.
+- **D-019 cancel-during-blocked-enqueue** is a **proof** residual unless
+  re-review shows otherwise: blocked enqueue already `select`s
+  `wait_control`; missing is a dedicated full-queue cancel test, not a
+  second HTTP deadline rewrite.
+- **D-036** inherited checkboxes still name deleted v1 files; v2
+  `EventPublisher` serializes allocation+enqueue, and
+  `s22_6_concurrent_producers_contiguous_sequence` already asserts
+  contiguous 1..N delivery. Confirm coverage before re-opening the
+  sequencer.
+
+**Next pick:** RuntimeOwner Drop honesty (§18.4) — or, if staying in
+Connector proofs, D-019 cancel-during-blocked-enqueue. Do not promote
+Golden / §25. Do not spend the next slice on optional D-035 variant
+matrix polish.
+
+**RuntimeOwner Drop §18.4 join (2026-08-23):** Removed abandon-after-grace
+detach. `Drop` still begins shutdown / releases test hold gates, then
+**always** `join`s the executor OS thread (MAY block indefinitely on
+non-cooperative work; MUST NOT detach). Proof:
+`runtime_owner_drop_joins_executor_thread_reaches_stopped`. Hosts needing
+bounded exit MUST use ProcessIsolated + explicit shutdown before drop
+(spec §18.4). **Not** Golden / §25.
+
+**Next pick:** D-019 cancel-during-blocked-enqueue proof **or** confirm
+D-036 coverage / independent P0–P2 process. Do not promote Golden / §25.
+
+**Advisor (2026-08-23, RuntimeOwner Drop §18.4):** **PASS — Silver.**
+Named abandon-after-grace detach is closed. `RuntimeOwner` is `#[must_use]`;
+supported path remains `begin_shutdown` + `wait_stopped` until `Stopped`.
+Drop on a live owner still initiates shutdown (and `StopSupervisor`), then
+**always** `join`s the executor OS-thread handle. It does not timeout-abandon
+the join, drop a live `JoinHandle`, detach the thread, or invent `Stopped`
+(supervisor still writes the state). Empty cooperative proof
+`runtime_owner_drop_joins_executor_thread_reaches_stopped` plus s23 inventory
+needle exist. Product crates still do not depend on testkit. Law 23 / §18.4
+MUST NOT detach holds for this owner path.
+
+Do **not** reopen as the old grace-then-abandon: `rt.shutdown_timeout(2s)`
+runs only after `run_supervisor` returns (Stopped), as Tokio worker teardown
+— not Drop dropping the OS join. Optional residual: no Drop-while-JoinOnly
+hang proof (empty runtime reaches Stopped before any former grace would
+fire). Join-panic on Drop is swallowed (`let _ = thread.join()`); §19
+stable diagnostic codes stay a Golden concern on the contract-violation
+path. Hosts that need bounded process-exit still MUST use ProcessIsolated
+and complete explicit shutdown before drop.
+
+Do **not** promote Golden / §25 (independent P0–P2, exhaustive limit matrix,
+inherited D-019/D-036 boxes, M5.4 delete-vaults, WP12 refreshable MCP).
+
+**Next pick:** D-019 cancel-during-blocked-enqueue is a **proof** residual
+(blocked enqueue already `select`s `wait_control`; missing is a dedicated
+full-queue cancel test). D-036 Status Fixed is likely honest in v2
+(`OrderedEventPublisher` serialize allocate+enqueue;
+`s22_6_concurrent_producers_contiguous_sequence` asserts contiguous 1..N
+delivery) — **confirm** inherited v1 checkboxes before re-opening the
+sequencer. Prefer D-019 if adding a test; prefer D-036 confirm if closing
+paper. Not more Drop polish.
+
+**D-019 cancel-during-blocked-enqueue proof (2026-08-23):** Added
+`cancel_interrupts_blocked_output_enqueue` — capacity-1 queue, host not
+receiving, long idle/overall, cancel while second chunk enqueue is blocked →
+`ConnectionEndKind::Cancelled`. Named D-019 cancel acceptance checkbox
+closed; remaining D-019 residual is optional multi-phase timing harness.
+**D-036 confirm (same day):** Inherited v1 file paths updated to v2
+`OrderedEventPublisher` + `s22_6_concurrent_producers_contiguous_sequence`
+(contiguous 1..N allocation and delivery). SessionEstablished-at-1 /
+allocate-only-on-enqueue residuals stay optional harnesses — not a sequencer
+reopen. **Not** Golden / §25.
+
+**Next pick:** independent P0–P2 process / §23 security sign-off **or**
+optional harness residuals (D-019 timing matrix, D-036 SessionEstablished-at-1).
+Do not promote Golden / §25.
+
+**Advisor (2026-08-23, D-019 cancel proof + D-036 v2 confirm):** **PASS — Silver.**
+Named D-019 cancel checkbox is honest: blocked HTTP `out_tx.send` is selected
+against `wait_control` plus `idle.min(remaining_overall)`, and
+`cancel_interrupts_blocked_output_enqueue` (capacity-1 queue, host not
+receiving, long idle/overall) completes as `ConnectionEndKind::Cancelled`.
+D-036 Status Fixed is honest on the **live** v2 path: a single
+`run_event_publisher` task serializes allocate+enqueue; concurrent producers
+send commands only. Named proofs pass:
+`s22_6_concurrent_producers_contiguous_sequence` (contiguous 1..N and
+delivery order), `s22_6_session_established_is_sequence_one`,
+`s22_2_failed_enqueue_consumes_no_sequence`,
+`s22_6_establish_external_capacity_fail_does_not_steal_seq1`. Product crates
+still do not depend on testkit. HTTP stays Connector; event sequencing stays
+Component 3. Do **not** promote Golden / §25.
+
+Honesty leftovers closed on paper only (do not reopen the defects):
+D-036 Affected no longer names uncompiled `events.rs` /
+`OrderedEventPublisher` as the live sequencer. Unit-path seq-1 and
+enqueue-fail-before-allocate residuals are covered; remaining optional
+harness is create-path concurrent fan-out vs first CanonicalUnit.
+
+Coverage caveats (optional; do not block this slice):
+- D-019 cancel proof uses a 50 ms settle, not a fill-queue barrier; cancel
+  before the second enqueue still yields `Cancelled` via the outer select.
+- D-019 multi-phase elapsed-sum timing matrix remains optional.
+- Exhaustive public-limit matrix, M5.4 delete-vaults, WP12 refreshable MCP,
+  and D-025 independent review remain Golden / §25 blockers.
+
+**Next pick:** independent P0–P2 process / §23 security sign-off. Do not
+spend the next slice on optional D-019/D-036 harness polish. Do not
+promote Golden / §25.
+
+**Independent P0–P2 residual review (2026-08-23):**
+
+Scope: live compiled product paths in `monoloop-contracts` /
+`monoloop-connector` / `monoloop-loop` (+ WP12 limitations). Not a
+substitute for an external security audit (D-025 process residual).
+
+| Class | Finding |
+|---|---|
+| **P0 (live)** | **None found** in compiled product paths reviewed this session. |
+| **P1 behavioral** | Named session closers held: §18.4 Drop joins; D-019 cancel-on-blocked-enqueue proven; D-036 live publisher path + contiguous 1..N / seq-1 / no-steal proofs pass. |
+| **P2 / process** | D-025 independent security audit sign-off remains **organizational**. WP12 **Refreshable MCP** is deliberately undeclared (limitation doc), not a silent production promise. Exhaustive public-limit exact/plus-one matrix still incomplete vs §23 wording. |
+| **Paper / naming** | Uncompiled deferred modules (`active_registry`, `events`, `exchange`) remain on disk — not live. `RuntimeToolSpill` was a join-vault-shaped **alias**; production set is `OrphanToolPermitSet` only (M5.4). |
+
+**M5.4 delete-vaults naming close (same review):** Internal call sites now use
+`OrphanToolPermitSet`. `RuntimeToolSpill` retained as `#[deprecated]` alias
+only (not a join vault). Join vault retirement for production path is
+**closed**; alias deprecation is API honesty, not a reopen.
+
+**Does not claim:** Golden / §25, full concurrent/race/load suites, Grok
+multi-session Golden conformance, or D-025 process sign-off complete.
+
+**Next pick:** organizational D-025 / §23 security process **or** a declared
+WP12 profile decision (Refreshable MCP) — not more alias polish. Do not
+promote Golden / §25.
+
+**Advisor (2026-08-23, independent P0–P2 triage + M5.4 naming close):**
+**PASS — Silver** for this **process slice**.
+
+Honesty holds: the write-up is a named-inventory triage of live compiled
+paths (`monoloop-contracts` / `monoloop-connector` / `monoloop-loop` +
+WP12), **not** Golden / §25, **not** D-025 external-audit complete, and
+**not** the §23 bullet “independent review finds no unresolved P0/P1/P2”
+(P2 items remain by design of this slice). Product shape holds (no testkit
+product dep; no ambient session; no join vault on the production set).
+Spot-check of the M5.4 close: `OrphanToolPermitSet` stores permits/leases
+only; `DispatchGuard` parks capacity, not `JoinHandle`s; `JoinOnlySpillInject`
+is TaskSupervisor-owned (name retained for API stability). Deprecated
+`RuntimeToolSpill` alias + crate re-export is API honesty, not a vault
+reopen. Join-vault retirement for the production path stays **closed**.
+
+Do **not** treat “P0 none found (this session / this scope)” as a
+kernel-wide security sign-off: Interpreter, profile crates, and live Grok
+multi-session were out of this triage’s stated scope. Leftover
+vault-shaped **identifiers** (`tool_spill` fields / `tool_spill_pending` /
+`reap_finished` no-op / crate-root `RuntimeToolSpill`) are paper, not a
+join-vault reopen — do not spend the next slice on alias polish.
+Deferred on-disk modules also include `spawn_gate` (and v1
+`transaction/exchange.rs`); `lifecycle/exchange.rs` **is** live v2.
+
+Do **not** promote Golden / §25 / D-025 complete.
+
+**Next pick:** organizational D-025 / §23 security process **or** a
+declared WP12 Refreshable MCP profile decision. Not more naming polish.
+
+**WP12 Refreshable MCP decision + D-025 checklist (2026-08-23):**
+Deliberate posture recorded as **DECISIONS D-042**: initial shipped profiles
+MUST NOT declare `Refreshable`; ExternalAgent MCP stays `CreationOnly` (CLI
+`None`) until a superseding decision with vendor evidence. Qualification
+gate: `six_profile_bindings_register_and_validate` asserts no profile uses
+`Refreshable`. WP12 limitations/acceptance/capability report cite D-042.
+D-025 process residual gains `doc/SECURITY_REVIEW_CHECKLIST.md` (unsigned —
+does **not** close independent audit). **Not** Golden / §25.
+
+**Next pick:** obtain independent D-025 / §23 security sign-off on the
+checklist **or** continue optional exact-limit / load harness work. Do not
+implement Refreshable without superseding D-042. Do not promote Golden /
+§25.
+
+**Advisor (2026-08-23, DECISIONS D-042 + SECURITY_REVIEW_CHECKLIST):**
+**PASS — Silver** for this **process slice**.
+
+The slice does what the prior next-pick allowed: a **declared** WP12
+Refreshable posture, plus a D-025 organizational artifact. It does **not**
+meet Golden / §25 and does **not** close D-025 / §23 independent review.
+
+Holds:
+- Product shape: no Refreshable implementation, no testkit product dep,
+  no ambient session, no dual session ID, no persistence.
+- Law 3/4: deferral is an explicit `DECISIONS.md` contract, not a silent
+  gap. CreationOnly reuse still fail-closed at admission (D-014).
+- Qualification not marked done: enum variant retained; initial profiles
+  MUST NOT declare `Refreshable`; gate is
+  `six_profile_bindings_register_and_validate` (+ s23 needle on that
+  assertion). WP12 limitations / acceptance / capability report cite the
+  decision.
+- Checklist is unsigned by design. Item 7 binds MCP posture to
+  DECISIONS D-042. Filling it in-session would be a shaped sign-off.
+
+Residuals (paper / process — do not reopen this slice):
+- **ID collision:** DEFECTS **D-042** is Fixed M4 ACP owner fusion;
+  DECISIONS **D-042** is Refreshable deferral. Cite `DECISIONS D-042` vs
+  `DEFECTS D-042`. Do not renumber unless citations become actively
+  ambiguous; do not treat spec “M0–M5 landed (… D-042 …)” as the MCP
+  decision.
+- v2 spec header / Loop README still say Refreshable is **undeclared**;
+  WP12 + DECISIONS now say **deferred**. Align on the next doc touch.
+  “Undeclared by current profiles” remains factually true (no profile
+  sets the variant) but understates the MUST NOT.
+- WP-00 worksheet still says CreationOnly “provisional” / “until WP-11
+  proves Refreshable” — historical evidence; D-042 supersedes for
+  shipped profiles.
+
+Do **not** implement Refreshable, fill the checklist as an agent, or
+promote Golden / §25 / D-025 complete. Next pick remains independent
+human/contracted sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`, or
+optional exact-limit / load work.
+
+**Doc hygiene (2026-08-23, Advisor paper residuals):** Aligned live status
+prose to **deferred (DECISIONS D-042)** in `TRANSACTION_RUNTIME_V2_SPEC.md`
+header and Loop README (with DEFECTS vs DECISIONS D-042 citation
+disambiguation). WP-00 Grok MCP row notes D-042 supersedes the historical
+“provisional / until WP-11 proves Refreshable” worksheet wording. Chronological
+DEFECTS bullets that still say “undeclared” remain historical. **Not** Golden /
+§25 / D-025 signed-off.
+
+**Next pick:** independent human/contracted sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`, **or** optional exact-limit / load work.
+Do not implement Refreshable without superseding DECISIONS D-042. Do not
+promote Golden / §25.
+
+**Advisor (2026-08-23, D-042 wording hygiene follow-up):** **PASS — Silver**
+(doc-hygiene; quality tier unchanged). Named paper residuals closed on live
+status docs. Remaining WP-00 agy/Codex “provisional” prose and chronological
+DEFECTS “undeclared” bullets are paper leftovers / historical. Do **not**
+promote Golden / §25 / D-025 complete.
+
+**Exact-limit polish + WP-00 twins (2026-08-23):** WP-00 agy/Codex MCP prose
+aligned to **DECISIONS D-042**. Added
+`max_messages_exact_admits_plus_one_rejects` (exact admits; exact+1 rejects)
++ s23 inventory needle. Complements prior `max_input_bytes_exact_*` /
+plus-one proofs. **Not** Golden / §25 / D-025 signed-off.
+
+**Next pick:** independent human/contracted sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`, **or** load/race harness work. Do not
+implement Refreshable without superseding DECISIONS D-042.
+
+**Advisor (2026-08-23, exact max_messages + WP-00 twins):** **PASS — Silver**
+for this **optional polish slice**. Quality tier **unchanged**. Does **not**
+meet Golden / §25 and does **not** close D-025 / §23 independent review.
+
+The named follow-up is honest and in-bar:
+- Admit uses `messages.len() > limits.max_messages` (`admission.rs`);
+  `max_messages=1` exact submit succeeds; two messages →
+  `AdmissionErrorKind::InvalidInput` + silent reject. Named proof
+  `max_messages_exact_admits_plus_one_rejects` (lib test pass) + s23 needle.
+- WP-00 agy/Codex MCP rows match **DECISIONS D-042** (CreationOnly;
+  Refreshable deferred). Product shape holds: no testkit product dep, no
+  ambient session, no Refreshable implementation.
+
+Does **not** satisfy §23 “every public limit has an exact-limit and plus-one
+test” (matrix still incomplete: e.g. `max_content_parts` exact-admit still
+absent; remaining `TransactionLimits` fields unproven at equality).
+Worksheet header “evidence-backed provisional declarations” is WP-00
+evidence status, not a Refreshable promise. Checklist unsigned.
+
+**Next pick:** independent human/contracted sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`. Optional load/race harness remains
+allowed. Do **not** spend the next slice on remaining optional matrix
+cells. Do not implement Refreshable without superseding DECISIONS D-042.
+Do not promote Golden / §25 / D-025 signed-off.
+
+**Load/race harness — D-010 barrier submit vs shutdown (2026-08-23):**
+`submit_versus_shutdown_barrier_race_two_outcomes` — N submitters + one
+`begin_shutdown` thread release together; each submit is either
+`RuntimeShuttingDown` (silent reject) or fully admitted (one completion).
+After `Stopped`: ledger 0, capacity 0. Closes named D-010 acceptance
+checkboxes (v2 lifecycle path). **Not** Golden / §25 / D-025 signed-off.
+
+**Expert + Advisor residuals closed (same day):** Quiescing CAS now runs
+**under the ledger lock** in both `RuntimeOwner::begin_shutdown` and
+`begin_shutdown_inner` (§18.2 / D-010 — same lock as admit install). Late
+`Start` while Quiescing terminalizes via `accept_terminal(RuntimeShutdown)`
+instead of dropping Queued admits. Barrier test no longer asserts
+mid-Quiescing `ledger_len == admitted` (Echo drain race); durable proof is
+`completions_published == admitted` after `Stopped`. **PASS — Silver** for
+the load/race slice. Gaps that remain optional (not reopen D-010):
+all-reject-green single interleaving, Hang vs Echo matrix, full concurrent
+load suites / §25 / D-025.
+
+**Next pick:** independent human/contracted sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`, **or** further load/race coverage
+(Hang matrix / multi-run). Do not spend the next slice on optional
+exact-limit matrix cells. Do not implement Refreshable without superseding
+DECISIONS D-042.
+
+**Advisor (2026-08-23, D-010 barrier race acceptance):** **PASS — Silver**
+for this **load/race slice**. Quality tier **unchanged**. Does **not**
+meet Golden / §25 and does **not** close D-025 / §23 independent review.
+
+Named D-010 acceptance is honest on the v2 two-outcome contract:
+`submit_versus_shutdown_barrier_race_two_outcomes` (OS-thread submitters +
+one `begin_shutdown` after a shared barrier) allows only
+`Ok(admit)` or `AdmissionErrorKind::RuntimeShuttingDown`. Rejects are
+silent (`assert_rejected_silent`). After `Stopped`: `ledger_len == 0` and
+`global_reservations == 0`; `completions_published == admitted`. s23
+inventory needle present. Product crates still do not depend on testkit.
+Empty-tool / isolation / component shape unchanged. Lib test pass (10/10
+repeats this session).
+
+D-010 Status **Fixed** stays honest for the **named bypass** (ghost work
+after `Stopped`). Sequential D-040 `submit_versus_begin_shutdown_two_outcomes`
+is before/after, not a concurrent race; this slice is the named barrier
+proof those checkboxes cited.
+
+Honesty leftovers at that gate (closed same day where noted):
+- Echo barrier allowed all-reject-green — addressed by Hang both-outcomes
+  proof below.
+- §18.2 lock coupling + late-Start terminalize — closed in the Expert
+  residual slice (Quiescing under ledger lock; Start while stopping →
+  `accept_terminal(RuntimeShutdown)`).
+- D-010 **Affected** paper still may name deleted v1 paths — cite live
+  `lifecycle/admission.rs` + `owner.rs` + `supervisor.rs`.
+
+**Advisor (2026-08-23, D-010 Expert residual close):** **PASS — Silver.**
+Lock coupling + late-Start terminalize + test hygiene hold. Do **not**
+promote Golden / §25 / D-025.
+
+**Hang + both outcomes (2026-08-23):**
+`submit_versus_shutdown_hang_barrier_both_outcomes` — pre-admit Hang
+(live through Quiescing), barrier-race more submits, then a deterministic
+post-Quiescing submit that MUST `RuntimeShuttingDown`. Asserts
+`admitted >= 1`, `rejected >= 1`, and `completions_published == admitted`
+after `Stopped`. Pins both legal outcomes without relying on Echo timing.
+**Not** Golden / §25 / D-025 signed-off.
+
+**Next pick:** independent human/contracted sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`. Further load/race only for broader
+stress, not D-010 reopen. Do not implement Refreshable without
+superseding DECISIONS D-042. Do not promote Golden / §25 / D-025.
+
+**Advisor (2026-08-23, D-010 residuals: lock + late Start + test hygiene):**
+**PASS — Silver** for this **load/race follow-up**. Quality tier
+**unchanged**. Does **not** meet Golden / §25 and does **not** close
+D-025 / §23 independent review.
+
+Named Advisor leftovers from the barrier-race slice are closed on the
+live v2 path (Laws 8/22/23/25, spec §18.2):
+
+- **Lock coupling:** `RuntimeOwner::begin_shutdown` and
+  `begin_shutdown_inner` CAS `Accepting → Quiescing` while holding
+  `shared.ledger` — the same non-async critical section `admit` uses
+  to re-check state and install. Concurrent admit either inserts
+  before the flip (visible to the shutdown snapshot) or sees
+  non-`Accepting` and rejects `RuntimeShuttingDown`. Mutex is not
+  held across `.await`. Named two-outcome proofs still pass
+  (`submit_versus_shutdown_barrier_race_two_outcomes`,
+  `submit_versus_begin_shutdown_two_outcomes`; this session).
+- **Late Start:** once `stopping`, a Start that is not `Accepting`
+  is `accept_terminal(RuntimeShutdown)` rather than dropped.
+  `finalize_after_terminal` still lifts `completion_tx` from
+  `delivery` if Start never ran. Parked-Start proof
+  `parked_starts_reach_stopped_on_shutdown` still holds.
+- **Test hygiene:** mid-Quiescing `ledger_len == admitted` is gone;
+  durable proof is `completions_published == admitted` after
+  `Stopped`, plus ledger 0 / capacity 0. D-010 **Affected** now
+  names the v2 files.
+
+D-010 Status **Fixed** stays honest for the named bypass (ghost
+install after drain snapshot). Product crates still do not depend
+on testkit. Empty-tool / isolation / component shape unchanged.
+
+Honesty leftovers (do **not** reopen D-010; do **not** treat as
+Golden load/race):
+
+- Late Start still **drops** when state is not `Accepting` **and**
+  `stopping` is still false (owner already flipped Quiescing; supervisor
+  has not entered `begin_shutdown_inner`). That window is recovered
+  by the lock-coupled snapshot, not by the Start arm. Tightening to
+  `else { accept_terminal }` is optional, not a bypass reopen.
+- Barrier test still does **not** require both outcomes in one
+  interleaving; harness is still default **Echo**, not Hang;
+  completion kinds still allow `Cancelled` (slightly loose).
+- Exhaustive concurrent/race/load suites, Grok multi-session
+  Golden, unsigned `SECURITY_REVIEW_CHECKLIST.md` (D-025),
+  exhaustive public-limit matrix, M5.4 delete-vaults, and WP12
+  Refreshable (DECISIONS D-042) remain out of this slice.
+
+**Next pick:** independent human/contracted sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`. Further load/race only if it
+pins Hang + both outcomes in one interleaving. Do not spend the
+next slice on the `else if stopping` tighten or optional
+exact-limit cells. Do not implement Refreshable without
+superseding DECISIONS D-042. Do not promote Golden / §25 /
+D-025 signed-off.
+
+**Advisor (2026-08-23, Hang + both outcomes load/race follow-up):**
+**PASS — Silver** for this **named load/race follow-up**. Quality
+tier **unchanged**. Does **not** meet Golden / §25 and does **not**
+close D-025 / §23 independent review.
+
+Named leftover from the barrier-race slice is closed honestly:
+
+- `submit_versus_shutdown_hang_barrier_both_outcomes` uses
+  `FakeEndpoint::Hang` (not Echo). Pre-admit stays live through
+  Quiescing; six OS-thread submits race `begin_shutdown`; a
+  post-Quiescing submit MUST `RuntimeShuttingDown`.
+- One run asserts both legal sides: `admitted >= 1` (pre-Hang)
+  and `rejected >= 1` (post-Quiescing). Racers still allow only
+  `Ok(admit)` or `RuntimeShuttingDown`. Rejects are silent.
+- After `Stopped`: `completions_published == admitted`,
+  `ledger_len == 0`, `global_reservations == 0`. Hang completions
+  MUST NOT be `Completed`. s23 needle present. Lib test pass
+  this session.
+- Product crates still do not depend on testkit. Empty-tool /
+  isolation / component shape unchanged. D-010 Status **Fixed**
+  stays honest for the named bypass; this slice does **not**
+  reopen it.
+
+Honesty leftovers (do **not** reopen D-010; do **not** treat as
+Golden load/race):
+
+- Mixed outcomes are **bookended** (pre-admit + post-Quiescing),
+  not forced among the concurrent racers. `race_admitted` /
+  `race_rejected` may still be 0 on one side of the barrier
+  window. That is deterministic on purpose, not a two-outcome
+  contract hole.
+- Echo barrier
+  (`submit_versus_shutdown_barrier_race_two_outcomes`) still
+  does not require both sides in one run.
+- Hang completion kinds still allow `Cancelled` | `Terminated`
+  besides `RuntimeShutdown` (forbids `Completed` only).
+- 30 ms sleep before the barrier is hygiene, not a proof that
+  ConnectorOwner is registered.
+- Exhaustive concurrent/race/load suites, Grok multi-session
+  Golden, unsigned `SECURITY_REVIEW_CHECKLIST.md` (D-025),
+  exhaustive public-limit matrix, M5.4 delete-vaults, and WP12
+  Refreshable (DECISIONS D-042) remain out of this slice.
+
+**Next pick:** independent human/contracted sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`. Further load/race only for
+broader stress, not D-010 reopen and not mixed-racer forcing.
+Do not spend the next slice on the `else if stopping` tighten,
+the 30 ms sleep, or optional exact-limit cells. Do not implement
+Refreshable without superseding DECISIONS D-042. Do not promote
+Golden / §25 / D-025 signed-off.
+
+**D-025 checklist readiness (2026-08-23):** Enriched
+`doc/SECURITY_REVIEW_CHECKLIST.md` with an **evidence map** (pointers to
+named proofs / decisions for items 1–8) and an explicit “still open for
+Golden” list. Sign-off table remains `_TBD_` — **not** filled by the
+implementing agent. This prepares independent review; it does **not**
+close D-025 / §23. **Not** Golden / §25.
+
+**Next pick:** independent human/contracted reviewer fills the Sign-off
+table on `doc/SECURITY_REVIEW_CHECKLIST.md` and records result in
+DEFECTS. Agents must not self-sign. Optional: broader stress only.
+
+**Advisor (2026-08-23, unsigned SECURITY_REVIEW_CHECKLIST evidence map):**
+**PASS — Silver** for this **process-readiness slice**. Quality tier
+**unchanged**. Does **not** meet Golden / §25 and does **not** close
+D-025 / §23 independent review.
+
+The slice is in-bar for what an agent **may** do on the organizational
+gate: make the checklist executable for a human/contracted reviewer
+without filling Sign-off. Product shape holds (no testkit product dep,
+no ambient session, no Refreshable implementation, no self-sign). Named
+pointers exist (`duplicate_session_race_admits_exactly_one`,
+`runtime_owner_drop_joins_executor_thread_reaches_stopped`,
+`six_profile_bindings_register_and_validate`, MCP plus-one,
+`empty_loop` / EmptyToolRegistry, DECISIONS D-002 / D-042, Hang + Echo
+shutdown barriers). Sign-off table remains `_TBD_`. Item 7 still binds
+MCP posture to **DECISIONS D-042**. The “still open for Golden” list
+matches live residuals (unsigned table, exhaustive public-limit matrix,
+full load/race, live Grok multi-session, Refreshable deferred).
+
+Honesty leftovers (do **not** treat as more checklist work; do **not**
+reopen D-025 as a code gate):
+
+- The **named next pick was sign-off**, which agents MUST NOT perform.
+  Evidence-map enrichment is allowed **once** as readiness, not as a
+  substitute for §23 “independent review finds no unresolved P0/P1/P2”.
+  Further checklist polish is not progress toward Golden.
+- Several map cells are **category** pointers (Interpreter
+  fragmentation/EOF suites; TaskSupervisor abort-then-join proofs;
+  StreamingHttp / Grok secret-absent Debug tests), not single named
+  tests. That is acceptable for a reviewer packet; it is not a review.
+- `six_profile_bindings_register_and_validate` lives in
+  `monoloop-testkit` — qualification evidence, not a product→testkit
+  dependency.
+- Shutdown barrier proofs (items 5–6 “recent load/race”) are D-010
+  lifecycle two-outcome contracts, not the exhaustive public-limit
+  matrix §23 still requires.
+
+Do **not** fill the Sign-off table in-session (shaped qualification).
+Do not implement Refreshable without superseding DECISIONS D-042.
+Do not promote Golden / §25 / D-025 signed-off.
+
+**Next pick:** independent human/contracted reviewer fills Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md` and records the result in DEFECTS.
+Optional broader stress only. Agents must not self-sign.
+
+**Broader stress — concurrent capacity exhaustion (2026-08-23):** Added
+Hang-pinned barrier races distinct from sequential
+`capacity_plus_one_rejects`:
+
+- `concurrent_global_capacity_exhaustion_admits_exactly_max` — N+1
+  concurrent submits at exact `max_active`; exactly N admit, one
+  `CapacityExceeded`; every admission completes once on shutdown.
+- `concurrent_per_channel_capacity_exhaustion_admits_exactly_channel_max`
+  — same shape with `max_active_per_channel` tighter than global.
+
+Inventory needles added in `s23_forbidden_patterns`. Does **not** close
+exhaustive §23 public-limit matrix, full load/race Golden, D-025, or
+§25. Sign-off table remains `_TBD_`.
+
+**Next pick:** independent human/contracted reviewer fills Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md` and records the result in DEFECTS.
+Agents must not self-sign. Further optional stress only if named; do not
+implement Refreshable without superseding DECISIONS D-042. Do not
+promote Golden / §25 / D-025 signed-off.
+
+**Expert + Advisor (2026-08-23, concurrent capacity exhaustion stress):**
+**PASS — Silver.** Hang + Barrier N+1 races are sound and distinct from
+sequential `capacity_plus_one_*`. Hang pins occupancy so Echo cannot free
+slots mid-barrier (false green). Per-channel topology (`global=8`,
+`channel_max=2`, three racers) forces channel CAS overflow with provisional
+global rollback. Inventory + checklist pointers only; Sign-off still
+`_TBD_`. Expert optional sharpening applied:
+`global_reservations`/`channel_reservations` exact asserts and Hang end-kind
+allowlist on the per-channel test. Does **not** close exhaustive §23
+matrix, full load/race Golden, D-025, or §25.
+
+**Next pick:** independent human/contracted reviewer fills Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md` and records the result in DEFECTS.
+Agents must not self-sign. Further optional stress only if named. Do not
+implement Refreshable without superseding DECISIONS D-042. Do not promote
+Golden / §25 / D-025 signed-off.

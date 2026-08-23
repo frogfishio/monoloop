@@ -9,7 +9,8 @@ use monoloop_contracts::{
 use monoloop_loop::{
     dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, HostToolRegistry, ImmediateToolHandler,
     IsolatedKillableToolHandler, LinkedToolExecutionHandle, ProcessIsolatedToolHandler,
-    RegisteredTool, ResolvedToolSet, RuntimeToolSpill, SharedToolCapacity, ToolExecutionCompletion,
+    OrphanToolPermitSet, RegisteredTool, ResolvedToolSet, SharedToolCapacity,
+    ToolExecutionCompletion,
     ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionToolDispatcher,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +66,8 @@ fn base_spec(id: &str, name: &str, class: ToolExecutionClass, deadline: Duration
 }
 
 /// Cooperative handler that acknowledges cancel and joins normally.
+///
+/// M5.4: inline `drive` + `cancel_only` (no ambient `tokio::spawn`).
 struct AckCancelCooperative;
 
 impl ToolHandler for AckCancelCooperative {
@@ -76,8 +79,7 @@ impl ToolHandler for AckCancelCooperative {
         let control = ToolExecutionControl::new();
         let body = control.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        // Join-only kill handle: cooperative owns the join without hard abort.
-        let join = tokio::spawn(async move {
+        let drive = Box::pin(async move {
             tokio::select! {
                 biased;
                 _ = body.cancelled() => {
@@ -94,15 +96,18 @@ impl ToolHandler for AckCancelCooperative {
         });
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
-            control,
+            control: control.clone(),
             completion: ToolExecutionCompletion::new(rx),
-            kill: Some(ToolKillHandle::join_only(join)),
-            drive: None,
+            kill: Some(ToolKillHandle::cancel_only(control)),
+            drive: Some(drive),
         })
     }
 }
 
 /// Cooperative handler that ignores cancel and never completes quickly.
+///
+/// M5.4: inline `drive` + `cancel_only` (no ambient spawn). Non-ack capacity is
+/// held by dispatcher orphan-permit park on cooperative deadline (§22.4).
 struct IgnoreCancelCooperative;
 
 impl ToolHandler for IgnoreCancelCooperative {
@@ -113,21 +118,20 @@ impl ToolHandler for IgnoreCancelCooperative {
     ) -> Result<LinkedToolExecutionHandle, ToolStartError> {
         let control = ToolExecutionControl::new();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let join = tokio::spawn(async move {
-            // Deliberately ignore cancel — sleep through grace (bounded so vault
-            // Drop can observe the join without a long hang).
+        // Deliberately ignore cancel — sleep through grace; capacity stays held
+        // via orphan park when deadline elapses before completion.
+        let drive = Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(400)).await;
             let _ = tx.send(ToolCompletion::Succeeded(CanonicalToolOutput::Json(
                 serde_json::json!({"ok": true}),
             )));
-            let _ = control.is_cancelled();
         });
         Ok(LinkedToolExecutionHandle {
             execution_id: ToolExecutionId::generate(),
-            control: ToolExecutionControl::new(),
+            control: control.clone(),
             completion: ToolExecutionCompletion::new(rx),
-            kill: Some(ToolKillHandle::join_only(join)),
-            drive: None,
+            kill: Some(ToolKillHandle::cancel_only(control)),
+            drive: Some(drive),
         })
     }
 }
@@ -536,11 +540,11 @@ async fn s22_4_async_handler_drives_inline_no_ambient_join() {
     assert!(matches!(completion, ToolCompletion::Succeeded(_)));
 }
 
-/// Law 8: unfinished tool work stays on a runtime-scoped spill — not a process-global set.
+/// Law 8: orphan tool permits stay on a runtime-scoped set — not process-global.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn s22_4_tool_spill_is_runtime_scoped_not_process_global() {
-    let spill_a = Arc::new(RuntimeToolSpill::new());
-    let spill_b = Arc::new(RuntimeToolSpill::new());
+async fn s22_4_orphan_permits_are_runtime_scoped_not_process_global() {
+    let orphans_a = Arc::new(OrphanToolPermitSet::new());
+    let orphans_b = Arc::new(OrphanToolPermitSet::new());
     let spec = base_spec(
         "ign2",
         "ign2",
@@ -561,7 +565,7 @@ async fn s22_4_tool_spill_is_runtime_scoped_not_process_global() {
         session_key(),
         ResolvedToolSet::from_registered(vec![tool]),
         Arc::clone(&shared),
-        Arc::clone(&spill_a),
+        Arc::clone(&orphans_a),
         4,
         8,
     );
@@ -584,20 +588,19 @@ async fn s22_4_tool_spill_is_runtime_scoped_not_process_global() {
     );
     d.reap_vault();
     assert!(
-        spill_a.pending_permits() >= 1,
-        "work must park on the runtime spill passed into the dispatcher"
+        orphans_a.pending_permits() >= 1,
+        "non-ack capacity must park on the runtime orphan set"
     );
     assert!(
-        spill_b.is_empty(),
-        "a sibling spill must stay empty (no process-global transfer)"
+        orphans_b.is_empty(),
+        "a sibling orphan set must stay empty (no process-global transfer)"
     );
-    // Dropping the dispatcher Arc must not move work onto spill_b / a global set.
     drop(d);
     assert!(
-        spill_a.pending_permits() >= 1,
-        "parked work remains on the same runtime spill after dispatcher drop"
+        orphans_a.pending_permits() >= 1,
+        "orphans remain on the same runtime set after dispatcher drop"
     );
-    assert!(spill_b.is_empty());
+    assert!(orphans_b.is_empty());
 }
 
 /// §22.4: tool cannot self-assert a stronger execution class than structural factory.

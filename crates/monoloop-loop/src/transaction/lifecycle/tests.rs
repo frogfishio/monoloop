@@ -9,6 +9,7 @@ use crate::transaction::channel_registry::{ChannelBinding, ChannelRegistry};
 use crate::transaction::fake_support::PanicEncoder;
 use crate::transaction::fake_support::TestTextEncoder;
 use crate::transaction::host_tools::HostToolRegistry;
+use crate::transaction::state::RuntimeState;
 use monoloop_connector::{FakeConnectorConfig, FakeConnectorFactory, FakeEndpoint};
 use monoloop_contracts::{
     transaction_delivery, user_text_input, AdmissionError, AdmissionErrorKind, AdmissionReceipt,
@@ -164,6 +165,411 @@ fn shutdown_owner(started: StartedRuntime) {
     });
 }
 
+/// D-035: TransactionLimits.max_messages exact admits; plus-one rejects.
+#[test]
+fn max_messages_exact_admits_plus_one_rejects() {
+    use monoloop_contracts::{CanonicalInput, CanonicalMessage, InputLimits, TextPart};
+
+    let limits = TransactionLimits {
+        max_messages: 1,
+        max_active_transactions: 4,
+        max_active_per_channel: 4,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 4)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let roomy = InputLimits {
+        max_messages: 16,
+        ..Default::default()
+    };
+
+    let exact = CanonicalInput::try_new(
+        vec![CanonicalMessage::User {
+            content: vec![TextPart::try_new("one", roomy.max_text_part_bytes).unwrap()],
+            name: None,
+        }],
+        &roomy,
+    )
+    .unwrap();
+    let (delivery_ok, mut recv_ok) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: Some(SessionId::try_new("exact-msg").unwrap()),
+            input: exact,
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery: delivery_ok,
+        })
+        .expect("exact max_messages must admit");
+    while recv_ok.events.try_recv().is_ok() {}
+    drop(recv_ok);
+
+    let plus = CanonicalInput::try_new(
+        vec![
+            CanonicalMessage::User {
+                content: vec![TextPart::try_new("one", roomy.max_text_part_bytes).unwrap()],
+                name: None,
+            },
+            CanonicalMessage::User {
+                content: vec![TextPart::try_new("two", roomy.max_text_part_bytes).unwrap()],
+                name: None,
+            },
+        ],
+        &roomy,
+    )
+    .unwrap();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let err = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: Some(SessionId::try_new("plus-msg").unwrap()),
+            input: plus,
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect_err("plus-one messages must reject");
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    assert_rejected_silent(receiver);
+    shutdown_owner(started);
+}
+
+/// D-035: TransactionLimits.max_messages plus-one rejects at admission.
+#[test]
+fn max_messages_plus_one_rejected_at_admit() {
+    use monoloop_contracts::{CanonicalInput, CanonicalMessage, InputLimits, TextPart};
+
+    let limits = TransactionLimits {
+        max_messages: 1,
+        max_active_transactions: 4,
+        max_active_per_channel: 4,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 4)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let roomy = InputLimits {
+        max_messages: 16,
+        ..Default::default()
+    };
+    let input = CanonicalInput::try_new(
+        vec![
+            CanonicalMessage::User {
+                content: vec![TextPart::try_new("one", roomy.max_text_part_bytes).unwrap()],
+                name: None,
+            },
+            CanonicalMessage::User {
+                content: vec![TextPart::try_new("two", roomy.max_text_part_bytes).unwrap()],
+                name: None,
+            },
+        ],
+        &roomy,
+    )
+    .unwrap();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let err = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: None,
+            input,
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect_err("plus-one messages must reject");
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    assert_rejected_silent(receiver);
+    shutdown_owner(started);
+}
+
+/// D-035: TransactionLimits.max_input_bytes plus-one rejects at admission.
+#[test]
+fn max_input_bytes_plus_one_rejected_at_admit() {
+    let limits = TransactionLimits {
+        max_input_bytes: 8,
+        max_active_transactions: 4,
+        max_active_per_channel: 4,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 4)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let err = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: None,
+            input: user_text_input("0123456789abcdef").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect_err("oversized text must reject");
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    assert_rejected_silent(receiver);
+    shutdown_owner(started);
+}
+
+/// D-035: TransactionLimits.max_content_parts plus-one rejects at admission.
+#[test]
+fn max_content_parts_plus_one_rejected_at_admit() {
+    use monoloop_contracts::{CanonicalInput, CanonicalMessage, InputLimits, TextPart};
+
+    let limits = TransactionLimits {
+        max_content_parts: 1,
+        max_active_transactions: 4,
+        max_active_per_channel: 4,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 4)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let roomy = InputLimits {
+        max_content_parts: 8,
+        ..Default::default()
+    };
+    let input = CanonicalInput::try_new(
+        vec![CanonicalMessage::User {
+            content: vec![
+                TextPart::try_new("a", roomy.max_text_part_bytes).unwrap(),
+                TextPart::try_new("b", roomy.max_text_part_bytes).unwrap(),
+            ],
+            name: None,
+        }],
+        &roomy,
+    )
+    .unwrap();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let err = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: None,
+            input,
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect_err("plus-one content parts must reject");
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    assert_rejected_silent(receiver);
+    shutdown_owner(started);
+}
+
+/// D-035: exact max_input_bytes admits; plus-one rejects (equality, not only oversized).
+#[test]
+fn max_input_bytes_exact_admits_plus_one_rejects() {
+    use monoloop_contracts::{
+        estimate_canonical_input_bytes, CanonicalInput, CanonicalMessage, InputLimits, TextPart,
+    };
+
+    let roomy = InputLimits::default();
+    let exact = CanonicalInput::try_new(
+        vec![CanonicalMessage::User {
+            content: vec![TextPart::try_new("01234567", roomy.max_text_part_bytes).unwrap()],
+            name: None,
+        }],
+        &roomy,
+    )
+    .unwrap();
+    let exact_bytes = estimate_canonical_input_bytes(&exact).unwrap();
+    assert_eq!(exact_bytes, 8);
+
+    let limits = TransactionLimits {
+        max_input_bytes: exact_bytes,
+        max_active_transactions: 4,
+        max_active_per_channel: 4,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 4)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let (delivery_ok, mut recv_ok) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: Some(SessionId::try_new("exact").unwrap()),
+            input: exact,
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery: delivery_ok,
+        })
+        .expect("exact max_input_bytes must admit");
+    // Drop receiver so shutdown can drain.
+    while recv_ok.events.try_recv().is_ok() {}
+    drop(recv_ok);
+
+    let plus = CanonicalInput::try_new(
+        vec![CanonicalMessage::User {
+            content: vec![TextPart::try_new("012345678", roomy.max_text_part_bytes).unwrap()],
+            name: None,
+        }],
+        &roomy,
+    )
+    .unwrap();
+    assert_eq!(estimate_canonical_input_bytes(&plus).unwrap(), exact_bytes + 1);
+    let (delivery_bad, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let err = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: Some(SessionId::try_new("plus").unwrap()),
+            input: plus,
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery: delivery_bad,
+        })
+        .expect_err("exact+1 must reject");
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    assert_rejected_silent(receiver);
+    shutdown_owner(started);
+}
+
+/// D-035: large historical tool arguments cannot bypass max_input_bytes via text-only construction.
+#[test]
+fn large_tool_arguments_counted_toward_max_input_bytes() {
+    use monoloop_contracts::{
+        estimate_canonical_input_bytes, CanonicalAssistantToolCall, CanonicalInput,
+        CanonicalMessage, InputLimits, TextPart, ToolName,
+    };
+
+    let limits = TransactionLimits {
+        // Text "hi" alone fits; args JSON pushes estimate over the cap.
+        max_input_bytes: 32,
+        max_active_transactions: 4,
+        max_active_per_channel: 4,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 4)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let roomy = InputLimits::default();
+    let args = serde_json::json!({"blob": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"});
+    let input = CanonicalInput::try_new(
+        vec![
+            CanonicalMessage::User {
+                content: vec![TextPart::try_new("hi", roomy.max_text_part_bytes).unwrap()],
+                name: None,
+            },
+            CanonicalMessage::Assistant {
+                content: vec![],
+                tool_calls: vec![CanonicalAssistantToolCall {
+                    tool_call_id: "c1".into(),
+                    tool_name: ToolName::try_new("search").unwrap(),
+                    arguments: args,
+                }],
+            },
+        ],
+        &roomy,
+    )
+    .unwrap();
+    let estimated = estimate_canonical_input_bytes(&input).unwrap();
+    assert!(
+        estimated > 32,
+        "fixture must exceed max_input_bytes via tool args, got {estimated}"
+    );
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    let err = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: None,
+            input,
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect_err("tool-arg bytes must count toward max_input_bytes");
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidInput);
+    assert_rejected_silent(receiver);
+    shutdown_owner(started);
+}
+
+/// §18.4: Dropping RuntimeOwner initiates shutdown and joins the executor thread
+/// (no abandon-after-grace detach). Empty cooperative runtime reaches Stopped.
+#[test]
+fn runtime_owner_drop_joins_executor_thread_reaches_stopped() {
+    let started = start_runtime(2, 2);
+    let handle = started.handle.clone();
+    // Contract violation path: drop without wait_stopped — ownership still joins.
+    drop(started.owner);
+    assert_eq!(
+        handle.state(),
+        RuntimeState::Stopped,
+        "§18.4 Drop must join through Stopped, not abandon Quiescing"
+    );
+}
+
 #[test]
 fn submit_from_plain_os_thread_no_tokio_context() {
     let started = start_runtime(4, 4);
@@ -235,6 +641,211 @@ fn capacity_plus_one_rejects() {
         owner.begin_shutdown();
         owner.wait_stopped(Duration::from_secs(2)).await
     });
+}
+
+/// Broader stress: N+1 barrier submits at exact `max_active` (global).
+///
+/// Distinct from sequential `capacity_plus_one_rejects`. Hang pins capacity so
+/// completions cannot free slots mid-race; exactly `max` admit and one
+/// `CapacityExceeded` reject are required.
+#[test]
+fn concurrent_global_capacity_exhaustion_admits_exactly_max() {
+    let max = 4usize;
+    let limits = TransactionLimits {
+        max_active_transactions: max,
+        max_active_per_channel: max,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", max)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let n = max + 1;
+    let barrier = Arc::new(Barrier::new(n));
+    let mut joins = Vec::new();
+    for i in 0..n {
+        let h = handle.clone();
+        let b = Arc::clone(&barrier);
+        let session = format!("cap-race-{i}");
+        joins.push(std::thread::spawn(move || {
+            b.wait();
+            submit_ports(&h, Some(&session))
+        }));
+    }
+
+    let mut admitted = 0usize;
+    let mut rejected = 0usize;
+    let mut receivers = Vec::new();
+    for j in joins {
+        let (res, recv) = j.join().unwrap();
+        match res {
+            Ok(receipt) => {
+                admitted += 1;
+                let _ = receipt;
+                receivers.push(recv);
+            }
+            Err(e) => {
+                assert_eq!(e.kind, AdmissionErrorKind::CapacityExceeded);
+                rejected += 1;
+                assert_rejected_silent(recv);
+            }
+        }
+    }
+    assert_eq!(admitted, max, "exactly max_active must admit under barrier race");
+    assert_eq!(rejected, 1, "exactly one CapacityExceeded overflow");
+    assert_eq!(started.owner.ledger_len(), max);
+    assert_eq!(started.owner.global_reservations(), max);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(report) => {
+            assert_eq!(
+                report.completions_published as usize, max,
+                "every admitted Hang tx must complete once"
+            );
+        }
+        other => panic!("expected Stopped after capacity race, got {other:?}"),
+    }
+    assert_eq!(owner.ledger_len(), 0);
+    assert_eq!(owner.global_reservations(), 0);
+
+    for recv in receivers {
+        let completion = rt
+            .block_on(recv.completion.recv())
+            .expect("admitted must complete");
+        assert!(matches!(
+            completion.end.kind,
+            monoloop_contracts::TransactionEndKind::RuntimeShutdown
+                | monoloop_contracts::TransactionEndKind::Cancelled
+                | monoloop_contracts::TransactionEndKind::Terminated
+        ));
+    }
+}
+
+/// Broader stress: per-channel max tighter than global — N+1 barrier submits
+/// on one channel admit exactly `max_active_per_channel`.
+#[test]
+fn concurrent_per_channel_capacity_exhaustion_admits_exactly_channel_max() {
+    let global = 8usize;
+    let channel_max = 2usize;
+    let limits = TransactionLimits {
+        max_active_transactions: global,
+        max_active_per_channel: channel_max,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", channel_max)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let n = channel_max + 1;
+    let barrier = Arc::new(Barrier::new(n));
+    let mut joins = Vec::new();
+    for i in 0..n {
+        let h = handle.clone();
+        let b = Arc::clone(&barrier);
+        let session = format!("ch-cap-race-{i}");
+        joins.push(std::thread::spawn(move || {
+            b.wait();
+            submit_ports(&h, Some(&session))
+        }));
+    }
+
+    let mut admitted = 0usize;
+    let mut rejected = 0usize;
+    let mut receivers = Vec::new();
+    for j in joins {
+        let (res, recv) = j.join().unwrap();
+        match res {
+            Ok(receipt) => {
+                admitted += 1;
+                let _ = receipt;
+                receivers.push(recv);
+            }
+            Err(e) => {
+                assert_eq!(e.kind, AdmissionErrorKind::CapacityExceeded);
+                rejected += 1;
+                assert_rejected_silent(recv);
+            }
+        }
+    }
+    assert_eq!(
+        admitted, channel_max,
+        "exactly max_active_per_channel must admit"
+    );
+    assert_eq!(rejected, 1, "exactly one per-channel CapacityExceeded");
+    assert_eq!(started.owner.ledger_len(), channel_max);
+    let llm = ChannelId::try_new("llm").unwrap();
+    assert_eq!(
+        started.owner.global_reservations(),
+        channel_max,
+        "provisional global permits held for admitted only"
+    );
+    assert_eq!(
+        started.owner.channel_reservations(&llm),
+        channel_max,
+        "channel pool must be at exact max"
+    );
+    assert!(
+        channel_max < global,
+        "topology must leave global headroom so overflow is channel-scoped"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(5)).await
+    });
+    match outcome {
+        ShutdownWaitOutcome::Stopped(report) => {
+            assert_eq!(report.completions_published as usize, channel_max);
+        }
+        other => panic!("expected Stopped after per-channel capacity race, got {other:?}"),
+    }
+    assert_eq!(owner.ledger_len(), 0);
+    assert_eq!(owner.global_reservations(), 0);
+    assert_eq!(owner.channel_reservations(&llm), 0);
+
+    for recv in receivers {
+        let completion = rt
+            .block_on(recv.completion.recv())
+            .expect("admitted must complete");
+        assert!(matches!(
+            completion.end.kind,
+            monoloop_contracts::TransactionEndKind::RuntimeShutdown
+                | monoloop_contracts::TransactionEndKind::Cancelled
+                | monoloop_contracts::TransactionEndKind::Terminated
+        ));
+    }
 }
 
 #[test]
@@ -633,6 +1244,217 @@ fn parked_starts_reach_stopped_on_shutdown() {
     }
 }
 
+/// D-010 / §22.1: barrier-controlled concurrent submit vs begin_shutdown.
+///
+/// Each racer ends as either silent reject (`RuntimeShuttingDown`) or fully
+/// admitted into the shutdown ledger (completion observed). Stopped implies
+/// zero ledger / capacity.
+#[test]
+fn submit_versus_shutdown_barrier_race_two_outcomes() {
+    let started = start_runtime(16, 16);
+    let handle = started.handle.clone();
+    let n_submitters = 8usize;
+    // +1 for the shutdown thread.
+    let barrier = Arc::new(Barrier::new(n_submitters + 1));
+    let mut joins = Vec::new();
+    for i in 0..n_submitters {
+        let h = handle.clone();
+        let b = Arc::clone(&barrier);
+        let session = format!("race-shut-{i}");
+        joins.push(std::thread::spawn(move || {
+            b.wait();
+            submit_ports(&h, Some(&session))
+        }));
+    }
+
+    let owner = started.owner;
+    let shut_barrier = Arc::clone(&barrier);
+    let shut_join = std::thread::spawn(move || {
+        shut_barrier.wait();
+        owner.begin_shutdown();
+        owner
+    });
+
+    let mut admitted = 0usize;
+    let mut rejected = 0usize;
+    let mut receivers = Vec::new();
+    for j in joins {
+        let (res, recv) = j.join().unwrap();
+        match res {
+            Ok(receipt) => {
+                admitted += 1;
+                let _ = receipt;
+                receivers.push(recv);
+            }
+            Err(e) => {
+                assert_eq!(
+                    e.kind,
+                    AdmissionErrorKind::RuntimeShuttingDown,
+                    "only RuntimeShuttingDown (or Ok) is legal, got {e:?}"
+                );
+                rejected += 1;
+                assert_rejected_silent(recv);
+            }
+        }
+    }
+    assert_eq!(
+        admitted + rejected,
+        n_submitters,
+        "every racer must resolve as Ok(admit) or RuntimeShuttingDown"
+    );
+
+    let mut owner = shut_join.join().unwrap();
+    // Do not assert mid-Quiescing ledger_len == admitted: Echo may drain before
+    // this thread rejoins. The durable proof is Stopped completions == admitted.
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = rt.block_on(owner.wait_stopped(Duration::from_secs(5)));
+    match outcome {
+        ShutdownWaitOutcome::Stopped(report) => {
+            assert_eq!(
+                report.completions_published as usize, admitted,
+                "every admitted transaction must complete once (no force-remove ghosts)"
+            );
+        }
+        other => panic!("expected Stopped after race, got {other:?}"),
+    }
+    assert_eq!(owner.ledger_len(), 0, "Stopped ⇒ empty ledger");
+    assert_eq!(owner.global_reservations(), 0, "Stopped ⇒ zero capacity");
+
+    for recv in receivers {
+        let completion = rt
+            .block_on(recv.completion.recv())
+            .expect("admitted must complete");
+        assert!(matches!(
+            completion.end.kind,
+            monoloop_contracts::TransactionEndKind::RuntimeShutdown
+                | monoloop_contracts::TransactionEndKind::Completed
+                | monoloop_contracts::TransactionEndKind::Cancelled
+        ));
+    }
+}
+
+/// D-010: Hang harness pins both outcomes in one interleaving.
+///
+/// Pre-admit a Hang worker (stays live through Quiescing), barrier-race more
+/// submits against `begin_shutdown`, then one post-Quiescing submit that MUST
+/// reject — so `admitted >= 1` and `rejected >= 1` are deterministic.
+#[test]
+fn submit_versus_shutdown_hang_barrier_both_outcomes() {
+    let limits = TransactionLimits {
+        max_active_transactions: 16,
+        max_active_per_channel: 16,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", 16)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let (pre_receipt, pre_recv) = submit(&handle, Some("pre-hang")).expect("pre-admit Hang");
+    let _ = pre_receipt;
+    // Let Hang register ConnectorOwner under the supervisor.
+    std::thread::sleep(Duration::from_millis(30));
+
+    let n_submitters = 6usize;
+    let barrier = Arc::new(Barrier::new(n_submitters + 1));
+    let mut joins = Vec::new();
+    for i in 0..n_submitters {
+        let h = handle.clone();
+        let b = Arc::clone(&barrier);
+        let session = format!("hang-race-{i}");
+        joins.push(std::thread::spawn(move || {
+            b.wait();
+            submit_ports(&h, Some(&session))
+        }));
+    }
+
+    let owner = started.owner;
+    let shut_barrier = Arc::clone(&barrier);
+    let shut_join = std::thread::spawn(move || {
+        shut_barrier.wait();
+        owner.begin_shutdown();
+        owner
+    });
+
+    let mut race_admitted = 0usize;
+    let mut race_rejected = 0usize;
+    let mut receivers = vec![pre_recv];
+    for j in joins {
+        let (res, recv) = j.join().unwrap();
+        match res {
+            Ok(receipt) => {
+                race_admitted += 1;
+                let _ = receipt;
+                receivers.push(recv);
+            }
+            Err(e) => {
+                assert_eq!(e.kind, AdmissionErrorKind::RuntimeShuttingDown);
+                race_rejected += 1;
+                assert_rejected_silent(recv);
+            }
+        }
+    }
+
+    let mut owner = shut_join.join().unwrap();
+    // Deterministic reject after Quiescing (does not rely on barrier timing).
+    let (post_err, post_recv) = submit_ports(&handle, Some("post-quiesce"));
+    assert_eq!(
+        post_err.expect_err("must reject after Quiescing").kind,
+        AdmissionErrorKind::RuntimeShuttingDown
+    );
+    assert_rejected_silent(post_recv);
+
+    let admitted = race_admitted + 1; // pre-Hang
+    let rejected = race_rejected + 1; // post-Quiescing
+    assert!(admitted >= 1, "Hang pre-admit guarantees an admit");
+    assert!(rejected >= 1, "post-Quiescing submit guarantees a reject");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcome = rt.block_on(owner.wait_stopped(Duration::from_secs(5)));
+    match outcome {
+        ShutdownWaitOutcome::Stopped(report) => {
+            assert_eq!(
+                report.completions_published as usize, admitted,
+                "every admitted Hang/race tx must complete once"
+            );
+        }
+        other => panic!("expected Stopped after Hang race, got {other:?}"),
+    }
+    assert_eq!(owner.ledger_len(), 0);
+    assert_eq!(owner.global_reservations(), 0);
+
+    for recv in receivers {
+        let completion = rt
+            .block_on(recv.completion.recv())
+            .expect("admitted must complete");
+        assert!(
+            matches!(
+                completion.end.kind,
+                monoloop_contracts::TransactionEndKind::RuntimeShutdown
+                    | monoloop_contracts::TransactionEndKind::Cancelled
+                    | monoloop_contracts::TransactionEndKind::Terminated
+            ),
+            "Hang shutdown path should not invent Completed, got {:?}",
+            completion.end.kind
+        );
+    }
+}
+
 /// D-040 / §22.1: submit vs begin_shutdown — only reject or fully admit into ledger.
 #[test]
 fn submit_versus_begin_shutdown_two_outcomes() {
@@ -849,9 +1671,9 @@ fn wait_stopped_reannounce_while_quiescing_then_stopped() {
     );
 }
 
-/// §22.4 / Law 23: JoinOnly parked on runtime spill blocks Stopped (not false Stopped).
+/// §22.4 / Law 23 / M5.4: TaskSupervisor-owned JoinOnly-style work blocks Stopped.
 #[test]
-fn join_only_spill_blocks_stopped_until_released() {
+fn join_only_owned_task_blocks_stopped_until_released() {
     use crate::transaction::state::RuntimeState;
 
     let inject = Arc::new(JoinOnlySpillInject::new());
@@ -877,7 +1699,7 @@ fn join_only_spill_blocks_stopped_until_released() {
         .enable_all()
         .build()
         .unwrap();
-    // Wait until supervisor parks the JoinOnly join on the runtime spill.
+    // Wait until supervised JoinOnly-style task has entered park.
     let entered = rt.block_on(async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while !inject.is_entered() && tokio::time::Instant::now() < deadline {
@@ -887,26 +1709,26 @@ fn join_only_spill_blocks_stopped_until_released() {
     });
     assert!(
         entered,
-        "JoinOnly spill inject must park before shutdown proof"
+        "JoinOnly owned-task inject must enter before shutdown proof"
     );
 
     let mut owner = started.owner;
     assert!(
-        owner.tool_spill_pending() >= 1,
-        "spill must hold JoinOnly before begin_shutdown, pending={}",
-        owner.tool_spill_pending()
+        owner.owned_task_count() >= 1,
+        "TaskSupervisor must own JoinOnly work before begin_shutdown, owned={}",
+        owner.owned_task_count()
     );
     owner.begin_shutdown();
     let mid = rt.block_on(owner.wait_stopped(Duration::from_millis(80)));
     assert!(
         matches!(mid, ShutdownWaitOutcome::TimedOut(_)),
-        "JoinOnly spill must keep Quiescing (not false Stopped), got {mid:?}"
+        "JoinOnly owned task must keep Quiescing (not false Stopped), got {mid:?}"
     );
     assert_eq!(owner.state(), RuntimeState::Quiescing);
     assert!(
-        owner.tool_spill_pending() >= 1,
-        "JoinOnly must remain on spill while Quiescing, pending={}",
-        owner.tool_spill_pending()
+        owner.owned_task_count() >= 1,
+        "JoinOnly must remain registered while Quiescing, owned={}",
+        owner.owned_task_count()
     );
 
     inject.release();
@@ -914,7 +1736,6 @@ fn join_only_spill_blocks_stopped_until_released() {
     match outcome {
         ShutdownWaitOutcome::Stopped(_) => {
             assert_eq!(owner.state(), RuntimeState::Stopped);
-            assert_eq!(owner.tool_spill_pending(), 0);
             assert_eq!(owner.owned_task_count(), 0);
         }
         other => panic!("expected Stopped after JoinOnly release, got {other:?}"),
@@ -1733,7 +2554,13 @@ fn mcp_dispatcher_rebind_session_before_activate() {
             "provisional key is transaction-scoped"
         );
 
-        let gw = McpGateway::bind_loopback(8).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let prepared = McpGateway::prepare_from_tokio_listener(listener, 8, None).unwrap();
+        let gw = prepared.handle();
+        let cancel = prepared.cancel_token();
+        let join = tokio::spawn(prepared.serve());
         let pending = gw
             .install_pending(
                 tx,
@@ -1752,7 +2579,9 @@ fn mcp_dispatcher_rebind_session_before_activate() {
         assert_ne!(pending.dispatcher.session_key(), provisional);
         gw.activate(&pending.token).unwrap();
         gw.revoke(&pending.token);
-        gw.shutdown().await;
+        gw.revoke_all_services();
+        cancel.cancel();
+        let _ = join.await;
     });
 }
 

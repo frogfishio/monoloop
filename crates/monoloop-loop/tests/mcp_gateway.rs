@@ -5,13 +5,61 @@ use monoloop_contracts::{
     ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec,
     ToolSuccessContract, TransactionId,
 };
+use futures_util::stream;
 use monoloop_loop::{
     dispatch_ready_tool, tool_definitions_from_resolved, CapabilityToken, DispatchOutcome,
-    HostToolRegistry, ImmediateToolHandler, McpBindingState, McpGateway, RegisteredTool,
-    ResolvedToolSet, SharedToolCapacity, ToolHandler, TransactionToolDispatcher,
+    HostToolRegistry, ImmediateToolHandler, McpBindingState, McpGateway, McpGatewayHandle,
+    McpGatewayLimits, RegisteredTool, ResolvedToolSet, SharedToolCapacity, ToolHandler,
+    TransactionToolDispatcher,
 };
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+/// Test-owned loopback gateway (ambient spawn stays in the test harness, not product src).
+struct BoundGateway {
+    handle: McpGatewayHandle,
+    cancel: CancellationToken,
+    join: JoinHandle<()>,
+}
+
+impl BoundGateway {
+    async fn bind(max_routes: usize) -> Self {
+        Self::bind_with_limits(max_routes, McpGatewayLimits::default()).await
+    }
+
+    async fn bind_with_limits(max_routes: usize, limits: McpGatewayLimits) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let prepared =
+            McpGateway::prepare_from_tokio_listener_with_limits(listener, max_routes, None, limits)
+                .expect("prepare gateway");
+        let handle = prepared.handle();
+        let cancel = prepared.cancel_token();
+        let join = tokio::spawn(prepared.serve());
+        Self {
+            handle,
+            cancel,
+            join,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.handle.revoke_all_services();
+        self.cancel.cancel();
+        let _ = self.join.await;
+    }
+}
+
+impl Deref for BoundGateway {
+    type Target = McpGatewayHandle;
+    fn deref(&self) -> &Self::Target {
+        &self.handle
+    }
+}
 
 fn object_schema() -> JsonSchema {
     JsonSchema::try_new(serde_json::json!({
@@ -94,7 +142,7 @@ fn resolved_echo() -> (HostToolRegistry, ResolvedToolSet) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bind_loopback_and_shutdown_revokes_routes() {
-    let gw = McpGateway::bind_loopback(32).await.unwrap();
+    let gw = BoundGateway::bind(32).await;
     assert!(gw.local_addr().ip().is_loopback());
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
@@ -107,7 +155,7 @@ async fn bind_loopback_and_shutdown_revokes_routes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pending_rejects_list_and_call_until_active() {
-    let gw = McpGateway::bind_loopback(32).await.unwrap();
+    let gw = BoundGateway::bind(32).await;
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
     let pending = gw
@@ -147,7 +195,7 @@ async fn pending_rejects_list_and_call_until_active() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_resolved_set_lists_no_tools() {
-    let gw = McpGateway::bind_loopback(8).await.unwrap();
+    let gw = BoundGateway::bind(8).await;
     let tools = ResolvedToolSet::empty();
     let d = build_dispatcher(tools.clone());
     let pending = gw
@@ -162,7 +210,7 @@ async fn empty_resolved_set_lists_no_tools() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_revoked_cross_transaction_isolation() {
-    let gw = McpGateway::bind_loopback(16).await.unwrap();
+    let gw = BoundGateway::bind(16).await;
     let (_, tools_a) = resolved_echo();
     let d_a = build_dispatcher(tools_a.clone());
     let a = gw
@@ -206,7 +254,7 @@ async fn unknown_revoked_cross_transaction_isolation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delayed_capability_a_cannot_enter_b() {
-    let gw = McpGateway::bind_loopback(16).await.unwrap();
+    let gw = BoundGateway::bind(16).await;
     let (_, tools) = resolved_echo();
     let d1 = build_dispatcher(tools.clone());
     let a = gw
@@ -245,7 +293,7 @@ async fn capability_redacted_in_debug() {
     assert!(dbg.contains("redacted"));
     assert!(!dbg.contains(&token.to_hex()));
 
-    let gw = McpGateway::bind_loopback(4).await.unwrap();
+    let gw = BoundGateway::bind(4).await;
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
     let pending = gw
@@ -275,7 +323,7 @@ async fn mcp_and_local_paths_same_handler_and_definitions() {
     assert_eq!(tools.specs()[0].name.as_str(), mcp_defs[0].name.as_ref());
 
     let dispatcher = build_dispatcher(tools.clone());
-    let gw = McpGateway::bind_loopback(8).await.unwrap();
+    let gw = BoundGateway::bind(8).await;
     let pending = gw
         .install_pending(
             TransactionId::generate(),
@@ -319,7 +367,7 @@ async fn mcp_and_local_paths_same_handler_and_definitions() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disallowed_tool_and_schema_invalid_on_mcp() {
-    let gw = McpGateway::bind_loopback(8).await.unwrap();
+    let gw = BoundGateway::bind(8).await;
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
     let pending = gw
@@ -342,7 +390,7 @@ async fn disallowed_tool_and_schema_invalid_on_mcp() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_unknown_capability_is_404() {
-    let gw = McpGateway::bind_loopback(4).await.unwrap();
+    let gw = BoundGateway::bind(4).await;
     let addr = gw.local_addr();
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/mcp/{}", "ab".repeat(32));
@@ -354,7 +402,7 @@ async fn http_unknown_capability_is_404() {
 /// D-018: oversized HTTP body is rejected before protocol dispatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_oversized_body_fails_closed() {
-    let gw = McpGateway::bind_loopback(4).await.unwrap();
+    let gw = BoundGateway::bind(4).await;
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
     let pending = gw
@@ -375,10 +423,179 @@ async fn http_oversized_body_fails_closed() {
     gw.shutdown().await;
 }
 
+/// Never-yielding body stream — used by duration plus-one (single request).
+fn hanging_body() -> reqwest::Body {
+    reqwest::Body::wrap_stream(stream::pending::<Result<bytes::Bytes, std::io::Error>>())
+}
+
+/// Open an HTTP/1.1 chunked POST and leave the body unfinished so the gateway
+/// holds concurrency permits inside `to_bytes` (server-side only — no client
+/// body-stream poll race).
+async fn hold_incomplete_chunked_post(
+    addr: std::net::SocketAddr,
+    token_hex: &str,
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect hold socket");
+    let req = format!(
+        "POST /mcp/{token_hex} HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Content-Type: application/json\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Connection: keep-alive\r\n\
+         \r\n"
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write hold headers");
+    // No chunks, no terminating 0-chunk — server waits in body read with permits held.
+    stream
+}
+
+async fn probe_until_status(
+    client: &reqwest::Client,
+    url: &str,
+    want: reqwest::StatusCode,
+    budget: Duration,
+) -> reqwest::Response {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut last = None;
+    while tokio::time::Instant::now() < deadline {
+        let resp = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("probe send");
+        if resp.status() == want {
+            return resp;
+        }
+        last = Some(resp.status());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("probe did not reach {want} within {budget:?}; last={last:?}");
+}
+
+/// D-034: per-capability concurrency exact limit held; plus-one fails closed (429).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_per_capability_concurrency_plus_one_rejects() {
+    let limits = McpGatewayLimits {
+        max_global_requests: 8,
+        max_per_capability_requests: 1,
+        request_duration: Duration::from_secs(5),
+    };
+    let gw = BoundGateway::bind_with_limits(4, limits).await;
+    let (_, tools) = resolved_echo();
+    let d = build_dispatcher(tools.clone());
+    let pending = gw
+        .install_pending(TransactionId::generate(), tools, d, ExchangeId::generate())
+        .unwrap();
+    gw.activate(&pending.token).unwrap();
+    let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+    let client = reqwest::Client::new();
+
+    let _hold =
+        hold_incomplete_chunked_post(gw.local_addr(), &pending.token.to_hex()).await;
+
+    let resp = probe_until_status(
+        &client,
+        &url,
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        Duration::from_secs(2),
+    )
+    .await;
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("mcp capability concurrency exceeded"),
+        "expected per-capability concurrency body, got {body:?}"
+    );
+
+    gw.shutdown().await;
+}
+
+/// D-034: global concurrency exact limit held; plus-one fails closed (429).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_global_concurrency_plus_one_rejects() {
+    let limits = McpGatewayLimits {
+        max_global_requests: 1,
+        max_per_capability_requests: 8,
+        request_duration: Duration::from_secs(5),
+    };
+    let gw = BoundGateway::bind_with_limits(4, limits).await;
+    let (_, tools) = resolved_echo();
+    let d = build_dispatcher(tools.clone());
+    let pending = gw
+        .install_pending(TransactionId::generate(), tools, d, ExchangeId::generate())
+        .unwrap();
+    gw.activate(&pending.token).unwrap();
+    let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+    let client = reqwest::Client::new();
+
+    let _hold =
+        hold_incomplete_chunked_post(gw.local_addr(), &pending.token.to_hex()).await;
+
+    let resp = probe_until_status(
+        &client,
+        &url,
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        Duration::from_secs(2),
+    )
+    .await;
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("mcp gateway concurrency exceeded"),
+        "expected global concurrency body, got {body:?}"
+    );
+
+    gw.shutdown().await;
+}
+
+/// D-034: request duration plus-one (hanging body past budget) fails closed (504).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_request_duration_plus_one_fails_closed() {
+    let limits = McpGatewayLimits {
+        max_global_requests: 4,
+        max_per_capability_requests: 4,
+        request_duration: Duration::from_millis(80),
+    };
+    let gw = BoundGateway::bind_with_limits(4, limits).await;
+    let (_, tools) = resolved_echo();
+    let d = build_dispatcher(tools.clone());
+    let pending = gw
+        .install_pending(TransactionId::generate(), tools, d, ExchangeId::generate())
+        .unwrap();
+    gw.activate(&pending.token).unwrap();
+    let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(hanging_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.contains("mcp request deadline exceeded"),
+        "expected duration fail-closed body, got {body:?}"
+    );
+    gw.shutdown().await;
+}
+
 /// D-018: same capability token reuses HTTP service across requests (session manager).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_active_capability_accepts_repeated_posts() {
-    let gw = McpGateway::bind_loopback(8).await.unwrap();
+    let gw = BoundGateway::bind(8).await;
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
     let pending = gw
@@ -446,7 +663,7 @@ fn first_jsonrpc_value(body: &str) -> Option<serde_json::Value> {
 /// D-018: real Streamable HTTP initialize → initialized → tools/list → tools/call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_mcp_initialize_list_call_sequence() {
-    let gw = McpGateway::bind_loopback(8).await.unwrap();
+    let gw = BoundGateway::bind(8).await;
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
     let pending = gw
@@ -575,7 +792,7 @@ async fn http_mcp_initialize_list_call_sequence() {
 /// D-018: pending (not activated) capability rejects tools/list after initialize.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_mcp_pending_token_rejects_tools_list() {
-    let gw = McpGateway::bind_loopback(4).await.unwrap();
+    let gw = BoundGateway::bind(4).await;
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
     let pending = gw
@@ -637,7 +854,7 @@ async fn http_mcp_pending_token_rejects_tools_list() {
 /// D-018: revoked capability 404s subsequent HTTP traffic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_mcp_revoked_token_is_404() {
-    let gw = McpGateway::bind_loopback(4).await.unwrap();
+    let gw = BoundGateway::bind(4).await;
     let (_, tools) = resolved_echo();
     let d = build_dispatcher(tools.clone());
     let pending = gw

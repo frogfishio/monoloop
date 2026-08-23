@@ -86,7 +86,8 @@ cargo doc --workspace --no-deps
 ## Open items (honest residual)
 
 1. Live SendAndRetain multi-exchange against each external agent profile.
-2. Refreshable MCP (not declared; CreationOnly only).
+2. Refreshable MCP — deferred by **DECISIONS D-042** (CreationOnly only for
+   initial ExternalAgent profiles; enum variant retained for future profiles).
 3. Headless CLI non-argv prompt transport (or host acceptance of D-002).
 4. Independent security audit sign-off (process gate).
 5. Sync admit cannot `await` aborted joins after install failure (abort only).

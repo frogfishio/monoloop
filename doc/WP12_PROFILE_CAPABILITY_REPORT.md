@@ -41,7 +41,7 @@ Covered by WP-09/WP-10 (`openai_chat_sse`, `direct_llm_e2e`).
 
 | Gap | Status |
 |---|---|
-| Refreshable MCP on retained external sessions | Not declared; CreationOnly only |
+| Refreshable MCP on retained external sessions | Deferred (**DECISIONS D-042**); CreationOnly only for initial profiles |
 | Live SendAndRetain multi-exchange proof against real agents | Testkit live examples only; not deterministic gate |
 | Unified attach/open without connector-local sequencing | Partial (encoders own prompt; open still profile-owned) |
 | Inline continuation with MCP | Explicitly unsupported for external agents |

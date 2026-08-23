@@ -27,20 +27,19 @@ Prefer the façade crate `monoloop` unless you need this crate as a direct depen
 
 Do not recreate the deleted v1 files (`runtime`, `admission`, `actor`,
 `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`).
-Follow the seven-stage plan in the v2 spec. Runtime-scoped
-`RuntimeToolSpill` (in `dispatcher.rs`) is the interim honesty fix for
-parked JoinOnly tool joins — not a revived v1 vault module.
-`AsyncToolHandler` / `IsolatedKillableToolHandler` /
-`ProcessIsolatedToolHandler` drive inline on the dispatcher task (M5.4; no
-ambient spawn / `spawn_blocking`). §23 forbidden-pattern search lives in
-`tests/s23_forbidden_patterns.rs`. Full delete-vaults remains once JoinOnly
-fixtures are also supervisor-owned.
+Follow the seven-stage plan in the v2 spec. M5.4 delete-vaults: joins are
+TaskSupervisor-owned (not vaulted). `OrphanToolPermitSet` (alias
+`OrphanToolPermitSet`; deprecated alias `RuntimeToolSpill`) holds only capacity orphans for §22.4 non-ack / Process
+mid-drop — not JoinHandles. JoinOnly Stopped inject is supervisor
+park/unpark. Production handlers drive inline. §23 gates live in
+`tests/s23_forbidden_patterns.rs`.
 
-**M0–M5 landed** (D-042 / D-043 / D-044). **M6 §22 closed enough** (D-045):
-§22.1–§22.7 proofs landed (host-adapter proofs outside core);
+**M0–M5 landed** (DEFECTS D-042 / D-043 / D-044). **M6 §22 closed enough**
+(D-045): §22.1–§22.7 proofs landed (host-adapter proofs outside core);
 MCP RuntimeService + CreationOnly + `TaskClass::McpRequest` ownership landed.
-Process-global tool-join pending set removed (`RuntimeToolSpill` + Stopped
-spill-empty gate). Refreshable MCP undeclared (WP12).
+Join vault retired to `OrphanToolPermitSet` (`RuntimeToolSpill` deprecated alias);
+`Stopped` is TaskSupervisor-empty after orphan release. Refreshable MCP
+**deferred** for initial profiles (**DECISIONS D-042** / WP12).
 
 **M7 façade landed (D-038 Fixed):** `StartedRuntime` + `TransactionSubmitRequest`
 is the assembler recipe; deprecated sink-shaped `TransactionRequest` /

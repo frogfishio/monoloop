@@ -174,35 +174,6 @@ impl DefaultLoopRuntime {
         })
     }
 
-    /// Legacy ambient spawn — **not** compiled into production builds (D-043).
-    ///
-    /// Prefer [`Self::prepare`] / [`Self::prepare_empty`] and an explicit owner.
-    #[cfg(test)]
-    #[deprecated(
-        note = "ambient tokio::spawn; use prepare()/prepare_empty() and an explicit owner (M5)"
-    )]
-    pub fn start(&self, request: StartLoop) -> Result<LoopHandle, LoopError> {
-        let (handle, fut) = self.prepare(request)?;
-        tokio::spawn(fut);
-        Ok(handle)
-    }
-
-    /// Legacy ambient empty-tool start — **not** compiled into production builds (D-043).
-    #[cfg(test)]
-    #[deprecated(note = "ambient tokio::spawn; use prepare_empty() and an explicit owner (M5)")]
-    pub fn start_empty(
-        &self,
-        monoloop_run_id: MonoloopRunId,
-        loop_id: LoopId,
-        scope: LoopScope,
-        subscription: CanonicalEventSubscription,
-        limits: LoopLimits,
-    ) -> Result<LoopHandle, LoopError> {
-        let (handle, fut) =
-            self.prepare_empty(monoloop_run_id, loop_id, scope, subscription, limits)?;
-        tokio::spawn(fut);
-        Ok(handle)
-    }
 }
 
 fn prepare_loop(request: StartLoop) -> Result<(LoopHandle, LoopRunFuture), LoopError> {

@@ -167,8 +167,9 @@ impl StartedRuntime {
                     .saturating_mul(4)
                     .max(8),
             ),
-            tool_spill: Arc::new(crate::transaction::dispatcher::RuntimeToolSpill::new()),
+            tool_spill: Arc::new(crate::transaction::dispatcher::OrphanToolPermitSet::new()),
             owned_processes: Arc::new(AtomicU32::new(0)),
+            transaction_limits: bootstrap.config.transaction_limits.clone(),
         });
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartupError>>();
@@ -338,19 +339,25 @@ impl RuntimeOwner {
     /// observes `Quiescing` via an internal wake so a full control queue cannot
     /// strand the runtime.
     pub fn begin_shutdown(&self) -> ShutdownTicket {
-        // Move to Quiescing (idempotent).
-        let _ = self.shared.state.compare_exchange(
-            STATE_ACCEPTING,
-            STATE_QUIESCING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
-        let _ = self.shared.state.compare_exchange(
-            STATE_STARTING,
-            STATE_QUIESCING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        // §18.2 / D-010: Quiescing transition under the same lock admit uses for
+        // install, so a concurrent admit either inserts before the flip (and is
+        // visible to the shutdown snapshot) or sees Quiescing and rejects.
+        {
+            let _ledger = self
+                .shared
+                .ledger
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = self.shared.state.compare_exchange(
+                STATE_ACCEPTING,
+                STATE_QUIESCING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            if self.shared.state.load(Ordering::SeqCst) == STATE_STARTING {
+                self.shared.state.store(STATE_QUIESCING, Ordering::SeqCst);
+            }
+        }
         // CAS 0→1 elects a single announcer; losers observe the published
         // generation immediately — no spin/yield race (§22.5).
         let generation = match self.shared.shutdown_generation.compare_exchange(
@@ -414,20 +421,21 @@ impl Drop for RuntimeOwner {
                 .control_tx
                 .try_send(ControlCommand::StopSupervisor);
             self.shared.wake.notify_one();
-            // §18.4: preferred path joins forever on non-cooperative work.
-            // Bounded fallback: after a grace, abandon the join so Drop cannot
-            // hang the host process (supervisor thread may outlive the owner).
-            if let Some(thread) = self.thread.take() {
-                let (done_tx, done_rx) = std::sync::mpsc::channel();
-                std::thread::Builder::new()
-                    .name("monoloop-owner-join".into())
-                    .spawn(move || {
-                        let _ = thread.join();
-                        let _ = done_tx.send(());
-                    })
-                    .ok();
-                let grace = self.shared.cleanup_deadline.max(Duration::from_secs(3));
-                let _ = done_rx.recv_timeout(grace);
+        }
+        // §18.4: Drop MUST preserve ownership — join the executor OS thread.
+        // MAY block indefinitely on non-cooperative in-process work. MUST NOT
+        // detach, abandon a live join handle, or invent a successful stop.
+        // Hosts that need bounded process-exit MUST use ProcessIsolated for
+        // untrusted work and complete explicit shutdown before dropping.
+        if let Some(thread) = self.thread.take() {
+            // Observe the join either way — panic on the executor thread is still
+            // ownership-complete (§18.4). Do not invent Stopped here.
+            match thread.join() {
+                Ok(()) => {}
+                Err(_) => {
+                    // Contract-violation Drop path: executor panicked. Join was
+                    // observed; leave supervisor-written state untouched.
+                }
             }
         }
     }

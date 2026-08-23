@@ -62,6 +62,56 @@ impl CanonicalInput {
     }
 }
 
+/// Deterministic admission byte estimate covering every canonical field (D-035).
+///
+/// Counts UTF-8 text parts, optional names, tool-call ids, tool names, and
+/// serialized tool-argument JSON. Encode failure fails closed (never counts as
+/// zero). This is independent of [`InputLimits::max_aggregate_text_bytes`],
+/// which only bounds text parts at construction.
+pub fn estimate_canonical_input_bytes(
+    input: &CanonicalInput,
+) -> Result<usize, InputValidationError> {
+    let mut total = 0usize;
+    for msg in input.messages() {
+        match msg {
+            CanonicalMessage::System { content, name }
+            | CanonicalMessage::User { content, name } => {
+                if let Some(n) = name {
+                    total = total.saturating_add(n.len());
+                }
+                for part in content {
+                    total = total.saturating_add(part.text().len());
+                }
+            }
+            CanonicalMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                for part in content {
+                    total = total.saturating_add(part.text().len());
+                }
+                for call in tool_calls {
+                    total = total.saturating_add(call.tool_call_id.len());
+                    total = total.saturating_add(call.tool_name.as_str().len());
+                    let encoded = serde_json::to_vec(&call.arguments)
+                        .map_err(|_| InputValidationError::JsonEncodeFailed)?;
+                    total = total.saturating_add(encoded.len());
+                }
+            }
+            CanonicalMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                total = total.saturating_add(tool_call_id.len());
+                for part in content {
+                    total = total.saturating_add(part.text().len());
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// One typed canonical message.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CanonicalMessage {
@@ -482,5 +532,46 @@ mod tests {
         let json = serde_json::to_string(&input).unwrap();
         let back: CanonicalInput = serde_json::from_str(&json).unwrap();
         assert_eq!(input, back);
+    }
+
+    #[test]
+    fn estimate_counts_names_ids_and_tool_arguments() {
+        let limits = InputLimits::default();
+        let args = serde_json::json!({"q": "abcdefghij"}); // larger than text-only path
+        let encoded_args = serde_json::to_vec(&args).unwrap().len();
+        let call = CanonicalAssistantToolCall {
+            tool_call_id: "call-id-123".into(),
+            tool_name: ToolName::try_new("search").unwrap(),
+            arguments: args,
+        };
+        let input = CanonicalInput::try_new(
+            vec![
+                CanonicalMessage::User {
+                    content: vec![TextPart::try_new("hi", limits.max_text_part_bytes).unwrap()],
+                    name: Some("alice".into()),
+                },
+                CanonicalMessage::Assistant {
+                    content: vec![],
+                    tool_calls: vec![call],
+                },
+                CanonicalMessage::Tool {
+                    tool_call_id: "call-id-123".into(),
+                    content: vec![TextPart::try_new("ok", limits.max_text_part_bytes).unwrap()],
+                },
+            ],
+            &limits,
+        )
+        .unwrap();
+
+        let bytes = estimate_canonical_input_bytes(&input).unwrap();
+        // text "hi" + name "alice" + id + tool name + args + id again + text "ok"
+        let expected = 2 + 5 + "call-id-123".len() + "search".len() + encoded_args
+            + "call-id-123".len()
+            + 2;
+        assert_eq!(bytes, expected);
+        assert!(
+            bytes > 2 + 2,
+            "tool args/ids/names must increase estimate beyond text-only"
+        );
     }
 }

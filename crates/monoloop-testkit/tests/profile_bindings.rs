@@ -7,7 +7,9 @@ use monoloop_connector_cursor::cursor_channel_binding;
 use monoloop_connector_grok::{grok_channel_binding, InMemorySecretResolver};
 use monoloop_connector_zai::zai_channel_binding;
 use monoloop_contracts::{user_text_input, ExchangeId, TransactionId};
-use monoloop_contracts::{EffectiveConfig, InitialEncodeRequest, OutboundDialectEncoder};
+use monoloop_contracts::{
+    EffectiveConfig, InitialEncodeRequest, McpConfigurationCapability, OutboundDialectEncoder,
+};
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{AcpPromptEncoder, AcpPromptWireShape, ChannelRegistry, HeadlessPromptEncoder};
 use std::sync::Arc;
@@ -73,6 +75,13 @@ fn six_profile_bindings_register_and_validate() {
     ];
     for b in &bindings {
         assert!(b.descriptor().validate().is_ok(), "{}", b.id.as_str());
+        // D-042: initial profiles MUST NOT declare Refreshable MCP.
+        assert_ne!(
+            b.descriptor().capabilities.mcp_configuration,
+            McpConfigurationCapability::Refreshable,
+            "{} must not declare Refreshable (DECISIONS D-042)",
+            b.id.as_str()
+        );
     }
     let reg = ChannelRegistry::build(bindings).unwrap();
     assert_eq!(reg.iter().count(), 6);

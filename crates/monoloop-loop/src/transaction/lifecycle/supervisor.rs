@@ -14,7 +14,7 @@ use crate::transaction::bootstrap::{
     FinalizerHoldGate, JoinOnlySpillInject, StartHoldGate, StoppedGate,
 };
 use crate::transaction::channel_registry::LiveChannel;
-use crate::transaction::dispatcher::RuntimeToolSpill;
+use crate::transaction::dispatcher::OrphanToolPermitSet;
 use crate::transaction::host_tools::HostToolRegistry;
 use crate::transaction::mcp::{McpGatewayHandle, PreparedMcpGateway};
 use crate::transaction::tool_capacity::SharedToolCapacity;
@@ -105,16 +105,18 @@ pub(crate) struct RuntimeShared {
     pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
     /// When `Some`, spawn a never-awaiting RuntimeService that signals before park.
     pub inject_non_yielding_service: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// When `Some`, park a JoinOnly tool join on `tool_spill` at supervisor start.
+    /// When `Some`, register TaskSupervisor-owned JoinOnly-style work at start.
     pub inject_join_only_spill: Option<Arc<JoinOnlySpillInject>>,
     /// Host tool definitions available to admission / coordinators.
     pub tools_registry: HostToolRegistry,
     /// Process-wide concurrent tool execution budget.
     pub shared_tool_capacity: Arc<SharedToolCapacity>,
     /// Runtime-scoped unfinished tool joins/permits (Law 8 — not process-global).
-    pub tool_spill: Arc<RuntimeToolSpill>,
+    pub tool_spill: Arc<OrphanToolPermitSet>,
     /// Live ProcessIsolated OS children (§18.2 ShutdownSnapshot.owned_processes).
     pub owned_processes: Arc<AtomicU32>,
+    /// Runtime admission / capacity limits (D-035 input accounting uses these).
+    pub transaction_limits: monoloop_contracts::TransactionLimits,
 }
 
 impl RuntimeShared {
@@ -192,17 +194,20 @@ pub(crate) async fn run_supervisor(
             }
         });
     }
-    // §22.4 / Law 23: JoinOnly parked on runtime spill must block Stopped
-    // (abort_abortables skips may_abort=false). Test-only inject.
+    // §22.4 / Law 23 / M5.4: JoinOnly-style work under TaskSupervisor (not spill,
+    // not ambient tokio::spawn). Park the worker thread so abort cannot join
+    // until release() unparks — same abort-resistance as §22.3 sacrificial.
     if let Some(inject) = shared.inject_join_only_spill.clone() {
-        let spill = Arc::clone(&shared.tool_spill);
-        let inject_wait = Arc::clone(&inject);
-        let join = tokio::spawn(async move {
-            inject_wait.wait_released().await;
+        tasks.spawn(TaskClass::RuntimeService, async move {
+            inject.store_parked_thread(std::thread::current());
+            inject.mark_entered();
+            loop {
+                if inject.is_released() {
+                    break;
+                }
+                std::thread::park();
+            }
         });
-        // may_abort=false ⇒ cooperative JoinOnly (not aborted at quiesce).
-        spill.park(join, None, false);
-        inject.mark_entered();
     }
     shared
         .owned_tasks
@@ -273,7 +278,7 @@ pub(crate) async fn run_supervisor(
         }
 
         if stopping {
-            // Drain AbortableAtYield; release join-less orphans; JoinOnly blocks Stopped.
+            // Release orphan tool permits (capacity); joins are TaskSupervisor-owned.
             let _ = shared.tool_spill.shutdown_progress();
 
             // Drive residual abort every lap so coordinator/tool work cannot
@@ -332,25 +337,23 @@ pub(crate) async fn run_supervisor(
             }
             // Ledger may have been re-populated if a late WorkerExited arrived.
             if shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true) {
-                // Tool spill must be empty before Stopped (Law 23 / §7 / §21).
-                let spill_pending = shared.tool_spill.shutdown_progress();
-                if tasks.is_empty() && spill_pending == 0 {
+                // M5.4: orphan permits never block Stopped after quiesce release.
+                let _ = shared.tool_spill.shutdown_progress();
+                if tasks.is_empty() {
                     ready_to_stop = true;
-                } else if !tasks.is_empty() {
+                } else {
                     // One bounded drain; on timeout fall through to select (50ms
                     // tick) — never tight-loop abort_and_drain (§18.2 / Drop).
                     if tasks.abort_and_drain().await {
-                        let spill_pending = shared.tool_spill.shutdown_progress();
+                        let _ = shared.tool_spill.shutdown_progress();
                         ready_to_stop = shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true)
-                            && tasks.is_empty()
-                            && spill_pending == 0;
+                            && tasks.is_empty();
                     } else {
                         shared
                             .owned_tasks
                             .store(tasks.registered_count() as u32, Ordering::SeqCst);
                     }
                 }
-                // else: spill still holds JoinOnly/orphans — stay Quiescing.
             }
         }
         if ready_to_stop {
@@ -401,6 +404,16 @@ pub(crate) async fn run_supervisor(
                 if let Some(StartCommand::Start(tx)) = start {
                     if shared.state.load(Ordering::SeqCst) == STATE_ACCEPTING {
                         handle_start(&shared, &mut tasks, tx);
+                    } else if stopping {
+                        // Late Start after Quiescing: entry was already snapshotted
+                        // (or must still terminalize). Never drop a Queued admit.
+                        accept_terminal(
+                            &shared,
+                            &mut tasks,
+                            tx,
+                            TerminalProposal::new(TransactionEndKind::RuntimeShutdown),
+                            false,
+                        );
                     }
                 }
             }
@@ -698,13 +711,17 @@ async fn finalize_after_terminal(
     }
 
     let end = end_event(tx, channel_id, session_id, kind, last_seq);
+    // Snapshot live ownership at completion publish (§18.2 honesty — no hardcodes).
+    let owned_tasks = shared.owned_tasks.load(Ordering::SeqCst);
+    let owned_processes = shared.owned_processes.load(Ordering::SeqCst);
+    let cooperative_tools = shared.tool_spill.pending_count() as u32;
     let completion = build_completion(
         end,
         terminal_delivery,
         CleanupStatus::Pending {
-            owned_tasks: 1,
-            owned_processes: 0,
-            cooperative_tools: 0,
+            owned_tasks,
+            owned_processes,
+            cooperative_tools,
         },
     );
     if let Some(sender) = completion_tx {
@@ -740,26 +757,26 @@ fn begin_shutdown_inner(
     tasks: &mut TaskSupervisor,
     stopping: &mut bool,
 ) {
-    let _ = shared.state.compare_exchange(
-        STATE_ACCEPTING,
-        STATE_QUIESCING,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    );
-    if shared.state.load(Ordering::SeqCst) == STATE_STARTING {
-        shared.state.store(STATE_QUIESCING, Ordering::SeqCst);
-    }
+    // §18.2 / D-010: flip Quiescing and snapshot ids under the admit install lock.
+    let ids = {
+        let ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = shared.state.compare_exchange(
+            STATE_ACCEPTING,
+            STATE_QUIESCING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        if shared.state.load(Ordering::SeqCst) == STATE_STARTING {
+            shared.state.store(STATE_QUIESCING, Ordering::SeqCst);
+        }
+        ledger.transaction_ids()
+    };
     *stopping = true;
     // Revoke MCP routes + cancel axum serve so RuntimeService can join (§17).
     super::mcp_listener::signal_mcp_shutdown(shared);
     // Wake any other runtime-wide waiters (D-043).
     shared.wake.notify_waiters();
 
-    let ids = shared
-        .ledger
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .transaction_ids();
     for tx in ids {
         let already = {
             let ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
