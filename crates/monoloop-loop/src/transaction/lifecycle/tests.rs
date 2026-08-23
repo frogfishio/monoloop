@@ -1467,6 +1467,57 @@ fn shutdown_control_not_starved_when_start_queue_full() {
     }
 }
 
+/// D-049: wait_stopped budget covers executor teardown join; Stopped only after join.
+#[test]
+fn wait_stopped_times_out_during_executor_teardown_then_completes() {
+    use crate::transaction::state::RuntimeState;
+
+    let gate = Arc::new(StoppedGate::new());
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            hold_executor_teardown: Some(Arc::clone(&gate)),
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (_r, _recv) = submit(&handle, Some("teardown")).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut owner = started.owner;
+    owner.begin_shutdown();
+    // Drain can complete quickly; join waits on teardown gate — short wait TimedOut.
+    let first = rt.block_on(owner.wait_stopped(Duration::from_millis(50)));
+    assert!(
+        matches!(first, ShutdownWaitOutcome::TimedOut(_)),
+        "D-049: short wait during executor teardown must TimedOut, got {first:?}"
+    );
+    assert_eq!(
+        owner.state(),
+        RuntimeState::Quiescing,
+        "public state must stay Quiescing until OS thread join"
+    );
+    gate.release();
+    let second = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(
+        matches!(second, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped after teardown release + join, got {second:?}"
+    );
+    assert_eq!(owner.state(), RuntimeState::Stopped);
+}
+
 /// D-040 / §22.1: short wait MUST TimedOut while Quiescing (not conditional Stopped).
 #[test]
 fn short_wait_may_timeout_while_quiescing_then_complete() {

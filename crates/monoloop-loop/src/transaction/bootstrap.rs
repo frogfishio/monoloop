@@ -198,7 +198,7 @@ pub struct RuntimeConfig {
     pub enable_mcp_listener: bool,
     /// Maximum time to wait for graceful drain during shutdown when not specified.
     pub default_shutdown_deadline: Duration,
-    /// When `Some`, supervisor defers `Stopped` until the gate is released.
+    /// When `Some`, supervisor defers drain-complete until the gate is released.
     /// Production leaves this `None`; §22.5 TimedOut proofs set it.
     pub block_stopped: Option<Arc<StoppedGate>>,
     /// When `Some`, supervisor skips draining `Start` while the gate is held.
@@ -211,6 +211,9 @@ pub struct RuntimeConfig {
     /// When `Some`, Finalizer waits after Seal before completion send (§22.2).
     /// Production leaves this `None`.
     pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
+    /// When `Some`, the executor OS thread waits here after supervisor drain and
+    /// before `shutdown_timeout` (D-049). Production leaves this `None`.
+    pub hold_executor_teardown: Option<Arc<StoppedGate>>,
     /// When `Some`, supervisor registers a never-awaiting `RuntimeService` that
     /// stores `true` on this flag immediately before parking (§22.3 sacrificial).
     /// Production leaves this `None`.
@@ -231,6 +234,7 @@ impl Default for RuntimeConfig {
             hold_start: None,
             start_queue_capacity: None,
             hold_finalizer_after_seal: None,
+            hold_executor_teardown: None,
             inject_non_yielding_service: None,
             inject_join_only_spill: None,
         }

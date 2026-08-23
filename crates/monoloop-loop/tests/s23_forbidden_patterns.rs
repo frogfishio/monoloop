@@ -127,6 +127,10 @@ fn s23_exact_limit_plus_one_inventory_present() {
         ),
         (
             "src/transaction/lifecycle/tests.rs",
+            "wait_stopped_times_out_during_executor_teardown_then_completes",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
             "capacity_plus_one_rejects",
         ),
         (

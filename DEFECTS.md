@@ -3153,7 +3153,7 @@ lease was dropped rather than because the child was reaped. This violates v2
 
 **Priority:** P1
 
-**Status:** Open (independent acceptance review, 2026-08-23)
+**Status:** Fixed (2026-08-23)
 
 **Affected:**
 - `crates/monoloop-loop/src/transaction/lifecycle/owner.rs`
@@ -3169,19 +3169,20 @@ runtime state can report `Stopped` while the supervisor future, executor, and OS
 thread are still alive. This contradicts v2 §3 and §18.2: the wait deadline must
 bound the entire API operation, and only `Stopped` may prove executor/thread join.
 
-**Required remediation:**
-- Separate supervisor `Drained`/`ReadyToJoin` from public `Stopped`.
-- Account for elapsed time when waiting for the OS thread to finish.
-- If the thread is not finished within the remaining wait budget, return
-  `TimedOut` and retain the join handle.
-- Publish `Stopped` only from owner-side logic after the thread join is observed.
+**Remediation (Fixed):**
+- Supervisor sets `drain_complete` (stays Quiescing); does **not** publish
+  public `STATE_STOPPED`.
+- Executor thread signals `thread_exited` after `shutdown_timeout`.
+- `wait_stopped` budgets drain wait + join wait; on join timeout retains
+  `JoinHandle` + exited receiver; publishes `Stopped` only after join.
+- Test gate `hold_executor_teardown` delays teardown for deterministic proof.
 
 **Acceptance criteria:**
-- [ ] `wait_stopped(short)` returns within tolerance even when executor teardown
-  is deliberately delayed after supervisor drain.
-- [ ] State remains `Quiescing` while the executor thread is alive.
-- [ ] A subsequent wait joins the same retained handle and returns `Stopped`.
-- [ ] No public handle can observe `Stopped` before executor/thread join.
+- [x] `wait_stopped(short)` TimedOut during delayed teardown
+  (`wait_stopped_times_out_during_executor_teardown_then_completes`).
+- [x] State remains `Quiescing` while the executor thread is alive.
+- [x] A subsequent wait joins the retained handle and returns `Stopped`.
+- [x] No public handle observes `Stopped` before executor/thread join.
 
 ## D-050: Abortable tool ownership still relies on self-asserted booleans
 
@@ -3410,5 +3411,14 @@ slice only. Registry parks live `ToolKillHandle` until reap; Stopped requires
 sacrificial abort-after-spawn PID-not-waitable proof. Do **not** promote
 Golden / §25 / D-025.
 
-**Next pick:** D-049 (`wait_stopped` deadline covers executor-thread join).
-Do not promote Golden / §25 / D-025 while D-049–D-054 remain open.
+**Remediation progress:** D-046–D-049 Fixed.
+
+**Expert + Advisor (2026-08-23, D-049 Fixed):** **PASS — Silver** for this
+slice only. Supervisor signals `drain_complete` without public `Stopped`;
+executor thread signals `thread_exited` after `shutdown_timeout`;
+`wait_stopped` budgets drain + join and retains the handle on timeout;
+`hold_executor_teardown` proves TimedOut→Quiescing then Stopped after join.
+Do **not** promote Golden / §25 / D-025.
+
+**Next pick:** D-050 (AbortableAtYield structural factory — no self-asserted
+boolean). Do not promote Golden / §25 / D-025 while D-050–D-054 remain open.

@@ -13,7 +13,7 @@ use super::ledger::LifecycleLedger;
 use super::mcp_listener::DEFAULT_MCP_MAX_ROUTES;
 use super::shutdown::ShutdownTicket;
 use super::supervisor::{
-    run_supervisor, wait_until_stopped, ControlCommand, RuntimeShared, STATE_ACCEPTING,
+    run_supervisor, wait_until_drain_complete, ControlCommand, RuntimeShared, STATE_ACCEPTING,
     STATE_QUIESCING, STATE_STARTING, STATE_STOPPED,
 };
 use crate::transaction::mcp::McpGateway;
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle as OsJoinHandle;
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// Unique owner of the executor, supervisor, ledger, connectors, and shutdown state.
 #[must_use = "RuntimeOwner must begin_shutdown and wait_stopped until Stopped"]
@@ -34,6 +34,8 @@ pub struct RuntimeOwner {
     shared: Arc<RuntimeShared>,
     /// Dedicated OS thread that owns the Tokio runtime.
     thread: Option<OsJoinHandle<()>>,
+    /// Signaled after executor `shutdown_timeout` completes (D-049).
+    thread_exited: Option<oneshot::Receiver<()>>,
     pool: Arc<ReservationPool>,
     /// Realized Connector instances (owner-held; handle clones the Arc for lookup).
     channels: Arc<HashMap<ChannelId, LiveChannel>>,
@@ -156,8 +158,10 @@ impl StartedRuntime {
             block_stopped: bootstrap.config.block_stopped.clone(),
             hold_start: bootstrap.config.hold_start.clone(),
             hold_finalizer_after_seal: bootstrap.config.hold_finalizer_after_seal.clone(),
+            hold_executor_teardown: bootstrap.config.hold_executor_teardown.clone(),
             inject_non_yielding_service: bootstrap.config.inject_non_yielding_service,
             inject_join_only_spill: bootstrap.config.inject_join_only_spill.clone(),
+            drain_complete: std::sync::atomic::AtomicBool::new(false),
             tools_registry: bootstrap.tools.clone(),
             shared_tool_capacity: crate::transaction::tool_capacity::SharedToolCapacity::new(
                 bootstrap
@@ -176,6 +180,8 @@ impl StartedRuntime {
         });
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartupError>>();
+        let (exited_tx, exited_rx) = oneshot::channel::<()>();
+        let teardown_gate = bootstrap.config.hold_executor_teardown.clone();
         let shared_thread = Arc::clone(&shared);
         let mcp_max_routes = bootstrap
             .config
@@ -258,9 +264,19 @@ impl StartedRuntime {
                     )
                     .await;
                 });
+                // D-049: optional test gate after drain, before executor teardown.
+                if let Some(gate) = teardown_gate {
+                    let rt_gate = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build();
+                    if let Ok(rt_gate) = rt_gate {
+                        rt_gate.block_on(gate.wait_released());
+                    }
+                }
                 // Bounded executor teardown so Drop/join cannot strand on
                 // residual background work after the supervisor has returned.
                 rt.shutdown_timeout(Duration::from_secs(2));
+                let _ = exited_tx.send(());
             })
             .map_err(|_| StartupError::ExecutorUnavailable)?;
 
@@ -283,6 +299,7 @@ impl StartedRuntime {
         let owner = RuntimeOwner {
             shared,
             thread: Some(thread),
+            thread_exited: Some(exited_rx),
             pool,
             channels,
         };
@@ -381,24 +398,62 @@ impl RuntimeOwner {
     }
 
     /// Wait until Stopped or the deadline elapses (v2: timeout ⇒ Quiescing, not false Stopped).
+    ///
+    /// D-049: the deadline bounds the **entire** API — including the executor OS
+    /// thread join. Public `Stopped` is published only after that join.
     pub async fn wait_stopped(&mut self, deadline: Duration) -> ShutdownWaitOutcome {
         if self.shared.state.load(Ordering::SeqCst) == STATE_ACCEPTING {
             let _ = self.begin_shutdown();
         }
-        // While Quiescing, keep re-announcing so a dropped BeginShutdown / missed
-        // wake cannot strand shutdown (D-039).
-        let outcome = wait_until_stopped(&self.shared, deadline).await;
-        if matches!(outcome, ShutdownWaitOutcome::Stopped(_)) {
-            let _ = self
+        if self.shared.state.load(Ordering::SeqCst) == STATE_STOPPED && self.thread.is_none() {
+            let report = self
                 .shared
-                .control_tx
-                .try_send(ControlCommand::StopSupervisor);
-            self.shared.wake.notify_one();
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+                .shutdown_report
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_else(|| self.shared.final_report());
+            return ShutdownWaitOutcome::Stopped(report);
+        }
+
+        let start = tokio::time::Instant::now();
+        // Phase 1: supervisor drain (state stays Quiescing until join).
+        if let Err(timed_out) = wait_until_drain_complete(&self.shared, deadline).await {
+            return timed_out;
+        }
+
+        let _ = self
+            .shared
+            .control_tx
+            .try_send(ControlCommand::StopSupervisor);
+        self.shared.wake.notify_one();
+
+        // Phase 2: wait for executor thread exit within remaining budget.
+        let remaining = deadline.saturating_sub(start.elapsed());
+        if let Some(rx) = self.thread_exited.as_mut() {
+            match tokio::time::timeout(remaining, &mut *rx).await {
+                Ok(Ok(())) | Ok(Err(_)) => {
+                    self.thread_exited = None;
+                }
+                Err(_) => {
+                    // Retain join handle + exited receiver for a later wait.
+                    return ShutdownWaitOutcome::TimedOut(self.shared.snapshot());
+                }
             }
         }
-        outcome
+        if let Some(thread) = self.thread.take() {
+            // Exited signal observed — join should return promptly.
+            let _ = thread.join();
+        }
+        self.shared.state.store(STATE_STOPPED, Ordering::SeqCst);
+        let report = self
+            .shared
+            .shutdown_report
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.shared.final_report());
+        ShutdownWaitOutcome::Stopped(report)
     }
 }
 
@@ -412,6 +467,9 @@ impl Drop for RuntimeOwner {
             gate.release();
         }
         if let Some(gate) = self.shared.hold_finalizer_after_seal.as_ref() {
+            gate.release();
+        }
+        if let Some(gate) = self.shared.hold_executor_teardown.as_ref() {
             gate.release();
         }
         if let Some(inject) = self.shared.inject_join_only_spill.as_ref() {
@@ -432,15 +490,17 @@ impl Drop for RuntimeOwner {
         // untrusted work and complete explicit shutdown before dropping.
         if let Some(thread) = self.thread.take() {
             // Observe the join either way — panic on the executor thread is still
-            // ownership-complete (§18.4). Do not invent Stopped here.
+            // ownership-complete (§18.4). Publish Stopped only after join (D-049).
             match thread.join() {
-                Ok(()) => {}
+                Ok(()) => {
+                    self.shared.state.store(STATE_STOPPED, Ordering::SeqCst);
+                }
                 Err(_) => {
-                    // Contract-violation Drop path: executor panicked. Join was
-                    // observed; leave supervisor-written state untouched.
+                    self.shared.state.store(STATE_STOPPED, Ordering::SeqCst);
                 }
             }
         }
+        self.thread_exited = None;
     }
 }
 

@@ -97,16 +97,21 @@ pub(crate) struct RuntimeShared {
     pub mcp_gateway: Mutex<Option<McpGatewayHandle>>,
     /// Cancels the MCP axum serve future on quiesce.
     pub mcp_cancel: Mutex<Option<CancellationToken>>,
-    /// When `Some`, defer `Stopped` until the gate is released (§22.5).
+    /// When `Some`, defer drain-complete until the gate is released (§22.5).
     pub block_stopped: Option<Arc<StoppedGate>>,
     /// When `Some` and held, supervisor does not drain the start queue (D-040).
     pub hold_start: Option<Arc<StartHoldGate>>,
     /// When `Some`, Finalizer waits after Seal before completion send (§22.2).
     pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
+    /// When `Some`, executor thread waits after drain before teardown (D-049).
+    pub hold_executor_teardown: Option<Arc<StoppedGate>>,
     /// When `Some`, spawn a never-awaiting RuntimeService that signals before park.
     pub inject_non_yielding_service: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// When `Some`, register TaskSupervisor-owned JoinOnly-style work at start.
     pub inject_join_only_spill: Option<Arc<JoinOnlySpillInject>>,
+    /// Supervisor finished drain; OS thread may still be in executor teardown (D-049).
+    /// Public `Stopped` is published by the owner only after thread join.
+    pub drain_complete: std::sync::atomic::AtomicBool,
     /// Host tool definitions available to admission / coordinators.
     pub tools_registry: HostToolRegistry,
     /// Process-wide concurrent tool execution budget.
@@ -377,11 +382,14 @@ pub(crate) async fn run_supervisor(
             if let Some(gate) = shared.block_stopped.as_ref() {
                 gate.wait_released().await;
             }
-            shared.state.store(STATE_STOPPED, Ordering::SeqCst);
+            // D-049: drain-complete ≠ public Stopped. Owner publishes Stopped
+            // only after the executor OS thread join is observed.
             *shared
                 .shutdown_report
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(shared.final_report());
+            shared.drain_complete.store(true, Ordering::SeqCst);
+            shared.wake.notify_waiters();
             return;
         }
 
@@ -876,24 +884,25 @@ fn force_remove_tombstone(shared: &Arc<RuntimeShared>, tx: &TransactionId) {
     let _ = ledger.remove(tx);
 }
 
-/// Wait helper used by owner.
-pub(crate) async fn wait_until_stopped(
+/// Wait until supervisor drain is complete (D-049) or the deadline elapses.
+///
+/// Does **not** mean public `Stopped` — the owner must still join the executor
+/// OS thread before publishing `STATE_STOPPED`.
+pub(crate) async fn wait_until_drain_complete(
     shared: &Arc<RuntimeShared>,
     deadline: Duration,
-) -> monoloop_contracts::ShutdownWaitOutcome {
+) -> Result<(), monoloop_contracts::ShutdownWaitOutcome> {
     let start = tokio::time::Instant::now();
     loop {
-        if shared.state.load(Ordering::SeqCst) == STATE_STOPPED {
-            let report = shared
-                .shutdown_report
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-                .unwrap_or_else(|| shared.final_report());
-            return monoloop_contracts::ShutdownWaitOutcome::Stopped(report);
+        if shared.state.load(Ordering::SeqCst) == STATE_STOPPED
+            || shared.drain_complete.load(Ordering::SeqCst)
+        {
+            return Ok(());
         }
         if start.elapsed() >= deadline {
-            return monoloop_contracts::ShutdownWaitOutcome::TimedOut(shared.snapshot());
+            return Err(monoloop_contracts::ShutdownWaitOutcome::TimedOut(
+                shared.snapshot(),
+            ));
         }
         // D-039: while Quiescing, re-send BeginShutdown + wake so a dropped
         // control command or missed notify cannot strand shutdown.
