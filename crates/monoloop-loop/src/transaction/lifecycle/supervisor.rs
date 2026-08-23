@@ -548,8 +548,19 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
     let pub_tx_task = pub_tx.clone();
     let channel_id_pub = channel_id.clone();
     let session_id_pub = session_id.clone();
+    let cancel_pub = Arc::clone(&cancel);
+    let deadline_pub = std::time::Instant::now() + deadline;
     tasks.spawn(TaskClass::EventPublisher(tx), async move {
-        let _ = run_event_publisher(tx, channel_id_pub, session_id_pub, event_tx, pub_rx).await;
+        let _ = run_event_publisher(
+            tx,
+            channel_id_pub,
+            session_id_pub,
+            event_tx,
+            pub_rx,
+            cancel_pub,
+            deadline_pub,
+        )
+        .await;
         let _ = pub_tx_task;
     });
 
@@ -671,6 +682,7 @@ async fn finalize_after_terminal(
     // D-041: never-attempted is not Published (spec §6.4).
     let mut terminal_delivery = TerminalEventDelivery::NotAttempted;
     let mut last_seq = 0u64;
+    let mut kind = kind;
     if let Some(cmd_tx) = pub_cmd {
         let (reply_tx, reply_rx) = oneshot::channel();
         let terminal = end_event(tx, channel_id.clone(), session_id.clone(), kind, 0);
@@ -680,9 +692,10 @@ async fn finalize_after_terminal(
             reply: reply_tx,
         }) {
             Ok(()) => {
-                if let Ok(Ok(res)) =
-                    tokio::time::timeout(Duration::from_millis(200), reply_rx).await
-                {
+                // Publisher may still be draining an ordinary wait; allow up to
+                // cleanup budget rather than a fixed 200ms (D-047).
+                let seal_wait = shared.cleanup_deadline.max(Duration::from_millis(200));
+                if let Ok(Ok(res)) = tokio::time::timeout(seal_wait, reply_rx).await {
                     terminal_delivery = res.delivery;
                     last_seq = res.last_sequence;
                 } else {
@@ -694,6 +707,25 @@ async fn finalize_after_terminal(
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 terminal_delivery = TerminalEventDelivery::DeadlineExceeded;
+            }
+        }
+    }
+
+    // D-047: sticky ordinary/establish publication failure must not report
+    // Completed / ContinuationRequired with a truncated event stream.
+    if matches!(
+        terminal_delivery,
+        TerminalEventDelivery::LimitExceeded
+            | TerminalEventDelivery::DeadlineExceeded
+            | TerminalEventDelivery::QueueClosed
+    ) && matches!(
+        kind,
+        TransactionEndKind::Completed | TransactionEndKind::ContinuationRequired
+    ) {
+        kind = TransactionEndKind::EventDeliveryFailed;
+        if let Ok(mut ledger) = shared.ledger.lock() {
+            if let Some(entry) = ledger.get_mut(&tx) {
+                entry.terminal = Some(TerminalDecision::new(kind));
             }
         }
     }

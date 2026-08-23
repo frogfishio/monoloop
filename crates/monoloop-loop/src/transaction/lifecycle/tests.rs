@@ -2336,6 +2336,8 @@ async fn event_publisher_prefers_authoritative_session_on_seal() {
         None,
         delivery.event_tx,
         cmd_rx,
+        Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
+        std::time::Instant::now() + Duration::from_secs(30),
     ));
 
     // First ordinary event invents tx-{id}.
@@ -3960,6 +3962,8 @@ async fn s22_2_no_event_after_terminal_attempt() {
         None,
         delivery.event_tx,
         cmd_rx,
+        Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
+        std::time::Instant::now() + Duration::from_secs(30),
     ));
 
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -4003,7 +4007,8 @@ async fn s22_2_no_event_after_terminal_attempt() {
     let _ = pub_task.await;
 }
 
-/// §22.2: failed ordinary enqueue does not consume sequence (publisher unit path).
+/// D-047 / §22.2: full mailbox waits; drain preserves contiguous sequences and
+/// payload count (no silent drop).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s22_2_failed_enqueue_consumes_no_sequence() {
     use super::event_publisher::{run_event_publisher, EventPublisherCommand};
@@ -4015,7 +4020,6 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
 
     let tx_id = TransactionId::generate();
     let channel = ChannelId::try_new("llm").unwrap();
-    // Tiny mailbox: first event fills it; second fails without advancing seq.
     let (delivery, mut receiver) =
         transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
@@ -4025,6 +4029,66 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
         None,
         delivery.event_tx,
         cmd_rx,
+        Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
+        std::time::Instant::now() + Duration::from_secs(30),
+    ));
+
+    let diag = |tag: &str| {
+        TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+            diagnostic: SafeDiagnostic::try_new("noop", Some(tag), 64).unwrap(),
+        })
+    };
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(diag("a"))))
+        .await
+        .unwrap();
+    // Fill capacity 1 without draining — second publish waits (D-047), does not drop.
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(diag("b"))))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let first = receiver.events.recv().await.expect("first");
+    assert_eq!(first.sequence, 1);
+    let second = receiver.events.recv().await.expect("second after wait");
+    assert_eq!(second.sequence, 2);
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(diag("c"))))
+        .await
+        .unwrap();
+    let third = receiver.events.recv().await.expect("third");
+    assert_eq!(third.sequence, 3, "contiguous after waited enqueue");
+    drop(cmd_tx);
+    let _ = pub_task.await;
+}
+
+/// D-047: permanently full host queue → sticky DeadlineExceeded on Seal (not
+/// Published / Completed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d047_full_queue_seal_reports_deadline_not_published() {
+    use super::event_publisher::{run_event_publisher, EventPublisherCommand, TerminalPublicationResult};
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, SafeDiagnostic, TerminalEventDelivery,
+        TransactionDiagnostic, TransactionEndEvent, TransactionEndKind, TransactionEventPayload,
+        TransactionId, TransactionUsage,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    let (delivery, _receiver) =
+        transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let cancel = Arc::new(crate::transaction::sticky_cancel::StickyCancel::new());
+    // Short deadline so the waiting second publish fails closed.
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel.clone(),
+        None,
+        delivery.event_tx,
+        cmd_rx,
+        Arc::clone(&cancel),
+        std::time::Instant::now() + Duration::from_millis(80),
     ));
 
     let diag = || {
@@ -4036,35 +4100,37 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
         .send(EventPublisherCommand::Publish(Box::new(diag())))
         .await
         .unwrap();
-    let first = receiver.events.recv().await.expect("first");
-    assert_eq!(first.sequence, 1);
+    // Do not drain — second publish waits until deadline.
+    cmd_tx
+        .send(EventPublisherCommand::Publish(Box::new(diag())))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
 
-    // Fill: leave first undrained after re-send... actually we drained first.
-    // Re-publish without draining to fill capacity 1, then fail second.
+    let (reply_tx, reply_rx) = oneshot::channel();
     cmd_tx
-        .send(EventPublisherCommand::Publish(Box::new(diag())))
+        .send(EventPublisherCommand::Seal {
+            terminal: TransactionEndEvent {
+                transaction_id: tx_id,
+                session_id: None,
+                channel_id: channel,
+                kind: TransactionEndKind::Completed,
+                emitted_events: 0,
+                usage: TransactionUsage::default(),
+                diagnostics: vec![],
+            },
+            reply: reply_tx,
+        })
         .await
         .unwrap();
-    // Do not recv — mailbox full (capacity 1). Next publish must not consume sequence.
-    cmd_tx
-        .send(EventPublisherCommand::Publish(Box::new(diag())))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    let second = receiver.events.recv().await.expect("second");
-    assert_eq!(second.sequence, 2);
-    // Failed third publish left next_seq at 3 only if it had succeeded; it failed,
-    // so a subsequent successful publish must still be sequence 3 (contiguous).
-    cmd_tx
-        .send(EventPublisherCommand::Publish(Box::new(diag())))
-        .await
-        .unwrap();
-    let third = receiver.events.recv().await.expect("third after drain");
+    let res: TerminalPublicationResult = reply_rx.await.expect("seal reply");
     assert_eq!(
-        third.sequence, 3,
-        "failed enqueue must not skip sequence; got {}",
-        third.sequence
+        res.delivery,
+        TerminalEventDelivery::DeadlineExceeded,
+        "sticky wait failure must surface on Seal, got {:?}",
+        res.delivery
     );
+    assert_eq!(res.last_sequence, 1, "only the first event committed");
     drop(cmd_tx);
     let _ = pub_task.await;
 }
@@ -4090,6 +4156,8 @@ async fn s22_6_session_established_is_sequence_one() {
         None,
         delivery.event_tx,
         cmd_rx,
+        Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
+        std::time::Instant::now() + Duration::from_secs(30),
     ));
 
     let external = ExternalSessionId::try_new("grok-ext-1").unwrap();
@@ -4152,6 +4220,8 @@ async fn s22_6_concurrent_producers_contiguous_sequence() {
         None,
         delivery.event_tx,
         cmd_rx,
+        Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
+        std::time::Instant::now() + Duration::from_secs(30),
     ));
 
     let mut joins = Vec::new();
@@ -4295,6 +4365,8 @@ async fn s22_6_establish_external_capacity_fail_does_not_steal_seq1() {
         None,
         delivery.event_tx,
         cmd_rx,
+        Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
+        std::time::Instant::now() + Duration::from_secs(30),
     ));
 
     let external = ExternalSessionId::try_new("grok-retry").unwrap();

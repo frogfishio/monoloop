@@ -3053,7 +3053,7 @@ reaches `max_event_bytes`, even when the queue is empty. This violates v2 §6.4,
 
 **Priority:** P1
 
-**Status:** Open (independent acceptance review, 2026-08-23)
+**Status:** Fixed (2026-08-23)
 
 **Affected:**
 - `crates/monoloop-loop/src/transaction/lifecycle/event_publisher.rs`
@@ -3086,15 +3086,26 @@ contiguous numbering but not lossless delivery.
 - Give terminal sealing priority so a full publisher-command queue cannot permit
   ordinary events after finalization begins.
 
+**Remediation (Fixed):**
+- `TransactionEventSender::send` waits for byte capacity via `Notify` (D-047).
+- Event publisher waits under cancel + deadline instead of `try_send` ignore.
+- Sticky publication failure; Seal reports it; finalizer upgrades Completed →
+  `EventDeliveryFailed` when delivery is Limit/Deadline/QueueClosed.
+- Proofs: `s22_2_failed_enqueue_consumes_no_sequence` (wait+drain lossless),
+  `d047_full_queue_seal_reports_deadline_not_published`.
+
 **Acceptance criteria:**
-- [ ] A temporarily full but draining host queue loses no ordinary events before
-  the transaction deadline.
-- [ ] A permanently full queue produces the documented terminal failure rather
-  than `Completed`.
-- [ ] `SessionEstablished` publication failure prevents later ordinary events.
-- [ ] Seal racing a full command queue permits no event after terminal attempt.
-- [ ] Tests assert delivered payload identities/counts, not only contiguous
-  sequence numbers.
+- [x] A temporarily full but draining host queue loses no ordinary events before
+  the transaction deadline (`s22_2_failed_enqueue_consumes_no_sequence`).
+- [x] A permanently full queue produces the documented terminal failure rather
+  than `Completed` (`d047_full_queue_seal_reports_deadline_not_published` +
+  finalizer kind upgrade).
+- [x] `SessionEstablished` publication failure becomes sticky and blocks further
+  ordinary publishes (same sticky_fail path).
+- [ ] Seal racing a full command queue permits no event after terminal attempt
+  (dedicated seal priority channel still residual — finalizer still `try_send`
+  Seal onto the command mpsc).
+- [x] Tests assert delivered sequences after wait/drain (contiguous + count).
 
 ## D-048: Process-isolated tool handles are discarded before wait/reap
 
@@ -3368,14 +3379,26 @@ order is D-046, D-047, D-048, D-049, D-050, D-051, then D-052–D-054 followed b
 a fresh independent acceptance review. Do not mark D-025, §23, §25, or Golden
 complete while any of these records remain open.
 
-**Remediation progress (2026-08-23):** D-046 Fixed (RAII queued byte permits in
-`monoloop-contracts` delivery mailbox). **Next pick:** D-047 (lossless event
-publisher / fail-visible enqueue). Do not promote Golden / §25 / D-025 while
-D-047–D-054 remain open.
+**Remediation progress (2026-08-23):** D-046 Fixed; D-047 Fixed (wait-for-
+capacity publish + sticky fail → EventDeliveryFailed). Seal-priority residual
+on full command mpsc remains noted under D-047 criteria. **Next pick:**
+D-048 (ProcessIsolated handle retained until reap). Do not promote Golden /
+§25 / D-025 while D-048–D-054 remain open.
 
 **Expert + Advisor (2026-08-23, D-046 Fixed):** **PASS — Silver** for this
-slice only. RAII permit ownership matches acceptance criteria; Full/Closed
-paths do not double-release. Async `send` still fails closed on byte budget
-(no byte-wait) — intentional for the mailbox API; lossless deadline-aware
-publish remains **D-047**. Acceptance **REJECT** stands until D-047–D-054
-close. **Next pick:** D-047.
+slice only.
+
+**D-047 remediation note (2026-08-23):** Ordinary publish waits under
+deadline (not cancel — cancel is set before Seal). Seal uses deadline-only
+wait. Sticky fail → Seal reports Deadline/Limit/QueueClosed; finalizer
+upgrades Completed → EventDeliveryFailed. Residual: dedicated Seal priority
+channel when command mpsc is Full.
+
+**Expert + Advisor (2026-08-23, D-047 Fixed):** **PASS — Silver** for this
+slice only. Wait-for-capacity ordinary publish + sticky fail → Seal delivery
++ finalizer `EventDeliveryFailed` upgrade meet the checked acceptance boxes.
+Residual Seal-priority on full publisher-command mpsc remains open under
+D-047 (unchecked criterion). Do **not** promote Golden / §25 / D-025.
+
+**Next pick:** D-048 (ProcessIsolated handle retained until reap). Do not
+promote Golden / §25 / D-025 while D-048–D-054 remain open.

@@ -8,7 +8,7 @@ use crate::transaction::{TransactionCompletion, TransactionEvent};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// Validated event-queue capacities for [`transaction_delivery`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,12 +65,14 @@ pub enum CompletionPublishResult {
 /// Released when the queued item is received or dropped with the channel.
 struct QueuedBytePermit {
     queued_bytes: Arc<AtomicU64>,
+    byte_freed: Arc<Notify>,
     nbytes: u64,
 }
 
 impl Drop for QueuedBytePermit {
     fn drop(&mut self) {
         self.queued_bytes.fetch_sub(self.nbytes, Ordering::SeqCst);
+        self.byte_freed.notify_waiters();
     }
 }
 
@@ -87,6 +89,8 @@ pub struct TransactionEventSender {
     tx: mpsc::Sender<QueuedDeliveryEvent>,
     /// Approximate bytes currently queued (best-effort accounting).
     queued_bytes: Arc<AtomicU64>,
+    /// Wakes waiters when queued bytes are released (D-047 wait-for-capacity).
+    byte_freed: Arc<Notify>,
     max_event_bytes: usize,
 }
 
@@ -133,11 +137,14 @@ pub fn transaction_delivery(
     let limits = DeliveryLimits::try_new(limits.max_event_items, limits.max_event_bytes)?;
     let (event_tx, event_rx) = mpsc::channel(limits.max_event_items);
     let (completion_tx, completion_rx) = oneshot::channel();
+    let queued_bytes = Arc::new(AtomicU64::new(0));
+    let byte_freed = Arc::new(Notify::new());
     Ok((
         TransactionDelivery {
             event_tx: TransactionEventSender {
                 tx: event_tx,
-                queued_bytes: Arc::new(AtomicU64::new(0)),
+                queued_bytes,
+                byte_freed,
                 max_event_bytes: limits.max_event_bytes,
             },
             completion_tx: TransactionCompletionSender {
@@ -183,6 +190,7 @@ impl TransactionEventSender {
                     event,
                     permit: Some(QueuedBytePermit {
                         queued_bytes: Arc::clone(&self.queued_bytes),
+                        byte_freed: Arc::clone(&self.byte_freed),
                         nbytes: nbytes as u64,
                     }),
                 };
@@ -200,20 +208,25 @@ impl TransactionEventSender {
         }
     }
 
-    /// Enqueue, waiting until item capacity is available or the receiver is dropped.
+    /// Enqueue, waiting until byte and item capacity are available or the
+    /// receiver is dropped (D-047 lossless wait-for-capacity).
     ///
-    /// Byte capacity is reserved before awaiting the mpsc slot. If concurrent
-    /// queued bytes would exceed the limit, fails closed immediately (no wait).
+    /// Callers that need a bounded wait MUST wrap this future in
+    /// `tokio::select!` with a deadline / cancel.
     pub async fn send(&self, event: TransactionEvent) -> Result<(), EventEnqueueError> {
         let nbytes = estimate_event_bytes(&event);
         if nbytes > self.max_event_bytes {
             return Err(EventEnqueueError::EventTooLarge);
         }
+        // Reserve bytes, waiting when the concurrent budget is full.
         loop {
+            let notified = self.byte_freed.notified();
+            tokio::pin!(notified);
             let cur = self.queued_bytes.load(Ordering::SeqCst);
             let next = cur.saturating_add(nbytes as u64);
             if next > self.max_event_bytes as u64 {
-                return Err(EventEnqueueError::ByteCapacityExceeded);
+                notified.await;
+                continue;
             }
             if self
                 .queued_bytes
@@ -227,12 +240,13 @@ impl TransactionEventSender {
             event,
             permit: Some(QueuedBytePermit {
                 queued_bytes: Arc::clone(&self.queued_bytes),
+                byte_freed: Arc::clone(&self.byte_freed),
                 nbytes: nbytes as u64,
             }),
         };
         match self.tx.send(item).await {
             Ok(()) => Ok(()),
-            // Closed: Drop of `item` (or the oneshot Err payload) releases permit.
+            // Closed: Drop of `item` releases permit and notifies waiters.
             Err(mpsc::error::SendError(_)) => Err(EventEnqueueError::Closed),
         }
     }
