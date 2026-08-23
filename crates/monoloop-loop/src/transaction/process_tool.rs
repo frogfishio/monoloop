@@ -135,6 +135,8 @@ impl ToolKillHandle {
     ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send>>) {
         let child_arc = Arc::new(Mutex::new(Some(child)));
         let child_for_wait = Arc::clone(&child_arc);
+        let kill = Self::from_process(Arc::clone(&child_arc));
+        let kill_for_drive = kill.clone();
         let drive = Box::pin(async move {
             let status = loop {
                 if Instant::now() >= wait_deadline {
@@ -181,9 +183,10 @@ impl ToolKillHandle {
                 Some(_) => ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed),
                 None => ToolCompletion::RuntimeFailed(ToolRuntimeError::CompletionLost),
             };
+            kill_for_drive.note_process_reaped();
             let _ = completion_tx.send(completion);
         });
-        (Self::from_process(child_arc), drive)
+        (kill, drive)
     }
 }
 
@@ -241,6 +244,35 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_isolated_owned_processes_counter_tracks_live_child() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = Arc::new(AtomicU32::new(0));
+        let handler = ProcessIsolatedToolHandler::sleep_until_killed(3600);
+        let mut handle = handler.start(call(), ctx()).expect("start");
+        let kill = handle.kill.as_ref().expect("kill");
+        kill.register_owned_process(Arc::clone(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "live child must count");
+        let drive = handle.drive.take().unwrap();
+        let wait = handle.completion.wait();
+        tokio::pin!(drive);
+        tokio::pin!(wait);
+        kill.kill();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                _ = &mut wait => {}
+                _ = &mut drive => { let _ = wait.await; }
+            }
+        })
+        .await
+        .expect("reaped");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "reaped child must release owned_processes"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5,10 +5,29 @@ use monoloop_contracts::{
 };
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Notify};
 use tokio::task::AbortHandle;
+
+/// RAII decrement for [`ShutdownSnapshot::owned_processes`] (§18.2 honesty).
+#[derive(Debug)]
+pub(crate) struct OwnedProcessLease {
+    counter: Arc<AtomicU32>,
+}
+
+impl OwnedProcessLease {
+    fn acquire(counter: Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for OwnedProcessLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Host-linked tool implementation.
 pub trait ToolHandler: Send + Sync {
@@ -134,6 +153,8 @@ enum KillInner {
     Process {
         child: Arc<Mutex<Option<std::process::Child>>>,
         join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+        /// Live until the child is observed reaped (or spill/Drop releases).
+        owned_slot: Mutex<Option<OwnedProcessLease>>,
     },
 }
 
@@ -181,8 +202,38 @@ impl ToolKillHandle {
             inner: Arc::new(KillInner::Process {
                 child,
                 join: Mutex::new(None),
+                owned_slot: Mutex::new(None),
             }),
         }
+    }
+
+    /// Register this ProcessIsolated child in the runtime `owned_processes` count.
+    ///
+    /// Idempotent. Call from the dispatcher after `start` when a shared counter exists.
+    pub fn register_owned_process(&self, counter: Arc<AtomicU32>) {
+        let KillInner::Process { owned_slot, .. } = &*self.inner else {
+            return;
+        };
+        let mut slot = owned_slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(OwnedProcessLease::acquire(counter));
+        }
+    }
+
+    /// Release the owned-process lease once the child is observed reaped.
+    pub fn note_process_reaped(&self) {
+        let KillInner::Process { owned_slot, .. } = &*self.inner else {
+            return;
+        };
+        let _ = owned_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    /// Take the lease for spill parking (keeps `owned_processes` honest across Drop).
+    pub(crate) fn take_process_lease(&self) -> Option<OwnedProcessLease> {
+        let KillInner::Process { owned_slot, .. } = &*self.inner else {
+            return None;
+        };
+        owned_slot.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Abort Tokio task or OS-kill the child (idempotent).
@@ -210,11 +261,18 @@ impl ToolKillHandle {
                 // Inline drive: caller drops/polls the drive future; no join to await.
                 Ok(())
             }
-            KillInner::Process { child, join } => {
+            KillInner::Process {
+                child,
+                join,
+                owned_slot,
+            } => {
                 let handle = join.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some(mut handle) = handle {
                     return match tokio::time::timeout(budget, &mut handle).await {
-                        Ok(_) => Ok(()),
+                        Ok(_) => {
+                            let _ = owned_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                            Ok(())
+                        }
                         Err(_) => {
                             *join.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
                             Err(())
@@ -227,11 +285,19 @@ impl ToolKillHandle {
                     let done = {
                         let mut guard = child.lock().unwrap_or_else(|e| e.into_inner());
                         match guard.as_mut() {
-                            Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+                            Some(c) => match c.try_wait() {
+                                Ok(Some(_)) => {
+                                    let _ = guard.take();
+                                    true
+                                }
+                                Ok(None) => false,
+                                Err(_) => true,
+                            },
                             None => true,
                         }
                     };
                     if done {
+                        let _ = owned_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
                         return Ok(());
                     }
                     if std::time::Instant::now() >= deadline {
@@ -280,12 +346,21 @@ impl ToolKillHandle {
             KillInner::Tokio { join, .. } | KillInner::JoinOnly { join } => {
                 join.lock().unwrap_or_else(|e| e.into_inner()).is_some()
             }
-            KillInner::Process { child, join } => {
+            KillInner::Process {
+                child,
+                join,
+                owned_slot,
+            } => {
                 if join.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                     return true;
                 }
                 // Drive-owned wait: capacity stays held until the child is observed exited.
-                Self::process_still_alive(child)
+                if Self::process_still_alive(child) {
+                    true
+                } else {
+                    let _ = owned_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    false
+                }
             }
             KillInner::CancelOnly { .. } => false,
         }

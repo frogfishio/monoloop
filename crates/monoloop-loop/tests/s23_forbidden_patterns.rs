@@ -102,6 +102,45 @@ fn s23_no_undocumented_ambient_tokio_spawn_in_production_src() {
     );
 }
 
+/// §23 exact-limit / plus-one inventory (documentation gate — not exhaustive codegen).
+///
+/// Lists high-value public limits that already have exact/plus-one proofs in-tree.
+/// Gaps remain documented in DEFECTS (MCP concurrency/duration, some canonical
+/// message variants). This test fails if a listed proof file disappears.
+#[test]
+fn s23_exact_limit_plus_one_inventory_present() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let required = [
+        ("tests/linked_tools.rs", "capacity_limit_plus_one_rejects"),
+        ("tests/mcp_gateway.rs", "http_oversized_body_fails_closed"),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "s22_6_event_byte_plus_one_fails_closed",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "s22_6_event_item_plus_one_fails_closed",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "capacity_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "start_queue_full_rolls_back_all_permits",
+        ),
+    ];
+    for (rel, needle) in required {
+        let path = root.join(rel);
+        assert!(path.is_file(), "missing limit-proof file {rel}");
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        assert!(
+            text.contains(needle),
+            "limit-proof `{needle}` missing from {rel}"
+        );
+    }
+}
+
 #[test]
 fn s23_adversarial_host_adapter_suite_present() {
     // §22.7 / §23: host-adapter adversarial proofs exist as an isolated suite.
@@ -121,6 +160,52 @@ fn s23_adversarial_host_adapter_suite_present() {
         assert!(
             text.contains(needle),
             "s22_7 suite missing proof `{needle}`"
+        );
+    }
+}
+
+/// §23: adversarial lifecycle tests run in isolated subprocesses with an outer
+/// harness timeout (never shape a missing proof into a green pass).
+#[test]
+fn s23_adversarial_lifecycle_subprocess_harness_inventory() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let harnesses = [
+        (
+            "tests/s22_3_non_yielding_sacrificial.rs",
+            "s22_3_non_yielding_sacrificial_never_false_stopped",
+            "MONOLOOP_S22_3_NON_YIELDING_CHILD",
+            "recv_timeout",
+        ),
+        (
+            "tests/s22_4_join_only_spill_sacrificial.rs",
+            "s22_4_join_only_spill_sacrificial_never_false_stopped",
+            "MONOLOOP_S22_4_JOIN_ONLY_SPILL_CHILD",
+            "recv_timeout",
+        ),
+    ];
+    for (rel, test_fn, child_env, timeout_api) in harnesses {
+        let path = root.join(rel);
+        assert!(path.is_file(), "missing subprocess harness file {rel}");
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        assert!(
+            text.contains(test_fn),
+            "harness `{rel}` missing test `{test_fn}`"
+        );
+        assert!(
+            text.contains(child_env),
+            "harness `{rel}` missing child env `{child_env}`"
+        );
+        assert!(
+            text.contains(timeout_api),
+            "harness `{rel}` must bound the parent wait with `{timeout_api}`"
+        );
+        assert!(
+            text.contains("child.kill()") || text.contains("child.kill();"),
+            "harness `{rel}` must kill the sacrificial child"
+        );
+        assert!(
+            text.contains("never false") || text.contains("false Stopped"),
+            "harness `{rel}` must document fail-closed / never-false-Stopped intent"
         );
     }
 }

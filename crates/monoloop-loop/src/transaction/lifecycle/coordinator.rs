@@ -76,6 +76,8 @@ pub struct CoordinatorParams {
     pub shared_tool_capacity: Arc<SharedToolCapacity>,
     /// Runtime-scoped tool join spill (shared with supervisor Stopped proof).
     pub tool_spill: Arc<RuntimeToolSpill>,
+    /// Runtime-scoped live ProcessIsolated child count.
+    pub owned_processes: Arc<std::sync::atomic::AtomicU32>,
     /// Runtime MCP gateway when `enable_mcp_listener` (CreationOnly install).
     pub mcp_gateway: Option<McpGatewayHandle>,
     /// Shared runtime state (ledger SessionKey claim after external create).
@@ -115,6 +117,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         tools_registry,
         shared_tool_capacity,
         tool_spill,
+        owned_processes,
         mcp_gateway,
         shared,
     } = params;
@@ -180,12 +183,13 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
                 .collect();
             let resolved = ResolvedToolSet::from_registered(registered);
             // Provisional SessionKey until claim; rebind_session before activate (D-026).
-            let dispatcher = TransactionToolDispatcher::with_runtime_spill(
+            let dispatcher = TransactionToolDispatcher::with_runtime_resources(
                 transaction_id,
                 session_key_for(channel_id.clone(), session_id.clone(), transaction_id),
                 resolved.clone(),
                 Arc::clone(&shared_tool_capacity),
                 Arc::clone(&tool_spill),
+                Arc::clone(&owned_processes),
                 8,
                 16,
             );
@@ -353,6 +357,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             tools_registry,
             shared_tool_capacity,
             tool_spill,
+            owned_processes,
         )
         .await;
 
@@ -401,6 +406,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         tools_registry,
         shared_tool_capacity,
         tool_spill,
+        owned_processes,
     )
     .await
 }
@@ -420,6 +426,7 @@ async fn finish_after_exchange(
     tools_registry: HostToolRegistry,
     shared_tool_capacity: Arc<SharedToolCapacity>,
     tool_spill: Arc<RuntimeToolSpill>,
+    owned_processes: Arc<std::sync::atomic::AtomicU32>,
 ) -> TerminalProposal {
     // §22.6: establish external session before ordinary events when not done
     // at the prompt-ready gate (DirectLlm / late discovery).
@@ -489,12 +496,13 @@ async fn finish_after_exchange(
                 .filter_map(|id| tools_registry.get(id).cloned())
                 .collect();
             let resolved = ResolvedToolSet::from_registered(registered);
-            let dispatcher = TransactionToolDispatcher::with_runtime_spill(
+            let dispatcher = TransactionToolDispatcher::with_runtime_resources(
                 transaction_id,
                 session_key_for(channel_id.clone(), session_id.clone(), transaction_id),
                 resolved.clone(),
                 shared_tool_capacity,
                 tool_spill,
+                owned_processes,
                 8,
                 16,
             );

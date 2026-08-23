@@ -1974,10 +1974,9 @@ TaskSupervisor ownership of tool worker bodies. Re-gate before claiming
 Unlisted residuals (block Golden; do not demote the named M6 bar):
 - `RuntimeOwner` Drop abandons the OS-thread join after grace (§18.4
   MUST NOT detach).
-- `ProcessIsolated` `spawn_blocking` wait is still not
-  `TaskClass::ToolWorker`; `ShutdownSnapshot.owned_processes` is always `0`.
 - Spec M5.4 / §20 still lists “delete tool join vaults” as the end state;
-  spill is the interim honesty fix until handler joins are supervisor-owned.
+  spill is the interim honesty fix until JoinOnly fixtures are supervisor-owned.
+  (`owned_processes` snapshot honesty landed 2026-08-20 — see below.)
 
 §23 extras still open: forbidden-pattern search, isolated adversarial
 harness inventory, exact-limit plus-one audit. Refreshable MCP undeclared
@@ -2032,6 +2031,35 @@ M6 §22 closed-enough **still holds**. Capacity-on-Drop honesty for driven
 ProcessIsolated addressed in-slice (orphan park while child alive). Do **not**
 promote Golden / §25.
 
-**Next pick:** exact-limit plus-one audit / adversarial subprocess inventory
-**or** JoinOnly fixture supervision + delete-vaults / `owned_processes`.
-Do not promote Golden / §25.
+**owned_processes + exact-limit inventory (2026-08-20):**
+`ShutdownSnapshot.owned_processes` reads `RuntimeShared.owned_processes`
+(`AtomicU32`). ProcessIsolated registers via
+`ToolKillHandle::register_owned_process` at dispatch; lease releases on reap
+(drive / join_timeout / has_join) or spill orphan Drop. Proof:
+`process_isolated_owned_processes_counter_tracks_live_child`. §23 inventory
+gate: `s23_exact_limit_plus_one_inventory_present` (high-value proofs present;
+MCP concurrency/duration + some canonical variants still open in DEFECTS).
+Still open: adversarial subprocess harness, JoinOnly fixture spawn,
+delete-vaults, remaining exact-limit gaps, `CleanupStatus.owned_processes`
+hardcode. **Not** Golden / §25.
+
+**Expert + Advisor (2026-08-20, owned_processes gate):** **PASS — Silver.**
+M6 §22 closed-enough **still holds**. Do **not** promote Golden / §25.
+
+**§23 adversarial lifecycle subprocess harness (2026-08-20):** Added
+`tests/s22_4_join_only_spill_sacrificial.rs` — isolated child proves JoinOnly
+spill → short `wait_stopped` → `TimedOut` + `Quiescing` + `spill_pending>=1`,
+never false `Stopped`; parent bounds with `recv_timeout` and always kills the
+child. Inventory gate:
+`s23_adversarial_lifecycle_subprocess_harness_inventory` covers both
+§22.3 non-yielding and §22.4 JoinOnly spill harnesses. Still open: JoinOnly
+*fixture* ambient spawn (s22_4_tools handlers), delete-vaults end state,
+remaining exact-limit gaps, independent P0–P2 review,
+`CleanupStatus.owned_processes` hardcode. **Not** Golden / §25.
+
+**Expert + Advisor (2026-08-20, sacrificial harness gate):** **PASS — Silver.**
+Named §23 adversarial lifecycle subprocess residual closed. M6 §22
+closed-enough **still holds**. Do **not** promote Golden / §25.
+
+**Next pick:** JoinOnly fixture supervision + delete-vaults **or** remaining
+exact-limit gaps / independent review. Do not promote Golden / §25.

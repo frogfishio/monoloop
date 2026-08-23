@@ -113,6 +113,8 @@ pub(crate) struct RuntimeShared {
     pub shared_tool_capacity: Arc<SharedToolCapacity>,
     /// Runtime-scoped unfinished tool joins/permits (Law 8 — not process-global).
     pub tool_spill: Arc<RuntimeToolSpill>,
+    /// Live ProcessIsolated OS children (§18.2 ShutdownSnapshot.owned_processes).
+    pub owned_processes: Arc<AtomicU32>,
 }
 
 impl RuntimeShared {
@@ -141,7 +143,7 @@ impl RuntimeShared {
             generation: self.shutdown_generation.load(Ordering::SeqCst),
             ledger_entries,
             owned_tasks: self.owned_tasks.load(Ordering::SeqCst),
-            owned_processes: 0,
+            owned_processes: self.owned_processes.load(Ordering::SeqCst),
             mcp_routes,
             completions_published: self.completions_published.load(Ordering::SeqCst),
         }
@@ -557,6 +559,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         tools_registry: shared.tools_registry.clone(),
         shared_tool_capacity: Arc::clone(&shared.shared_tool_capacity),
         tool_spill: Arc::clone(&shared.tool_spill),
+        owned_processes: Arc::clone(&shared.owned_processes),
         mcp_gateway,
         shared: Arc::clone(shared),
     };

@@ -57,6 +57,10 @@ name = "s22_3_non_yielding_sacrificial"
 path = "tests/s22_3_non_yielding_sacrificial.rs"
 
 [[test]]
+name = "s22_4_join_only_spill_sacrificial"
+path = "tests/s22_4_join_only_spill_sacrificial.rs"
+
+[[test]]
 name = "s22_4_tools"
 path = "tests/s22_4_tools.rs"
 

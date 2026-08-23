@@ -168,6 +168,7 @@ impl StartedRuntime {
                     .max(8),
             ),
             tool_spill: Arc::new(crate::transaction::dispatcher::RuntimeToolSpill::new()),
+            owned_processes: Arc::new(AtomicU32::new(0)),
         });
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), StartupError>>();

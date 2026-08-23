@@ -2,7 +2,8 @@
 
 use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapacity};
-use super::tool_handler::{ToolExecutionControl, ToolKillHandle};
+use super::tool_handler::{OwnedProcessLease, ToolExecutionControl, ToolKillHandle};
+use std::sync::atomic::AtomicU32;
 
 /// Runtime-scoped unfinished tool joins and/or orphaned permits (§22.4 / D-028).
 ///
@@ -21,6 +22,10 @@ struct ParkedToolWork {
     /// When true, supervisor quiesce may abort (AbortableAtYield).
     /// Cooperative `JoinOnly` stays false — cancel is best-effort only (§14.1).
     may_abort: bool,
+    /// Keeps `owned_processes` honest while a ProcessIsolated orphan is parked.
+    /// Read via `Drop` of [`OwnedProcessLease`] when this entry is released.
+    #[allow(dead_code)]
+    process_lease: Option<OwnedProcessLease>,
 }
 
 impl RuntimeToolSpill {
@@ -48,16 +53,27 @@ impl RuntimeToolSpill {
             join: Some(join),
             permit,
             may_abort,
+            process_lease: None,
         });
     }
 
     /// Hold a permit with no killable join (missing kill fallback).
     fn park_orphan_permit(&self, permit: ToolPermit) {
+        self.park_orphan_permit_with_lease(permit, None);
+    }
+
+    /// Orphan permit plus optional ProcessIsolated owned-process lease.
+    fn park_orphan_permit_with_lease(
+        &self,
+        permit: ToolPermit,
+        process_lease: Option<OwnedProcessLease>,
+    ) {
         let mut parked = self.parked.lock().unwrap_or_else(|e| e.into_inner());
         parked.push(ParkedToolWork {
             join: None,
             permit: Some(permit),
             may_abort: false,
+            process_lease,
         });
     }
 
@@ -237,6 +253,8 @@ pub struct TransactionToolDispatcher {
     capacity: Arc<TransactionToolCapacity>,
     /// Runtime-scoped spill for unfinished joins (D-028 / Law 8).
     tool_spill: Arc<RuntimeToolSpill>,
+    /// Runtime-scoped live ProcessIsolated child count (§18.2 snapshot).
+    owned_processes: Arc<AtomicU32>,
     /// Transaction-wide payload cap (D-015); applied as min with per-tool limit.
     max_tool_payload_bytes: usize,
     /// Transaction-wide output cap (D-015); applied as min with per-tool limit.
@@ -284,6 +302,7 @@ impl TransactionToolDispatcher {
             shared_capacity,
             limits,
             Arc::new(RuntimeToolSpill::new()),
+            Arc::new(AtomicU32::new(0)),
         )
     }
 
@@ -294,6 +313,30 @@ impl TransactionToolDispatcher {
         tools: ResolvedToolSet,
         shared_capacity: Arc<SharedToolCapacity>,
         tool_spill: Arc<RuntimeToolSpill>,
+        max_concurrent_tools: usize,
+        max_queued_tools: usize,
+    ) -> Arc<Self> {
+        Self::with_runtime_resources(
+            transaction_id,
+            session_key,
+            tools,
+            shared_capacity,
+            tool_spill,
+            Arc::new(AtomicU32::new(0)),
+            max_concurrent_tools,
+            max_queued_tools,
+        )
+    }
+
+    /// Build with runtime-shared spill and owned-process counter (production path).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_runtime_resources(
+        transaction_id: TransactionId,
+        session_key: SessionKey,
+        tools: ResolvedToolSet,
+        shared_capacity: Arc<SharedToolCapacity>,
+        tool_spill: Arc<RuntimeToolSpill>,
+        owned_processes: Arc<AtomicU32>,
         max_concurrent_tools: usize,
         max_queued_tools: usize,
     ) -> Arc<Self> {
@@ -309,6 +352,7 @@ impl TransactionToolDispatcher {
                 max_tool_output_bytes: usize::MAX,
             },
             tool_spill,
+            owned_processes,
         )
     }
 
@@ -320,6 +364,7 @@ impl TransactionToolDispatcher {
         shared_capacity: Arc<SharedToolCapacity>,
         limits: DispatcherLimits,
         tool_spill: Arc<RuntimeToolSpill>,
+        owned_processes: Arc<AtomicU32>,
     ) -> Arc<Self> {
         let capacity = TransactionToolCapacity::new(
             shared_capacity,
@@ -335,6 +380,7 @@ impl TransactionToolDispatcher {
             tools,
             capacity,
             tool_spill,
+            owned_processes,
             max_tool_payload_bytes: limits.max_tool_payload_bytes.max(1),
             max_tool_output_bytes: limits.max_tool_output_bytes.max(1),
             max_error_message_bytes: 1024,
@@ -567,6 +613,12 @@ impl TransactionToolDispatcher {
         let control = handle.control.clone();
         dispatch_guard.kill = handle.kill.clone();
         let kill = dispatch_guard.kill.clone();
+        // Count live ProcessIsolated children for ShutdownSnapshot.owned_processes.
+        if let Some(ref k) = kill {
+            if k.is_process_isolated() {
+                k.register_owned_process(Arc::clone(&self.owned_processes));
+            }
+        }
         // Post-start invariant: Abortable needs a kill handle; ProcessIsolated
         // needs an OS-process kill handle (not Tokio abort).
         let kill_ok = match &policy {
@@ -902,9 +954,10 @@ impl Drop for DispatchGuard {
                 }
             } else if k.is_process_isolated() && k.has_join() {
                 // Drive-owned ProcessIsolated: no JoinHandle to park, but child may
-                // still be exiting — hold capacity as an orphan until quiesce/reap.
+                // still be exiting — hold capacity + owned_processes lease.
+                let lease = k.take_process_lease();
                 if let Some(permit) = self.permit.take() {
-                    self.spill.park_orphan_permit(permit);
+                    self.spill.park_orphan_permit_with_lease(permit, lease);
                 }
                 return;
             }
