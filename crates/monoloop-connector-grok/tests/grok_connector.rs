@@ -13,10 +13,9 @@ use monoloop_contracts::GrokSessionId;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn drive_owner(opened: &mut monoloop_connector::OpenedRawConnection) {
-    if let Some(work) = opened.take_owner_work() {
-        tokio::spawn(work.into_future());
-    }
+fn drive_pending(pending: &mut monoloop_connector::PendingRawConnection) {
+    let work = pending.take_owner_work();
+    tokio::spawn(work.into_future());
 }
 
 #[tokio::test]
@@ -383,11 +382,12 @@ async fn proxy_routes_to_grok_backend() {
     open.credential_ref = Some("GROK_SECRET".into());
     open.limits.connect_deadline = Duration::from_secs(5);
 
-    let mut opened = tokio::time::timeout(Duration::from_secs(10), proxy.begin_open(open).opened)
+    let mut pending = proxy.begin_open(open);
+    drive_pending(&mut pending);
+    let opened = tokio::time::timeout(Duration::from_secs(10), pending.opened)
         .await
         .expect("timeout")
         .expect("open");
-    drive_owner(&mut opened);
     assert!(opened.external_session_id.is_some());
     assert_eq!(opened.dialect.input.framing, "json_rpc");
 

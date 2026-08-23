@@ -149,11 +149,10 @@ impl RuntimeShared {
             .and_then(|g| g.as_ref().map(|h| h.routes().len() as u32))
             .unwrap_or(0);
         // Prefer registry live count (D-048); fall back to lease counter.
-        let owned_processes = self
-            .process_registry
-            .live_count()
-            .max(self.owned_processes.load(Ordering::SeqCst) as usize)
-            as u32;
+        let owned_processes =
+            self.process_registry
+                .live_count()
+                .max(self.owned_processes.load(Ordering::SeqCst) as usize) as u32;
         ShutdownSnapshot {
             generation: self.shutdown_generation.load(Ordering::SeqCst),
             ledger_entries,

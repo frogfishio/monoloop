@@ -8,10 +8,10 @@ use monoloop_contracts::{
 };
 use monoloop_loop::{
     dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, HostToolRegistry, ImmediateToolHandler,
-    IsolatedKillableToolHandler, LinkedToolExecutionHandle, ProcessIsolatedToolHandler,
-    OrphanToolPermitSet, RegisteredTool, ResolvedToolSet, SharedToolCapacity,
-    ToolExecutionCompletion,
-    ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionToolDispatcher,
+    IsolatedKillableToolHandler, LinkedToolExecutionHandle, OrphanToolPermitSet,
+    ProcessIsolatedToolHandler, RegisteredTool, ResolvedToolSet, SharedToolCapacity,
+    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, ToolKillHandle,
+    TransactionToolDispatcher,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -261,10 +261,10 @@ async fn s22_4_abortable_permit_held_until_join() {
         },
         Duration::from_millis(30),
     );
-    // Yielding body — abortable at await points.
-    let host = HostToolRegistry::build(vec![RegisteredTool::new(
+    // Yielding body — abortable at await points (structural factory D-050).
+    let host = HostToolRegistry::build(vec![RegisteredTool::try_new_abortable(
         spec,
-        Arc::new(AsyncToolHandler::new(move |_c, _x, ctl| {
+        AsyncToolHandler::new(move |_c, _x, ctl| {
             let entered = Arc::clone(&entered_h);
             Box::pin(async move {
                 entered.store(true, Ordering::SeqCst);
@@ -279,8 +279,9 @@ async fn s22_4_abortable_permit_held_until_join() {
                     }
                 }
             })
-        })),
-    )])
+        }),
+    )
+    .unwrap()])
     .unwrap();
     let tool = host.get(&ToolId::try_new("ab").unwrap()).unwrap().clone();
     let shared = SharedToolCapacity::new(1);
@@ -329,20 +330,6 @@ async fn s22_4_abortable_permit_held_until_join() {
 /// §22.4: capacity remains unavailable while worker is still owned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s22_4_capacity_unavailable_while_worker_owned() {
-    let hold = Arc::new(AsyncToolHandler::new(|_c, _x, ctl| {
-        Box::pin(async move {
-            tokio::select! {
-                _ = ctl.cancelled() => ToolCompletion::RuntimeFailed(
-                    monoloop_contracts::ToolRuntimeError::TerminationFailed
-                ),
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    ToolCompletion::Succeeded(CanonicalToolOutput::Json(
-                        serde_json::json!({"ok": true}),
-                    ))
-                }
-            }
-        })
-    })) as Arc<dyn ToolHandler>;
     let hold_spec = base_spec(
         "hold",
         "hold",
@@ -360,7 +347,24 @@ async fn s22_4_capacity_unavailable_while_worker_owned() {
         Duration::from_secs(2),
     );
     let host = HostToolRegistry::build(vec![
-        RegisteredTool::new(hold_spec, hold),
+        RegisteredTool::try_new_abortable(
+            hold_spec,
+            AsyncToolHandler::new(|_c, _x, ctl| {
+                Box::pin(async move {
+                    tokio::select! {
+                        _ = ctl.cancelled() => ToolCompletion::RuntimeFailed(
+                            monoloop_contracts::ToolRuntimeError::TerminationFailed
+                        ),
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                            ToolCompletion::Succeeded(CanonicalToolOutput::Json(
+                                serde_json::json!({"ok": true}),
+                            ))
+                        }
+                    }
+                })
+            }),
+        )
+        .unwrap(),
         RegisteredTool::new(
             echo_spec,
             Arc::new(ImmediateToolHandler::new(|_c, _x| {
@@ -625,6 +629,38 @@ fn s22_4_cannot_self_assert_stronger_class() {
     let msg = format!("{err}");
     assert!(
         msg.contains("try_new_process_isolated") || msg.contains("ProcessIsolated"),
+        "got {msg}"
+    );
+}
+
+/// D-050: AbortableAtYield cannot be self-asserted through supports_abort on dyn.
+#[test]
+fn s22_4_cannot_self_assert_abortable_via_boolean() {
+    struct Forged;
+    impl ToolHandler for Forged {
+        fn start(
+            &self,
+            _call: ToolCall,
+            _ctx: ToolCallContext,
+        ) -> Result<LinkedToolExecutionHandle, ToolStartError> {
+            Err(ToolStartError::Rejected("forged"))
+        }
+        fn supports_abort(&self) -> bool {
+            true
+        }
+    }
+    let spec = base_spec(
+        "forge",
+        "forge",
+        ToolExecutionClass::AbortableAtYield {
+            grace: Duration::from_millis(50),
+        },
+        Duration::from_secs(1),
+    );
+    let err = RegisteredTool::try_new(spec, Arc::new(Forged)).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("try_new_abortable") || msg.contains("AbortableAtYield"),
         "got {msg}"
     );
 }

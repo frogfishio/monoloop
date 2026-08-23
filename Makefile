@@ -5,7 +5,7 @@
 #   VERSION  — semver (e.g. 0.1.0), bumped by `make bump` or hand-edited
 #   BUILD    — monotonic build number; `make dist` increments (or CI sets it)
 
-.PHONY: help bump dist sync-version check test package publish-dry-run fmt clippy doc cli-check
+.PHONY: help bump dist sync-version check test package publish-dry-run fmt clippy doc gates cli-check
 
 VERSION_FILE := VERSION
 BUILD_FILE := BUILD
@@ -24,9 +24,11 @@ help:
 	@echo "  make package         cargo package dry-run for publishable crates (ordered)"
 	@echo "  make publish-dry-run Alias of package"
 	@echo "  make cli-check       Verify monoloop --help/--version/--copyright"
-	@echo "  make fmt / clippy / doc"
+	@echo "  make fmt / clippy / doc / gates"
+	@echo "  make gates           §23: fmt + clippy -D + test --all-targets + rustdoc -D"
 	@echo ""
 	@echo "CI: set CI=1 and optionally GITHUB_RUN_NUMBER so dist records the CI build id in BUILD."
+	@echo "Release blocking: run \`make gates\` (or the four §23 commands) before dist/publish."
 
 sync-version:
 	@test -f $(VERSION_FILE) || (echo "missing $(VERSION_FILE)" && exit 1)
@@ -53,6 +55,7 @@ else
 endif
 	@cp "$(BUILD_FILE)" crates/monoloop/BUILD
 	@$(MAKE) sync-version
+	@$(MAKE) gates
 	cargo build --workspace --release
 	@$(MAKE) package
 	@$(MAKE) cli-check
@@ -71,7 +74,11 @@ clippy:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 doc:
-	cargo doc --workspace --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+# TRANSACTION_RUNTIME_V2_SPEC.md §23 core commands (release-blocking).
+gates: fmt clippy test doc
+	@echo "§23 gates passed (fmt / clippy -D / test --all-targets / rustdoc -D)"
 
 # Dry-run package for the leaf crate (always works). Dependents need parents on
 # crates.io first — see PUBLISHING.md.

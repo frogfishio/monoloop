@@ -90,13 +90,9 @@ impl Connector for AgyConnector {
         let control_state = ControlState::new();
         let control = ConnectionControlHandle::new(Arc::clone(&control_state));
         let control_open = control.clone();
-        let opened =
-            Box::pin(async move { open_raw(config, request, control_open, control_state).await });
-        PendingRawConnection {
-            connection_id,
-            control,
-            opened,
-        }
+        PendingRawConnection::open_owned(connection_id, control, async move {
+            open_raw(config, request, control_open, control_state).await
+        })
     }
 }
 
@@ -117,7 +113,7 @@ async fn open_raw(
     request: OpenConnection,
     control: ConnectionControlHandle,
     control_state: Arc<ControlState>,
-) -> Result<OpenedRawConnection, monoloop_contracts::ConnectorError> {
+) -> Result<(OpenedRawConnection, ConnectionOwnerWork), monoloop_contracts::ConnectorError> {
     let mut agent = AgyAgentHandle::connect(config.clone())
         .await
         .map_err(|e| e.into_connector_error())?;
@@ -245,16 +241,18 @@ async fn open_raw(
         });
     });
 
-    Ok(OpenedRawConnection {
-        connection_id: request.connection_id,
-        external_session_id,
-        dialect,
-        input,
-        output,
-        control,
-        completion,
-        owner_work: Some(owner_work),
-    })
+    Ok((
+        OpenedRawConnection {
+            connection_id: request.connection_id,
+            external_session_id,
+            dialect,
+            input,
+            output,
+            control,
+            completion,
+        },
+        owner_work,
+    ))
 }
 
 fn safe_prompt_error(e: &AgyConnectorError) -> String {

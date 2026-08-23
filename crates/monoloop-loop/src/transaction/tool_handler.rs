@@ -57,7 +57,28 @@ pub trait ToolHandler: Send + Sync {
     fn os_process_isolated(&self) -> bool {
         false
     }
+
+    /// Structural AbortableAtYield ownership (V2 §14.2 / D-050).
+    ///
+    /// Default **false**. Only handlers registered via
+    /// [`super::host_tools::RegisteredTool::try_new_abortable`] may return true;
+    /// they yield CancelOnly + an unspawned `drive` future the runtime polls.
+    /// Capability booleans alone are insufficient.
+    fn runtime_owns_abortable_drive(&self) -> bool {
+        false
+    }
 }
+
+mod abortable_seal {
+    /// Seals [`super::AbortableAtYieldHandler`] to crate-defined factories.
+    pub trait Sealed {}
+}
+
+/// Structural AbortableAtYield factory marker (V2 §14.2 / D-050).
+///
+/// Only crate-owned handlers that produce CancelOnly + inline `drive` implement
+/// this. Custom `dyn ToolHandler` values cannot self-assert via `supports_abort`.
+pub trait AbortableAtYieldHandler: ToolHandler + abortable_seal::Sealed {}
 
 /// Cancellation control for a running linked tool.
 #[derive(Clone, Debug)]
@@ -420,6 +441,20 @@ where
     fn supports_abort(&self) -> bool {
         true
     }
+
+    fn runtime_owns_abortable_drive(&self) -> bool {
+        true
+    }
+}
+
+impl<F> abortable_seal::Sealed for AsyncToolHandler<F> where
+    F: Fn(ToolCall, ToolCallContext, ToolExecutionControl) -> BoxFut + Send + Sync
+{
+}
+
+impl<F> AbortableAtYieldHandler for AsyncToolHandler<F> where
+    F: Fn(ToolCall, ToolCallContext, ToolExecutionControl) -> BoxFut + Send + Sync
+{
 }
 
 /// Stubborn in-process worker for AbortableAtYield / legacy D-024 fixtures.
@@ -480,6 +515,20 @@ where
         // D-043: Tokio abort must not satisfy ProcessIsolated registration.
         false
     }
+
+    fn runtime_owns_abortable_drive(&self) -> bool {
+        true
+    }
+}
+
+impl<F> abortable_seal::Sealed for IsolatedKillableToolHandler<F> where
+    F: Fn(ToolCall, ToolCallContext) -> BoxFut + Send + Sync
+{
+}
+
+impl<F> AbortableAtYieldHandler for IsolatedKillableToolHandler<F> where
+    F: Fn(ToolCall, ToolCallContext) -> BoxFut + Send + Sync
+{
 }
 
 /// Handler that always fails at start (tests).

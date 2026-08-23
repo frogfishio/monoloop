@@ -3,15 +3,19 @@
 use crate::control::ConnectionControlHandle;
 use crate::handles::{ConnectionCompletionHandle, RawInputHandle, RawOutputHandle};
 use crate::session::SessionAttachment;
-use monoloop_contracts::{ConnectionId, ConnectorLimits, DialectBinding, ExternalSessionId};
+use monoloop_contracts::{
+    ConnectionId, ConnectorError, ConnectorLimits, DialectBinding, ExternalSessionId,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::oneshot;
 
 /// Unspawned connection-local owner future (v2 §15).
 ///
-/// The Loop MUST spawn this via `TaskSupervisor` as `ConnectorOwner` before
-/// relying on input/output. Transport semantic completion does not imply this
+/// The Loop MUST spawn this via `TaskSupervisor` as `ConnectorOwner` **before**
+/// polling [`PendingRawConnection::opened`]. The owner future drives open I/O
+/// and post-open transport; transport semantic completion does not imply this
 /// future has finished unless the profile documents that equivalence.
 pub struct ConnectionOwnerWork {
     run: Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -28,7 +32,7 @@ impl ConnectionOwnerWork {
         }
     }
 
-    /// No-op owner (open failed before any owner ran, or inert placeholder).
+    /// No-op owner (open failed before any owner I/O, or inert placeholder).
     pub fn noop() -> Self {
         Self {
             run: Box::pin(async {}),
@@ -88,17 +92,100 @@ impl OpenConnection {
     }
 }
 
-// SessionAttachment is not Debug by default on route — provide limited Debug for OpenConnection.
-// OpenConnection derives Debug; SessionAttachment needs Debug.
-
-/// Open in progress: control is available immediately.
+/// Open in progress: control and owner identity are available immediately (D-051 / v2 §15).
+///
+/// The Loop MUST [`Self::take_owner_work`] and register `ConnectorOwner` **before**
+/// the first poll of [`Self::opened`]. Open I/O runs inside that owner future.
 pub struct PendingRawConnection {
     /// Connection identity.
     pub connection_id: ConnectionId,
     /// Same connection-scoped control as the eventual opened connection.
     pub control: ConnectionControlHandle,
     /// Completes with opened handles or a typed open error.
+    ///
+    /// Signaled by the owner future after open setup; do not poll until the
+    /// owner is registered under `TaskSupervisor`.
     pub opened: OpenCompletion,
+    /// Owner work: open I/O + post-open transport (taken exactly once).
+    owner_work: Option<ConnectionOwnerWork>,
+}
+
+impl PendingRawConnection {
+    /// Construct pending open with required owner work (D-051).
+    pub fn new(
+        connection_id: ConnectionId,
+        control: ConnectionControlHandle,
+        opened: OpenCompletion,
+        owner_work: ConnectionOwnerWork,
+    ) -> Self {
+        Self {
+            connection_id,
+            control,
+            opened,
+            owner_work: Some(owner_work),
+        }
+    }
+
+    /// Wrap an open-setup future that returns handles + post-open transport work.
+    ///
+    /// The combined owner future performs setup I/O, signals [`Self::opened`],
+    /// then runs transport until completion. Spawn this owner before polling
+    /// `opened`.
+    pub fn open_owned<F>(
+        connection_id: ConnectionId,
+        control: ConnectionControlHandle,
+        open_and_own: F,
+    ) -> Self
+    where
+        F: Future<Output = Result<(OpenedRawConnection, ConnectionOwnerWork), ConnectorError>>
+            + Send
+            + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let owner_work = ConnectionOwnerWork::new(async move {
+            match open_and_own.await {
+                Ok((opened, transport)) => {
+                    let _ = tx.send(Ok(opened));
+                    transport.into_future().await;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        });
+        Self {
+            connection_id,
+            control,
+            opened: Box::pin(async move {
+                rx.await
+                    .unwrap_or_else(|_| Err(ConnectorError::cancelled()))
+            }),
+            owner_work: Some(owner_work),
+        }
+    }
+
+    /// Fail-closed pending (no open I/O). Owner is a noop so spawn/join stays honest.
+    pub fn failed(
+        connection_id: ConnectionId,
+        control: ConnectionControlHandle,
+        err: ConnectorError,
+    ) -> Self {
+        Self {
+            connection_id,
+            control,
+            opened: Box::pin(async move { Err(err) }),
+            owner_work: Some(ConnectionOwnerWork::noop()),
+        }
+    }
+
+    /// Take owner work for supervised spawn (exactly once).
+    ///
+    /// Panics if called twice — profiles and the Loop must transfer ownership once.
+    pub fn take_owner_work(&mut self) -> ConnectionOwnerWork {
+        self.owner_work
+            .take()
+            .expect("PendingRawConnection owner_work already taken")
+    }
 }
 
 /// Future resolving to an opened connection or error.
@@ -108,7 +195,7 @@ pub type OpenCompletion = Pin<
     >,
 >;
 
-/// Successfully opened raw connection.
+/// Successfully opened raw connection (handles only — no owner work; D-051).
 pub struct OpenedRawConnection {
     /// Connection identity.
     pub connection_id: ConnectionId,
@@ -124,16 +211,4 @@ pub struct OpenedRawConnection {
     pub control: ConnectionControlHandle,
     /// Exactly-one terminal outcome.
     pub completion: ConnectionCompletionHandle,
-    /// Connection owner work the Loop MUST spawn via TaskSupervisor (v2 §15).
-    ///
-    /// `None` is a temporary migration residual for profiles not yet converted
-    /// off ambient spawn; v2 exchange fails closed when this is missing.
-    pub owner_work: Option<ConnectionOwnerWork>,
-}
-
-impl OpenedRawConnection {
-    /// Take owner work for supervised spawn (exactly once).
-    pub fn take_owner_work(&mut self) -> Option<ConnectionOwnerWork> {
-        self.owner_work.take()
-    }
 }

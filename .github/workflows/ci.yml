@@ -32,10 +32,14 @@ jobs:
         with:
           name: monoloop-build-number
           path: BUILD
+      # TRANSACTION_RUNTIME_V2_SPEC.md §23 core commands (must match `make gates`).
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-targets --all-features
-      - run: cargo doc --workspace --no-deps
+      - name: rustdoc (-D warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
       - name: CLI flags
         run: |
           cargo build -p monoloop --bin monoloop

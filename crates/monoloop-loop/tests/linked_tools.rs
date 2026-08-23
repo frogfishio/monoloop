@@ -8,8 +8,9 @@ use monoloop_contracts::{
 use monoloop_loop::{
     dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, EmptyToolRegistry, HostToolRegistry,
     ImmediateToolHandler, LostCompletionHandler, PanicOnStartHandler, RegisteredTool,
-    ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet, SharedToolCapacity, StartFailHandler,
-    ToolHandler, ToolRegistry, ToolResolution, ToolUnavailableReason, TransactionToolDispatcher,
+    ResolveToolRequest, ResolvedToolRegistry, ResolvedToolSet, SharedToolCapacity,
+    StartFailHandler, ToolHandler, ToolRegistry, ToolResolution, ToolUnavailableReason,
+    TransactionToolDispatcher,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -607,15 +608,15 @@ async fn empty_tool_registry_still_unavailable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_running_async_tool() {
     // Short deadline forces timeout cancel path while the handler still runs.
-    // Abortable + AsyncToolHandler (supports_abort + kill handle) is the structural pair.
+    // Abortable + AsyncToolHandler via try_new_abortable is the structural pair (D-050).
     let mut spec = make_spec("c", "cancel_me");
     spec.execution_class = ToolExecutionClass::AbortableAtYield {
         grace: std::time::Duration::from_secs(1),
     };
     spec.limits.execution_deadline = Duration::from_millis(50);
-    let host = HostToolRegistry::build(vec![RegisteredTool::new(
+    let host = HostToolRegistry::build(vec![RegisteredTool::try_new_abortable(
         spec,
-        Arc::new(AsyncToolHandler::new(move |_call, _ctx, ctl| {
+        AsyncToolHandler::new(move |_call, _ctx, ctl| {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let _ = ctl.is_cancelled();
@@ -623,8 +624,9 @@ async fn cancel_running_async_tool() {
                     serde_json::json!({"ok": true}),
                 ))
             })
-        })),
-    )])
+        }),
+    )
+    .unwrap()])
     .unwrap();
     let d = dispatcher_from(&host, &["c"]);
     let out = dispatch_ready_tool(

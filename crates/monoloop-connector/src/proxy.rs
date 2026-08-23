@@ -173,10 +173,5 @@ fn failed_pending(
     use crate::control::{ConnectionControlHandle, ControlState};
     let state = ControlState::new();
     let control = ConnectionControlHandle::new(state);
-    let opened = Box::pin(async move { Err(err) });
-    PendingRawConnection {
-        connection_id,
-        control,
-        opened,
-    }
+    PendingRawConnection::failed(connection_id, control, err)
 }

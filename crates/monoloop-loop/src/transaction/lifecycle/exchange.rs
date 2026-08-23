@@ -242,38 +242,13 @@ async fn run_inner(
         open = open.with_session_attachment(attachment);
     }
 
-    let pending = connector.begin_open(open);
+    let mut pending = connector.begin_open(open);
     let control = pending.control.clone();
-
-    let mut opened = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            let _ = control.terminate(TerminationReason::CallerForced);
-            return Err(ExchangeFailure::Cancelled);
-        }
-        res = tokio::time::timeout(remaining(), pending.opened) => {
-            match res {
-                Ok(Ok(o)) => o,
-                Ok(Err(_)) => return Err(ExchangeFailure::ChannelOpenFailed),
-                Err(_) => {
-                    let _ = control.terminate(TerminationReason::CallerForced);
-                    return Err(ExchangeFailure::DeadlineExceeded);
-                }
-            }
-        }
-    };
-
-    let Some(owner_work) = opened.take_owner_work() else {
-        let _ = opened.control.terminate(TerminationReason::CallerForced);
-        return Err(ExchangeFailure::InvariantFailed);
-    };
-
-    let mut children = ChildJoins::new();
-    let open_control = opened.control.clone();
-
-    // Spawn Connector owner before send/receive (v2 §15).
+    // D-051 / v2 §15: register ConnectorOwner before first poll of open I/O.
+    let owner_work = pending.take_owner_work();
     let owner_future = owner_work.into_future();
     let (owner_done_tx, owner_done_rx) = oneshot::channel::<()>();
+    let mut children = ChildJoins::new();
     match tasks
         .spawn(
             TaskClass::ConnectorOwner(transaction_id, exchange_id),
@@ -289,17 +264,43 @@ async fn run_inner(
         }
         Err(SpawnReject::Busy { future } | SpawnReject::Rejected { future }) => {
             // Spawner rejected before accept: drive owner inline after terminate.
-            let _ = open_control.terminate(TerminationReason::CallerForced);
+            let _ = control.terminate(TerminationReason::CallerForced);
             let _ = tokio::time::timeout(cleanup_deadline, future).await;
             return Err(ExchangeFailure::SpawnFailed);
         }
         Err(SpawnReject::Orphaned) => {
             // Future left the caller; fail closed (Law 23/25).
-            let _ = open_control.terminate(TerminationReason::CallerForced);
+            let _ = control.terminate(TerminationReason::CallerForced);
             children.wait(cleanup_deadline).await;
             return Err(ExchangeFailure::SpawnFailed);
         }
     }
+
+    let opened = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            let _ = control.terminate(TerminationReason::CallerForced);
+            children.wait(cleanup_deadline).await;
+            return Err(ExchangeFailure::Cancelled);
+        }
+        res = tokio::time::timeout(remaining(), pending.opened) => {
+            match res {
+                Ok(Ok(o)) => o,
+                Ok(Err(_)) => {
+                    let _ = control.terminate(TerminationReason::CallerForced);
+                    children.wait(cleanup_deadline).await;
+                    return Err(ExchangeFailure::ChannelOpenFailed);
+                }
+                Err(_) => {
+                    let _ = control.terminate(TerminationReason::CallerForced);
+                    children.wait(cleanup_deadline).await;
+                    return Err(ExchangeFailure::DeadlineExceeded);
+                }
+            }
+        }
+    };
+
+    let open_control = opened.control.clone();
 
     let interpretation = match interpreter.start(StartInterpretation {
         interpretation_id: interpretation_id.clone(),

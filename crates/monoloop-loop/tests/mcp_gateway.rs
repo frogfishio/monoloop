@@ -1,11 +1,11 @@
 //! WP-07: MCP capability lifecycle, list/call parity, isolation.
 
+use futures_util::stream;
 use monoloop_contracts::{
     CanonicalToolOutput, ChannelId, ExchangeId, JsonSchema, SessionId, SessionKey, ToolActionId,
     ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName, ToolOutputContract, ToolSpec,
     ToolSuccessContract, TransactionId,
 };
-use futures_util::stream;
 use monoloop_loop::{
     dispatch_ready_tool, tool_definitions_from_resolved, CapabilityToken, DispatchOutcome,
     HostToolRegistry, ImmediateToolHandler, McpBindingState, McpGateway, McpGatewayHandle,
@@ -499,8 +499,7 @@ async fn mcp_per_capability_concurrency_plus_one_rejects() {
     let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
     let client = reqwest::Client::new();
 
-    let _hold =
-        hold_incomplete_chunked_post(gw.local_addr(), &pending.token.to_hex()).await;
+    let _hold = hold_incomplete_chunked_post(gw.local_addr(), &pending.token.to_hex()).await;
 
     let resp = probe_until_status(
         &client,
@@ -536,8 +535,7 @@ async fn mcp_global_concurrency_plus_one_rejects() {
     let url = format!("{}/mcp/{}", gw.base_url(), pending.token.to_hex());
     let client = reqwest::Client::new();
 
-    let _hold =
-        hold_incomplete_chunked_post(gw.local_addr(), &pending.token.to_hex()).await;
+    let _hold = hold_incomplete_chunked_post(gw.local_addr(), &pending.token.to_hex()).await;
 
     let resp = probe_until_status(
         &client,

@@ -1,21 +1,24 @@
-//! D-026 claim-gate fail-closed typing: missing provider session id → InvariantFailed.
+//! D-026 / D-053: claim-gate fail-closed typing on StartedRuntime.
+//!
+//! Missing provider session id on ExternalAgent create → InvariantFailed
+//! (must not remapped to Cancelled).
 
 use monoloop_connector::{FakeConnectorConfig, FakeConnectorFactory, FakeSessionAdapterConfig};
 use monoloop_contracts::{
-    user_text_input, ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
-    ContinuationPolicy, DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink,
-    InvocationConfig, McpConfigurationCapability, McpReachability, OptionPolicy, SessionMode,
-    ToolExecutionMode, TransactionEnd, TransactionEndKind, TransactionRequest, TransactionRuntime,
+    transaction_delivery, user_text_input, ChannelCapabilities, ChannelDefaults, ChannelId,
+    ChannelKind, ChannelLimits, ContinuationPolicy, DeliveryLimits, DialectDescriptor,
+    ExchangeMode, InvocationConfig, McpConfigurationCapability, McpReachability, OptionPolicy,
+    SessionMode, ShutdownWaitOutcome, ToolExecutionMode, TransactionEndKind,
+    TransactionSubmitRequest,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
-    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, RuntimeBootstrap,
-    RuntimeConfig, TestTextEncoder,
+    ChannelBinding, ChannelRegistry, HostToolRegistry, RuntimeBootstrap, RuntimeConfig,
+    StartedRuntime, TestTextEncoder,
 };
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
 
 fn external_agent_omit_session(id: &str) -> ChannelBinding {
     let d = DialectDescriptor::test_raw();
@@ -51,41 +54,24 @@ fn external_agent_omit_session(id: &str) -> ChannelBinding {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_without_provider_session_id_ends_invariant_failed() {
-    let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
+#[test]
+fn create_without_provider_session_id_ends_invariant_failed() {
+    let started = StartedRuntime::start(RuntimeBootstrap {
         config: RuntimeConfig {
             enable_mcp_listener: false,
             ..Default::default()
         },
         channels: ChannelRegistry::build(vec![external_agent_omit_session("agent")]).unwrap(),
         tools: HostToolRegistry::empty(),
-        executor: tokio::runtime::Handle::current(),
     })
-    .await
-    .unwrap();
+    .expect("start");
+    let handle = started.handle.clone();
 
-    let ends = Arc::new(Mutex::new(Vec::<TransactionEnd>::new()));
-    let done = Arc::new(Notify::new());
-    let ends_s = Arc::clone(&ends);
-    let done_s = Arc::clone(&done);
-
-    let events: Arc<dyn monoloop_contracts::TransactionEventSink> =
-        Arc::new(FnEventSink(|_| Box::pin(async { Ok(()) }) as _));
-    let completion: Box<dyn monoloop_contracts::CompletionCallback> =
-        Box::new(FnCompletionCallback(move |end: TransactionEnd| {
-            let ends_s = Arc::clone(&ends_s);
-            let done_s = Arc::clone(&done_s);
-            Box::pin(async move {
-                ends_s.lock().unwrap().push(end);
-                done_s.notify_waiters();
-                Ok(())
-            }) as _
-        }));
-
-    TransactionRuntime::submit(
-        rt.as_ref(),
-        TransactionRequest {
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    // `receiver` is mut for completion.recv(); events drained only if needed.
+    handle
+        .submit(TransactionSubmitRequest {
             channel_id: ChannelId::try_new("agent").unwrap(),
             session_id: None,
             input: user_text_input("hello").unwrap(),
@@ -96,26 +82,35 @@ async fn create_without_provider_session_id_ends_invariant_failed() {
                 ..Default::default()
             },
             tools: vec![],
-            events,
-            completion,
-        },
-    )
-    .unwrap();
+            delivery,
+        })
+        .expect("admit");
 
-    tokio::time::timeout(Duration::from_secs(5), done.notified())
-        .await
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), receiver.completion.recv()).await
+        })
+        .expect("completion timeout")
         .expect("completion");
 
-    {
-        let ends = ends.lock().unwrap();
-        assert_eq!(ends.len(), 1);
-        assert_eq!(
-            ends[0].kind,
-            TransactionEndKind::InvariantFailed,
-            "missing provider sessionId must not remapped to Cancelled; got {:?}",
-            ends[0].kind
-        );
-    }
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::InvariantFailed,
+        "missing provider sessionId must not remapped to Cancelled; got {:?}",
+        completion.end.kind
+    );
 
-    TransactionRuntime::shutdown(rt.as_ref(), Duration::from_secs(1)).await;
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(2)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
 }

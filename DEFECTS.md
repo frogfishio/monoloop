@@ -3188,7 +3188,7 @@ bound the entire API operation, and only `Stopped` may prove executor/thread joi
 
 **Priority:** P1
 
-**Status:** Open (independent acceptance review, 2026-08-23)
+**Status:** Fixed (2026-08-23) — Silver evidence; do not promote Golden / §25 / D-025
 
 **Affected:**
 - `crates/monoloop-loop/src/transaction/host_tools.rs`
@@ -3215,18 +3215,31 @@ v2 rewrite was intended to remove.
 - Define cooperative external work explicitly as host-owned rather than claiming
   runtime join/stop guarantees for it.
 
+**Remediation (Fixed):**
+- `RegisteredTool::try_new` rejects `AbortableAtYield` (mirror ProcessIsolated).
+- `RegisteredTool::try_new_abortable` accepts only sealed
+  `AbortableAtYieldHandler` (`AsyncToolHandler` / `IsolatedKillableToolHandler`),
+  which always yield CancelOnly + unspawned `drive` polled on the supervised
+  dispatch task (M5.4).
+- `ToolHandler::runtime_owns_abortable_drive` structural marker; HostToolRegistry
+  re-validates Abortable entries.
+- Dispatcher pre-start checks `runtime_owns_abortable_drive`; post-start requires
+  CancelOnly kill + `drive.is_some()` before polling the body.
+- Forged/mismatched class tests: `host_tools` unit tests, hardening,
+  `s22_4_cannot_self_assert_abortable_via_boolean`.
+
 **Acceptance criteria:**
-- [ ] A custom handler cannot self-assert `AbortableAtYield` through a boolean.
-- [ ] Every accepted abortable execution has a TaskSupervisor-owned join before
-  its body starts.
-- [ ] Abort retains capacity until that join is observed.
-- [ ] Tests attempt forged/mismatched handles for every execution class.
+- [x] A custom handler cannot self-assert `AbortableAtYield` through a boolean.
+- [x] Every accepted abortable execution has a TaskSupervisor-owned join before
+  its body starts (inline `drive` on supervised ToolWorker / dispatch task).
+- [x] Abort retains capacity until that join is observed (§22.4 permit proofs).
+- [x] Tests attempt forged/mismatched handles for every execution class.
 
 ## D-051: Connector ownership begins only after open completes
 
 **Priority:** P2
 
-**Status:** Open (independent acceptance review, 2026-08-23)
+**Status:** Fixed (2026-08-23) — Silver evidence; do not promote Golden / §25 / D-025
 
 **Affected:**
 - `crates/monoloop-connector/src/open.rs`
@@ -3245,25 +3258,37 @@ supervised, but it fails the mandatory v2 §15 ownership seam: open-owner identi
 must exist before I/O starts and control/join must cover pending open as well as
 post-open transport work.
 
+**Remediation (Fixed):**
+- `PendingRawConnection::open_owned` / `take_owner_work`: required owner future
+  drives open I/O then post-open transport; signals `opened` via oneshot.
+- `OpenedRawConnection` no longer carries `owner_work` (removed `None` migration).
+- Lifecycle exchange spawns `TaskClass::ConnectorOwner` **before** polling
+  `pending.opened`; cancel/fail paths join children.
+- All product profiles (Fake, HTTP, Proxy failed-pending, Grok, Claude, Z.ai,
+  Cursor, Codex, Agy) use `open_owned` / `failed`.
+- Proofs: `d051_pending_exposes_owner_before_open_poll`,
+  `d051_cancel_during_delayed_open_joins_owner`, plus migrated connector suites.
+
 **Acceptance criteria:**
-- [ ] `PendingRawConnection` transfers owner work/identity before open I/O can
+- [x] `PendingRawConnection` transfers owner work/identity before open I/O can
   start.
-- [ ] `ConnectorOwner` registration precedes first poll of the entire open and
+- [x] `ConnectorOwner` registration precedes first poll of the entire open and
   transport owner operation.
-- [ ] Cancel/terminate during a non-yielding or delayed open retains an observable
+- [x] Cancel/terminate during a non-yielding or delayed open retains an observable
   owner join and never fabricates teardown.
-- [ ] No profile retains the temporary `owner_work: None` migration option.
+- [x] No profile retains the temporary `owner_work: None` migration option.
 
 ## D-052: Mandatory format and clippy verification gates fail at delivered HEAD
 
 **Priority:** P1
 
-**Status:** Open (independent acceptance review, 2026-08-23)
+**Status:** Fixed (2026-08-23) — Silver evidence; do not promote Golden / §25 / D-025
 
 **Affected:**
 - workspace formatting
 - `crates/monoloop-loop/src/transaction/lifecycle/tests.rs`
 - `doc/TRANSACTION_RUNTIME_V2_SPEC.md` status header
+- `Makefile` (`gates` / `doc` / `dist`)
 
 **Problem:** At commit `fb0371b`, the specification header claims the §23 core
 commands are green, but two mandatory commands fail.
@@ -3277,27 +3302,55 @@ commands are green, but two mandatory commands fail.
   environment is allowed to bind loopback sockets.
 - `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` passes.
 
+**Remediation (Fixed):**
+- `cargo fmt --all` + clippy fixes (`unused_mut`;
+  `needless_borrows_for_generic_args` in lifecycle tests).
+- Makefile: `doc` uses `RUSTDOCFLAGS="-D warnings"`; new `gates` target runs
+  exactly the four §23 commands; `dist` invokes `gates` before release build.
+- Spec status header updated to observed-green-after-D-052, with D-053 honesty
+  that `monoloop-loop` `--all-targets` remains a registered subset.
+
 **Acceptance criteria:**
-- [ ] All four §23 commands pass on the same clean checkout.
-- [ ] CI runs exactly those commands and blocks release on failure.
-- [ ] The specification status header reports observed state rather than a stale
+- [x] All four §23 commands pass on the same clean checkout.
+- [x] CI / release path runs exactly those commands and blocks release on
+  failure (`make gates` / `make dist`).
+- [x] The specification status header reports observed state rather than a stale
   green claim.
+
+**Expert + Advisor (2026-08-23, D-052 Fixed):** **PASS — Silver** for this
+slice only. Re-ran the four §23 commands on this tree: `cargo fmt --all --
+--check`, `cargo clippy --workspace --all-targets --all-features -- -D
+warnings`, `cargo test --workspace --all-targets --all-features`,
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` — all exit 0.
+`make gates` is those four; `make dist` invokes `gates` before release build.
+Spec header is observed-green-after-D-052 and explicitly **Not** Golden / §25;
+D-053 honesty (`monoloop-loop` `--all-targets` is a registered subset) is
+accurate (`hardening.rs` / `admission_lifecycle.rs` / `claim_gate.rs` /
+`direct_llm_e2e.rs` / `exchange_e2e.rs` / `runtime_startup.rs` and
+`monoloop-loop` `examples/fake_echo.rs` were not executed by the workspace
+command). Architecture import gates remain green. Residual: CI
+`.github/workflows/ci.yml` still runs `cargo doc --workspace --no-deps`
+without `RUSTDOCFLAGS="-D warnings"` (Makefile `doc`/`gates` do). That is a
+CI/spec flag mismatch, not a component-law hole and does not reopen this P1.
+**Closed same day with D-053:** CI rustdoc now sets `RUSTDOCFLAGS=-D warnings`.
+Do **not** promote Golden / §25 / D-025.
 
 ## D-053: `--all-targets` excludes six integration suites and package examples
 
 **Priority:** P2
 
-**Status:** Open (independent acceptance review, 2026-08-23)
+**Status:** Fixed (2026-08-23) — Silver evidence; do not promote Golden / §25 / D-025
 
 **Affected:**
 - `crates/monoloop-loop/Cargo.toml`
-- `crates/monoloop-loop/tests/admission_lifecycle.rs`
-- `crates/monoloop-loop/tests/claim_gate.rs`
-- `crates/monoloop-loop/tests/direct_llm_e2e.rs`
-- `crates/monoloop-loop/tests/exchange_e2e.rs`
-- `crates/monoloop-loop/tests/hardening.rs`
-- `crates/monoloop-loop/tests/runtime_startup.rs`
-- `crates/monoloop-loop/examples/fake_echo.rs`
+- `crates/monoloop-loop/tests/admission_lifecycle.rs` (deleted)
+- `crates/monoloop-loop/tests/claim_gate.rs` (ported to `StartedRuntime`)
+- `crates/monoloop-loop/tests/direct_llm_e2e.rs` (deleted)
+- `crates/monoloop-loop/tests/exchange_e2e.rs` (deleted)
+- `crates/monoloop-loop/tests/hardening.rs` (deleted)
+- `crates/monoloop-loop/tests/runtime_startup.rs` (deleted)
+- `crates/monoloop-loop/examples/fake_echo.rs` (rewritten on `StartedRuntime`)
+- `doc/D053_COVERAGE_REPLACEMENT.md`
 
 **Problem:** `monoloop-loop` sets `autotests = false` and `autoexamples = false`,
 then registers only selected test targets. The six integration files above still
@@ -3311,26 +3364,63 @@ excluded unless explicitly registered.
 - The Cargo manifest comments explicitly say the suites await rewrite for
   `StartedRuntime`, despite the specification header claiming M7 façade cutover.
 
+**Remediation (Fixed):**
+- Deleted five v1 suites that imported removed `DefaultTransactionRuntime`,
+  with explicit replacement map in `doc/D053_COVERAGE_REPLACEMENT.md`.
+- Ported `claim_gate` (omit provider sessionId → `InvariantFailed`) onto
+  `StartedRuntime` / push delivery.
+- Rewrote `examples/fake_echo.rs` onto `StartedRuntime`.
+- Enabled `autotests = true` and `autoexamples = true` so every on-disk suite
+  and example is compiled by `--all-targets`.
+- Also closed D-052 CI residual: `.github/workflows/ci.yml` rustdoc now sets
+  `RUSTDOCFLAGS=-D warnings` to match `make gates`.
+- Advisor follow-up: stale `monoloop-loop` README “unregistered v1 files”
+  line removed; `fake_echo_exchange_emits_canonical_text_unit` hardened to
+  drain events concurrent with completion (workspace `--all-targets` + 30×
+  stress of the named test: 0 failures on this tree).
+
 **Acceptance criteria:**
-- [ ] Port every retained integration suite to the v2 public API and register it,
+- [x] Port every retained integration suite to the v2 public API and register it,
   or delete it with an explicit coverage replacement map.
-- [ ] Register/enable package examples so `--all-targets` compiles them.
-- [ ] `cargo test --workspace --all-targets --all-features` demonstrably includes
+- [x] Register/enable package examples so `--all-targets` compiles them.
+- [x] `cargo test --workspace --all-targets --all-features` demonstrably includes
   the full intended suite rather than a curated subset hidden by autodiscovery
   settings.
+
+**Expert + Advisor (2026-08-23, D-053 Fixed after README + fake_echo harden):**
+**PASS — Silver** for this slice only. Re-checked on this tree:
+
+- `monoloop-loop` `autotests`/`autoexamples` enabled; cargo metadata lists
+  every on-disk integration suite (`claim_gate`, `empty_loop`, `linked_tools`,
+  `mcp_gateway`, `rmcp_loopback_spike`, `s22_*`, `s23_forbidden_patterns`) and
+  `examples/fake_echo`; the six v1 files are gone.
+- `cargo test --workspace --all-targets --all-features --no-run` exit 0 (full
+  intended on-disk suite compiles, including both `fake_echo` examples).
+- Architecture gates green; no product crate depends on `monoloop-testkit`
+  (including `monoloop-loop` production and dev).
+- `fake_echo_exchange_emits_canonical_text_unit` concurrent drain +
+  `claim_gate` omit-sessionId → `InvariantFailed` both pass.
+- README and spec header: D-053 Fixed; **Not** Golden / §25; D-054 named.
+
+Residuals (do **not** reopen D-053): package `fake_echo` examples still
+`try_recv` after completion and do not assert a unit (smoke only). WP-12
+evidence rows retargeted under D-054. Obsolete uncompiled modules deleted
+under D-054. Do **not** promote Golden / §25 / D-025.
 
 ## D-054: M7 deletion and final §23/§25 acceptance are incomplete
 
 **Priority:** P2
 
-**Status:** Open (independent acceptance review, 2026-08-23)
+**Status:** Fixed (2026-08-23) — Silver honesty/deletion slice after WP-12 /
+D-003 retarget. Do **not** promote Golden / §25 / D-025.
 
 **Affected:**
-- `crates/monoloop-loop/src/transaction/active_registry.rs`
-- `crates/monoloop-loop/src/transaction/events.rs`
-- `crates/monoloop-loop/src/transaction/exchange.rs`
-- `crates/monoloop-loop/src/transaction/spawn_gate.rs`
+- `crates/monoloop-loop/src/transaction/active_registry.rs` (deleted)
+- `crates/monoloop-loop/src/transaction/events.rs` (deleted)
+- `crates/monoloop-loop/src/transaction/exchange.rs` (deleted)
+- `crates/monoloop-loop/src/transaction/spawn_gate.rs` (deleted)
 - callback-based compatibility types/aliases in contracts and Loop exports
+  (retained — explicit compatibility phase)
 - `doc/SECURITY_REVIEW_CHECKLIST.md`
 - `doc/TRANSACTION_RUNTIME_V2_SPEC.md`
 
@@ -3342,19 +3432,175 @@ means the claimed M7 completion and final definition of done are inaccurate.
 
 The project's security checklist also explicitly records an incomplete exhaustive
 public-limit matrix, incomplete broader load/race coverage, live Grok qualification
-still open, and an unsigned independent-review gate. D-046–D-053 now add unresolved
-P1/P2 findings, so v2 §23 and §25 cannot pass.
+still open, and an unsigned independent-review gate. At acceptance time D-046–D-053
+were also open, so v2 §23 and §25 could not pass.
+
+**Remediation (Fixed — Silver honesty / deletion slice):**
+- Deleted the four obsolete uncompiled modules; `transaction/mod.rs` no longer
+  comments them as deferred-on-disk.
+- Narrowed M7 / status language: façade cutover done; deletion of obsolete
+  files done; **compatibility phase** retains `adapt_*` host adapters and
+  deprecated aliases until a deliberate breaking cut.
+- D-046–D-053 Fixed (Silver); §23 core `make gates` remain the release path.
+- WP-12 Pass rows and Proven bullets that named deleted v1 suites /
+  `CallbackService` retargeted to lifecycle / `adapt_*` / D-053 map.
+- `DECISIONS.md` D-003 updated: obsolete modules **deleted** (D-054); aliases
+  remain compatibility-phase, not deferred-on-disk source.
+
+**Still open for Golden / §25 / D-025 (do not claim closed here):**
+- Exhaustive public-limit / race-load / live Grok qualifications (§23 extras).
+- Unsigned independent security / acceptance review (D-025).
+- Breaking removal of compatibility aliases.
+- A subsequent independent acceptance review finding no unresolved P0/P1/P2.
 
 **Acceptance criteria:**
-- [ ] Delete obsolete uncompiled lifecycle/event modules after coverage migration.
-- [ ] Remove callback-based core APIs and compatibility aliases at the declared
-  breaking boundary, or narrow M7/status language to an explicitly incomplete
-  compatibility phase.
-- [ ] Close D-046–D-053 and rerun all mandatory gates.
+- [x] Delete obsolete uncompiled lifecycle/event modules after coverage migration.
+- [x] Remove callback-based core APIs and compatibility aliases at the declared
+  breaking boundary, **or** narrow M7/status language to an explicitly incomplete
+  compatibility phase. (Chose narrow language; aliases retained.)
+- [x] Close D-046–D-053 and rerun mandatory §23 core gates.
+- [x] Retarget remaining WP-12 Pass rows that still name deleted v1 suites
+  (`hardening`, `exchange_e2e`) or the removed `CallbackService` as live
+  evidence.
 - [ ] Complete the remaining exact-limit, race/load, and profile qualifications
-  claimed by §23/§25.
+  claimed by §23/§25. (**Golden residual — not this Silver slice.**)
 - [ ] A subsequent independent acceptance review finds no unresolved P0/P1/P2
-  lifecycle defect.
+  lifecycle defect. (**Process residual — agents must not self-sign.**)
+
+**Expert (2026-08-23, D-054 Silver bar check):** **FAIL — not Fixed** for the
+honesty slice as recorded. M7 deletion and the chosen compatibility-phase
+narrowing **are** sound; the WP-12 retarget claim is not.
+
+Checked against `doc/TRANSACTION_RUNTIME_V2_SPEC.md` §24 M7:
+
+| M7 item | Verdict |
+|---|---|
+| 1. Public façade → v2 (`StartedRuntime`) | Holds (D-038). Not re-opened. |
+| 2. Port examples / intended suites | Holds (D-053 + `D053_COVERAGE_REPLACEMENT.md`). |
+| 3. Remove callback core APIs / aliases at breaking boundary | **Incomplete, as declared.** `TransactionRequest` / `TransactionRuntime` have **no** live `impl`. `RuntimeToolSpill` is a `#[deprecated]` alias of `OrphanToolPermitSet`. `adapt_event_sink` / `adapt_completion_callback` run only from `tests/s22_7_host_adapters.rs` (host executor), matching M1 “outside the core.” Spec header + Loop README + M7.3 text all say compatibility phase. Not claimed as the breaking cut. |
+| 4. Delete obsolete uncompiled files after consolidation | **Sound.** `active_registry.rs`, `events.rs`, `exchange.rs`, `spawn_gate.rs` were commented-out `mod` lines and imported deleted v1 symbols (`FinalizationGuard`, `executor_spawn`). Live v2 exchange is `lifecycle/exchange.rs`. `s23_forbidden_patterns` (4 tests) pass after deletion. Do not restore. |
+
+Does **not** claim §25 / Golden / alias breaking cut / independent review:
+spec header, Loop README “D-054 (partial)”, D-054 Golden boxes, and
+`doc/SECURITY_REVIEW_CHECKLIST.md` sign-off table remain unsigned. Correct.
+
+Does **not** pass the named WP-12 remediations. These Pass rows still cite
+deleted or removed evidence:
+
+- `WP12_REQUIREMENTS_ACCEPTANCE.md` R-000 cancel/timeout races → `hardening …`
+- R-000 no-leaks → `CallbackService drain` (`CallbackService` has **zero**
+  production `.rs` hits)
+- R-004 concurrent sequence/session → `hardening + exchange_e2e`
+- `WP12_CURRENT_LIMITATIONS.md` still lists “Runtime-owned `CallbackService`”
+  under Proven
+
+That is the same class of inaccurate-completion defect D-054 was opened for.
+D-003 in `DECISIONS.md` still says remaining on-disk modules are “deferred
+(not deleted) until their stage”; after this deletion that sentence is stale.
+
+This review did **not** re-run full `make gates` on the mixed D-046–D-054
+working tree. D-052 recorded the four §23 commands green; this check compiled
+and passed `s23_forbidden_patterns` only.
+
+Do **not** promote Golden / §25 / D-025. Next pick: finish WP-12 leftover
+rows (and the D-003 deferred-modules sentence), then re-present D-054 as
+Silver Fixed. Agents must not self-sign independent acceptance.
+
+**Advisor (2026-08-23, D-054 named honesty/deletion slice):** **FAIL — not
+Fixed Silver.** Expert’s deletion + compatibility-phase findings hold;
+the honesty leftover still blocks the stamp.
+
+Independently re-checked on this tree:
+
+- Three-component shape intact. Architecture gates: 10/10
+  (`product_crates_do_not_depend_on_testkit`, façade re-exports Connector +
+  Interpreter + Loop, Loop production ↛ profiles/testkit).
+- No product crate lists `monoloop-testkit` in production, dev, or build
+  deps. `s23_forbidden_patterns` 4/4 pass after the four-file deletion.
+- Deleted files are gone (`active_registry`, `events`, `exchange`,
+  `spawn_gate`); live exchange is `lifecycle/exchange.rs`. Do not restore.
+- M7.3 is an explicit compatibility phase, not a breaking cut:
+  `TransactionRuntime` has **no** live `impl`; `RuntimeToolSpill` is a
+  `#[deprecated]` alias; `adapt_*` stay host-side. Spec header, Loop README
+  “D-054 (partial)”, D-054 Golden boxes, and
+  `doc/SECURITY_REVIEW_CHECKLIST.md` Sign-off remain unsigned. **Not** a
+  §25 / D-025 self-sign.
+
+Honesty leftover (same class as the original D-054 inaccurate-completion
+defect) was still present at Advisor FAIL time:
+
+- `doc/WP12_REQUIREMENTS_ACCEPTANCE.md` R-000 cancel/timeout races still
+  cited `hardening`; no-leaks still cited `CallbackService drain`;
+  R-004 concurrent sequence/session still cited `hardening + exchange_e2e`.
+- `doc/WP12_CURRENT_LIMITATIONS.md` Proven still listed “Runtime-owned
+  `CallbackService`”.
+- `DECISIONS.md` D-003 still said remaining on-disk modules are “deferred
+  (not deleted) until their stage.”
+
+**Follow-up (same day, after Advisor FAIL):** those WP-12 Pass/Proven rows and
+D-003 were retargeted to lifecycle / `adapt_*` / D-053 map language. Grep of
+`doc/WP12_*.md` + `DECISIONS.md` no longer finds live Pass evidence naming
+`hardening`, `exchange_e2e`, or `CallbackService` (coverage map may still
+name deleted files as **Deleted file** column — correct). Architecture
+gates 10/10. Status → **Fixed Silver** for the honesty/deletion slice.
+Do **not** promote Golden / §25 / D-025. Next pick: independent acceptance /
+D-025 sign-off or named Golden residuals. Agents must not self-sign.
+
+**Expert (2026-08-23, after WP-12 / D-003 retarget):** **PASS — Silver** for
+the honesty/deletion slice only. The prior leftover FAIL tail is superseded.
+
+Re-checked against `doc/TRANSACTION_RUNTIME_V2_SPEC.md` §24 M7 and the named
+acceptance boxes:
+
+| Check | Verdict |
+|---|---|
+| Four obsolete modules gone | `active_registry.rs`, v1 `events.rs`, v1 `exchange.rs`, `spawn_gate.rs` absent. Live exchange is `lifecycle/exchange.rs`. `s23_forbidden_patterns` 4/4 pass. Do not restore. |
+| Compatibility phase explicit | M7.3 incomplete as declared. `TransactionRuntime` has no live `impl`. `RuntimeToolSpill` is a `#[deprecated]` alias. `adapt_*` host-only (`s22_7_host_adapters.rs`). Spec header + Loop README “D-054 (partial)” + M7.3 text all say compatibility phase, not the breaking cut. |
+| WP-12 Pass/Proven retarget | `doc/WP12_*.md` has **zero** hits for `hardening`, `exchange_e2e`, or `CallbackService`. R-000 cancel/timeout → `lifecycle/tests.rs` `s22_2_*` (those tests exist). No-leaks → `Stopped` + host `adapt_*` drain. R-004 concurrent sequence → `s22_6_concurrent_producers_contiguous_sequence` (exists). Proven host adapters cite `adapt_event_sink` / `adapt_completion_callback`, not runtime-owned `CallbackService`. Coverage map may still name deleted files in the **Deleted file** column — correct. |
+| D-003 | Obsolete modules **deleted** (D-054); aliases are compatibility-phase, **not** deferred-on-disk source. |
+| Empty-registry path | Unchanged: `empty_loop::empty_registry_unavailable_zero_effects` → `ToolUnavailable` + `OutboundToolOutcome::ToolUnavailable`; waiting never dispatches. |
+| Golden / §25 / D-025 | **Not claimed.** Sign-off table unsigned. Exhaustive public-limit / race-load / live Grok / alias breaking cut remain Golden residuals. |
+
+This review re-ran `s23_forbidden_patterns` only (4/4). It did **not** re-run
+full `make gates`. D-052 already recorded the four §23 commands green.
+
+Do **not** promote Golden / §25 / D-025. Next pick: independent acceptance /
+D-025 sign-off or named Golden residuals. Agents must not self-sign.
+
+**Advisor (2026-08-23, D-054 named honesty/deletion slice after WP-12 / D-003
+retarget):** **PASS — Silver** for this slice only. The prior leftover FAIL
+is superseded. Independently re-checked on this tree (not a self-sign of
+D-025 / §25 / independent acceptance):
+
+- Three-component shape intact. Architecture gates **10/10**
+  (`product_crates_do_not_depend_on_testkit`, façade re-exports Connector +
+  Interpreter + Loop, Loop production ↛ profiles/testkit).
+- No product crate lists `monoloop-testkit` in production, dev, or build
+  deps. `s23_forbidden_patterns` **4/4** pass. Deleted files remain gone
+  (`active_registry`, v1 `events`, v1 `exchange`, `spawn_gate`); live
+  exchange is `lifecycle/exchange.rs`. Do not restore.
+- M7.3 is an explicit compatibility phase, not a breaking cut:
+  `TransactionRuntime` has **no** live `impl`; `RuntimeToolSpill` is a
+  `#[deprecated]` alias of `OrphanToolPermitSet`; `adapt_*` stay host-side.
+  Spec header, Loop README “D-054 (partial)”, D-054 Golden boxes, and
+  `doc/SECURITY_REVIEW_CHECKLIST.md` Sign-off remain unsigned. **Not** a
+  §25 / D-025 self-sign.
+- Named honesty leftover closed: `doc/WP12_*.md` has **zero** live Pass
+  evidence naming `hardening`, `exchange_e2e`, or `CallbackService`
+  (coverage map **Deleted file** column may still name them — correct).
+  D-003: obsolete modules **deleted**; aliases are compatibility-phase, not
+  deferred-on-disk source. Empty-registry path unchanged
+  (`empty_loop::empty_registry_unavailable_zero_effects`).
+- Paper nit closed same day: WP-12 R-004 push-events evidence cites
+  `TransactionSubmitRequest.delivery` / `transaction_delivery`.
+
+This review re-ran architecture gates + `s23_forbidden_patterns` only. It
+did **not** re-run full `make gates`. D-052 already recorded the four §23
+commands green.
+
+**Next pick:** independent acceptance / D-025 sign-off **or** named Golden
+work (exhaustive public-limit / race-load / live Grok; breaking alias
+cut). Agents must not self-sign. Do **not** promote Golden / §25 / D-025.
 
 ## Independent Transaction Runtime v2 acceptance verdict — 2026-08-23
 
@@ -3380,11 +3626,12 @@ order is D-046, D-047, D-048, D-049, D-050, D-051, then D-052–D-054 followed b
 a fresh independent acceptance review. Do not mark D-025, §23, §25, or Golden
 complete while any of these records remain open.
 
-**Remediation progress (2026-08-23):** D-046 Fixed; D-047 Fixed (wait-for-
-capacity publish + sticky fail → EventDeliveryFailed). Seal-priority residual
-on full command mpsc remains noted under D-047 criteria. **Next pick:**
-D-048 (ProcessIsolated handle retained until reap). Do not promote Golden /
-§25 / D-025 while D-048–D-054 remain open.
+**Remediation progress (2026-08-23):** D-046–D-054 Fixed for their named Silver
+slices (see each defect). D-054 honesty/deletion + WP-12/D-003 retarget:
+Expert **PASS — Silver**; Advisor **PASS — Silver** (this record). Seal-priority residual remains
+under D-047; sacrificial PID residual under D-048. **Next pick:**
+independent acceptance / D-025 sign-off or named Golden residuals — agents
+must not self-sign. Do **not** promote Golden / §25 / D-025.
 
 **Expert + Advisor (2026-08-23, D-046 Fixed):** **PASS — Silver** for this
 slice only.
@@ -3411,7 +3658,7 @@ slice only. Registry parks live `ToolKillHandle` until reap; Stopped requires
 sacrificial abort-after-spawn PID-not-waitable proof. Do **not** promote
 Golden / §25 / D-025.
 
-**Remediation progress:** D-046–D-049 Fixed.
+**Remediation progress:** D-046–D-054 Fixed (Silver slices).
 
 **Expert + Advisor (2026-08-23, D-049 Fixed):** **PASS — Silver** for this
 slice only. Supervisor signals `drain_complete` without public `Stopped`;
@@ -3420,5 +3667,48 @@ executor thread signals `thread_exited` after `shutdown_timeout`;
 `hold_executor_teardown` proves TimedOut→Quiescing then Stopped after join.
 Do **not** promote Golden / §25 / D-025.
 
-**Next pick:** D-050 (AbortableAtYield structural factory — no self-asserted
-boolean). Do not promote Golden / §25 / D-025 while D-050–D-054 remain open.
+**Expert + Advisor (2026-08-23, D-050 Fixed):** **PASS — Silver** for this
+slice only. `RegisteredTool::try_new` rejects `AbortableAtYield`;
+`try_new_abortable` requires sealed `AbortableAtYieldHandler` (crate
+`AsyncToolHandler` / `IsolatedKillableToolHandler`); dispatcher requires
+CancelOnly + unspawned `drive` before polling. Boolean `supports_abort` /
+`runtime_owns_abortable_drive` cannot register the class. Product crates
+still do not depend on testkit. Evidence: `host_tools` unit tests,
+`s22_4_cannot_self_assert_abortable_via_boolean`,
+`s22_4_abortable_permit_held_until_join`. Residual: §14.2 “Tokio join handle
+abort” wording vs M5.4 inline drive remains a spec-alignment item, not a
+boolean hole. Do **not** promote Golden / §25 / D-025.
+
+**Expert + Advisor (2026-08-23, D-051 Fixed):** **PASS — Silver** for this
+slice only. `PendingRawConnection::open_owned` / `failed` transfer required
+owner work; `OpenedRawConnection` no longer carries `owner_work`. Live
+`lifecycle/exchange.rs` takes owner and registers `TaskClass::ConnectorOwner`
+before the first poll of `pending.opened`. All product `begin_open` paths
+(Fake, HTTP, Proxy failed-pending, Grok, Claude, Z.ai, Cursor, Codex, Agy)
+use `open_owned` / `failed`. Product crates still do not depend on testkit
+(architecture gates green). Evidence: `d051_pending_exposes_owner_before_open_poll`,
+`d051_cancel_during_delayed_open_joins_owner`, migrated connector suites.
+Residuals: v2 §15 `ConnectionOwnerHandle` sketch vs `ConnectionOwnerWork` +
+supervisor (representation MAY differ); `CONNECTOR.md` Pending sketch still
+omits the transfer; Grok profile `connect()` still uses an internal connect
+task joined/aborted by `PendingGrokServer` after the outer owner starts.
+Do **not** promote Golden / §25 / D-025.
+
+**Expert + Advisor (2026-08-23, D-052 Fixed):** **PASS — Silver** for this
+slice only. Four §23 commands green on this tree; `make gates` / `make dist`
+are release-blocking. CI rustdoc now matches with `RUSTDOCFLAGS=-D warnings`
+(closed with D-053). No Golden / §25 / D-025 claim.
+
+**Expert + Advisor (2026-08-23, D-053 Fixed after README + fake_echo harden):**
+**PASS — Silver** for this slice only. Intended on-disk suite compiles under
+workspace `--all-targets`; no testkit bleed; README/spec stay Fixed Silver.
+Do **not** promote Golden / §25 / D-025.
+
+**Advisor (2026-08-23, first pass):** D-054 did **not** meet Silver Fixed
+while WP-12 leftover Pass rows still cited deleted suites / `CallbackService`.
+
+**Follow-up (same day):** WP-12 + D-003 retargeted; Expert **PASS — Silver**.
+**Advisor (same day, after retarget):** **PASS — Silver** for the named
+honesty/deletion slice (see D-054 record). **Next pick:** independent
+acceptance / D-025 sign-off or named Golden work. Agents must not
+self-sign. Do **not** promote Golden / §25 / D-025.

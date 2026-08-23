@@ -181,8 +181,11 @@ together for in-process futures.
    `TRANSACTION_RUNTIME_IMPLEMENTATION.md` as superseded for those topics.
 4. Preserve Connector → Interpreter → Loop, canonical types, Channel identity,
    bounded resources, and provider-neutral tool semantics.
-5. Migrate in stages M1–M7 from the v2 spec. Remaining on-disk modules that still
-   depend on deleted symbols are deferred (not deleted) until their stage.
+5. Migrate in stages M1–M7 from the v2 spec. Obsolete uncompiled v1 modules
+   (`active_registry`, `events`, `exchange`, `spawn_gate`) were **deleted** under
+   D-054 (do not restore). Host callback adapters and deprecated aliases remain
+   in an explicit **compatibility phase** until a deliberate breaking cut
+   (D-054); that is not “deferred on-disk source.”
 
 **Consequences:**
 

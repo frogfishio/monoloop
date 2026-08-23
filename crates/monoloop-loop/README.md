@@ -45,12 +45,17 @@ Join vault retired to `OrphanToolPermitSet` (`RuntimeToolSpill` deprecated alias
 is the assembler recipe; deprecated sink-shaped `TransactionRequest` /
 `TransactionRuntime` trait are not core submit APIs. Host adapters
 `adapt_event_sink` / `adapt_completion_callback` stay (outside the kernel).
-Unregistered v1 integration `.rs` files remain on disk until rewritten.
-**Not Golden / §25 DoD** while §23 workspace gates and independent review
-remain open. D-039 / D-040 / D-041 Fixed.
+**D-053 Fixed:** legacy v1 integration suites were deleted (coverage map
+`doc/D053_COVERAGE_REPLACEMENT.md`); `autotests` / `autoexamples` are enabled
+so every on-disk suite and example is compiled by `--all-targets`.
+**Not Golden / §25 DoD** while remaining §23 extras, independent review, and
+compatibility-alias cleanup remain open. D-039 / D-040 / D-041 Fixed.
 
-Deferred on-disk modules (`active_registry`, `spawn_gate`, …) stay uncompiled
-until Loop-machine consolidation — deleting them is not part of façade cutover.
+**D-054 (partial):** obsolete uncompiled v1 modules (`active_registry`,
+`events`, `exchange`, `spawn_gate`) **deleted**. Host adapters
+`adapt_event_sink` / `adapt_completion_callback` and deprecated aliases
+(`RuntimeToolSpill`, sink-shaped `TransactionRequest`) remain as an explicit
+compatibility phase — not claimed as full M7 deletion.
 
 ## Agent assembly recipe (v2 / M2)
 

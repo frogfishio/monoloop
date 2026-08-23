@@ -363,11 +363,7 @@ impl RuntimeOwner {
         // install, so a concurrent admit either inserts before the flip (and is
         // visible to the shutdown snapshot) or sees Quiescing and rejects.
         {
-            let _ledger = self
-                .shared
-                .ledger
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _ledger = self.shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
             let _ = self.shared.state.compare_exchange(
                 STATE_ACCEPTING,
                 STATE_QUIESCING,

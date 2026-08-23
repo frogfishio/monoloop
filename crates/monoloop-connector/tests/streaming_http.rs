@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-fn drive_owner(opened: &mut monoloop_connector::OpenedRawConnection) {
-    if let Some(work) = opened.take_owner_work() {
-        tokio::spawn(work.into_future());
-    }
+/// D-051: spawn ConnectorOwner before polling `opened`.
+fn drive_pending(pending: &mut monoloop_connector::PendingRawConnection) {
+    let work = pending.take_owner_work();
+    tokio::spawn(work.into_future());
 }
 
 async fn bind_router(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -52,9 +52,9 @@ async fn open_and_send(
     let mut open = OpenConnection::new(ConnectionId::generate(), url);
     open.credential_ref = credential_ref.map(|s| s.to_string());
     open.limits = limits;
-    let pending = c.begin_open(open);
-    let mut opened = pending.opened.await.unwrap();
-    drive_owner(&mut opened);
+    let mut pending = c.begin_open(open);
+    drive_pending(&mut pending);
+    let opened = pending.opened.await.unwrap();
     if !body.is_empty() {
         opened.input.send(Bytes::from(body.to_vec())).await.unwrap();
     }
@@ -196,7 +196,8 @@ async fn credential_resolution_and_header() {
     // Missing credential ref fails at open.
     let mut open = OpenConnection::new(ConnectionId::generate(), format!("http://{addr}/auth"));
     open.credential_ref = Some("missing".into());
-    let pending = c.begin_open(open);
+    let mut pending = c.begin_open(open);
+    drive_pending(&mut pending);
     let err = match pending.opened.await {
         Err(e) => e,
         Ok(_) => panic!("expected credential failure"),
@@ -229,9 +230,9 @@ async fn max_request_bytes_plus_one() {
         max_queued_output_bytes: 1024,
         max_chunk_bytes: 64,
     };
-    let pending = c.begin_open(open);
-    let mut opened = pending.opened.await.unwrap();
-    drive_owner(&mut opened);
+    let mut pending = c.begin_open(open);
+    drive_pending(&mut pending);
+    let opened = pending.opened.await.unwrap();
     opened.input.send(Bytes::from(vec![b'x'; 9])).await.unwrap();
     opened.input.finish().await.unwrap();
     let end = opened.completion.wait().await;
@@ -286,10 +287,10 @@ async fn cancel_while_request_in_flight() {
     );
     let mut open = OpenConnection::new(ConnectionId::generate(), format!("http://{addr}/ok"));
     open.limits.connect_deadline = Duration::from_secs(10);
-    let pending = c.begin_open(open);
+    let mut pending = c.begin_open(open);
+    drive_pending(&mut pending);
     let control = pending.control.clone();
-    let mut opened = pending.opened.await.unwrap();
-    drive_owner(&mut opened);
+    let opened = pending.opened.await.unwrap();
     opened.input.send(Bytes::from_static(b"{}")).await.unwrap();
     opened.input.finish().await.unwrap();
     // Cancel while HTTP request is in flight.
@@ -314,13 +315,13 @@ async fn cancel_before_request_send() {
         Arc::new(MapCredentialResolver::empty()),
         StreamingHttpConfig::default(),
     );
-    let pending = c.begin_open(OpenConnection::new(
+    let mut pending = c.begin_open(OpenConnection::new(
         ConnectionId::generate(),
         format!("http://{addr}/ok"),
     ));
+    drive_pending(&mut pending);
     let control = pending.control.clone();
-    let mut opened = pending.opened.await.unwrap();
-    drive_owner(&mut opened);
+    let opened = pending.opened.await.unwrap();
     // Cancel while waiting for body finish.
     control.cancel(CancellationReason::CallerRequested);
     let end = opened.completion.wait().await;
@@ -335,13 +336,13 @@ async fn terminate_during_open_collect() {
         Arc::new(MapCredentialResolver::empty()),
         StreamingHttpConfig::default(),
     );
-    let pending = c.begin_open(OpenConnection::new(
+    let mut pending = c.begin_open(OpenConnection::new(
         ConnectionId::generate(),
         format!("http://{addr}/ok"),
     ));
+    drive_pending(&mut pending);
     let control = pending.control.clone();
-    let mut opened = pending.opened.await.unwrap();
-    drive_owner(&mut opened);
+    let opened = pending.opened.await.unwrap();
     control.terminate(TerminationReason::CallerForced);
     let end = opened.completion.wait().await;
     assert_eq!(end.kind, ConnectionEndKind::Terminated);
@@ -432,7 +433,8 @@ async fn malformed_endpoint_fails_open() {
         Arc::new(MapCredentialResolver::empty()),
         StreamingHttpConfig::default(),
     );
-    let pending = c.begin_open(OpenConnection::new(ConnectionId::generate(), "not-a-url"));
+    let mut pending = c.begin_open(OpenConnection::new(ConnectionId::generate(), "not-a-url"));
+    drive_pending(&mut pending);
     let err = match pending.opened.await {
         Err(e) => e,
         Ok(_) => panic!("expected config failure"),
@@ -481,14 +483,7 @@ async fn absolute_request_deadline_covers_header_and_body_delay() {
         connect_deadline: Duration::from_secs(5),
         ..ConnectorLimits::default()
     };
-    let opened = open_and_send(
-        &c,
-        format!("http://{addr}/slow"),
-        b"{}",
-        None,
-        limits,
-    )
-    .await;
+    let opened = open_and_send(&c, format!("http://{addr}/slow"), b"{}", None, limits).await;
     let end = opened.completion.wait().await;
     assert_eq!(end.kind, ConnectionEndKind::TransportFailure);
     let msg = end.safe_transport_error.unwrap_or_default();
@@ -511,9 +506,8 @@ async fn full_output_queue_terminates_at_overall_deadline() {
                 Bytes::from_static(b"ijklmnop"),
                 Bytes::from_static(b"qrstuvwx"),
             ];
-            let stream = futures_util::stream::iter(
-                chunks.into_iter().map(Ok::<_, std::io::Error>),
-            );
+            let stream =
+                futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
             Response::builder()
                 .status(StatusCode::OK)
                 .body(Body::from_stream(stream))
@@ -538,14 +532,7 @@ async fn full_output_queue_terminates_at_overall_deadline() {
         },
         ..ConnectorLimits::default()
     };
-    let opened = open_and_send(
-        &c,
-        format!("http://{addr}/flood"),
-        b"{}",
-        None,
-        limits,
-    )
-    .await;
+    let opened = open_and_send(&c, format!("http://{addr}/flood"), b"{}", None, limits).await;
     // Deliberately do not receive — output queue must fill and deadline must fire.
     let end = opened.completion.wait().await;
     assert_eq!(end.kind, ConnectionEndKind::TransportFailure);
@@ -585,7 +572,10 @@ async fn cancel_interrupts_blocked_output_enqueue() {
         ..Default::default()
     };
     let c = connector(Arc::new(MapCredentialResolver::empty()), config);
-    let mut open = OpenConnection::new(ConnectionId::generate(), format!("http://{addr}/block-cancel"));
+    let mut open = OpenConnection::new(
+        ConnectionId::generate(),
+        format!("http://{addr}/block-cancel"),
+    );
     open.limits = ConnectorLimits {
         connect_deadline: Duration::from_secs(5),
         buffers: TransportBufferLimits {
@@ -595,10 +585,10 @@ async fn cancel_interrupts_blocked_output_enqueue() {
         },
         ..ConnectorLimits::default()
     };
-    let pending = c.begin_open(open);
+    let mut pending = c.begin_open(open);
+    drive_pending(&mut pending);
     let control = pending.control.clone();
-    let mut opened = pending.opened.await.unwrap();
-    drive_owner(&mut opened);
+    let opened = pending.opened.await.unwrap();
     opened.input.send(Bytes::from_static(b"{}")).await.unwrap();
     opened.input.finish().await.unwrap();
     // Allow first chunk to fill the queue and second enqueue to block.
@@ -650,14 +640,7 @@ async fn blocked_enqueue_honors_idle_before_overall_deadline() {
         },
         ..ConnectorLimits::default()
     };
-    let opened = open_and_send(
-        &c,
-        format!("http://{addr}/idle-block"),
-        b"{}",
-        None,
-        limits,
-    )
-    .await;
+    let opened = open_and_send(&c, format!("http://{addr}/idle-block"), b"{}", None, limits).await;
     let end = opened.completion.wait().await;
     assert_eq!(end.kind, ConnectionEndKind::TransportFailure);
     let msg = end.safe_transport_error.unwrap_or_default();
@@ -683,9 +666,8 @@ async fn max_queued_output_bytes_plus_one_fails_closed() {
                 Bytes::from_static(b"01234567"),
                 Bytes::from_static(b"abcdefgh"),
             ];
-            let stream = futures_util::stream::iter(
-                chunks.into_iter().map(Ok::<_, std::io::Error>),
-            );
+            let stream =
+                futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
             Response::builder()
                 .status(StatusCode::OK)
                 .body(Body::from_stream(stream))

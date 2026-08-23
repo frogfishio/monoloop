@@ -5,9 +5,13 @@ D-003; D-042; D-043; D-044 Fixed). **M6 §22 matrix closed enough** (D-045):
 §22.1–§22.7 proofs landed (host adapters outside core); MCP RuntimeService +
 CreationOnly + `TaskClass::McpRequest` ownership landed. Refreshable MCP
 **deferred** for initial profiles (**DECISIONS D-042** / WP12). **M7 façade
-landed** (D-038 Fixed). **§23 core commands** (fmt / clippy / test / doc -D
-warnings) green on tree; remaining §23 extras + independent review still
-open. **Not** Golden / §25. D-039 / D-040 / D-041 Fixed.
+cutover landed** (D-038 Fixed); **M7 deletion incomplete** (D-054): obsolete
+uncompiled v1 modules deleted, but host callback adapters and deprecated
+aliases remain in an explicit compatibility phase. **§23 core commands** (fmt /
+clippy / test / doc -D warnings) observed green after D-052 via `make gates`.
+D-053 Fixed (`autotests`/`autoexamples`; `doc/D053_COVERAGE_REPLACEMENT.md`).
+Remaining §23 extras + §25 DoD + independent review still open. **Not** Golden /
+§25. D-039 / D-040 / D-041 Fixed.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 
@@ -897,9 +901,12 @@ Adapt:
 
 Delete or permanently retire:
 
-- `active_registry.rs`;
-- `spawn_gate.rs`;
-- callback-based core traits after compatibility migration;
+- `active_registry.rs` — **deleted** (D-054);
+- `spawn_gate.rs` — **deleted** (D-054);
+- obsolete uncompiled `events.rs` / v1 `exchange.rs` — **deleted** (D-054);
+  live exchange is `lifecycle/exchange.rs`;
+- callback-based core traits after compatibility migration
+  (**compatibility phase** — not yet the breaking cut; D-054);
 - `FinalizationGuard` and any equivalent actor/supervisor shared CAS;
 - reaper tasks;
 - callback services inside the runtime; and
@@ -1074,12 +1081,16 @@ Additional gates:
 
 ### M7 — Cutover and deletion
 
-1. Move the public façade to runtime v2.
-2. Port examples and testkit adapters.
+1. Move the public façade to runtime v2. **Done** (D-038 / `StartedRuntime`).
+2. Port examples and testkit adapters. **Done** for intended suites (D-053).
 3. Remove callback-based core APIs and compatibility aliases on the planned
-   breaking-version boundary.
+   breaking-version boundary. **Incomplete — compatibility phase** (D-054):
+   `adapt_event_sink` / `adapt_completion_callback` and deprecated aliases
+   (`RuntimeToolSpill`, sink-shaped `TransactionRequest` / `TransactionRuntime`)
+   remain exported until a deliberate breaking cut.
 4. Delete `active_registry.rs`, `spawn_gate.rs`, obsolete event delivery, and the
    unused duplicate Loop implementation only after behavior is consolidated.
+   **Done for the four obsolete uncompiled files** (D-054); do not restore.
 
 ## 25. Definition of done
 

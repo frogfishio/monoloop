@@ -11,10 +11,11 @@ keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
 description = "Minimal extensible Loop: lossless canonical subscription, empty-capable tools"
-# Disable autodiscovery so legacy v1 integration tests are not built unless
-# explicitly listed (and gated) below during Runtime v2 migration.
-autotests = false
-autoexamples = false
+# D-053: all on-disk integration tests and examples are the intended suite.
+# Legacy v1 DefaultTransactionRuntime suites were deleted with a coverage map
+# (see DEFECTS.md D-053). Autodiscovery keeps `--all-targets` honest.
+autotests = true
+autoexamples = true
 
 [dependencies]
 monoloop-contracts = { workspace = true }
@@ -35,48 +36,8 @@ uuid = { workspace = true }
 
 [features]
 default = []
-# v1 integration suites under tests/{admission_lifecycle,exchange_e2e,…}.rs and
-# examples/fake_echo.rs are kept on disk but not registered until rewritten for
-# StartedRuntime (D-038 / M7). Do not reintroduce a feature that compiles deleted
-# v1 symbols.
 
 [dev-dependencies]
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
 reqwest = { workspace = true }
-
-[[test]]
-name = "empty_loop"
-path = "tests/empty_loop.rs"
-
-[[test]]
-name = "rmcp_loopback_spike"
-path = "tests/rmcp_loopback_spike.rs"
-
-[[test]]
-name = "s22_3_non_yielding_sacrificial"
-path = "tests/s22_3_non_yielding_sacrificial.rs"
-
-[[test]]
-name = "s22_4_join_only_spill_sacrificial"
-path = "tests/s22_4_join_only_spill_sacrificial.rs"
-
-[[test]]
-name = "s22_4_tools"
-path = "tests/s22_4_tools.rs"
-
-[[test]]
-name = "linked_tools"
-path = "tests/linked_tools.rs"
-
-[[test]]
-name = "mcp_gateway"
-path = "tests/mcp_gateway.rs"
-
-[[test]]
-name = "s22_7_host_adapters"
-path = "tests/s22_7_host_adapters.rs"
-
-[[test]]
-name = "s23_forbidden_patterns"
-path = "tests/s23_forbidden_patterns.rs"

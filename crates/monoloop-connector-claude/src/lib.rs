@@ -95,13 +95,9 @@ impl Connector for ClaudeConnector {
         let control_state = ControlState::new();
         let control = ConnectionControlHandle::new(Arc::clone(&control_state));
         let control_open = control.clone();
-        let opened =
-            Box::pin(async move { open_raw(config, request, control_open, control_state).await });
-        PendingRawConnection {
-            connection_id,
-            control,
-            opened,
-        }
+        PendingRawConnection::open_owned(connection_id, control, async move {
+            open_raw(config, request, control_open, control_state).await
+        })
     }
 }
 
@@ -122,7 +118,7 @@ async fn open_raw(
     request: OpenConnection,
     control: ConnectionControlHandle,
     control_state: Arc<ControlState>,
-) -> Result<OpenedRawConnection, monoloop_contracts::ConnectorError> {
+) -> Result<(OpenedRawConnection, ConnectionOwnerWork), monoloop_contracts::ConnectorError> {
     let dialect = DialectBinding::negotiated(DialectDescriptor::claude_code("1"));
     let max_chunk = request.limits.buffers.max_chunk_bytes.max(64 * 1024);
     let (in_tx, mut in_rx) = mpsc::channel::<RawInputMessage>(8);
@@ -207,14 +203,16 @@ async fn open_raw(
         });
     });
 
-    Ok(OpenedRawConnection {
-        connection_id: request.connection_id,
-        external_session_id,
-        dialect,
-        input,
-        output,
-        control,
-        completion,
-        owner_work: Some(owner_work),
-    })
+    Ok((
+        OpenedRawConnection {
+            connection_id: request.connection_id,
+            external_session_id,
+            dialect,
+            input,
+            output,
+            control,
+            completion,
+        },
+        owner_work,
+    ))
 }

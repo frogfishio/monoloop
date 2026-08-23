@@ -69,26 +69,24 @@ pub async fn run_event_publisher(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             EventPublisherCommand::EstablishExternal(_) if sticky_fail.is_some() => {}
-            EventPublisherCommand::EstablishExternal(external) => {
-                match establish_external_waiting(
-                    &event_tx,
-                    transaction_id,
-                    &channel_id,
-                    external,
-                    &mut session,
-                    &mut next_seq,
-                    &mut last_committed,
-                    &mut session_established,
-                    deadline,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(fail) => {
-                        sticky_fail = Some(fail);
-                    }
+            EventPublisherCommand::EstablishExternal(external) => match establish_external_waiting(
+                &event_tx,
+                transaction_id,
+                &channel_id,
+                external,
+                &mut session,
+                &mut next_seq,
+                &mut last_committed,
+                &mut session_established,
+                deadline,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(fail) => {
+                    sticky_fail = Some(fail);
                 }
-            }
+            },
             EventPublisherCommand::Publish(_) if sticky_fail.is_some() => {
                 // Refuse ordinary events after a sticky publish failure so Seal
                 // cannot paper over a truncated stream with Completed.

@@ -1,9 +1,8 @@
 //! Transaction runtime composition (Component 3 outer layer).
 //!
 //! Runtime v2 lifecycle lives in [`lifecycle`] (`doc/TRANSACTION_RUNTIME_V2_SPEC.md`).
-//! The deleted v1 files are **not** restored.
-//!
-//! Deferred on-disk modules (`exchange`, …) remain until their migration stage.
+//! Obsolete uncompiled v1 modules (`active_registry`, `events`, `exchange`,
+//! `spawn_gate`) were deleted under D-054; do not restore them.
 
 mod acp_encoder;
 mod bootstrap;
@@ -23,14 +22,8 @@ mod validation;
 
 mod dispatcher;
 mod loop_adapters;
-mod owned_process_registry;
-
-// Deferred until later migration stages (kept on disk, not compiled):
-// mod active_registry;
-// mod events;
-// mod exchange;
 mod mcp;
-// mod spawn_gate;
+mod owned_process_registry;
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
 pub use bootstrap::{
@@ -38,12 +31,12 @@ pub use bootstrap::{
     StoppedGate,
 };
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
+#[allow(deprecated)]
+pub use dispatcher::RuntimeToolSpill;
 pub use dispatcher::{
     DispatchOutcome, DispatchRequest, DispatcherLimits, OrphanToolPermitSet,
     TransactionToolDispatcher,
 };
-#[allow(deprecated)]
-pub use dispatcher::RuntimeToolSpill;
 pub use error::StartupError;
 pub use fake_support::{EmptyBytesEncoder, PanicEncoder, RejectEncoder, TestTextEncoder};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
@@ -60,8 +53,7 @@ pub use loop_adapters::{
 pub use mcp::{
     tool_definitions_from_resolved, CapabilityToken, McpBindingState, McpGateway, McpGatewayHandle,
     McpGatewayLimits, McpInstallError, McpRequestOwner, McpRouteTable, PendingMcpBinding,
-    PreparedMcpGateway,
-    TransactionMcpHandler,
+    PreparedMcpGateway, TransactionMcpHandler,
 };
 
 pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};
@@ -72,9 +64,9 @@ pub use resolved_tools::{ResolvedTool, ResolvedToolSet};
 pub use state::RuntimeState;
 pub use tool_capacity::{SharedToolCapacity, TransactionToolCapacity};
 pub use tool_handler::{
-    AsyncToolHandler, ImmediateToolHandler, IsolatedKillableToolHandler, LinkedToolExecutionHandle,
-    LostCompletionHandler, PanicOnStartHandler, StartFailHandler, ToolExecutionCompletion,
-    ToolExecutionControl, ToolHandler, ToolKillHandle,
+    AbortableAtYieldHandler, AsyncToolHandler, ImmediateToolHandler, IsolatedKillableToolHandler,
+    LinkedToolExecutionHandle, LostCompletionHandler, PanicOnStartHandler, StartFailHandler,
+    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, ToolKillHandle,
 };
 pub use validation::{
     validate_tool_completion, validate_tool_input, InputValidationFailure, OutputValidationFailure,

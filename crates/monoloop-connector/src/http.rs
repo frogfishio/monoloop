@@ -13,7 +13,7 @@ use crate::handles::{
 use crate::instance::{
     ConnectorBuildError, ConnectorFactory, ConnectorInstance, ConnectorInstanceId,
 };
-use crate::open::{OpenConnection, OpenedRawConnection, PendingRawConnection};
+use crate::open::{ConnectionOwnerWork, OpenConnection, OpenedRawConnection, PendingRawConnection};
 use crate::session::validate_open_attachment_owner;
 use crate::traits::Connector;
 use bytes::Bytes;
@@ -166,7 +166,8 @@ impl Connector for StreamingHttpConnector {
         let control_state_for_open = Arc::clone(&control_state);
         let instance_id = self.instance_id.clone();
 
-        let opened = Box::pin(async move {
+        // D-051: open I/O + HTTP owner run inside ConnectorOwner before `opened` is polled.
+        PendingRawConnection::open_owned(connection_id, control, async move {
             open_http(
                 request,
                 client,
@@ -177,13 +178,7 @@ impl Connector for StreamingHttpConnector {
                 instance_id,
             )
             .await
-        });
-
-        PendingRawConnection {
-            connection_id,
-            control,
-            opened,
-        }
+        })
     }
 }
 
@@ -274,7 +269,7 @@ async fn open_http(
     control: ConnectionControlHandle,
     control_state: Arc<ControlState>,
     instance_id: ConnectorInstanceId,
-) -> Result<OpenedRawConnection, ConnectorError> {
+) -> Result<(OpenedRawConnection, ConnectionOwnerWork), ConnectorError> {
     validate_open_attachment_owner(&instance_id, request.session_attachment.as_deref())?;
 
     let url = validate_endpoint_url(&request.endpoint_ref, config.require_https)
@@ -338,7 +333,7 @@ async fn open_http(
     let connect_deadline = request.limits.connect_deadline;
     let dialect = config.dialect.clone();
 
-    let owner_work = crate::open::ConnectionOwnerWork::new(run_http_owner(
+    let owner_work = ConnectionOwnerWork::new(run_http_owner(
         connection_id.clone(),
         control_state,
         in_rx,
@@ -351,16 +346,18 @@ async fn open_http(
         connect_deadline,
     ));
 
-    Ok(OpenedRawConnection {
-        connection_id,
-        external_session_id,
-        dialect,
-        input,
-        output,
-        control,
-        completion,
-        owner_work: Some(owner_work),
-    })
+    Ok((
+        OpenedRawConnection {
+            connection_id,
+            external_session_id,
+            dialect,
+            input,
+            output,
+            control,
+            completion,
+        },
+        owner_work,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

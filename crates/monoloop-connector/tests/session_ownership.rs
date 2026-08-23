@@ -10,10 +10,10 @@ use monoloop_contracts::{ChannelId, ConnectionId, SessionConfig, SessionId, Tran
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn drive_owner(opened: &mut monoloop_connector::OpenedRawConnection) {
-    if let Some(work) = opened.take_owner_work() {
-        tokio::spawn(work.into_future());
-    }
+/// D-051: spawn ConnectorOwner before polling `opened`.
+fn drive_pending(pending: &mut monoloop_connector::PendingRawConnection) {
+    let work = pending.take_owner_work();
+    tokio::spawn(work.into_future());
 }
 
 fn attach_request(requested: Option<SessionId>, config: SessionConfig) -> SessionAttachRequest {
@@ -41,7 +41,9 @@ async fn attachment_from_instance_a_rejected_by_instance_b() {
 
     let open = OpenConnection::new(ConnectionId::new("c-cross"), "default")
         .with_session_attachment(attachment);
-    let result = b.connector.begin_open(open).opened.await;
+    let mut pending = b.connector.begin_open(open);
+    drive_pending(&mut pending);
+    let result = pending.opened.await;
     let err = match result {
         Err(e) => e,
         Ok(_) => panic!("expected owner mismatch to fail open"),
@@ -63,8 +65,9 @@ async fn same_instance_accepts_own_attachment() {
     let attachment = pending.completion.await.unwrap();
     let open = OpenConnection::new(ConnectionId::new("c-ok"), "default")
         .with_session_attachment(attachment);
-    let mut opened = inst.connector.begin_open(open).opened.await.unwrap();
-    drive_owner(&mut opened);
+    let mut pending = inst.connector.begin_open(open);
+    drive_pending(&mut pending);
+    let opened = pending.opened.await.unwrap();
     assert!(opened.external_session_id.is_some());
 }
 
@@ -242,13 +245,11 @@ async fn blocked_session_does_not_block_unrelated() {
 async fn direct_llm_factory_has_no_session_adapter() {
     let inst = FakeConnectorFactory::direct_llm().create().unwrap();
     assert!(inst.sessions.is_none());
-    let mut opened = inst
+    let mut pending = inst
         .connector
-        .begin_open(OpenConnection::new(ConnectionId::new("d1"), "default"))
-        .opened
-        .await
-        .unwrap();
-    drive_owner(&mut opened);
+        .begin_open(OpenConnection::new(ConnectionId::new("d1"), "default"));
+    drive_pending(&mut pending);
+    let opened = pending.opened.await.unwrap();
     assert!(opened.external_session_id.is_none());
 }
 
@@ -286,11 +287,8 @@ fn same_session_key_excluded_before_connector_invocation() {
 #[tokio::test]
 async fn fake_connector_without_attachment_still_works() {
     let c = FakeConnector::echo();
-    let mut opened = c
-        .begin_open(OpenConnection::new(ConnectionId::new("plain"), "default"))
-        .opened
-        .await
-        .unwrap();
-    drive_owner(&mut opened);
+    let mut pending = c.begin_open(OpenConnection::new(ConnectionId::new("plain"), "default"));
+    drive_pending(&mut pending);
+    let opened = pending.opened.await.unwrap();
     assert!(opened.external_session_id.is_none());
 }

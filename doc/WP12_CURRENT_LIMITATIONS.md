@@ -7,16 +7,18 @@ path”; it records what is proven, partial, or out of scope.
 ## Proven (deterministic gates)
 
 - Runtime bootstrap, Channel registry, admission, dual-index SessionKey registry.
-- Exactly-one callback / Ended sequencing on FakeConnector + Test dialect paths.
-- Runtime-owned `CallbackService`: capacity released while host callbacks run;
-  shutdown drains inflight callbacks.
+- Exactly-one completion publication on FakeConnector + Test dialect paths
+  (`lifecycle/tests.rs` §22.2).
+- Host adapters (`adapt_event_sink` / `adapt_completion_callback`) run **outside**
+  the core executor; capacity is not held for host callback duration (v2 §7 / M1).
 - Global and per-Channel active capacity plus-one rejection and release.
 - Distinct-session and encoded-exchange channel limits; event byte budget;
   tool payload/output caps; empty extension allowlist deny.
 - Multi-Channel same session-string isolation; concurrent transaction isolation.
-- Subscriber backpressure isolated to the slow transaction’s sink.
-- Shutdown with active work: finalize + zero active/capacity after drain.
-- Cancel during delayed open and during Hang (no provider body) response wait.
+- Event delivery fail-closed under item/byte pressure (lifecycle §22.6).
+- Shutdown with active work: finalize + zero active/capacity after drain;
+  timeout yields `Quiescing`, not false `Stopped`.
+- Cancel during delayed open (D-051) and Hang-pinned response wait.
 - EmptyToolRegistry / NoToolRuntime → `tool_unavailable`, zero effects.
 - Host linked tools (dispatcher, capacity, validation) and MCP gateway binding
   lifecycle (loopback, HTTP initialize/list/call, capability redaction, revoke).
@@ -27,7 +29,8 @@ path”; it records what is proven, partial, or out of scope.
 - Architecture: product crates do not depend on `monoloop-testkit`; Connector /
   Interpreter / Loop production dependency direction holds.
 - Testkit: chat projection rebuilds from canonical TransactionEvent units only.
-- Tool registration rejects Abortable handlers that do not `supports_abort`.
+- Tool registration requires structural factories per class (`try_new_abortable` /
+  `try_new_process_isolated`); dyn boolean self-assert is rejected.
 
 ## Partial / not release-proven
 

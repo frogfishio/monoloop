@@ -565,9 +565,8 @@ mod tests {
 
         let bytes = estimate_canonical_input_bytes(&input).unwrap();
         // text "hi" + name "alice" + id + tool name + args + id again + text "ok"
-        let expected = 2 + 5 + "call-id-123".len() + "search".len() + encoded_args
-            + "call-id-123".len()
-            + 2;
+        let expected =
+            2 + 5 + "call-id-123".len() + "search".len() + encoded_args + "call-id-123".len() + 2;
         assert_eq!(bytes, expected);
         assert!(
             bytes > 2 + 2,

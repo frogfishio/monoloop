@@ -30,31 +30,30 @@ pub use tools::{
     NoToolRuntime, StartToolExecution, ToolExecutionHandle, ToolRuntime, ToolRuntimeError,
     ToolRuntimeTerminal,
 };
+#[allow(deprecated)]
+pub use transaction::RuntimeToolSpill;
 pub use transaction::{
     adapt_completion_callback, adapt_event_sink, build_completion, dispatch_ready_tool,
     dispatch_ready_tool_cancellable, tool_definitions_from_resolved, validate_tool_completion,
-    validate_tool_input, AcpPromptEncoder, AcpPromptWireShape, AsyncToolHandler, CapabilityToken,
-    ChannelBinding, ChannelRegistry, DispatchOutcome, DispatchRequest, DispatcherLimits,
-    EmptyBytesEncoder, FinalizerHoldGate, HeadlessPromptEncoder, HostCompletionAdapter,
-    HostEventAdapter, HostToolRegistry, HostToolRuntime, ImmediateToolHandler,
-    InputValidationFailure, IsolatedKillableToolHandler, JoinOnlySpillInject, LedgerEntry,
-    LifecycleLedger, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
-    McpBindingState, McpGateway, McpGatewayHandle, McpGatewayLimits, McpInstallError, McpRequestOwner,
-    McpRouteTable,
-    OpenAiChatCompletionsEncoder, OpenAiEncoderOptions, OrphanToolPermitSet,
-    OutputValidationFailure, PanicEncoder, PanicOnStartHandler, PendingMcpBinding,
-    PreparedMcpGateway, ProcessIsolatedToolHandler, ProcessToolCommand, RegisteredTool,
-    RejectEncoder, ReservationPool, ReservationPoolError, ResolvedTool, ResolvedToolRegistry,
-    ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeOwner, RuntimeState,
-    SharedToolCapacity, ShutdownTicket, SpawnReject, StartFailHandler, StartHoldGate,
+    validate_tool_input, AbortableAtYieldHandler, AcpPromptEncoder, AcpPromptWireShape,
+    AsyncToolHandler, CapabilityToken, ChannelBinding, ChannelRegistry, DispatchOutcome,
+    DispatchRequest, DispatcherLimits, EmptyBytesEncoder, FinalizerHoldGate, HeadlessPromptEncoder,
+    HostCompletionAdapter, HostEventAdapter, HostToolRegistry, HostToolRuntime,
+    ImmediateToolHandler, InputValidationFailure, IsolatedKillableToolHandler, JoinOnlySpillInject,
+    LedgerEntry, LifecycleLedger, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
+    McpBindingState, McpGateway, McpGatewayHandle, McpGatewayLimits, McpInstallError,
+    McpRequestOwner, McpRouteTable, OpenAiChatCompletionsEncoder, OpenAiEncoderOptions,
+    OrphanToolPermitSet, OutputValidationFailure, PanicEncoder, PanicOnStartHandler,
+    PendingMcpBinding, PreparedMcpGateway, ProcessIsolatedToolHandler, ProcessToolCommand,
+    RegisteredTool, RejectEncoder, ReservationPool, ReservationPoolError, ResolvedTool,
+    ResolvedToolRegistry, ResolvedToolSet, RuntimeBootstrap, RuntimeConfig, RuntimeOwner,
+    RuntimeState, SharedToolCapacity, ShutdownTicket, SpawnReject, StartFailHandler, StartHoldGate,
     StartedRuntime, StartupError, StoppedGate, SupervisorCommand, TaskClass, TaskExit, TaskId,
     TaskSupervisor, TerminalDecision, TerminalProposal, TestTextEncoder, ToolExecutionCompletion,
     ToolExecutionControl, ToolHandler, ToolKillHandle, TransactionMcpHandler, TransactionPhase,
     TransactionReservations, TransactionRuntimeHandle, TransactionTaskSpawner,
     TransactionToolCapacity, TransactionToolDispatcher,
 };
-#[allow(deprecated)]
-pub use transaction::RuntimeToolSpill;
 
 pub use monoloop_contracts::{
     estimate_event_bytes, transaction_delivery, AdmissionError, AdmissionErrorKind,

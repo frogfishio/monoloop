@@ -173,7 +173,6 @@ impl DefaultLoopRuntime {
             limits,
         })
     }
-
 }
 
 fn prepare_loop(request: StartLoop) -> Result<(LoopHandle, LoopRunFuture), LoopError> {

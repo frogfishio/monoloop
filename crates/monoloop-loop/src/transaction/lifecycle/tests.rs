@@ -652,7 +652,10 @@ fn max_input_bytes_exact_admits_plus_one_rejects() {
         &roomy,
     )
     .unwrap();
-    assert_eq!(estimate_canonical_input_bytes(&plus).unwrap(), exact_bytes + 1);
+    assert_eq!(
+        estimate_canonical_input_bytes(&plus).unwrap(),
+        exact_bytes + 1
+    );
     let (delivery_bad, receiver) =
         transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
     let err = handle
@@ -968,7 +971,10 @@ fn concurrent_global_capacity_exhaustion_admits_exactly_max() {
             }
         }
     }
-    assert_eq!(admitted, max, "exactly max_active must admit under barrier race");
+    assert_eq!(
+        admitted, max,
+        "exactly max_active must admit under barrier race"
+    );
     assert_eq!(rejected, 1, "exactly one CapacityExceeded overflow");
     assert_eq!(started.owner.ledger_len(), max);
     assert_eq!(started.owner.global_reservations(), max);
@@ -1216,11 +1222,7 @@ fn multi_channel_multi_session_concurrent_load() {
 
     // Fill each channel's remaining slot with a unique session.
     for ch in channel_ids {
-        let (res, recv) = submit_ports_on(
-            &handle,
-            ch,
-            Some(&format!("fill-{ch}")),
-        );
+        let (res, recv) = submit_ports_on(&handle, ch, Some(&format!("fill-{ch}")));
         let receipt = res.expect("fill slot must admit");
         let _ = receipt;
         receivers.push(recv);
@@ -1230,7 +1232,9 @@ fn multi_channel_multi_session_concurrent_load() {
     assert_eq!(started.owner.ledger_len(), global);
     for ch in channel_ids {
         assert_eq!(
-            started.owner.channel_reservations(&ChannelId::try_new(ch).unwrap()),
+            started
+                .owner
+                .channel_reservations(&ChannelId::try_new(ch).unwrap()),
             per_channel
         );
     }
@@ -1341,17 +1345,47 @@ fn fake_echo_exchange_emits_canonical_text_unit() {
         .enable_all()
         .build()
         .unwrap();
+    // Drain events concurrently with completion so a late publisher cannot
+    // leave Text unread when completion wins the race (D-053 advisor residual).
     let (completion, saw_text) = rt.block_on(async {
         let mut events = receiver.events;
-        let completion = tokio::time::timeout(Duration::from_secs(3), receiver.completion.recv())
-            .await
-            .expect("completion timed out")
-            .expect("completion channel closed");
+        let completion_fut = receiver.completion.recv();
+        tokio::pin!(completion_fut);
         let mut saw_text = false;
+        let completion = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    c = &mut completion_fut => {
+                        break c.expect("completion channel closed");
+                    }
+                    ev = events.recv() => {
+                        if let Some(ev) = ev {
+                            if let monoloop_contracts::TransactionEventPayload::CanonicalUnit(unit) =
+                                &ev.payload
+                            {
+                                if let monoloop_contracts::CanonicalUnit::Text(t) =
+                                    &unit.snapshot().unit
+                                {
+                                    // TestTextEncoder appends ". " to "hi"
+                                    assert!(
+                                        t.content.contains("hi"),
+                                        "unexpected text: {}",
+                                        t.content
+                                    );
+                                    saw_text = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("completion timed out");
         while let Ok(ev) = events.try_recv() {
             if let monoloop_contracts::TransactionEventPayload::CanonicalUnit(unit) = &ev.payload {
                 if let monoloop_contracts::CanonicalUnit::Text(t) = &unit.snapshot().unit {
-                    // TestTextEncoder appends ". " to "hi"
                     assert!(t.content.contains("hi"), "unexpected text: {}", t.content);
                     saw_text = true;
                 }
@@ -1362,7 +1396,9 @@ fn fake_echo_exchange_emits_canonical_text_unit() {
     assert!(saw_text, "expected Text canonical unit from Fake echo");
     assert_eq!(
         completion.end.kind,
-        monoloop_contracts::TransactionEndKind::Completed
+        monoloop_contracts::TransactionEndKind::Completed,
+        "Fake DirectLlm echo must Complete; got {:?}",
+        completion.end.kind
     );
 
     let mut owner = started.owner;
@@ -2616,7 +2652,7 @@ fn external_agent_claim_time_distinct_sessions_plus_one_limit_exceeded() {
             .submit(TransactionSubmitRequest {
                 channel_id: ChannelId::try_new("agent").unwrap(),
                 session_id: None,
-                input: user_text_input(&format!("hold-{i}")).unwrap(),
+                input: user_text_input(format!("hold-{i}")).unwrap(),
                 session_config: None,
                 invocation_config: InvocationConfig::default(),
                 tools: vec![],
@@ -4117,7 +4153,9 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
 /// Published / Completed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn d047_full_queue_seal_reports_deadline_not_published() {
-    use super::event_publisher::{run_event_publisher, EventPublisherCommand, TerminalPublicationResult};
+    use super::event_publisher::{
+        run_event_publisher, EventPublisherCommand, TerminalPublicationResult,
+    };
     use monoloop_contracts::{
         transaction_delivery, DeliveryLimits, SafeDiagnostic, TerminalEventDelivery,
         TransactionDiagnostic, TransactionEndEvent, TransactionEndKind, TransactionEventPayload,

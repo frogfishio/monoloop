@@ -35,7 +35,8 @@ Qualification: `external_encoders_reject_nonempty_tools_and_own_prompt_text`.
 
 Separate from the six external profiles: `StreamingHttpConnector` +
 `OpenAiChatCompletionsEncoder` + OpenAI Chat Completions Interpreter dialect.
-Covered by WP-09/WP-10 (`openai_chat_sse`, `direct_llm_e2e`).
+Covered by WP-09/WP-10 (`openai_chat_sse`) and lifecycle Fake DirectLlm
+(`fake_echo_exchange_*`; see `doc/D053_COVERAGE_REPLACEMENT.md`).
 
 ## Honest residual gaps
 

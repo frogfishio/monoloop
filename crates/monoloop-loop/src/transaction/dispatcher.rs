@@ -1,8 +1,8 @@
 //! Single validated execution path for linked tools (MCP and model share this).
 
+use super::owned_process_registry::OwnedProcessRegistry;
 use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapacity};
-use super::owned_process_registry::OwnedProcessRegistry;
 use super::tool_handler::{OwnedProcessLease, ToolExecutionControl, ToolKillHandle};
 use std::sync::atomic::AtomicU32;
 
@@ -499,9 +499,12 @@ impl TransactionToolDispatcher {
         let policy = spec.execution_class.clone();
 
         // Structural termination support must be confirmed *before* start so a
-        // missing kill capability cannot leave an ignoring worker running (D-028).
+        // missing kill capability cannot leave an ignoring worker running (D-028 / D-050).
         let supports_required_termination = match &policy {
-            ToolExecutionClass::AbortableAtYield { .. } => handler.supports_abort(),
+            // V2 §14.2: structural Abortable claim, not boolean-only supports_abort.
+            ToolExecutionClass::AbortableAtYield { .. } => {
+                handler.runtime_owns_abortable_drive() && handler.supports_abort()
+            }
             // V2 §14.3: structural OS process claim, not boolean-only kill support.
             ToolExecutionClass::ProcessIsolated { .. } => {
                 handler.os_process_isolated() && handler.supports_isolated_kill()
@@ -574,16 +577,18 @@ impl TransactionToolDispatcher {
                 k.register_owned_process(Arc::clone(&self.owned_processes));
             }
         }
-        // Post-start invariant: Abortable needs a kill handle; ProcessIsolated
-        // needs an OS-process kill handle (not Tokio abort).
-        let kill_ok = match &policy {
-            ToolExecutionClass::AbortableAtYield { .. } => kill.is_some(),
+        // Post-start invariant: Abortable needs CancelOnly + runtime-owned drive;
+        // ProcessIsolated needs an OS-process kill handle (not Tokio abort).
+        let ownership_ok = match &policy {
+            ToolExecutionClass::AbortableAtYield { .. } => {
+                kill.as_ref().is_some_and(|k| k.is_cancel_only()) && handle.drive.is_some()
+            }
             ToolExecutionClass::ProcessIsolated { .. } => {
-                kill.as_ref().is_some_and(|k| k.is_process_isolated())
+                kill.as_ref().is_some_and(|k| k.is_process_isolated()) && handle.drive.is_some()
             }
             ToolExecutionClass::CooperativeInProcess { .. } => true,
         };
-        if !kill_ok {
+        if !ownership_ok {
             // Handler claimed abort/kill support but returned no ToolKillHandle —
             // we do not own the real worker. Never fabricate a completion waiter
             // whose abort would release the permit while work may still run.

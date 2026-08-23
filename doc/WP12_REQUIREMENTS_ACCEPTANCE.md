@@ -12,11 +12,11 @@ proven · **Open** = not acceptance-complete.
 |---|---|---|
 | Advertised Fake/scripted paths work end to end | Pass | Fake + OpenAI scripted + empty-tool + linked tools + MCP HTTP initialize/list/call |
 | Typed truthful errors | Pass | Admission/tool/MCP/HTTP error kinds in component tests |
-| Cancel/timeout/completion races single terminal | Pass | hardening cancel/hang/deadline + admission shutdown |
-| Bounded concurrency under load | Pass | capacity plus-one; thousands-of-fake |
+| Cancel/timeout/completion races single terminal | Pass | `lifecycle/tests.rs` cancel/hang/deadline + shutdown (`s22_2_*`) |
+| Bounded concurrency under load | Pass | capacity plus-one; lifecycle admit/claim stress cells |
 | Enforced bounds | Pass | limits validate; event bytes; distinct sessions; encoded exchange; extension deny |
-| No leaks after completion/shutdown | Pass | active_count/capacity zero; CallbackService drain; admission abort on install fail |
-| Backpressure explicit | Pass | `subscriber_backpressure_isolated` |
+| No leaks after completion/shutdown | Pass | active/capacity zero after `Stopped`; host `adapt_*` drain outside core; admit abort on install fail |
+| Backpressure explicit | Pass | lifecycle event delivery fail-closed / byte+item plus-one |
 | Security fail-closed (Grok) | Pass | non-loopback deny; non-loopback + allow still requires `wss`; credential redaction |
 | No cross-route under concurrency | Pass | SessionKey + concurrent isolation |
 | Docs state actual limitations | Pass | this file + `WP12_CURRENT_LIMITATIONS.md` + `DECISIONS.md` D-002 |
@@ -36,7 +36,7 @@ cargo doc --workspace --no-deps
 | Criterion | Status | Evidence |
 |---|---|---|
 | Explicit Channel select | Pass | Admission unknown channel; no fallback |
-| Shared OpenAI path for compatible providers | Pass | `direct_llm_e2e`, interpreter OpenAI SSE |
+| Shared OpenAI path for compatible providers | Pass | interpreter OpenAI SSE; lifecycle Fake DirectLlm (`fake_echo_exchange_*`); see `doc/D053_COVERAGE_REPLACEMENT.md` |
 | Canonical input + invocation config | Pass | contracts + merge_effective_config |
 | Credentials via resolver only | Pass | streaming HTTP; Debug redaction; Z.ai `-k` removed |
 | Streaming SSE assembly | Pass | interpreter OpenAI dialect tests |
@@ -46,8 +46,8 @@ cargo doc --workspace --no-deps
 | Criterion | Status | Evidence |
 |---|---|---|
 | SessionKey isolation | Pass | duplicate reject; same string different channels |
-| Generated + supplied DirectLlm sessions | Pass | admission lifecycle |
-| Shutdown finalizes callbacks | Pass | shutdown + CallbackService drain |
+| Generated + supplied DirectLlm sessions | Pass | `lifecycle/tests.rs` admission + session isolation |
+| Shutdown finalizes callbacks | Pass | lifecycle shutdown / `Stopped` proofs |
 | External create/reuse (Fake) | Pass | FakeSessionAdapter + actor attach |
 | Live multi-exchange per agent profile | Partial | Qualification / environment (not Fake gate) |
 
@@ -58,16 +58,16 @@ cargo doc --workspace --no-deps
 | Empty registry unavailable zero effects | Pass | `empty_loop` |
 | Linked host tools | Pass | `linked_tools` including IsolatedKillable escalate |
 | MCP capability lifecycle | Pass | `mcp_gateway` HTTP initialize/list/call |
-| Exactly one completion callback | Pass | hardening + CallbackService |
+| Exactly one completion callback | Pass | lifecycle §22.2 one-completion proofs |
 | Headless CLI in-process tools | Partial | Z.ai/Claude execute tools inside CLI; kernel EmptyToolRegistry observational only (`DECISIONS.md` D-002) |
 
 ## R-004 Ephemeral events and presentation
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| Push events with transaction admission | Pass | event sink on TransactionRequest |
+| Push events with transaction admission | Pass | `TransactionSubmitRequest.delivery` / `transaction_delivery` (push ports) |
 | Canonical not presentation | Pass | TransactionEventPayload::CanonicalUnit |
-| Concurrent sequence/session | Pass | hardening + exchange_e2e |
+| Concurrent sequence/session | Pass | `lifecycle/tests.rs` `s22_6_concurrent_producers_contiguous_sequence` + SessionKey isolation |
 | Reconstruct presentation downstream | Pass | testkit `canonical_event_presentation` |
 | No persistence | Pass | no product DB |
 | State released after completion | Pass | capacity zero; slow callback does not hold capacity |

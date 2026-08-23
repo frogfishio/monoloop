@@ -7,7 +7,7 @@ use crate::handles::{
     RawInputMessage, RawOutputHandle,
 };
 use crate::instance::ConnectorInstanceId;
-use crate::open::{OpenConnection, OpenedRawConnection, PendingRawConnection};
+use crate::open::{ConnectionOwnerWork, OpenConnection, OpenedRawConnection, PendingRawConnection};
 use crate::session::validate_open_attachment_owner;
 use crate::traits::Connector;
 use bytes::Bytes;
@@ -148,7 +148,8 @@ impl Connector for FakeConnector {
         let control_state_for_open = Arc::clone(&control_state);
         let instance_id = self.instance_id.clone();
 
-        let opened = Box::pin(async move {
+        // D-051: open I/O + transport run inside ConnectorOwner before `opened` is polled.
+        PendingRawConnection::open_owned(connection_id, control, async move {
             open_fake(
                 request,
                 config,
@@ -159,13 +160,7 @@ impl Connector for FakeConnector {
                 instance_id,
             )
             .await
-        });
-
-        PendingRawConnection {
-            connection_id,
-            control,
-            opened,
-        }
+        })
     }
 }
 
@@ -177,7 +172,7 @@ async fn open_fake(
     control: ConnectionControlHandle,
     control_state: Arc<ControlState>,
     instance_id: ConnectorInstanceId,
-) -> Result<OpenedRawConnection, ConnectorError> {
+) -> Result<(OpenedRawConnection, ConnectionOwnerWork), ConnectorError> {
     validate_open_attachment_owner(&instance_id, request.session_attachment.as_deref())?;
 
     if config.fail_open {
@@ -249,26 +244,24 @@ async fn open_fake(
     let completion = ConnectionCompletionHandle::new(end_rx);
 
     let owner_work = match endpoint {
-        FakeEndpoint::Echo => crate::open::ConnectionOwnerWork::new(run_echo_owner(
+        FakeEndpoint::Echo => ConnectionOwnerWork::new(run_echo_owner(
             connection_id.clone(),
             control_state,
             in_rx,
             out_tx,
             end_tx,
         )),
-        FakeEndpoint::Scripted { chunks } => {
-            crate::open::ConnectionOwnerWork::new(run_scripted_owner(
-                connection_id.clone(),
-                control_state,
-                in_rx,
-                out_tx,
-                end_tx,
-                chunks,
-            ))
-        }
+        FakeEndpoint::Scripted { chunks } => ConnectionOwnerWork::new(run_scripted_owner(
+            connection_id.clone(),
+            control_state,
+            in_rx,
+            out_tx,
+            end_tx,
+            chunks,
+        )),
         FakeEndpoint::Pair { pair_key } => {
             let peer_tx = register_pair(&pairs, &pair_key, out_tx.clone()).await?;
-            crate::open::ConnectionOwnerWork::new(run_pair_owner(
+            ConnectionOwnerWork::new(run_pair_owner(
                 connection_id.clone(),
                 control_state,
                 in_rx,
@@ -280,7 +273,7 @@ async fn open_fake(
         FakeEndpoint::Hang => {
             // Never emit output; hold until local cancel/terminate.
             drop(out_tx);
-            crate::open::ConnectionOwnerWork::new(run_hang_owner(
+            ConnectionOwnerWork::new(run_hang_owner(
                 connection_id.clone(),
                 control_state,
                 in_rx,
@@ -289,16 +282,18 @@ async fn open_fake(
         }
     };
 
-    Ok(OpenedRawConnection {
-        connection_id,
-        external_session_id,
-        dialect: DialectBinding::fixed(DialectDescriptor::test_raw()),
-        input,
-        output,
-        control,
-        completion,
-        owner_work: Some(owner_work),
-    })
+    Ok((
+        OpenedRawConnection {
+            connection_id,
+            external_session_id,
+            dialect: DialectBinding::fixed(DialectDescriptor::test_raw()),
+            input,
+            output,
+            control,
+            completion,
+        },
+        owner_work,
+    ))
 }
 
 async fn register_pair(

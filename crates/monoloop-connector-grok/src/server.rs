@@ -86,14 +86,10 @@ impl Connector for GrokConnector {
         let control_state = ControlState::new();
         let control = ConnectionControlHandle::new(Arc::clone(&control_state));
         let control_open = control.clone();
-        let opened = Box::pin(async move {
+        // D-051: connect/session I/O + transport owner run before `opened` is polled.
+        PendingRawConnection::open_owned(connection_id, control, async move {
             open_as_raw_connection(secrets, request, control_open, control_state).await
-        });
-        PendingRawConnection {
-            connection_id,
-            control,
-            opened,
-        }
+        })
     }
 }
 
@@ -102,7 +98,7 @@ async fn open_as_raw_connection(
     request: OpenConnection,
     control: ConnectionControlHandle,
     control_state: Arc<ControlState>,
-) -> Result<OpenedRawConnection, monoloop_contracts::ConnectorError> {
+) -> Result<(OpenedRawConnection, ConnectionOwnerWork), monoloop_contracts::ConnectorError> {
     use crate::secret::SecretRef;
     use url::Url;
 
@@ -334,16 +330,18 @@ async fn open_as_raw_connection(
         }
     });
 
-    Ok(OpenedRawConnection {
-        connection_id: cid,
-        external_session_id: Some(ExternalSessionId::new(session_id.as_str())),
-        dialect: DialectBinding::negotiated(DialectDescriptor::acp_json_rpc("1")),
-        input,
-        output: out,
-        control,
-        completion: ConnectionCompletionHandle::new(end_rx),
-        owner_work: Some(owner_work),
-    })
+    Ok((
+        OpenedRawConnection {
+            connection_id: cid,
+            external_session_id: Some(ExternalSessionId::new(session_id.as_str())),
+            dialect: DialectBinding::negotiated(DialectDescriptor::acp_json_rpc("1")),
+            input,
+            output: out,
+            control,
+            completion: ConnectionCompletionHandle::new(end_rx),
+        },
+        owner_work,
+    ))
 }
 
 /// Pending server connection.

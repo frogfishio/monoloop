@@ -1,26 +1,27 @@
 //! Minimal DirectLlm smoke assembly with FakeConnector (no network, no testkit).
 //!
-//! Component-level twin of `monoloop`'s `fake_echo` example.
+//! Component-level twin of `monoloop`'s `fake_echo` example (D-053 registered).
+//!
+//! Runtime v2: `StartedRuntime::start` owns the executor (no external `Handle`).
 //!
 //! Run: `cargo run -p monoloop-loop --example fake_echo`
 
 use monoloop_connector::FakeConnectorFactory;
 use monoloop_contracts::{
-    user_text_input, ChannelCapabilities, ChannelDefaults, ChannelId, ChannelKind, ChannelLimits,
-    ContinuationPolicy, DialectDescriptor, ExchangeMode, FnCompletionCallback, FnEventSink,
-    InvocationConfig, McpConfigurationCapability, McpReachability, OptionPolicy, SessionMode,
-    ToolExecutionMode, TransactionEnd, TransactionEndKind, TransactionEvent,
-    TransactionEventPayload, TransactionRequest, TransactionRuntime,
+    transaction_delivery, user_text_input, ChannelCapabilities, ChannelDefaults, ChannelId,
+    ChannelKind, ChannelLimits, ContinuationPolicy, DeliveryLimits, DialectDescriptor,
+    ExchangeMode, InvocationConfig, McpConfigurationCapability, McpReachability, OptionPolicy,
+    SessionMode, ShutdownWaitOutcome, ToolExecutionMode, TransactionEventPayload,
+    TransactionSubmitRequest,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
-    ChannelBinding, ChannelRegistry, DefaultTransactionRuntime, HostToolRegistry, RuntimeBootstrap,
-    RuntimeConfig, TestTextEncoder,
+    ChannelBinding, ChannelRegistry, HostToolRegistry, RuntimeBootstrap, RuntimeConfig,
+    StartedRuntime, TestTextEncoder,
 };
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 
 fn echo_channel(id: &str) -> ChannelBinding {
     let d = DialectDescriptor::test_raw();
@@ -49,50 +50,24 @@ fn echo_channel(id: &str) -> ChannelBinding {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let rt = DefaultTransactionRuntime::start(RuntimeBootstrap {
+fn main() {
+    let started = StartedRuntime::start(RuntimeBootstrap {
         config: RuntimeConfig {
             enable_mcp_listener: false,
             ..Default::default()
         },
         channels: ChannelRegistry::build(vec![echo_channel("echo")]).expect("registry"),
         tools: HostToolRegistry::empty(),
-        executor: tokio::runtime::Handle::current(),
     })
-    .await
     .expect("runtime start");
 
-    let units = Arc::new(Mutex::new(0usize));
-    let (done_tx, done_rx) = oneshot::channel::<()>();
-    let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+    let handle = started.handle.clone();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).expect("limits"))
+            .expect("delivery");
 
-    let units_sink = Arc::clone(&units);
-    let events = Arc::new(FnEventSink(move |ev: TransactionEvent| {
-        let units_sink = Arc::clone(&units_sink);
-        Box::pin(async move {
-            if matches!(ev.payload, TransactionEventPayload::CanonicalUnit(_)) {
-                *units_sink.lock().expect("lock") += 1;
-            }
-            Ok(())
-        }) as monoloop_contracts::EventDelivery
-    }));
-
-    let done_cb = Arc::clone(&done_tx);
-    let completion = Box::new(FnCompletionCallback(move |end: TransactionEnd| {
-        let done_cb = Arc::clone(&done_cb);
-        Box::pin(async move {
-            assert_eq!(end.kind, TransactionEndKind::Completed);
-            if let Some(tx) = done_cb.lock().expect("lock").take() {
-                let _ = tx.send(());
-            }
-            Ok(())
-        }) as monoloop_contracts::CompletionDelivery
-    }));
-
-    TransactionRuntime::submit(
-        rt.as_ref(),
-        TransactionRequest {
+    handle
+        .submit(TransactionSubmitRequest {
             channel_id: ChannelId::try_new("echo").expect("id"),
             session_id: None,
             input: user_text_input("Hello from monoloop-loop fake_echo").expect("input"),
@@ -103,19 +78,41 @@ async fn main() {
                 ..Default::default()
             },
             tools: vec![],
-            events,
-            completion,
-        },
-    )
-    .expect("admit");
+            delivery,
+        })
+        .expect("admit");
 
-    tokio::time::timeout(Duration::from_secs(5), done_rx)
-        .await
+    let wait_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("wait runtime");
+
+    let completion = wait_rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), receiver.completion.recv()).await
+        })
         .expect("completion timeout")
         .expect("completion channel");
 
+    let mut units = 0usize;
+    while let Ok(ev) = receiver.events.try_recv() {
+        if matches!(ev.payload, TransactionEventPayload::CanonicalUnit(_)) {
+            units = units.saturating_add(1);
+        }
+    }
+
+    let mut owner = started.owner;
+    let outcome = wait_rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
+
     println!(
-        "ok: completed with {} canonical unit event(s)",
-        *units.lock().expect("lock")
+        "ok: {:?} with {} canonical unit event(s)",
+        completion.end.kind, units
     );
 }

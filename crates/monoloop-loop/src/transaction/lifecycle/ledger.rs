@@ -201,8 +201,7 @@ impl LifecycleLedger {
             .as_ref()
             .is_some_and(|old| old.channel_id == key.channel_id);
         if let Some(max) = max_distinct_sessions {
-            if !replacing_same_channel
-                && self.distinct_sessions_on_channel(&key.channel_id) >= max
+            if !replacing_same_channel && self.distinct_sessions_on_channel(&key.channel_id) >= max
             {
                 return Err(LedgerInsertError::DistinctSessionsExceeded);
             }

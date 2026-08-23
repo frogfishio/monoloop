@@ -248,8 +248,7 @@ impl McpGateway {
 
         let routes = McpRouteTable::new(max_routes);
         let services = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let request_permits =
-            Arc::new(tokio::sync::Semaphore::new(limits.max_global_requests));
+        let request_permits = Arc::new(tokio::sync::Semaphore::new(limits.max_global_requests));
         let base_url = format!("http://{}", local_addr);
         let cancel = CancellationToken::new();
         let state = GatewayState {
