@@ -2455,17 +2455,48 @@ fn external_agent_binding(id: &str, channel_max: usize) -> ChannelBinding {
     external_agent_binding_with_session(id, channel_max, Default::default())
 }
 
+fn hang_external_agent_binding(id: &str, channel_max: usize) -> ChannelBinding {
+    let mut binding = external_agent_binding_with_session_and_connector(
+        id,
+        channel_max,
+        Default::default(),
+        FakeConnectorConfig {
+            default_endpoint: FakeEndpoint::Hang,
+            ..FakeConnectorConfig::default()
+        },
+    );
+    binding.limits.max_distinct_sessions = channel_max;
+    binding
+}
+
 fn external_agent_binding_with_session(
     id: &str,
     channel_max: usize,
     session_config: monoloop_connector::FakeSessionAdapterConfig,
+) -> ChannelBinding {
+    external_agent_binding_with_session_and_connector(
+        id,
+        channel_max,
+        session_config,
+        FakeConnectorConfig::default(),
+    )
+}
+
+fn external_agent_binding_with_session_and_connector(
+    id: &str,
+    channel_max: usize,
+    session_config: monoloop_connector::FakeSessionAdapterConfig,
+    connector_config: FakeConnectorConfig,
 ) -> ChannelBinding {
     let d = DialectDescriptor::test_raw();
     ChannelBinding {
         id: ChannelId::try_new(id).unwrap(),
         kind: ChannelKind::ExternalAgent,
         tool_mode: ToolExecutionMode::McpGateway,
-        connector_factory: Arc::new(FakeConnectorFactory::external_agent(session_config)),
+        connector_factory: Arc::new(FakeConnectorFactory::external_agent_with_connector_config(
+            session_config,
+            connector_config,
+        )),
         encoder: Arc::new(TestTextEncoder),
         interpreter: Arc::new(DefaultInterpreterFactory::new()),
         endpoint_ref: "default".into(),
@@ -2486,6 +2517,141 @@ fn external_agent_binding_with_session(
             max_active_transactions: channel_max,
             ..ChannelLimits::default()
         },
+    }
+}
+
+/// D-015 claim-time: ExternalAgent `session_id: None` admits, then
+/// `bind_session` enforces `max_distinct_sessions` → `LimitExceeded`.
+///
+/// Distinct from admit-time Hang DirectLlm
+/// `max_distinct_sessions_exact_admits_plus_one_rejects`: first two creates
+/// claim successfully (Hang-pinned); the third admits without a SessionKey
+/// then fails closed at claim with `LimitExceeded` (not `InvariantFailed`).
+#[test]
+fn external_agent_claim_time_distinct_sessions_plus_one_limit_exceeded() {
+    let distinct_max = 2usize;
+    let limits = TransactionLimits {
+        max_active_transactions: 8,
+        max_active_per_channel: 8,
+        transaction_deadline: Duration::from_secs(30),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let mut binding = hang_external_agent_binding("agent", 8);
+    binding.limits.max_distinct_sessions = distinct_max;
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            enable_mcp_listener: false,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![binding]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut held = Vec::new();
+    for i in 0..distinct_max {
+        let (delivery, mut recv) =
+            transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+        handle
+            .submit(TransactionSubmitRequest {
+                channel_id: ChannelId::try_new("agent").unwrap(),
+                session_id: None,
+                input: user_text_input(&format!("hold-{i}")).unwrap(),
+                session_config: None,
+                invocation_config: InvocationConfig::default(),
+                tools: vec![],
+                delivery,
+            })
+            .unwrap_or_else(|e| panic!("create {i} must admit: {e:?}"));
+        let established = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(ev) = recv.events.recv().await {
+                    if matches!(
+                        ev.payload,
+                        monoloop_contracts::TransactionEventPayload::SessionEstablished { .. }
+                    ) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+            .unwrap_or(false)
+        });
+        assert!(
+            established,
+            "create {i} must claim SessionKey before Hang holds"
+        );
+        held.push(recv);
+    }
+    assert_eq!(
+        started.owner.ledger_len(),
+        distinct_max,
+        "claimed creates remain Hang-pinned in ledger"
+    );
+
+    // Third create: admit succeeds (no SessionKey yet); claim fails LimitExceeded.
+    let (delivery, overflow) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("agent").unwrap(),
+            session_id: None,
+            input: user_text_input("overflow").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect("third create must admit before claim");
+
+    let overflow_kind = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), overflow.completion.recv())
+            .await
+            .expect("overflow completion timed out")
+            .expect("overflow completion channel")
+            .end
+            .kind
+    });
+    assert_eq!(
+        overflow_kind,
+        TransactionEndKind::LimitExceeded,
+        "claim-time distinct overflow must be LimitExceeded, not InvariantFailed"
+    );
+    // Overflow leaves the ledger after terminal cleanup; held creates remain.
+    let drained = rt.block_on(async {
+        for _ in 0..100 {
+            if started.owner.ledger_len() == distinct_max {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    });
+    assert!(
+        drained,
+        "overflow must leave ledger; held creates stay, got len={}",
+        started.owner.ledger_len()
+    );
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(10)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
+    for recv in held {
+        let _ = rt.block_on(recv.completion.recv());
     }
 }
 

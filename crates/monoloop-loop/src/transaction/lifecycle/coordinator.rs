@@ -1,7 +1,10 @@
 //! Per-transaction coordinator (v2 §11) — supervised exchange + Loop tools.
 
 use super::event_publisher::EventPublisherCommand;
-use super::exchange::{run_direct_llm_exchange, DirectExchangeOutcome, PromptReadyGate};
+use super::exchange::{
+    run_direct_llm_exchange, DirectExchangeOutcome, PromptProceedError, PromptReadyGate,
+};
+use super::ledger::LedgerInsertError;
 use super::loop_dispatch::{
     needs_loop_dispatch, run_supervised_empty_loop, run_supervised_tool_loop, LoopDispatchError,
 };
@@ -265,16 +268,16 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             let external = match opened_rx.await {
                 Ok(Some(ext)) => ext,
                 Ok(None) | Err(_) => {
-                    let _ = proceed_tx.send(Err(()));
+                    let _ = proceed_tx.send(Err(PromptProceedError::Failed));
                     return (None, false);
                 }
             };
             if cancel_gate.is_cancelled() {
-                let _ = proceed_tx.send(Err(()));
+                let _ = proceed_tx.send(Err(PromptProceedError::Failed));
                 return (None, false);
             }
             let Ok(sid) = SessionId::try_new(external.as_str()) else {
-                let _ = proceed_tx.send(Err(()));
+                let _ = proceed_tx.send(Err(PromptProceedError::Failed));
                 return (None, false);
             };
             let key = SessionKey {
@@ -284,12 +287,16 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             // Reserve claimed SessionKey in the ledger before activate / prompt.
             {
                 let mut ledger = shared_gate.ledger.lock().unwrap_or_else(|e| e.into_inner());
-                if ledger
-                    .bind_session(&tx_gate, key.clone(), Some(max_distinct_gate))
-                    .is_err()
-                {
-                    let _ = proceed_tx.send(Err(()));
-                    return (None, false);
+                match ledger.bind_session(&tx_gate, key.clone(), Some(max_distinct_gate)) {
+                    Ok(()) => {}
+                    Err(LedgerInsertError::DistinctSessionsExceeded) => {
+                        let _ = proceed_tx.send(Err(PromptProceedError::DistinctSessionsExceeded));
+                        return (None, false);
+                    }
+                    Err(_) => {
+                        let _ = proceed_tx.send(Err(PromptProceedError::Failed));
+                        return (None, false);
+                    }
                 }
             }
             if publish_gate
@@ -297,7 +304,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
                 .await
                 .is_err()
             {
-                let _ = proceed_tx.send(Err(()));
+                let _ = proceed_tx.send(Err(PromptProceedError::Failed));
                 return (None, false);
             }
             // Authoritative SessionKey before activate (no synthetic key on MCP path).
@@ -306,11 +313,11 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             }
             if let Some(token) = mcp_token_gate.as_ref() {
                 let Some(gw) = mcp_gateway_gate.as_ref() else {
-                    let _ = proceed_tx.send(Err(()));
+                    let _ = proceed_tx.send(Err(PromptProceedError::Failed));
                     return (Some(external), false);
                 };
                 if gw.activate(token).is_err() {
-                    let _ = proceed_tx.send(Err(()));
+                    let _ = proceed_tx.send(Err(PromptProceedError::Failed));
                     return (Some(external), false);
                 }
             }

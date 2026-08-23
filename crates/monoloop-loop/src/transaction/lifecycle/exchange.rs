@@ -108,12 +108,21 @@ impl ChildJoins {
     }
 }
 
+/// Why the prompt-ready gate aborted after Connector open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptProceedError {
+    /// `ChannelLimits.max_distinct_sessions` exceeded at SessionKey claim.
+    DistinctSessionsExceeded,
+    /// Any other claim / activate / establish failure (fail closed).
+    Failed,
+}
+
 /// After open succeeds, before prompt send (CreationOnly claim / MCP activate).
 pub struct PromptReadyGate {
     /// Exchange reports the opened external session (if any).
     pub opened: oneshot::Sender<Option<monoloop_contracts::ExternalSessionId>>,
     /// Coordinator signals ready to send prompt (`Ok`) or abort (`Err`).
-    pub proceed: oneshot::Receiver<Result<(), ()>>,
+    pub proceed: oneshot::Receiver<Result<(), PromptProceedError>>,
 }
 
 /// Run one supervised exchange with TaskSupervisor-owned children.
@@ -402,7 +411,16 @@ async fn run_inner(
         };
         match proceed {
             Ok(Ok(())) => {}
-            Ok(Err(())) | Err(_) => {
+            Ok(Err(PromptProceedError::DistinctSessionsExceeded)) => {
+                return fail_cleanup(
+                    &open_control,
+                    children,
+                    cleanup_deadline,
+                    ExchangeFailure::LimitExceeded,
+                )
+                .await;
+            }
+            Ok(Err(PromptProceedError::Failed)) | Err(_) => {
                 return fail_cleanup(
                     &open_control,
                     children,

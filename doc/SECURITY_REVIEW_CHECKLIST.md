@@ -58,6 +58,8 @@ does **not** close D-025.
   port of unregistered v1 hardening cell; `InvalidConfiguration`)
 - `max_distinct_sessions_exact_admits_plus_one_rejects` (v2 ledger + admit;
   Hang-pinned; session-less does not consume slot at admit)
+- `external_agent_claim_time_distinct_sessions_plus_one_limit_exceeded`
+  (claim-time `bind_session` → `LimitExceeded`, not `InvariantFailed`)
 - `concurrent_session_new_and_explicit_load` (Grok mock; not live)
 - Quiescing CAS under ledger lock (`owner.rs` / `supervisor.rs`); late Start
   terminalizes while `stopping`

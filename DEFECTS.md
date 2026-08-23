@@ -2978,3 +2978,31 @@ leak on DistinctSessionsExceeded. Does **not** close D-025 / §25.
 Fake load). Agents must not self-sign. Do not implement Refreshable
 without superseding DECISIONS D-042. Do not register broken
 `tests/hardening.rs`. Do not promote Golden / §25 / D-025 signed-off.
+
+**Golden pursuit — ExternalAgent claim-time distinct plus-one
+(2026-08-23):** Closed the Expert honesty leftover from the v2 wire
+slice.
+
+- `PromptProceedError::{DistinctSessionsExceeded, Failed}` on the
+  prompt-ready gate; DistinctSessions → exchange `LimitExceeded`
+  (was conflated as `InvariantFailed`).
+- Proof: `external_agent_claim_time_distinct_sessions_plus_one_limit_exceeded`
+  — Hang ExternalAgent creates claim 2 SessionKeys; third `session_id:
+  None` admits then fails closed at `bind_session` with
+  `LimitExceeded`; held creates remain. s23 + checklist needles.
+
+Does **not** close D-025 / §25 / live Grok / exhaustive matrix /
+Refreshable. Sign-off still `_TBD_`.
+
+**Expert + Advisor (2026-08-23, ExternalAgent claim-time distinct):**
+**PASS — Silver.** `LimitExceeded` is the correct post-admit terminal
+(admit-time remains `CapacityExceeded`). Bind fail before
+EstablishExternal / activate; no SessionKey leak. Proof Hang-pinned with
+active headroom. Does **not** close D-025 / §25 / live Grok.
+
+**Next pick:** independent human/contracted D-025 Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md` **or** next named agent residual
+(further exact-limit cells / Fake load). Agents must not self-sign. Do
+not implement Refreshable without superseding DECISIONS D-042. Do not
+register broken `tests/hardening.rs`. Do not promote Golden / §25 /
+D-025 signed-off.

@@ -127,6 +127,10 @@ fn s23_exact_limit_plus_one_inventory_present() {
         ),
         (
             "src/transaction/lifecycle/tests.rs",
+            "external_agent_claim_time_distinct_sessions_plus_one_limit_exceeded",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
             "concurrent_global_capacity_exhaustion_admits_exactly_max",
         ),
         (
