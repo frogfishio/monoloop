@@ -115,6 +115,8 @@ pub(crate) struct RuntimeShared {
     pub tool_spill: Arc<OrphanToolPermitSet>,
     /// Live ProcessIsolated OS children (§18.2 ShutdownSnapshot.owned_processes).
     pub owned_processes: Arc<AtomicU32>,
+    /// ProcessIsolated children retained until OS exit is observed (D-048).
+    pub process_registry: Arc<crate::transaction::owned_process_registry::OwnedProcessRegistry>,
     /// Runtime admission / capacity limits (D-035 input accounting uses these).
     pub transaction_limits: monoloop_contracts::TransactionLimits,
 }
@@ -141,11 +143,17 @@ impl RuntimeShared {
             .ok()
             .and_then(|g| g.as_ref().map(|h| h.routes().len() as u32))
             .unwrap_or(0);
+        // Prefer registry live count (D-048); fall back to lease counter.
+        let owned_processes = self
+            .process_registry
+            .live_count()
+            .max(self.owned_processes.load(Ordering::SeqCst) as usize)
+            as u32;
         ShutdownSnapshot {
             generation: self.shutdown_generation.load(Ordering::SeqCst),
             ledger_entries,
             owned_tasks: self.owned_tasks.load(Ordering::SeqCst),
-            owned_processes: self.owned_processes.load(Ordering::SeqCst),
+            owned_processes,
             mcp_routes,
             completions_published: self.completions_published.load(Ordering::SeqCst),
         }
@@ -280,6 +288,8 @@ pub(crate) async fn run_supervisor(
         if stopping {
             // Release orphan tool permits (capacity); joins are TaskSupervisor-owned.
             let _ = shared.tool_spill.shutdown_progress();
+            // D-048: kill+poll ProcessIsolated children; do not clear without reap.
+            let _ = shared.process_registry.shutdown_progress();
 
             // Drive residual abort every lap so coordinator/tool work cannot
             // strand Finalizer → tombstone → Stopped.
@@ -339,15 +349,20 @@ pub(crate) async fn run_supervisor(
             if shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true) {
                 // M5.4: orphan permits never block Stopped after quiesce release.
                 let _ = shared.tool_spill.shutdown_progress();
-                if tasks.is_empty() {
+                let _ = shared.process_registry.shutdown_progress();
+                // D-048: Stopped requires process registry empty (reaped), not
+                // merely owned_processes counter zero via lease Drop.
+                if tasks.is_empty() && shared.process_registry.is_empty() {
                     ready_to_stop = true;
                 } else {
                     // One bounded drain; on timeout fall through to select (50ms
                     // tick) — never tight-loop abort_and_drain (§18.2 / Drop).
                     if tasks.abort_and_drain().await {
                         let _ = shared.tool_spill.shutdown_progress();
+                        let _ = shared.process_registry.shutdown_progress();
                         ready_to_stop = shared.ledger.lock().map(|l| l.is_empty()).unwrap_or(true)
-                            && tasks.is_empty();
+                            && tasks.is_empty()
+                            && shared.process_registry.is_empty();
                     } else {
                         shared
                             .owned_tasks
@@ -584,6 +599,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         shared_tool_capacity: Arc::clone(&shared.shared_tool_capacity),
         tool_spill: Arc::clone(&shared.tool_spill),
         owned_processes: Arc::clone(&shared.owned_processes),
+        process_registry: Arc::clone(&shared.process_registry),
         mcp_gateway,
         shared: Arc::clone(shared),
     };

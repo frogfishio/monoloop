@@ -23,6 +23,7 @@ mod validation;
 
 mod dispatcher;
 mod loop_adapters;
+mod owned_process_registry;
 
 // Deferred until later migration stages (kept on disk, not compiled):
 // mod active_registry;
@@ -64,6 +65,8 @@ pub use mcp::{
 };
 
 pub use openai_encoder::{OpenAiChatCompletionsEncoder, OpenAiEncoderOptions};
+#[allow(unused_imports)] // public D-048 surface for hosts/tests
+pub use owned_process_registry::OwnedProcessRegistry;
 pub use process_tool::{ProcessIsolatedToolHandler, ProcessToolCommand};
 pub use resolved_tools::{ResolvedTool, ResolvedToolSet};
 pub use state::RuntimeState;

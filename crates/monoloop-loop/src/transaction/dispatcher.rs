@@ -2,6 +2,7 @@
 
 use super::resolved_tools::ResolvedToolSet;
 use super::tool_capacity::{SharedToolCapacity, ToolPermit, TransactionToolCapacity};
+use super::owned_process_registry::OwnedProcessRegistry;
 use super::tool_handler::{OwnedProcessLease, ToolExecutionControl, ToolKillHandle};
 use std::sync::atomic::AtomicU32;
 
@@ -200,6 +201,8 @@ pub struct TransactionToolDispatcher {
     tool_spill: Arc<OrphanToolPermitSet>,
     /// Runtime-scoped live ProcessIsolated child count (§18.2 snapshot).
     owned_processes: Arc<AtomicU32>,
+    /// ProcessIsolated children retained until OS exit (D-048).
+    process_registry: Arc<OwnedProcessRegistry>,
     /// Transaction-wide payload cap (D-015); applied as min with per-tool limit.
     max_tool_payload_bytes: usize,
     /// Transaction-wide output cap (D-015); applied as min with per-tool limit.
@@ -248,6 +251,7 @@ impl TransactionToolDispatcher {
             limits,
             Arc::new(OrphanToolPermitSet::new()),
             Arc::new(AtomicU32::new(0)),
+            Arc::new(OwnedProcessRegistry::new()),
         )
     }
 
@@ -268,12 +272,13 @@ impl TransactionToolDispatcher {
             shared_capacity,
             tool_spill,
             Arc::new(AtomicU32::new(0)),
+            Arc::new(OwnedProcessRegistry::new()),
             max_concurrent_tools,
             max_queued_tools,
         )
     }
 
-    /// Build with runtime-shared spill and owned-process counter (production path).
+    /// Build with runtime-shared spill, owned-process counter, and process registry.
     #[allow(clippy::too_many_arguments)]
     pub fn with_runtime_resources(
         transaction_id: TransactionId,
@@ -282,6 +287,7 @@ impl TransactionToolDispatcher {
         shared_capacity: Arc<SharedToolCapacity>,
         tool_spill: Arc<OrphanToolPermitSet>,
         owned_processes: Arc<AtomicU32>,
+        process_registry: Arc<OwnedProcessRegistry>,
         max_concurrent_tools: usize,
         max_queued_tools: usize,
     ) -> Arc<Self> {
@@ -298,10 +304,12 @@ impl TransactionToolDispatcher {
             },
             tool_spill,
             owned_processes,
+            process_registry,
         )
     }
 
     /// Build with an explicit runtime-scoped tool spill (D-028).
+    #[allow(clippy::too_many_arguments)]
     fn with_limits_and_spill(
         transaction_id: TransactionId,
         session_key: SessionKey,
@@ -310,6 +318,7 @@ impl TransactionToolDispatcher {
         limits: DispatcherLimits,
         tool_spill: Arc<OrphanToolPermitSet>,
         owned_processes: Arc<AtomicU32>,
+        process_registry: Arc<OwnedProcessRegistry>,
     ) -> Arc<Self> {
         let capacity = TransactionToolCapacity::new(
             shared_capacity,
@@ -326,6 +335,7 @@ impl TransactionToolDispatcher {
             capacity,
             tool_spill,
             owned_processes,
+            process_registry,
             max_tool_payload_bytes: limits.max_tool_payload_bytes.max(1),
             max_tool_output_bytes: limits.max_tool_output_bytes.max(1),
             max_error_message_bytes: 1024,
@@ -457,7 +467,7 @@ impl TransactionToolDispatcher {
         let mut dispatch_guard = DispatchGuard {
             permit: Some(permit),
             kill: None,
-            spill: Arc::clone(&self.tool_spill),
+            process_registry: Arc::clone(&self.process_registry),
         };
 
         let mut lifecycle = vec![ToolLifecycleEvent::Started {
@@ -874,12 +884,13 @@ async fn await_tool_termination_driven(
 }
 
 /// Holds the tool permit and optional kill handle for the duration of dispatch.
-/// On drop, unfinished ProcessIsolated / cooperative non-ack capacity is parked
-/// as orphan permits (M5.4: joins are not vaulted — TaskSupervisor owns them).
+/// On drop, unfinished ProcessIsolated children transfer to
+/// [`OwnedProcessRegistry`] until OS exit is observed (D-048). Cooperative
+/// non-ack capacity parks as orphan permits (M5.4).
 struct DispatchGuard {
     permit: Option<ToolPermit>,
     kill: Option<ToolKillHandle>,
-    spill: Arc<OrphanToolPermitSet>,
+    process_registry: Arc<OwnedProcessRegistry>,
 }
 
 impl DispatchGuard {
@@ -898,11 +909,10 @@ impl Drop for DispatchGuard {
         if let Some(k) = self.kill.take() {
             k.kill(); // cancel_only / OS kill
             if k.is_process_isolated() && k.has_join() {
-                // Drive-owned ProcessIsolated: child may still be exiting.
-                let lease = k.take_process_lease();
-                if let Some(permit) = self.permit.take() {
-                    self.spill.park_orphan_permit_with_lease(permit, lease);
-                }
+                // D-048: retain the real Child (via ToolKillHandle) until reap —
+                // not merely an owned_processes counter lease.
+                let permit = self.permit.take();
+                self.process_registry.park(k, permit);
                 return;
             }
         }

@@ -81,6 +81,8 @@ pub struct CoordinatorParams {
     pub tool_spill: Arc<OrphanToolPermitSet>,
     /// Runtime-scoped live ProcessIsolated child count.
     pub owned_processes: Arc<std::sync::atomic::AtomicU32>,
+    /// ProcessIsolated children retained until OS exit (D-048).
+    pub process_registry: Arc<crate::transaction::owned_process_registry::OwnedProcessRegistry>,
     /// Runtime MCP gateway when `enable_mcp_listener` (CreationOnly install).
     pub mcp_gateway: Option<McpGatewayHandle>,
     /// Shared runtime state (ledger SessionKey claim after external create).
@@ -121,6 +123,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         shared_tool_capacity,
         tool_spill,
         owned_processes,
+        process_registry,
         mcp_gateway,
         shared,
     } = params;
@@ -193,6 +196,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
                 Arc::clone(&shared_tool_capacity),
                 Arc::clone(&tool_spill),
                 Arc::clone(&owned_processes),
+                Arc::clone(&process_registry),
                 8,
                 16,
             );
@@ -369,6 +373,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             shared_tool_capacity,
             tool_spill,
             owned_processes,
+            process_registry,
         )
         .await;
 
@@ -418,6 +423,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         shared_tool_capacity,
         tool_spill,
         owned_processes,
+        process_registry,
     )
     .await
 }
@@ -438,6 +444,7 @@ async fn finish_after_exchange(
     shared_tool_capacity: Arc<SharedToolCapacity>,
     tool_spill: Arc<OrphanToolPermitSet>,
     owned_processes: Arc<std::sync::atomic::AtomicU32>,
+    process_registry: Arc<crate::transaction::owned_process_registry::OwnedProcessRegistry>,
 ) -> TerminalProposal {
     // §22.6: establish external session before ordinary events when not done
     // at the prompt-ready gate (DirectLlm / late discovery).
@@ -514,6 +521,7 @@ async fn finish_after_exchange(
                 shared_tool_capacity,
                 tool_spill,
                 owned_processes,
+                process_registry,
                 8,
                 16,
             );

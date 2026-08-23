@@ -193,6 +193,7 @@ impl ToolKillHandle {
     }
 
     /// Take the lease for spill parking (keeps `owned_processes` honest across Drop).
+    #[allow(dead_code)] // retained for D-048 registry / spill compatibility
     pub(crate) fn take_process_lease(&self) -> Option<OwnedProcessLease> {
         let KillInner::Process { owned_slot, .. } = &*self.inner else {
             return None;

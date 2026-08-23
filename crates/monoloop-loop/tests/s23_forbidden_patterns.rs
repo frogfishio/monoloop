@@ -122,6 +122,10 @@ fn s23_exact_limit_plus_one_inventory_present() {
             "d047_full_queue_seal_reports_deadline_not_published",
         ),
         (
+            "src/transaction/owned_process_registry.rs",
+            "registry_retains_until_reap_then_empties",
+        ),
+        (
             "src/transaction/lifecycle/tests.rs",
             "capacity_plus_one_rejects",
         ),

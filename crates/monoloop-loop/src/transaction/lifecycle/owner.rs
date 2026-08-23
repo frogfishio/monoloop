@@ -169,6 +169,9 @@ impl StartedRuntime {
             ),
             tool_spill: Arc::new(crate::transaction::dispatcher::OrphanToolPermitSet::new()),
             owned_processes: Arc::new(AtomicU32::new(0)),
+            process_registry: Arc::new(
+                crate::transaction::owned_process_registry::OwnedProcessRegistry::new(),
+            ),
             transaction_limits: bootstrap.config.transaction_limits.clone(),
         });
 

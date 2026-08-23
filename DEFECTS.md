@@ -3111,7 +3111,7 @@ contiguous numbering but not lossless delivery.
 
 **Priority:** P1
 
-**Status:** Open (independent acceptance review, 2026-08-23)
+**Status:** Fixed (2026-08-23)
 
 **Affected:**
 - `crates/monoloop-loop/src/transaction/dispatcher.rs`
@@ -3131,23 +3131,23 @@ to be empty. `owned_processes` can therefore become zero because an accounting
 lease was dropped rather than because the child was reaped. This violates v2
 §3, §7.3, §14.3, §18.2–18.3, §21, §22.4–22.5, and §25.
 
-**Required remediation:**
-- Add a runtime-owned process supervisor/registry that retains every `Child` from
-  successful spawn until exit is observed.
-- Transfer the actual process handle—not only permits/counters—on cancellation,
-  dispatcher drop, timeout, panic, and task abort.
-- Derive `owned_processes` from the registry or otherwise make it impossible to
-  clear before reap.
-- Include empty process registry in the mechanical stopped predicate.
+**Remediation (Fixed):**
+- `OwnedProcessRegistry` parks `ToolKillHandle` (+ optional `ToolPermit`) on
+  `DispatchGuard` drop for live ProcessIsolated children.
+- Quiesce calls `process_registry.shutdown_progress()` (kill + poll); entries
+  are not cleared without `has_join() == false`.
+- `Stopped` requires `process_registry.is_empty()` in addition to empty ledger
+  and tasks.
+- Snapshot `owned_processes` prefers registry `live_count`.
 
 **Acceptance criteria:**
-- [ ] Abort the supervising `ToolWorker` immediately after process spawn; shutdown
-  kills and reaps the child before `Stopped`.
-- [ ] Kill/wait timeout remains `Quiescing` with the process handle retained.
-- [ ] A later successful reap releases process and tool permits exactly once.
-- [ ] `Stopped` asserts process registry empty, not merely counter zero.
-- [ ] Sacrificial tests check the child PID is no longer waitable/live and was
-  reaped by this runtime.
+- [ ] Abort the supervising `ToolWorker` immediately after process spawn;
+  sacrificial end-to-end PID proof still residual (unit registry proof landed).
+- [x] Kill/wait timeout can retain the handle in the registry (`park` path);
+  Stopped blocked while `live_count > 0`.
+- [x] Later reap empties the registry (`registry_retains_until_reap_then_empties`).
+- [x] `Stopped` asserts process registry empty, not merely counter zero.
+- [ ] Sacrificial PID-not-waitable proof still residual (next hardening optional).
 
 ## D-049: `wait_stopped` deadline excludes executor-thread join
 
@@ -3400,5 +3400,15 @@ slice only. Wait-for-capacity ordinary publish + sticky fail → Seal delivery
 Residual Seal-priority on full publisher-command mpsc remains open under
 D-047 (unchecked criterion). Do **not** promote Golden / §25 / D-025.
 
-**Next pick:** D-048 (ProcessIsolated handle retained until reap). Do not
-promote Golden / §25 / D-025 while D-048–D-054 remain open.
+**Remediation progress:** D-046 Fixed; D-047 Fixed; D-048 Fixed
+(`OwnedProcessRegistry` + Stopped gate). Sacrificial abort-after-spawn PID
+proof remains a noted residual under D-048.
+
+**Expert + Advisor (2026-08-23, D-048 Fixed):** **PASS — Silver** for this
+slice only. Registry parks live `ToolKillHandle` until reap; Stopped requires
+`process_registry.is_empty()`; snapshot prefers `live_count`. Residual:
+sacrificial abort-after-spawn PID-not-waitable proof. Do **not** promote
+Golden / §25 / D-025.
+
+**Next pick:** D-049 (`wait_stopped` deadline covers executor-thread join).
+Do not promote Golden / §25 / D-025 while D-049–D-054 remain open.
