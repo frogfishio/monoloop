@@ -245,6 +245,76 @@ async fn session_load_uses_explicit_id() {
     assert_eq!(session.session_id.as_str(), "explicit-resume-id");
 }
 
+/// Golden progress (mock only): concurrent `session/new` + explicit `session/load`.
+///
+/// Distinct from sequential `multiple_sessions_isolated` / `session_load_uses_explicit_id`.
+/// Does **not** close live Grok multi-session qualification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_session_new_and_explicit_load() {
+    let secret = "concurrent-session-secret";
+    let addr = common::mock_acp_server::start_mock_acp_server(secret).await;
+    let secrets = Arc::new(InMemorySecretResolver::new());
+    secrets.insert("S", secret);
+    let connector = GrokConnector::new(secrets);
+    let config = GrokServerConfig::loopback(addr.port(), SecretRef::new("S")).unwrap();
+    let server = Arc::new(connector.connect(config).unwrap().wait().await.unwrap());
+
+    let load_a = GrokSessionId::new("explicit-load-a");
+    let load_b = GrokSessionId::new("explicit-load-b");
+    let barrier = Arc::new(tokio::sync::Barrier::new(6));
+    let mut joins = Vec::new();
+
+    for i in 0..4 {
+        let server = Arc::clone(&server);
+        let barrier = Arc::clone(&barrier);
+        joins.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let session = server
+                .sessions
+                .begin_new(GrokSessionConfig::default())
+                .expect("begin_new")
+                .wait()
+                .await
+                .expect("session/new");
+            (format!("new-{i}"), session.session_id.as_str().to_string())
+        }));
+    }
+    for (label, known) in [("load-a", load_a.clone()), ("load-b", load_b.clone())] {
+        let server = Arc::clone(&server);
+        let barrier = Arc::clone(&barrier);
+        let known = known.clone();
+        let expected = known.as_str().to_string();
+        joins.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let session = server
+                .sessions
+                .begin_load(known, GrokSessionLoadConfig::default())
+                .expect("begin_load")
+                .wait()
+                .await
+                .expect("session/load");
+            assert_eq!(
+                session.session_id.as_str(),
+                expected,
+                "{label} must return the explicit id (no most-recent heuristic)"
+            );
+            (label.to_string(), session.session_id.as_str().to_string())
+        }));
+    }
+
+    let mut ids = std::collections::BTreeSet::new();
+    for j in joins {
+        let (label, sid) = j.await.expect("join");
+        assert!(
+            ids.insert(sid.clone()),
+            "session ids must be unique across concurrent new/load, duplicate {sid} from {label}"
+        );
+    }
+    assert!(ids.contains("explicit-load-a"));
+    assert!(ids.contains("explicit-load-b"));
+    assert_eq!(ids.len(), 6);
+}
+
 #[tokio::test]
 async fn non_loopback_without_opt_in_fails_closed() {
     let secrets = Arc::new(InMemorySecretResolver::new());

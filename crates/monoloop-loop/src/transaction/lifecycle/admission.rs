@@ -21,6 +21,12 @@ pub(crate) trait ChannelIndex {
         let _ = id;
         false
     }
+
+    /// `ChannelLimits.max_distinct_sessions` when known (`None` = do not enforce).
+    fn max_distinct_sessions(&self, id: &ChannelId) -> Option<usize> {
+        let _ = id;
+        None
+    }
 }
 
 impl ChannelIndex for HashMap<ChannelId, ()> {
@@ -40,6 +46,11 @@ impl ChannelIndex for HashMap<ChannelId, super::super::channel_registry::LiveCha
                 && live.binding.capabilities.mcp_configuration
                     == McpConfigurationCapability::CreationOnly
         })
+    }
+
+    fn max_distinct_sessions(&self, id: &ChannelId) -> Option<usize> {
+        self.get(id)
+            .map(|live| live.binding.limits.max_distinct_sessions)
     }
 }
 
@@ -177,6 +188,8 @@ pub(crate) fn admit(
         }
     }
 
+    let max_distinct = channels.max_distinct_sessions(&request.channel_id);
+
     let entry = LedgerEntry {
         transaction_id,
         channel_id: request.channel_id.clone(),
@@ -197,10 +210,11 @@ pub(crate) fn admit(
         diagnostic_count: 0,
     };
 
-    if let Err(e) = ledger.insert_queued(entry) {
+    if let Err(e) = ledger.insert_queued(entry, max_distinct) {
         drop(ledger);
         let kind = match e {
             LedgerInsertError::SessionAlreadyActive => AdmissionErrorKind::SessionAlreadyActive,
+            LedgerInsertError::DistinctSessionsExceeded => AdmissionErrorKind::CapacityExceeded,
             LedgerInsertError::DuplicateTransaction => AdmissionErrorKind::CapacityExceeded,
             LedgerInsertError::UnknownTransaction => AdmissionErrorKind::CapacityExceeded,
         };

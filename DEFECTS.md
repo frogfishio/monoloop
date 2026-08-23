@@ -2882,3 +2882,99 @@ matrix, full load/race Golden, D-025, or §25.
 Agents must not self-sign. Further optional stress only if named. Do not
 implement Refreshable without superseding DECISIONS D-042. Do not promote
 Golden / §25 / D-025 signed-off.
+
+**Golden pursuit — Fake multi-channel load + D-035 cell (2026-08-23):**
+Agent-doable Silver→Golden *progress* only (does **not** claim Golden /
+§25). Delivered:
+
+- `multi_channel_multi_session_concurrent_load` — Hang barrier across 3
+  Channels; shared session-string SessionKey isolation; headroom so
+  `SessionAlreadyActive` is not masked by `CapacityExceeded`; fill-to-cap
+  overflow; one shutdown / one completion per admission.
+- `max_content_parts_exact_admits_plus_one_rejects` — missing exact-admit
+  twin for the existing plus-one cell.
+- s23 inventory needles + checklist evidence-map pointers. Sign-off still
+  `_TBD_`.
+
+Honesty: `tests/hardening.rs` remains **unregistered** (`autotests =
+false`; v1 `DefaultTransactionRuntime` / deprecated submit API — does not
+compile against current façades). Do not treat on-disk hardening.rs as
+live WP-12 evidence until rewritten for `StartedRuntime`. Refreshable
+still DECISIONS D-042. Live Grok multi-session still open. Exhaustive
+public-limit matrix still incomplete.
+
+**Expert + Advisor (2026-08-23, Golden pursuit — Fake multi-channel load +
+D-035 cell):** **PASS — Silver** (progress toward Golden only). Headroom
+before session-reject matches capacity-first admit order. Hang pins
+occupancy; exact `max_content_parts` cell sound. Does **not** close
+D-025 / §23 / §25 / live Grok / exhaustive matrix / Refreshable.
+
+**Next pick:** independent human/contracted D-025 Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md` **or** next named agent Golden residual
+(further exact-limit cells / Fake load / deterministic Grok mock
+multi-session). Agents must not self-sign. Do not implement Refreshable
+without superseding DECISIONS D-042. Do not register broken
+`tests/hardening.rs`. Do not promote Golden / §25 / D-025 signed-off.
+
+**Golden pursuit — max_tools cell + Grok mock concurrent sessions
+(2026-08-23):** Further agent Golden *progress* (tier still Silver):
+
+- `max_tools_per_transaction_exact_admits_plus_one_rejects` on
+  `StartedRuntime` (exact=2 admits; plus-one → `InvalidConfiguration`).
+  Replaces dead v1 hardening evidence that asserted `InvalidInput`.
+- `concurrent_session_new_and_explicit_load` — mock ACP barrier of 4×
+  `session/new` + 2× explicit `session/load`; unique ids; load returns
+  exact id (no most-recent heuristic). **Not** live Grok qualification.
+- Multi-channel Hang `transaction_deadline` widened to 30s (Expert nit).
+- s23 / checklist pointers updated. Sign-off still `_TBD_`.
+
+Note: `ChannelLimits.max_distinct_sessions` plus-one is **not** yet proven
+on v2 ledger admission (old `ActiveRegistry` path / unregistered
+hardening only). Do not invent a passing cell without wiring.
+
+**Expert + Advisor (2026-08-23, max_tools + Grok mock concurrent):**
+**PASS — Silver.** `InvalidConfiguration` matches live v2 admission
+vocabulary (v1 `InvalidInput` was wrong). Grok mock barrier is sound for
+explicit-load / no most-recent; not live. `max_distinct_sessions` honesty
+correct — do not invent a cell. Pre-existing residual noted by Expert:
+DirectLlm encode still projects `tools: &[]` (out of this slice). Does
+**not** close D-025 / §25 / live Grok / exhaustive matrix.
+
+**Next pick:** independent human/contracted D-025 Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md` **or** wire+prove
+`ChannelLimits.max_distinct_sessions` on v2 ledger admission. Agents must
+not self-sign. Do not implement Refreshable without superseding DECISIONS
+D-042. Do not register broken `tests/hardening.rs`. Do not promote Golden
+/ §25 / D-025 signed-off.
+
+**Golden pursuit — wire+prove max_distinct_sessions on v2 (2026-08-23):**
+Closed the named honesty gap: `ChannelLimits.max_distinct_sessions` is
+enforced on v2 `LifecycleLedger` / admission (not only old
+`ActiveRegistry` / unregistered hardening).
+
+- `ledger.insert_queued(..., max_distinct)` /
+  `ledger.bind_session(..., max_distinct)` →
+  `LedgerInsertError::DistinctSessionsExceeded` → admit
+  `CapacityExceeded`.
+- `ChannelIndex::max_distinct_sessions` from live binding; coordinator
+  claim path passes channel limit into `bind_session`.
+- Proof: `max_distinct_sessions_exact_admits_plus_one_rejects`
+  (Hang-pinned exact=2; plus-one CapacityExceeded; session-less admit
+  does not consume a distinct slot at admit). s23 + checklist needles.
+
+Does **not** close D-025 / §25 / live Grok / exhaustive matrix /
+Refreshable. Sign-off still `_TBD_`.
+
+**Expert + Advisor (2026-08-23, max_distinct_sessions v2 wire):**
+**PASS — Silver.** Admit order sound (duplicate before distinct under
+lock; active-capacity headroom in proof). Session-less not counting at
+admit is correct; ExternalAgent `bind_session` is wired but **not**
+proven by the Hang DirectLlm cell (honesty leftover). No reservation
+leak on DistinctSessionsExceeded. Does **not** close D-025 / §25.
+
+**Next pick:** independent human/contracted D-025 Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md` **or** next named agent residual
+(ExternalAgent claim-time distinct plus-one / further exact-limit cells /
+Fake load). Agents must not self-sign. Do not implement Refreshable
+without superseding DECISIONS D-042. Do not register broken
+`tests/hardening.rs`. Do not promote Golden / §25 / D-025 signed-off.

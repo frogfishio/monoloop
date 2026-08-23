@@ -123,6 +123,10 @@ fn s23_exact_limit_plus_one_inventory_present() {
         ),
         (
             "src/transaction/lifecycle/tests.rs",
+            "max_distinct_sessions_exact_admits_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
             "concurrent_global_capacity_exhaustion_admits_exactly_max",
         ),
         (
@@ -176,7 +180,23 @@ fn s23_exact_limit_plus_one_inventory_present() {
         ),
         (
             "src/transaction/lifecycle/tests.rs",
+            "max_content_parts_exact_admits_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "max_tools_per_transaction_exact_admits_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
             "max_input_bytes_exact_admits_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "multi_channel_multi_session_concurrent_load",
+        ),
+        (
+            "../monoloop-connector-grok/tests/grok_connector.rs",
+            "concurrent_session_new_and_explicit_load",
         ),
         (
             "src/transaction/lifecycle/tests.rs",

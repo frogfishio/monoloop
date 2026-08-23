@@ -132,14 +132,32 @@ impl LifecycleLedger {
         self.by_session.get(key).copied()
     }
 
-    /// Insert a complete Queued entry. Returns `Err` if id or session collides.
-    pub fn insert_queued(&mut self, entry: LedgerEntry) -> Result<(), LedgerInsertError> {
+    /// Count distinct active sessions on a channel (D-015 / ChannelLimits).
+    pub fn distinct_sessions_on_channel(&self, channel: &ChannelId) -> usize {
+        self.by_session
+            .keys()
+            .filter(|k| k.channel_id == *channel)
+            .count()
+    }
+
+    /// Insert a complete Queued entry. Returns `Err` if id or session collides
+    /// or if `max_distinct_sessions` would be exceeded for a new SessionKey.
+    pub fn insert_queued(
+        &mut self,
+        entry: LedgerEntry,
+        max_distinct_sessions: Option<usize>,
+    ) -> Result<(), LedgerInsertError> {
         if self.by_transaction.contains_key(&entry.transaction_id) {
             return Err(LedgerInsertError::DuplicateTransaction);
         }
         if let Some(ref key) = entry.session_key {
             if self.by_session.contains_key(key) {
                 return Err(LedgerInsertError::SessionAlreadyActive);
+            }
+            if let Some(max) = max_distinct_sessions {
+                if self.distinct_sessions_on_channel(&key.channel_id) >= max {
+                    return Err(LedgerInsertError::DistinctSessionsExceeded);
+                }
             }
         }
         if let Some(ref key) = entry.session_key {
@@ -161,13 +179,33 @@ impl LifecycleLedger {
     }
 
     /// Bind session key after external session claim (supervisor only).
+    ///
+    /// When `max_distinct_sessions` is `Some`, a net-new session on the channel
+    /// that would exceed the bound fails with `DistinctSessionsExceeded`.
+    /// Replacing an existing key on the same channel does not consume an extra
+    /// distinct slot.
     pub fn bind_session(
         &mut self,
         id: &TransactionId,
         key: SessionKey,
+        max_distinct_sessions: Option<usize>,
     ) -> Result<(), LedgerInsertError> {
         if self.by_session.contains_key(&key) {
             return Err(LedgerInsertError::SessionAlreadyActive);
+        }
+        let replacing_same_channel = self
+            .by_transaction
+            .get(id)
+            .ok_or(LedgerInsertError::UnknownTransaction)?
+            .session_key
+            .as_ref()
+            .is_some_and(|old| old.channel_id == key.channel_id);
+        if let Some(max) = max_distinct_sessions {
+            if !replacing_same_channel
+                && self.distinct_sessions_on_channel(&key.channel_id) >= max
+            {
+                return Err(LedgerInsertError::DistinctSessionsExceeded);
+            }
         }
         let entry = self
             .by_transaction
@@ -189,6 +227,8 @@ pub enum LedgerInsertError {
     DuplicateTransaction,
     /// Session key already has an active transaction.
     SessionAlreadyActive,
+    /// Channel `max_distinct_sessions` would be exceeded.
+    DistinctSessionsExceeded,
     /// Unknown transaction id.
     UnknownTransaction,
 }

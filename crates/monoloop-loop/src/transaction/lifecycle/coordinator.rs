@@ -260,6 +260,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         let channel_id_gate = channel_id.clone();
         let shared_gate = Arc::clone(&shared);
         let tx_gate = transaction_id;
+        let max_distinct_gate = live.binding.limits.max_distinct_sessions;
         let gate_task = async move {
             let external = match opened_rx.await {
                 Ok(Some(ext)) => ext,
@@ -283,7 +284,10 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             // Reserve claimed SessionKey in the ledger before activate / prompt.
             {
                 let mut ledger = shared_gate.ledger.lock().unwrap_or_else(|e| e.into_inner());
-                if ledger.bind_session(&tx_gate, key.clone()).is_err() {
+                if ledger
+                    .bind_session(&tx_gate, key.clone(), Some(max_distinct_gate))
+                    .is_err()
+                {
                     let _ = proceed_tx.send(Err(()));
                     return (None, false);
                 }
