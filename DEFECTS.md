@@ -3006,3 +3006,376 @@ active headroom. Does **not** close D-025 / §25 / live Grok.
 not implement Refreshable without superseding DECISIONS D-042. Do not
 register broken `tests/hardening.rs`. Do not promote Golden / §25 /
 D-025 signed-off.
+
+## D-046: Event byte capacity is never released after receive
+
+**Priority:** P1
+
+**Status:** Fixed (2026-08-23)
+
+**Affected:**
+- `crates/monoloop-contracts/src/delivery.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/delivery.rs`
+
+**Problem:** `TransactionEventSender::send` / `try_send` increments the shared
+`queued_bytes` counter, but `TransactionEventReceiver::recv` and `try_recv` do
+not decrement it. The only decrement API, `TransactionEventSender::note_received`,
+has no production callers and is not available to a receiver that owns no sender.
+
+The configured queue-byte capacity therefore behaves as a cumulative lifetime
+quota. A host that continuously drains its event receiver will eventually see
+all later events rejected once the sum of previously delivered event sizes
+reaches `max_event_bytes`, even when the queue is empty. This violates v2 §6.4,
+§12, §22.6, and §25 bounded queued-resource semantics.
+
+**Acceptance review evidence:**
+- Repository-wide search finds `note_received` only at its definition.
+- Existing delivery tests cover item capacity but do not prove byte capacity is
+  recovered after receive or receiver drop.
+
+**Remediation (Fixed):**
+- Queued mailbox items carry an RAII `QueuedBytePermit`; Drop releases bytes.
+- `recv` / `try_recv` drop the permit; receiver/channel drop releases remaining.
+- Removed host-callable `note_received`.
+
+**Acceptance criteria:**
+- [x] Repeated send→receive cycles whose cumulative size exceeds the configured
+  byte limit continue succeeding when concurrent queued bytes stay within limit
+  (`event_byte_capacity_recovered_after_receive`).
+- [x] Exact concurrent byte capacity succeeds and plus-one fails closed
+  (`event_byte_capacity_exact_and_plus_one`).
+- [x] Dropping a receiver releases every outstanding byte reservation
+  (`event_byte_capacity_released_on_receiver_drop`).
+- [x] Concurrent sender tests prove no underflow, overflow, or leaked capacity
+  (`event_byte_capacity_concurrent_send_recv_no_leak`).
+
+## D-047: Event publisher silently discards accepted ordinary events
+
+**Priority:** P1
+
+**Status:** Open (independent acceptance review, 2026-08-23)
+
+**Affected:**
+- `crates/monoloop-loop/src/transaction/lifecycle/event_publisher.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/coordinator.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs`
+
+**Problem:** The event publisher uses `event_tx.try_send`. It ignores
+`ItemCapacityExceeded`, `ByteCapacityExceeded`, and `EventTooLarge` for ordinary
+`Publish` and `EstablishExternal` commands. The coordinator has already observed
+successful insertion into the internal publisher-command mailbox, so it cannot
+distinguish external publication from silent loss. A transaction can consequently
+select `Completed` with missing canonical events.
+
+This is an explicit divergence from v2 §6.4 and §12, which require ordinary
+events to wait for capacity under the remaining transaction deadline and require
+publication failures to become supervisor-visible. A failed
+`EstablishExternal` may also be followed by an ordinary event, violating the
+requirement that a new external session publish `SessionEstablished` first.
+
+The current `s22_2_failed_enqueue_consumes_no_sequence` test manually resubmits a
+dropped event. Production has no retry or failure command, so that test proves
+contiguous numbering but not lossless delivery.
+
+**Required remediation:**
+- Use deadline-aware capacity acquisition for ordinary event publication.
+- Report queue closure, deadline, and limit failures to the supervisor through a
+  bounded `PublisherFailed`/equivalent command.
+- Ensure `EstablishExternal` either commits sequence 1 or terminates before any
+  ordinary event can publish.
+- Give terminal sealing priority so a full publisher-command queue cannot permit
+  ordinary events after finalization begins.
+
+**Acceptance criteria:**
+- [ ] A temporarily full but draining host queue loses no ordinary events before
+  the transaction deadline.
+- [ ] A permanently full queue produces the documented terminal failure rather
+  than `Completed`.
+- [ ] `SessionEstablished` publication failure prevents later ordinary events.
+- [ ] Seal racing a full command queue permits no event after terminal attempt.
+- [ ] Tests assert delivered payload identities/counts, not only contiguous
+  sequence numbers.
+
+## D-048: Process-isolated tool handles are discarded before wait/reap
+
+**Priority:** P1
+
+**Status:** Open (independent acceptance review, 2026-08-23)
+
+**Affected:**
+- `crates/monoloop-loop/src/transaction/dispatcher.rs`
+- `crates/monoloop-loop/src/transaction/tool_handler.rs`
+- `crates/monoloop-loop/src/transaction/process_tool.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs`
+
+**Problem:** On an interrupted `ProcessIsolated` dispatch, `DispatchGuard::drop`
+kills the child but parks only a `ToolPermit` and `OwnedProcessLease`. It does not
+park the `ToolKillHandle` or its `Child`. Once drive/guard handles drop, the
+runtime can lose its last process handle without observing `wait`/`try_wait`.
+
+`OrphanToolPermitSet::shutdown_progress` then clears those permits and leases
+unconditionally. The supervisor's stopped predicate checks an empty ledger and
+empty Tokio task set but does not require an authoritative process-owner registry
+to be empty. `owned_processes` can therefore become zero because an accounting
+lease was dropped rather than because the child was reaped. This violates v2
+§3, §7.3, §14.3, §18.2–18.3, §21, §22.4–22.5, and §25.
+
+**Required remediation:**
+- Add a runtime-owned process supervisor/registry that retains every `Child` from
+  successful spawn until exit is observed.
+- Transfer the actual process handle—not only permits/counters—on cancellation,
+  dispatcher drop, timeout, panic, and task abort.
+- Derive `owned_processes` from the registry or otherwise make it impossible to
+  clear before reap.
+- Include empty process registry in the mechanical stopped predicate.
+
+**Acceptance criteria:**
+- [ ] Abort the supervising `ToolWorker` immediately after process spawn; shutdown
+  kills and reaps the child before `Stopped`.
+- [ ] Kill/wait timeout remains `Quiescing` with the process handle retained.
+- [ ] A later successful reap releases process and tool permits exactly once.
+- [ ] `Stopped` asserts process registry empty, not merely counter zero.
+- [ ] Sacrificial tests check the child PID is no longer waitable/live and was
+  reaped by this runtime.
+
+## D-049: `wait_stopped` deadline excludes executor-thread join
+
+**Priority:** P1
+
+**Status:** Open (independent acceptance review, 2026-08-23)
+
+**Affected:**
+- `crates/monoloop-loop/src/transaction/lifecycle/owner.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/supervisor.rs`
+
+**Problem:** `RuntimeOwner::wait_stopped` applies its deadline only inside
+`wait_until_stopped`. After observing `STATE_STOPPED`, it performs an unbounded
+`std::thread::JoinHandle::join`. The supervisor stores `STATE_STOPPED` before its
+future returns and before the executor thread executes `Runtime::shutdown_timeout`.
+
+Consequently, a short `wait_stopped` call can block past its deadline, and public
+runtime state can report `Stopped` while the supervisor future, executor, and OS
+thread are still alive. This contradicts v2 §3 and §18.2: the wait deadline must
+bound the entire API operation, and only `Stopped` may prove executor/thread join.
+
+**Required remediation:**
+- Separate supervisor `Drained`/`ReadyToJoin` from public `Stopped`.
+- Account for elapsed time when waiting for the OS thread to finish.
+- If the thread is not finished within the remaining wait budget, return
+  `TimedOut` and retain the join handle.
+- Publish `Stopped` only from owner-side logic after the thread join is observed.
+
+**Acceptance criteria:**
+- [ ] `wait_stopped(short)` returns within tolerance even when executor teardown
+  is deliberately delayed after supervisor drain.
+- [ ] State remains `Quiescing` while the executor thread is alive.
+- [ ] A subsequent wait joins the same retained handle and returns `Stopped`.
+- [ ] No public handle can observe `Stopped` before executor/thread join.
+
+## D-050: Abortable tool ownership still relies on self-asserted booleans
+
+**Priority:** P1
+
+**Status:** Open (independent acceptance review, 2026-08-23)
+
+**Affected:**
+- `crates/monoloop-loop/src/transaction/host_tools.rs`
+- `crates/monoloop-loop/src/transaction/tool_handler.rs`
+- `crates/monoloop-loop/src/transaction/dispatcher.rs`
+
+**Problem:** `ProcessIsolated` registration has a concrete constructor, but
+`AbortableAtYield` accepts any public `dyn ToolHandler` whose
+`supports_abort()` returns true. A custom handler can self-assert abortability,
+return a fabricated cancel-only handle, and run its actual work elsewhere without
+transferring an owned join to the runtime. Post-start validation similarly checks
+only the presence of a `ToolKillHandle`.
+
+This violates v2 §14: handler capability booleans are insufficient and
+registration must require a structural execution factory for the declared class.
+It also reopens the detached-work and premature-capacity-release failure mode the
+v2 rewrite was intended to remove.
+
+**Required remediation:**
+- Replace the single boolean-driven `ToolHandler` registration seam with typed
+  factories/handles per execution class.
+- Require `AbortableAtYield` to yield an unspawned future that the runtime places
+  directly under `TaskSupervisor`, or an equivalent runtime-owned task handle.
+- Define cooperative external work explicitly as host-owned rather than claiming
+  runtime join/stop guarantees for it.
+
+**Acceptance criteria:**
+- [ ] A custom handler cannot self-assert `AbortableAtYield` through a boolean.
+- [ ] Every accepted abortable execution has a TaskSupervisor-owned join before
+  its body starts.
+- [ ] Abort retains capacity until that join is observed.
+- [ ] Tests attempt forged/mismatched handles for every execution class.
+
+## D-051: Connector ownership begins only after open completes
+
+**Priority:** P2
+
+**Status:** Open (independent acceptance review, 2026-08-23)
+
+**Affected:**
+- `crates/monoloop-connector/src/open.rs`
+- `crates/monoloop-connector/src/traits.rs`
+- `crates/monoloop-loop/src/transaction/lifecycle/exchange.rs`
+- all Connector profile `begin_open` implementations
+
+**Problem:** `PendingRawConnection` contains control and an `OpenCompletion`, but
+no owner work/handle. `ConnectionOwnerWork` is available only after
+`OpenCompletion` returns `OpenedRawConnection`. Open-time Connector I/O is
+therefore driven as part of the transaction coordinator rather than by a
+`ConnectorOwner` registered before I/O begins.
+
+This does not necessarily detach current futures, because the coordinator is
+supervised, but it fails the mandatory v2 §15 ownership seam: open-owner identity
+must exist before I/O starts and control/join must cover pending open as well as
+post-open transport work.
+
+**Acceptance criteria:**
+- [ ] `PendingRawConnection` transfers owner work/identity before open I/O can
+  start.
+- [ ] `ConnectorOwner` registration precedes first poll of the entire open and
+  transport owner operation.
+- [ ] Cancel/terminate during a non-yielding or delayed open retains an observable
+  owner join and never fabricates teardown.
+- [ ] No profile retains the temporary `owner_work: None` migration option.
+
+## D-052: Mandatory format and clippy verification gates fail at delivered HEAD
+
+**Priority:** P1
+
+**Status:** Open (independent acceptance review, 2026-08-23)
+
+**Affected:**
+- workspace formatting
+- `crates/monoloop-loop/src/transaction/lifecycle/tests.rs`
+- `doc/TRANSACTION_RUNTIME_V2_SPEC.md` status header
+
+**Problem:** At commit `fb0371b`, the specification header claims the §23 core
+commands are green, but two mandatory commands fail.
+
+**Acceptance review evidence:**
+- `cargo fmt --all -- --check` fails with diffs across Connector tests,
+  contracts, Loop sources, lifecycle tests, and MCP tests.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` fails on
+  `clippy::needless-borrows-for-generic-args` in lifecycle tests.
+- `cargo test --workspace --all-targets --all-features` passes when the review
+  environment is allowed to bind loopback sockets.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` passes.
+
+**Acceptance criteria:**
+- [ ] All four §23 commands pass on the same clean checkout.
+- [ ] CI runs exactly those commands and blocks release on failure.
+- [ ] The specification status header reports observed state rather than a stale
+  green claim.
+
+## D-053: `--all-targets` excludes six integration suites and package examples
+
+**Priority:** P2
+
+**Status:** Open (independent acceptance review, 2026-08-23)
+
+**Affected:**
+- `crates/monoloop-loop/Cargo.toml`
+- `crates/monoloop-loop/tests/admission_lifecycle.rs`
+- `crates/monoloop-loop/tests/claim_gate.rs`
+- `crates/monoloop-loop/tests/direct_llm_e2e.rs`
+- `crates/monoloop-loop/tests/exchange_e2e.rs`
+- `crates/monoloop-loop/tests/hardening.rs`
+- `crates/monoloop-loop/tests/runtime_startup.rs`
+- `crates/monoloop-loop/examples/fake_echo.rs`
+
+**Problem:** `monoloop-loop` sets `autotests = false` and `autoexamples = false`,
+then registers only selected test targets. The six integration files above still
+use the deleted/deprecated v1 runtime surface and are neither compiled nor run by
+the mandatory workspace `--all-targets` command. Package examples are likewise
+excluded unless explicitly registered.
+
+**Acceptance review evidence:**
+- `cargo test -p monoloop-loop --test hardening` reports no such test target.
+- `cargo test -p monoloop-loop --test direct_llm_e2e` reports no such test target.
+- The Cargo manifest comments explicitly say the suites await rewrite for
+  `StartedRuntime`, despite the specification header claiming M7 façade cutover.
+
+**Acceptance criteria:**
+- [ ] Port every retained integration suite to the v2 public API and register it,
+  or delete it with an explicit coverage replacement map.
+- [ ] Register/enable package examples so `--all-targets` compiles them.
+- [ ] `cargo test --workspace --all-targets --all-features` demonstrably includes
+  the full intended suite rather than a curated subset hidden by autodiscovery
+  settings.
+
+## D-054: M7 deletion and final §23/§25 acceptance are incomplete
+
+**Priority:** P2
+
+**Status:** Open (independent acceptance review, 2026-08-23)
+
+**Affected:**
+- `crates/monoloop-loop/src/transaction/active_registry.rs`
+- `crates/monoloop-loop/src/transaction/events.rs`
+- `crates/monoloop-loop/src/transaction/exchange.rs`
+- `crates/monoloop-loop/src/transaction/spawn_gate.rs`
+- callback-based compatibility types/aliases in contracts and Loop exports
+- `doc/SECURITY_REVIEW_CHECKLIST.md`
+- `doc/TRANSACTION_RUNTIME_V2_SPEC.md`
+
+**Problem:** The v2 migration plan §24 M7 requires obsolete lifecycle/event
+files and compatibility aliases to be removed after cutover. The four obsolete
+files above remain tracked but uncompiled, and deprecated callback/runtime/tool
+aliases remain exported. This is not a live behavior defect by itself, but it
+means the claimed M7 completion and final definition of done are inaccurate.
+
+The project's security checklist also explicitly records an incomplete exhaustive
+public-limit matrix, incomplete broader load/race coverage, live Grok qualification
+still open, and an unsigned independent-review gate. D-046–D-053 now add unresolved
+P1/P2 findings, so v2 §23 and §25 cannot pass.
+
+**Acceptance criteria:**
+- [ ] Delete obsolete uncompiled lifecycle/event modules after coverage migration.
+- [ ] Remove callback-based core APIs and compatibility aliases at the declared
+  breaking boundary, or narrow M7/status language to an explicitly incomplete
+  compatibility phase.
+- [ ] Close D-046–D-053 and rerun all mandatory gates.
+- [ ] Complete the remaining exact-limit, race/load, and profile qualifications
+  claimed by §23/§25.
+- [ ] A subsequent independent acceptance review finds no unresolved P0/P1/P2
+  lifecycle defect.
+
+## Independent Transaction Runtime v2 acceptance verdict — 2026-08-23
+
+**Reviewed commit:** `fb0371b`
+
+**Result:** **REJECT — not v2 spec-complete; not releasable as Golden / §25**
+
+The review found no immediate P0 memory-safety defect. It found five live P1
+lifecycle/ownership defects (D-046–D-050), one P1 release-gate defect (D-052),
+and three P2 contract/migration defects (D-051, D-053, D-054).
+
+Positive findings retained from the delivery:
+- production owns its executor;
+- synchronous admission uses ledger installation, state recheck, and rollback;
+- TaskSupervisor registers tasks before releasing their start gate;
+- arbitrary event/completion callbacks execute outside the core executor;
+- deliberately non-yielding supervised work keeps shutdown `Quiescing`;
+- registered workspace tests pass with required loopback access; and
+- rustdoc succeeds with warnings denied.
+
+These strengths do not override the open defects above. Recommended remediation
+order is D-046, D-047, D-048, D-049, D-050, D-051, then D-052–D-054 followed by
+a fresh independent acceptance review. Do not mark D-025, §23, §25, or Golden
+complete while any of these records remain open.
+
+**Remediation progress (2026-08-23):** D-046 Fixed (RAII queued byte permits in
+`monoloop-contracts` delivery mailbox). **Next pick:** D-047 (lossless event
+publisher / fail-visible enqueue). Do not promote Golden / §25 / D-025 while
+D-047–D-054 remain open.
+
+**Expert + Advisor (2026-08-23, D-046 Fixed):** **PASS — Silver** for this
+slice only. RAII permit ownership matches acceptance criteria; Full/Closed
+paths do not double-release. Async `send` still fails closed on byte budget
+(no byte-wait) — intentional for the mailbox API; lossless deadline-aware
+publish remains **D-047**. Acceptance **REJECT** stands until D-047–D-054
+close. **Next pick:** D-047.

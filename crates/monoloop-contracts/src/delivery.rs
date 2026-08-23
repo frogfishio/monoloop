@@ -60,10 +60,31 @@ pub enum CompletionPublishResult {
     InvariantFailed,
 }
 
+/// RAII permit for one queued event's byte reservation (D-046).
+///
+/// Released when the queued item is received or dropped with the channel.
+struct QueuedBytePermit {
+    queued_bytes: Arc<AtomicU64>,
+    nbytes: u64,
+}
+
+impl Drop for QueuedBytePermit {
+    fn drop(&mut self) {
+        self.queued_bytes.fetch_sub(self.nbytes, Ordering::SeqCst);
+    }
+}
+
+/// Internal mailbox item: event + byte reservation owned by the queue entry.
+struct QueuedDeliveryEvent {
+    event: TransactionEvent,
+    /// `None` only if already taken (should not happen in normal flow).
+    permit: Option<QueuedBytePermit>,
+}
+
 /// Runtime-held half of the event mailbox.
 #[derive(Debug, Clone)]
 pub struct TransactionEventSender {
-    tx: mpsc::Sender<TransactionEvent>,
+    tx: mpsc::Sender<QueuedDeliveryEvent>,
     /// Approximate bytes currently queued (best-effort accounting).
     queued_bytes: Arc<AtomicU64>,
     max_event_bytes: usize,
@@ -72,7 +93,7 @@ pub struct TransactionEventSender {
 /// Host-held half of the event mailbox.
 #[derive(Debug)]
 pub struct TransactionEventReceiver {
-    rx: mpsc::Receiver<TransactionEvent>,
+    rx: mpsc::Receiver<QueuedDeliveryEvent>,
 }
 
 /// Runtime-held one-shot completion sender (consumed exactly once).
@@ -141,7 +162,7 @@ impl TransactionEventSender {
         self.queued_bytes.load(Ordering::SeqCst)
     }
 
-    /// Try to enqueue without waiting. Returns `false` when full or closed.
+    /// Try to enqueue without waiting.
     pub fn try_send(&self, event: TransactionEvent) -> Result<(), EventEnqueueError> {
         let nbytes = estimate_event_bytes(&event);
         if nbytes > self.max_event_bytes {
@@ -158,16 +179,20 @@ impl TransactionEventSender {
                 .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                match self.tx.try_send(event) {
+                let item = QueuedDeliveryEvent {
+                    event,
+                    permit: Some(QueuedBytePermit {
+                        queued_bytes: Arc::clone(&self.queued_bytes),
+                        nbytes: nbytes as u64,
+                    }),
+                };
+                match self.tx.try_send(item) {
                     Ok(()) => return Ok(()),
-                    Err(mpsc::error::TrySendError::Full(e)) => {
-                        self.queued_bytes.fetch_sub(nbytes as u64, Ordering::SeqCst);
-                        let _ = e;
+                    // Dropping the returned item releases the RAII permit.
+                    Err(mpsc::error::TrySendError::Full(_)) => {
                         return Err(EventEnqueueError::ItemCapacityExceeded);
                     }
-                    Err(mpsc::error::TrySendError::Closed(e)) => {
-                        self.queued_bytes.fetch_sub(nbytes as u64, Ordering::SeqCst);
-                        let _ = e;
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
                         return Err(EventEnqueueError::Closed);
                     }
                 }
@@ -175,13 +200,15 @@ impl TransactionEventSender {
         }
     }
 
-    /// Enqueue, waiting until capacity is available or the receiver is dropped.
+    /// Enqueue, waiting until item capacity is available or the receiver is dropped.
+    ///
+    /// Byte capacity is reserved before awaiting the mpsc slot. If concurrent
+    /// queued bytes would exceed the limit, fails closed immediately (no wait).
     pub async fn send(&self, event: TransactionEvent) -> Result<(), EventEnqueueError> {
         let nbytes = estimate_event_bytes(&event);
         if nbytes > self.max_event_bytes {
             return Err(EventEnqueueError::EventTooLarge);
         }
-        // Reserve bytes before awaiting channel capacity.
         loop {
             let cur = self.queued_bytes.load(Ordering::SeqCst);
             let next = cur.saturating_add(nbytes as u64);
@@ -196,30 +223,40 @@ impl TransactionEventSender {
                 break;
             }
         }
-        match self.tx.send(event).await {
+        let item = QueuedDeliveryEvent {
+            event,
+            permit: Some(QueuedBytePermit {
+                queued_bytes: Arc::clone(&self.queued_bytes),
+                nbytes: nbytes as u64,
+            }),
+        };
+        match self.tx.send(item).await {
             Ok(()) => Ok(()),
-            Err(_) => {
-                self.queued_bytes.fetch_sub(nbytes as u64, Ordering::SeqCst);
-                Err(EventEnqueueError::Closed)
-            }
+            // Closed: Drop of `item` (or the oneshot Err payload) releases permit.
+            Err(mpsc::error::SendError(_)) => Err(EventEnqueueError::Closed),
         }
-    }
-
-    /// Account for a host-side receive (byte budget release).
-    pub fn note_received(&self, nbytes: usize) {
-        self.queued_bytes.fetch_sub(nbytes as u64, Ordering::SeqCst);
     }
 }
 
 impl TransactionEventReceiver {
     /// Receive the next event, or `None` when the sender has been dropped.
+    ///
+    /// Releases the queued byte reservation for the received item (D-046).
     pub async fn recv(&mut self) -> Option<TransactionEvent> {
-        self.rx.recv().await
+        self.rx.recv().await.map(|item| {
+            let QueuedDeliveryEvent { event, permit } = item;
+            drop(permit);
+            event
+        })
     }
 
-    /// Non-blocking receive.
+    /// Non-blocking receive; releases byte reservation on success (D-046).
     pub fn try_recv(&mut self) -> Result<TransactionEvent, mpsc::error::TryRecvError> {
-        self.rx.try_recv()
+        self.rx.try_recv().map(|item| {
+            let QueuedDeliveryEvent { event, permit } = item;
+            drop(permit);
+            event
+        })
     }
 }
 
@@ -280,6 +317,8 @@ mod tests {
         CleanupStatus, TerminalEventDelivery, TransactionDiagnostic, TransactionEndEvent,
         TransactionEndKind, TransactionEventPayload, TransactionUsage,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     fn sample_completion() -> TransactionCompletion {
         TransactionCompletion {
@@ -324,23 +363,160 @@ mod tests {
         assert_eq!(result, CompletionPublishResult::ReceiverDropped);
     }
 
-    #[tokio::test]
-    async fn event_try_send_item_capacity() {
-        let (delivery, _receiver) =
-            transaction_delivery(DeliveryLimits::try_new(1, 1024 * 1024).unwrap()).unwrap();
-        let tx_id = TransactionId::generate();
-        let ev = TransactionEvent {
-            transaction_id: tx_id,
+    fn sample_event(sequence: u64) -> TransactionEvent {
+        TransactionEvent {
+            transaction_id: TransactionId::generate(),
             channel_id: ChannelId::try_new("ch").unwrap(),
             session_id: SessionId::try_new("s").unwrap(),
-            sequence: 1,
+            sequence,
             payload: TransactionEventPayload::Diagnostic(TransactionDiagnostic {
                 diagnostic: crate::safe::SafeDiagnostic::try_new_default("internal", Some("x"))
                     .unwrap(),
             }),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn event_try_send_item_capacity() {
+        let (delivery, _receiver) =
+            transaction_delivery(DeliveryLimits::try_new(1, 1024 * 1024).unwrap()).unwrap();
+        let ev = sample_event(1);
         delivery.event_tx.try_send(ev.clone()).unwrap();
         let err = delivery.event_tx.try_send(ev).unwrap_err();
         assert_eq!(err, EventEnqueueError::ItemCapacityExceeded);
+    }
+
+    /// D-046: byte budget is recovered after receive so cumulative lifetime
+    /// volume may exceed the limit while concurrent queued bytes stay within it.
+    #[tokio::test]
+    async fn event_byte_capacity_recovered_after_receive() {
+        let ev = sample_event(1);
+        let one = estimate_event_bytes(&ev);
+        let (delivery, mut receiver) =
+            transaction_delivery(DeliveryLimits::try_new(4, one).unwrap()).unwrap();
+
+        for i in 0..8u64 {
+            let next = sample_event(i + 1);
+            delivery
+                .event_tx
+                .try_send(next)
+                .unwrap_or_else(|e| panic!("cycle {i} must succeed after receive release: {e:?}"));
+            let _ = receiver
+                .events
+                .recv()
+                .await
+                .expect("receive releases bytes");
+            assert_eq!(
+                delivery.event_tx.queued_bytes(),
+                0,
+                "queued bytes must be zero after receive"
+            );
+        }
+    }
+
+    /// D-046: exact concurrent byte capacity succeeds; plus-one fails closed.
+    #[tokio::test]
+    async fn event_byte_capacity_exact_and_plus_one() {
+        let ev = sample_event(1);
+        let one = estimate_event_bytes(&ev);
+        let (delivery, mut receiver) =
+            transaction_delivery(DeliveryLimits::try_new(8, one * 2).unwrap()).unwrap();
+        let a = sample_event(1);
+        let b = sample_event(2);
+        let c = sample_event(3);
+        assert_eq!(estimate_event_bytes(&a), one);
+        assert_eq!(estimate_event_bytes(&b), one);
+        assert_eq!(estimate_event_bytes(&c), one);
+
+        delivery.event_tx.try_send(a).unwrap();
+        delivery.event_tx.try_send(b).unwrap();
+        assert_eq!(delivery.event_tx.queued_bytes(), (one * 2) as u64);
+        let err = delivery.event_tx.try_send(c).unwrap_err();
+        assert_eq!(err, EventEnqueueError::ByteCapacityExceeded);
+
+        let _ = receiver.events.recv().await.unwrap();
+        assert_eq!(delivery.event_tx.queued_bytes(), one as u64);
+        delivery.event_tx.try_send(sample_event(4)).unwrap();
+        assert_eq!(delivery.event_tx.queued_bytes(), (one * 2) as u64);
+    }
+
+    /// D-046: dropping the receiver releases every outstanding byte reservation.
+    #[tokio::test]
+    async fn event_byte_capacity_released_on_receiver_drop() {
+        let ev = sample_event(1);
+        let one = estimate_event_bytes(&ev);
+        let (delivery, receiver) =
+            transaction_delivery(DeliveryLimits::try_new(4, one * 3).unwrap()).unwrap();
+        delivery.event_tx.try_send(sample_event(1)).unwrap();
+        delivery.event_tx.try_send(sample_event(2)).unwrap();
+        assert!(delivery.event_tx.queued_bytes() > 0);
+        drop(receiver);
+        // Allow Drop of queued items to run.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            delivery.event_tx.queued_bytes(),
+            0,
+            "receiver drop must release all queued byte permits"
+        );
+        // Channel closed — further sends fail closed, not byte-capacity.
+        let err = delivery.event_tx.try_send(sample_event(3)).unwrap_err();
+        assert_eq!(err, EventEnqueueError::Closed);
+    }
+
+    /// D-046: concurrent senders + drain never underflow or leak capacity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn event_byte_capacity_concurrent_send_recv_no_leak() {
+        let ev = sample_event(1);
+        let one = estimate_event_bytes(&ev);
+        let (delivery, mut receiver) =
+            transaction_delivery(DeliveryLimits::try_new(32, one * 8).unwrap()).unwrap();
+        let tx = delivery.event_tx.clone();
+        let sent = Arc::new(AtomicU64::new(0));
+        let mut joins = Vec::new();
+        for t in 0..4u64 {
+            let tx = tx.clone();
+            let sent = Arc::clone(&sent);
+            joins.push(tokio::spawn(async move {
+                for i in 0..32u64 {
+                    let event = sample_event(t * 100 + i + 1);
+                    loop {
+                        match tx.try_send(event.clone()) {
+                            Ok(()) => {
+                                sent.fetch_add(1, Ordering::SeqCst);
+                                break;
+                            }
+                            Err(EventEnqueueError::ByteCapacityExceeded)
+                            | Err(EventEnqueueError::ItemCapacityExceeded) => {
+                                tokio::task::yield_now().await;
+                            }
+                            Err(e) => panic!("unexpected enqueue error: {e:?}"),
+                        }
+                    }
+                }
+            }));
+        }
+        let drain = tokio::spawn(async move {
+            let mut n = 0u64;
+            while n < 128 {
+                if let Some(_ev) = receiver.events.recv().await {
+                    n += 1;
+                } else {
+                    break;
+                }
+            }
+            n
+        });
+        for j in joins {
+            j.await.unwrap();
+        }
+        drop(tx);
+        let drained = drain.await.unwrap();
+        assert_eq!(sent.load(Ordering::SeqCst), 128);
+        assert_eq!(drained, 128);
+        assert_eq!(
+            delivery.event_tx.queued_bytes(),
+            0,
+            "no leaked byte capacity after concurrent drain"
+        );
     }
 }
