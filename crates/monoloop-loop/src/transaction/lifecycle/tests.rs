@@ -2460,6 +2460,7 @@ async fn event_publisher_prefers_authoritative_session_on_seal() {
                 diagnostics: vec![],
             },
             reply: reply_tx,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
         })
         .await
         .unwrap();
@@ -4128,6 +4129,7 @@ async fn s22_2_no_event_after_terminal_attempt() {
                 diagnostics: vec![],
             },
             reply: reply_tx,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
         })
         .await
         .unwrap();
@@ -4277,6 +4279,7 @@ async fn d047_full_queue_seal_reports_deadline_not_published() {
                 diagnostics: vec![],
             },
             reply: reply_tx,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
         })
         .await
         .unwrap();
@@ -4358,6 +4361,7 @@ async fn d047_seal_priority_when_ordinary_cmd_queue_full() {
                 diagnostics: vec![],
             },
             reply: reply_tx,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
         })
         .expect("Seal must enqueue on dedicated channel while ordinary is Full");
 
@@ -4377,6 +4381,98 @@ async fn d047_seal_priority_when_ordinary_cmd_queue_full() {
         res.delivery
     );
     drop(cmd_tx);
+    drop(seal_tx);
+    let _ = pub_task.await;
+}
+
+/// D-047 reopen: Seal enqueue uses SealCommand.deadline (terminal budget), not
+/// the long ordinary transaction deadline — so Finalizer and publisher share
+/// one authoritative Instant and Ended cannot publish after completion timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d047_seal_uses_terminal_deadline_not_transaction_deadline() {
+    use super::event_publisher::{run_event_publisher, SealCommand, TerminalPublicationResult};
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, TerminalEventDelivery, TransactionEndEvent,
+        TransactionEndKind, TransactionId, TransactionUsage,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    // Capacity 1, never drained → Seal enqueue waits.
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
+    // Occupy the single host slot so Seal cannot publish immediately.
+    {
+        use monoloop_contracts::{
+            SafeDiagnostic, TransactionDiagnostic, TransactionEvent, TransactionEventPayload,
+        };
+        let occupy = TransactionEvent {
+            transaction_id: tx_id,
+            channel_id: channel.clone(),
+            session_id: SessionId::try_new("s").unwrap(),
+            sequence: 1,
+            payload: TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+                diagnostic: SafeDiagnostic::try_new("occupy", Some("x"), 64).unwrap(),
+            }),
+        };
+        delivery
+            .event_tx
+            .try_send(occupy)
+            .expect("occupy host slot");
+    }
+    let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (seal_tx, seal_rx) = mpsc::channel(1);
+    let cancel = Arc::new(crate::transaction::sticky_cancel::StickyCancel::new());
+    // Ordinary transaction deadline is long — must NOT govern Seal.
+    let long_tx_deadline = std::time::Instant::now() + Duration::from_secs(600);
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel.clone(),
+        None,
+        delivery.event_tx,
+        cmd_rx,
+        seal_rx,
+        Arc::clone(&cancel),
+        long_tx_deadline,
+    ));
+
+    let seal_deadline = std::time::Instant::now() + Duration::from_millis(80);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    seal_tx
+        .try_send(SealCommand {
+            terminal: TransactionEndEvent {
+                transaction_id: tx_id,
+                session_id: None,
+                channel_id: channel,
+                kind: TransactionEndKind::Completed,
+                emitted_events: 0,
+                usage: TransactionUsage::default(),
+                diagnostics: vec![],
+            },
+            reply: reply_tx,
+            deadline: seal_deadline,
+        })
+        .expect("seal enqueue");
+
+    let res: TerminalPublicationResult = tokio::time::timeout(Duration::from_millis(500), reply_rx)
+        .await
+        .expect("Seal must conclude under terminal deadline, not 600s tx deadline")
+        .expect("seal reply");
+    assert_eq!(
+        res.delivery,
+        TerminalEventDelivery::DeadlineExceeded,
+        "Seal must fail on terminal deadline while host is full, got {:?}",
+        res.delivery
+    );
+
+    // Drain later must not reveal a late Ended (publisher already replied).
+    while receiver.events.try_recv().is_ok() {}
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        receiver.events.try_recv().is_err(),
+        "no late Ended after Seal DeadlineExceeded reply"
+    );
     drop(seal_tx);
     let _ = pub_task.await;
 }

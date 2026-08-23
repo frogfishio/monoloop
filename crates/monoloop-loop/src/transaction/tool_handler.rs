@@ -162,7 +162,7 @@ enum KillInner {
     CancelOnly { control: ToolExecutionControl },
     /// OS child process — real kill boundary (V2 §14.3).
     Process {
-        child: Arc<Mutex<Option<std::process::Child>>>,
+        child: Arc<Mutex<Option<tokio::process::Child>>>,
         /// Live until the child is observed reaped (or spill/Drop releases).
         owned_slot: Mutex<Option<OwnedProcessLease>>,
     },
@@ -179,11 +179,12 @@ impl ToolKillHandle {
         }
     }
 
-    /// Own an OS [`std::process::Child`] (D-043 / M5.4).
+    /// Own an OS [`tokio::process::Child`] (D-043 / M5.4 / D-048).
     ///
-    /// Wait/poll runs on [`LinkedToolExecutionHandle::drive`] (no `spawn_blocking`).
-    /// `child` is shared so kill and the drive loop observe the same process.
-    pub(crate) fn from_process(child: Arc<Mutex<Option<std::process::Child>>>) -> Self {
+    /// Wait/poll runs on [`LinkedToolExecutionHandle::drive`] (no ambient
+    /// `spawn_blocking`). `child` is shared so kill and the drive loop observe
+    /// the same process.
+    pub(crate) fn from_process(child: Arc<Mutex<Option<tokio::process::Child>>>) -> Self {
         Self {
             inner: Arc::new(KillInner::Process {
                 child,
@@ -228,7 +229,7 @@ impl ToolKillHandle {
             KillInner::CancelOnly { control } => control.cancel(),
             KillInner::Process { child, .. } => {
                 if let Some(c) = child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                    let _ = c.kill();
+                    let _ = c.start_kill();
                 }
             }
         }
@@ -289,7 +290,7 @@ impl ToolKillHandle {
         }
     }
 
-    fn process_still_alive(child: &Mutex<Option<std::process::Child>>) -> bool {
+    fn process_still_alive(child: &Mutex<Option<tokio::process::Child>>) -> bool {
         let mut guard = child.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
             Some(c) => match c.try_wait() {

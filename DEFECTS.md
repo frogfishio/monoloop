@@ -3100,6 +3100,12 @@ select / preempt during ordinary host-capacity wait; publisher no longer retains
 a Sender to its own ordinary channel. Proof:
 `d047_seal_priority_when_ordinary_cmd_queue_full`.
 
+**Second REJECT + close (same day):** Finalizer/`enqueue_seal` deadline skew —
+Finalizer waited `cleanup_deadline` while publisher used the transaction
+deadline. Now both sides share `SealCommand.deadline =
+now + terminal_event_delivery_deadline`. Proof:
+`d047_seal_uses_terminal_deadline_not_transaction_deadline`.
+
 **Acceptance criteria:**
 - [x] A temporarily full but draining host queue loses no ordinary events before
   the transaction deadline (`s22_2_failed_enqueue_consumes_no_sequence`).
@@ -3111,6 +3117,9 @@ a Sender to its own ordinary channel. Proof:
 - [x] Seal racing a full ordinary command queue permits no event after terminal
   attempt (`d047_seal_priority_when_ordinary_cmd_queue_full`; dedicated seal
   channel + preempt).
+- [x] Seal terminal enqueue and Finalizer reply wait share one authoritative
+  `terminal_event_delivery_deadline` Instant (not cleanup / tx deadline)
+  (`d047_seal_uses_terminal_deadline_not_transaction_deadline`).
 - [x] Tests assert delivered sequences after wait/drain (contiguous + count).
 
 ## D-048: Process-isolated tool handles are discarded before wait/reap
@@ -3148,9 +3157,15 @@ lease was dropped rather than because the child was reaped. This violates v2
 
 **Reopen + close (independent review `b82c763`):** `ProcessIsolatedToolHandler`
 no longer blocks `start` on `stdin.write_all`. Kill handle / Child ownership
-exist before stdin; stdin is delivered on the owned drive via bounded
-`spawn_blocking`. Proof:
-`process_isolated_program_owns_before_stdin_and_is_killable`.
+exist before stdin.
+
+**Second REJECT + close (same day):** first stdin remediation used ambient
+`spawn_blocking` (failed §23) and called `note_process_reaped` after kill
+without observed exit. Now: `tokio::process::Child` + async stdin write on the
+owned drive; post-kill poll until `try_wait` observes exit; reap accounting
+only then. Proofs:
+`process_isolated_program_owns_before_stdin_and_is_killable`,
+`process_isolated_stdin_timeout_reaps_only_after_observed_exit`.
 
 **Acceptance criteria:**
 - [ ] Abort the supervising `ToolWorker` immediately after process spawn;
@@ -3162,6 +3177,9 @@ exist before stdin; stdin is delivered on the owned drive via bounded
 - [x] Process ownership precedes stdin delivery; `start` returns a killable
   handle before any blocking stdin write
   (`process_isolated_program_owns_before_stdin_and_is_killable`).
+- [x] Stdin delivery is owned (async on drive); no ambient `spawn_blocking`;
+  reap only after observed exit
+  (`process_isolated_stdin_timeout_reaps_only_after_observed_exit` + §23).
 - [ ] Sacrificial PID-not-waitable proof still residual (next hardening optional).
 
 ## D-049: `wait_stopped` deadline excludes executor-thread join
@@ -3632,40 +3650,52 @@ cut). Agents must not self-sign. Do **not** promote Golden / §25 / D-025.
 
 ## Independent Transaction Runtime v2 acceptance verdict — 2026-08-23 (re-review)
 
-**Reviewed commit:** `b82c763`
+**Reviewed commit:** `b82c763` (+ uncommitted remediations)
 
-**Result:** **REJECT — not §25 / Golden / D-025**
+**Result:** **REJECT — not §25 / Golden / D-025** (second independent pass)
 
-Findings (remediated same day; still no Golden claim):
-1. **P1 D-047** Seal lost on full ordinary cmd queue → dedicated `SealCommand`
-   channel + preempt; proof `d047_seal_priority_when_ordinary_cmd_queue_full`.
-2. **P1 D-048** ProcessIsolated blocked `start` on stdin → own-before-stdin +
-   bounded `spawn_blocking`; proof
-   `process_isolated_program_owns_before_stdin_and_is_killable`.
-3. **P2 D-051** Busy/Rejected owner polled inline → drop unregistered future.
-4. **P2 D-053** DirectLlm coverage map overstated → narrowed to smoke + Golden
-   residual for HTTP/OpenAI vertical e2e.
+### Second-pass findings (supersede prior premature Silver PASS)
 
-Sacrificial PID residual under D-048 remains. Do **not** self-sign.
+A prior agent stamp of **Expert + Advisor PASS — Silver** on this section is
+**superseded and withdrawn**. That stamp was premature: remediations were
+uncommitted, `s23_no_undocumented_ambient_tokio_spawn_in_production_src`
+failed on ambient `spawn_blocking` stdin, and the ambient writer / false-reap
+path was a lifecycle ownership defect (not a harmless residual).
 
-**Expert + Advisor (2026-08-23, re-review findings Silver bar):** **PASS — Silver**
-for the named `b82c763` reopen slice only. Remediations are uncommitted on
-top of `b82c763` until landed; proofs below were re-run on this tree.
+1. **P1 D-048** stdin via ambient `spawn_blocking` (not TaskSupervisor-owned;
+   timeout detaches writer) + `note_process_reaped` after `kill` without
+   observed `wait`/`try_wait`. Also failed mandatory §23 gate.
+2. **P1 D-047** Finalizer waited `cleanup_deadline` for Seal reply while
+   publisher `enqueue_seal` used the long transaction deadline — completion
+   could record `DeadlineExceeded` then a later `EndedEvent` could still
+   publish. `terminal_event_delivery_deadline` was unused.
+3. **P1 release gate** `s23_no_undocumented_ambient_tokio_spawn_in_production_src`
+   failed on `process_tool.rs` `spawn_blocking`.
+4. **P2** Premature Silver PASS in this record (withdrawn above).
 
-| Finding | Proof |
-|---|---|
-| P1 D-047 Seal lost on full ordinary cmd queue | Dedicated `SealCommand` mpsc (cap 1) + biased select / `wait_send_or_seal` preempt; publisher does not retain a Sender to its own ordinary channel; Finalizer `try_send`s Seal on the taken seal sender. Named test `d047_seal_priority_when_ordinary_cmd_queue_full` **passed** on this tree. |
-| P1 D-048 `start` blocked on stdin | Kill handle + `Child` exist before any stdin write; stdin is bounded `spawn_blocking` on the owned drive. Named test `process_isolated_program_owns_before_stdin_and_is_killable` **passed** on this tree. |
-| P2 D-051 Busy/Rejected owner polled inline | `exchange.rs` drops the unregistered owner future after `terminate` (no inline poll). `open_owned` constructs a lazy owner; first poll of `open_and_own` is what starts I/O. Named proofs: `d051_pending_exposes_owner_before_open_poll`, `d051_cancel_during_delayed_open_joins_owner`, and `d051_busy_rejected_drops_unregistered_owner_without_poll` (PanicOnPoll fixture for Busy + Rejected) **passed**. |
-| P2 D-053 DirectLlm map overstated | `doc/D053_COVERAGE_REPLACEMENT.md` **Not equivalently replaced** for HTTP/OpenAI SSE composition / continuation / tool second-exchange / call-ID reuse / concurrency. Retained smoke only (`fake_echo_exchange_emits_canonical_text_unit`, `empty_loop`, `examples/fake_echo.rs`). |
+Confirmed still holding from first reopen close: dedicated Seal channel;
+Busy/Rejected owner drop; D-053 DirectLlm honesty.
 
-DirectLlm vertical e2e through `StartedRuntime` is an **explicit Golden residual**. Spec header, Loop README, D-054 Golden boxes, and `doc/SECURITY_REVIEW_CHECKLIST.md` Sign-off remain unsigned. **Not** Golden / §25 / D-025.
+### Remediation (same day, after second REJECT)
 
-Declared residuals that do **not** demote this slice: D-048 sacrificial abort-after-spawn PID-not-waitable proof; `spawn_blocking` stdin offload is not `TaskClass::ToolWorker` (D-043 class leftover).
+| Finding | Fix | Proof |
+|---|---|---|
+| P1 D-048 detached writer + false reap | `tokio::process` Child + async stdin on owned drive; post-kill poll until observed `try_wait`; `note_process_reaped` only after observed exit | `process_isolated_program_owns_before_stdin_and_is_killable`, `process_isolated_stdin_timeout_reaps_only_after_observed_exit`; `s23_no_undocumented_ambient_tokio_spawn_in_production_src` |
+| P1 D-047 Seal vs Finalizer deadline skew | `SealCommand.deadline` = `now + terminal_event_delivery_deadline`; publisher `enqueue_seal` and Finalizer reply wait share that Instant | `d047_seal_uses_terminal_deadline_not_transaction_deadline`, `d047_seal_priority_when_ordinary_cmd_queue_full` |
+| P1 §23 gate | No production `spawn_blocking` in process_tool | `s23_forbidden_patterns` green |
+| P2 premature PASS | This REJECT supersedes the withdrawn stamp | (this record) |
 
-Three-component shape holds for this slice (Loop + Connector ownership seams; no testkit product dep). Chronological D-047 notes below that still call Seal-priority an open residual are **historical** and superseded by the dedicated channel + named test.
+Sacrificial PID residual under D-048 remains. DirectLlm vertical e2e remains a
+Golden residual. **Not** Golden / §25 / D-025. Agents must not self-sign.
 
-**Next pick:** independent human re-review of this Silver remediation slice / D-025 sign-off **or** named Golden work (DirectLlm `StartedRuntime` vertical e2e, exhaustive public-limit / race-load / live Grok, alias breaking cut). Agents must not self-sign. Do **not** promote Golden / §25 / D-025.
+**Expert + Advisor (2026-08-23, second-pass remediations Silver bar):**
+**PASS — Silver** for this slice only. Named proofs + `s23_forbidden_patterns`
+re-run green on this tree. Premature first-pass PASS remains withdrawn; this
+stamp covers only the second-REJECT closures (async stdin + honest reap;
+shared `terminal_event_delivery_deadline`; §23; DEFECTS honesty).
+
+**Next pick:** independent human re-review of this Silver remediation slice.
+Do **not** promote Golden / §25 / D-025.
 
 ## Independent Transaction Runtime v2 acceptance verdict — 2026-08-23
 
@@ -3694,12 +3724,11 @@ complete while any of these records remain open.
 **Remediation progress (2026-08-23):** D-046–D-054 Fixed for their named Silver
 slices (see each defect). D-054 honesty/deletion + WP-12/D-003 retarget:
 Expert **PASS — Silver**; Advisor **PASS — Silver** (this record).
-**Re-review `b82c763` named P1/P2:** Expert + Advisor **PASS — Silver** (see
-re-review section). Seal-priority is closed (dedicated channel + named test);
-D-051 Busy/Rejected poll-detector landed; sacrificial PID residual remains
-under D-048. **Next pick:** independent human re-review / D-025 sign-off or
-named Golden residuals — agents must not self-sign. Do **not** promote
-Golden / §25 / D-025.
+**Re-review `b82c763` named P1/P2:** prior Silver PASS **withdrawn** after
+second independent REJECT; second-pass remediations: Expert + Advisor
+**PASS — Silver** (see re-review section). Sacrificial PID residual remains
+under D-048. **Next pick:** independent human re-review. Agents must not
+self-sign. Do **not** promote Golden / §25 / D-025.
 
 **Expert + Advisor (2026-08-23, D-046 Fixed):** **PASS — Silver** for this
 slice only.

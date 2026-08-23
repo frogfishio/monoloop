@@ -5,8 +5,10 @@
 //! held across an `.await`). Cooperative cancel is best-effort only until
 //! escalate-to-kill; it does not claim to stop the child by itself.
 //!
-//! M5.4: the wait/poll loop is returned as [`LinkedToolExecutionHandle::drive`]
-//! and polled on the dispatcher / ToolWorker task — no ambient `spawn_blocking`.
+//! M5.4 / D-048: the wait/poll loop is returned as
+//! [`LinkedToolExecutionHandle::drive`] and polled on the dispatcher /
+//! ToolWorker task. Stdin is delivered with `tokio::process` async write on
+//! that same owned drive — no ambient `spawn_blocking`.
 
 use super::tool_handler::{
     LinkedToolExecutionHandle, ToolExecutionCompletion, ToolExecutionControl, ToolHandler,
@@ -17,11 +19,12 @@ use monoloop_contracts::{
     ToolRuntimeError, ToolStartError,
 };
 use std::future::Future;
-use std::io::Write;
 use std::pin::Pin;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
 /// How the child process is launched for ProcessIsolated tools.
@@ -141,10 +144,11 @@ impl ToolKillHandle {
     }
 
     /// Own a [`Child`] immediately; optional stdin is written on the owned drive
-    /// path with a bounded blocking offload (D-048 — never block `ToolHandler::start`).
+    /// via `tokio::process` async I/O (D-048 — never block `ToolHandler::start`,
+    /// never ambient `spawn_blocking`).
     pub fn from_child_driven_with_stdin(
         child: Child,
-        stdin: Option<std::process::ChildStdin>,
+        stdin: Option<tokio::process::ChildStdin>,
         payload: Vec<u8>,
         completion_tx: oneshot::Sender<ToolCompletion>,
         wait_deadline: Instant,
@@ -154,59 +158,57 @@ impl ToolKillHandle {
         let kill = Self::from_process(Arc::clone(&child_arc));
         let kill_for_drive = kill.clone();
         let drive = Box::pin(async move {
-            // Bounded stdin delivery under ownership (D-048).
+            // Stdin on the owned drive. Failures kill the child, then the wait
+            // loop below must observe exit before any reap accounting.
+            let mut fail_deadline = false;
             if let Some(mut stdin) = stdin {
-                let write = tokio::task::spawn_blocking(move || {
-                    let _ = stdin.write_all(&payload);
-                    drop(stdin);
-                });
                 let remaining = wait_deadline.saturating_duration_since(Instant::now());
-                match tokio::time::timeout(remaining, write).await {
-                    Ok(Ok(())) => {}
-                    _ => {
-                        // Timeout / join fail: kill child and fail closed.
-                        if let Some(c) = child_for_wait
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .as_mut()
-                        {
-                            let _ = c.kill();
-                        }
-                        kill_for_drive.note_process_reaped();
-                        let _ = completion_tx.send(ToolCompletion::RuntimeFailed(
-                            ToolRuntimeError::DeadlineExceeded,
-                        ));
-                        return;
-                    }
-                }
-            }
-
-            let status = loop {
-                if Instant::now() >= wait_deadline {
+                let write_ok = matches!(
+                    tokio::time::timeout(remaining, stdin.write_all(&payload)).await,
+                    Ok(Ok(()))
+                );
+                // Always drop stdin so the child can see EOF when the write finished.
+                drop(stdin);
+                if !write_ok {
+                    fail_deadline = true;
                     if let Some(c) = child_for_wait
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .as_mut()
                     {
-                        let _ = c.kill();
+                        let _ = c.start_kill();
                     }
-                    let last = {
-                        let mut guard = child_for_wait.lock().unwrap_or_else(|e| e.into_inner());
-                        match guard.as_mut() {
-                            Some(c) => match c.try_wait() {
-                                Ok(s) => s,
-                                Err(_) => break None,
-                            },
-                            None => break None,
-                        }
-                    };
-                    break last;
+                }
+            }
+
+            // After kill, keep polling until try_wait observes exit (or a bounded
+            // post-kill grace elapses). Never treat start_kill as reap.
+            let mut killed_at: Option<Instant> = if fail_deadline {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let post_kill_grace = Duration::from_secs(2);
+            let status = loop {
+                if killed_at.is_none() && Instant::now() >= wait_deadline {
+                    if let Some(c) = child_for_wait
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                    {
+                        let _ = c.start_kill();
+                    }
+                    killed_at = Some(Instant::now());
                 }
                 let polled = {
                     let mut guard = child_for_wait.lock().unwrap_or_else(|e| e.into_inner());
                     match guard.as_mut() {
                         Some(c) => match c.try_wait() {
-                            Ok(s) => s,
+                            Ok(Some(s)) => {
+                                let _ = guard.take();
+                                Some(s)
+                            }
+                            Ok(None) => None,
                             Err(_) => break None,
                         },
                         None => break None,
@@ -215,16 +217,33 @@ impl ToolKillHandle {
                 if let Some(st) = polled {
                     break Some(st);
                 }
+                if killed_at.is_some_and(|t| Instant::now() >= t + post_kill_grace) {
+                    break None;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             };
-            let completion = match status {
-                Some(st) if st.success() => ToolCompletion::Succeeded(CanonicalToolOutput::Json(
-                    serde_json::json!({"ok": true}),
-                )),
-                Some(_) => ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed),
-                None => ToolCompletion::RuntimeFailed(ToolRuntimeError::CompletionLost),
+
+            // Reap accounting only after observed exit (or Child already taken).
+            let observed = status.is_some()
+                || child_for_wait
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_none();
+            if observed {
+                kill_for_drive.note_process_reaped();
+            }
+
+            let completion = if fail_deadline {
+                ToolCompletion::RuntimeFailed(ToolRuntimeError::DeadlineExceeded)
+            } else {
+                match status {
+                    Some(st) if st.success() => ToolCompletion::Succeeded(
+                        CanonicalToolOutput::Json(serde_json::json!({"ok": true})),
+                    ),
+                    Some(_) => ToolCompletion::RuntimeFailed(ToolRuntimeError::TerminationFailed),
+                    None => ToolCompletion::RuntimeFailed(ToolRuntimeError::CompletionLost),
+                }
             };
-            kill_for_drive.note_process_reaped();
             let _ = completion_tx.send(completion);
         });
         (kill, drive)
@@ -376,6 +395,50 @@ mod tests {
         kill.join_timeout(Duration::from_secs(1))
             .await
             .expect("child reaped after kill");
+    }
+
+    /// D-048: stdin write lives on the owned drive (async), and reap accounting
+    /// requires an observed `try_wait` exit — not merely `start_kill`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_isolated_stdin_timeout_reaps_only_after_observed_exit() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = Arc::new(AtomicU32::new(0));
+        // cat reads stdin forever if we never close... but we close after write.
+        // Use sleep so stdin write to a non-reader can block until deadline/kill.
+        let handler = ProcessIsolatedToolHandler::new(ProcessToolCommand::Program {
+            program: "sleep".into(),
+            args: vec!["30".into()],
+        });
+        let mut short = ctx();
+        short.deadline = Instant::now() + Duration::from_millis(80);
+        let mut big = call();
+        big.arguments = serde_json::json!({"pad": "x".repeat(256 * 1024)});
+        let mut handle = handler.start(big, short).expect("start");
+        let kill = handle.kill.as_ref().expect("kill");
+        kill.register_owned_process(Arc::clone(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let drive = handle.drive.take().unwrap();
+        let wait = handle.completion.wait();
+        tokio::pin!(drive);
+        tokio::pin!(wait);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                _ = &mut wait => {}
+                _ = &mut drive => { let _ = wait.await; }
+            }
+        })
+        .await
+        .expect("drive must conclude");
+        // After observed exit, owned_processes must be released.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "note_process_reaped only after observed exit"
+        );
+        assert!(
+            !kill.has_join(),
+            "kill handle must report reaped after observed exit"
+        );
     }
 
     #[test]

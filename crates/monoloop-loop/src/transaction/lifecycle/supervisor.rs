@@ -80,6 +80,8 @@ pub(crate) struct RuntimeShared {
     pub channels: Arc<HashMap<ChannelId, LiveChannel>>,
     pub default_deadline: Duration,
     pub cleanup_deadline: Duration,
+    /// Independent budget for terminal `Ended` enqueue (spec §8 / D-047).
+    pub terminal_event_delivery_deadline: Duration,
     pub task_spawner: TransactionTaskSpawner,
     pub shutdown_generation: AtomicU64,
     pub shutdown_report: Mutex<Option<ShutdownReport>>,
@@ -715,19 +717,31 @@ async fn finalize_after_terminal(
         let (reply_tx, reply_rx) = oneshot::channel();
         let terminal = end_event(tx, channel_id.clone(), session_id.clone(), kind, 0);
         // Dedicated seal channel (cap 1): not blocked by a full ordinary cmd queue.
+        // One authoritative terminal-delivery Instant for Finalizer + publisher
+        // (`terminal_event_delivery_deadline` — never cleanup/tx deadline).
+        let seal_budget = shared
+            .terminal_event_delivery_deadline
+            .max(Duration::from_millis(50));
+        let seal_deadline = std::time::Instant::now() + seal_budget;
         match seal_tx.try_send(super::event_publisher::SealCommand {
             terminal,
             reply: reply_tx,
+            deadline: seal_deadline,
         }) {
             Ok(()) => {
-                // Publisher may still be draining an ordinary wait; Seal preempts
-                // that wait. Allow up to cleanup budget for the reply (D-047).
-                let seal_wait = shared.cleanup_deadline.max(Duration::from_millis(200));
-                if let Ok(Ok(res)) = tokio::time::timeout(seal_wait, reply_rx).await {
-                    terminal_delivery = res.delivery;
-                    last_seq = res.last_sequence;
-                } else {
-                    terminal_delivery = TerminalEventDelivery::DeadlineExceeded;
+                // Publisher uses the same Instant for enqueue_seal. Wait slightly
+                // past it so a DeadlineExceeded reply can land before we record.
+                let wait_budget = seal_budget + Duration::from_millis(100);
+                match tokio::time::timeout(wait_budget, reply_rx).await {
+                    Ok(Ok(res)) => {
+                        terminal_delivery = res.delivery;
+                        last_seq = res.last_sequence;
+                    }
+                    _ => {
+                        // Publisher must have timed out or died; do not leave a
+                        // path where Ended can still publish after completion.
+                        terminal_delivery = TerminalEventDelivery::DeadlineExceeded;
+                    }
                 }
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {

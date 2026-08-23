@@ -143,6 +143,10 @@ impl StartedRuntime {
             channels: Arc::clone(&channels),
             default_deadline: bootstrap.config.transaction_limits.transaction_deadline,
             cleanup_deadline: bootstrap.config.transaction_limits.cleanup_deadline,
+            terminal_event_delivery_deadline: bootstrap
+                .config
+                .transaction_limits
+                .terminal_event_delivery_deadline,
             task_spawner,
             shutdown_generation: AtomicU64::new(0),
             shutdown_report: Mutex::new(None),

@@ -33,6 +33,10 @@ pub struct SealCommand {
     pub terminal: TransactionEndEvent,
     /// Reply with publication result + last committed sequence.
     pub reply: oneshot::Sender<TerminalPublicationResult>,
+    /// Authoritative absolute deadline for terminal `Ended` enqueue
+    /// (`terminal_event_delivery_deadline`). Shared with the Finalizer wait so
+    /// completion cannot publish before a later successful terminal delivery.
+    pub deadline: StdInstant,
 }
 
 /// Result of Seal.
@@ -93,7 +97,6 @@ pub async fn run_event_publisher(
                             &mut next_seq,
                             &mut last_committed,
                             None,
-                            deadline,
                         )
                         .await;
                     }
@@ -136,7 +139,6 @@ pub async fn run_event_publisher(
                                     &mut next_seq,
                                     &mut last_committed,
                                     None,
-                                    deadline,
                                 )
                                 .await;
                             }
@@ -169,7 +171,6 @@ pub async fn run_event_publisher(
                                     &mut next_seq,
                                     &mut last_committed,
                                     None,
-                                    deadline,
                                 )
                                 .await;
                             }
@@ -219,7 +220,6 @@ async fn finish_seal(
     next_seq: &mut u64,
     last_committed: &mut u64,
     sticky_fail: Option<TerminalEventDelivery>,
-    deadline: StdInstant,
 ) -> TerminalPublicationResult {
     if let Some(fail) = sticky_fail {
         return reply_sticky(cmd, fail, *last_committed);
@@ -227,6 +227,7 @@ async fn finish_seal(
     let SealCommand {
         mut terminal,
         reply,
+        deadline,
     } = cmd;
     let sid = ensure_session(session, terminal.session_id.clone(), transaction_id);
     let seq = *next_seq;
@@ -239,6 +240,8 @@ async fn finish_seal(
         sequence: seq,
         payload: TransactionEventPayload::EndedEvent(terminal),
     };
+    // Use the Seal-carried terminal deadline — never the transaction deadline —
+    // so Finalizer and publisher share one authoritative budget.
     let delivery = match enqueue_seal(event_tx, event, deadline).await {
         Ok(()) => {
             *last_committed = seq;
