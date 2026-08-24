@@ -61,7 +61,9 @@ pub use live_cursor::{
     run_live_cursor_prompt, LiveCursorArtifactPaths, LiveCursorRunOptions, LiveCursorRunReport,
 };
 pub use live_grok::{
-    run_live_grok_prompt, LiveGrokArtifactPaths, LiveGrokRunOptions, LiveGrokRunReport,
+    run_live_grok_multi_session, run_live_grok_prompt, LiveGrokArtifactPaths,
+    LiveGrokMultiSessionOptions, LiveGrokMultiSessionReport, LiveGrokRunOptions, LiveGrokRunReport,
+    LiveGrokSessionOutcome,
 };
 pub use live_zai::{
     run_live_zai_prompt, LiveZaiArtifactPaths, LiveZaiRunOptions, LiveZaiRunReport,

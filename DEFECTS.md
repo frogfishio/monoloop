@@ -5781,3 +5781,52 @@ no over-ceiling Hang twin. **Not** Golden / §25 / D-025.
 
 **Next pick:** live Grok when `GROK_AGENT_SECRET` present — or further Fake race —
 or human D-025 Sign-off. Do not re-pick this acceptance closeout.
+
+**Live Grok multi-session (2026-08-24):** On preauthorized agent hosts the default
+`GROK_AGENT_SECRET=monoloop-live-test` is sufficient (no separate secret bootstrap).
+Landed `run_live_grok_multi_session` + example `live_grok_multi_session`:
+
+- One managed serve; concurrent `session/new` → distinct `sessionId`s
+- Concurrent prompts with markers `MONOLOOP_MS_A` / `MONOLOOP_MS_B`; isolation asserts
+- Verified this tree: PASS (distinct ids, markers present, no cross-talk)
+- Standing: explicit live `session/load` of a just-finished short session returns
+  `Invalid params` on this Grok Build — recorded honestly (`load_a_ok=Some(false)`);
+  mock `concurrent_session_new_and_explicit_load` remains
+
+**Not** Golden / §25 / D-025.
+
+**Expert (2026-08-24, live Grok multi-session):** **PASS — Silver** for the
+delivered bar (concurrent `session/new` + marker isolation on one managed
+serve). Explicit live `session/load` remains an honest standing residual, not
+a must-fix before this PASS. **Not** Golden / §25 / D-025. This is **not** a
+Sign-off self-sign.
+
+Independently re-checked this tree and re-ran
+`cargo run -p monoloop-testkit --example live_grok_multi_session` (default
+secret; `GROK_AGENT_SECRET` unset): distinct ids; both prompts completed
+(`timed_out=false`); markers present / no cross-talk; example exit PASS;
+`session/load` → `ProtocolFailed: rpc error -32602: Invalid params`
+(`load_a_ok=Some(false)`). Docs (S23 inventory, D025 pack, SECURITY checklist,
+README) match the scoped claim.
+
+| Question | Verdict |
+|---|---|
+| 1. Concurrent `session/new` + marker isolation — true multi-session proof or underclaim? | **True proof for the claimed bar — not underclaim.** One serve, one WS, demux by `sessionId`; `tokio::try_join!` of two `begin_new` → distinct ids; concurrent `session/prompt` with `MONOLOOP_MS_A`/`B`; each chat must contain own marker and must not contain the other's. Connector inserts handle `sessionId` on send and routes inbound notifications by `sessionId`. Not a `Barrier` storm and not TransactionRuntime Golden — docs do not claim those. Minor asymmetry: marker presence checks chat **or** events; cross-talk forbid is chat-only (projection covers Text units). |
+| 2. `session/load` Invalid params — honest residual or must-fix before PASS? | **Honest standing residual.** Primary PASS is concurrent new + isolation; example warns on `load_a_ok=Some(false)` and still exits 0; summary records it; S23/D025/SECURITY name the residual; mock `concurrent_session_new_and_explicit_load` remains. Independent re-run reproduced `-32602 Invalid params` after cancel + 500ms settle — agent reject of just-finished short session, not a hidden fail. Closing live load is a follow-up, not a gate for this Silver. |
+| 3. Product→testkit bleed? | **No bleed.** `run_live_grok_multi_session` + example live only under `monoloop-testkit`; `ManagedGrokServe` is test-kit-owned spawn/kill. No product crate gained a multi-session harness. |
+| 4. Holey async / cleanup on dual session drains? | **Standing cleanup nits — not a fail of the isolation proof.** After cancel, `SessionInner::finish` detaches routing but does **not** close `out_tx` (comment claims close; code does not), so each `prompt_one_session` drain hits the 3s `timeout` while the handle still holds the sender; timed-out `JoinHandle` is dropped without `abort` (brief detach until drop). `detach_session` uses `try_write` and can silently skip under map lock contention. Serve stop is owned (`stop` / `kill_on_drop`) and worked on re-run. Dual drains did not break marker isolation or hide the load residual. |
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** optional follow-up to close live `session/load` residual (or
+document agent precondition) — **or** harden drain close / `detach_session`
+await write — **or** human D-025 Sign-off. Do not re-pick concurrent new +
+isolation as open.
+
+**Advisor (2026-08-24, live Grok multi-session bar check):** **PASS — Silver**
+for connector live multi-session qualification (concurrent new + isolation).
+Explicit live `session/load` residual honest. Testkit-only; no Golden overclaim.
+**Not** Golden / §25 / D-025.
+
+**Next pick:** human D-025 Sign-off — or further Fake race — or optional live
+`session/load` follow-up. Do not re-pick concurrent new+isolation as open.

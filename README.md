@@ -80,6 +80,8 @@ export GROK_AGENT_SECRET=monoloop-live-test   # optional; default monoloop-live-
 cargo run -p monoloop-testkit --example live_grok_ask -- --preset crud
 cargo run -p monoloop-testkit --example live_grok_ask -- --preset analyze
 cargo run -p monoloop-testkit --example live_grok_ask -- "Your free-form question"
+# Concurrent multi-session (distinct sessionId + marker isolation):
+cargo run -p monoloop-testkit --example live_grok_multi_session
 open target/live_grok_ask.html   # or live_grok_crud / live_grok_analyze
 
 # Optional safety ceiling only (default: wait until Grok finishes, ≤ 2h RPC deadline):

@@ -33,7 +33,12 @@ fn fails the gate).
 ## Explicitly not claimed
 
 - Exhaustive scheduler / OS-load fuzzing
-- Live Grok multi-session (requires `GROK_AGENT_SECRET` / agent env)
+- Live Grok multi-session **qualification example**:
+  `cargo run -p monoloop-testkit --example live_grok_multi_session`
+  (default secret `monoloop-live-test` on preauthorized agent hosts; optional
+  `GROK_AGENT_SECRET`). Proves concurrent `session/new` + marker isolation.
+  Explicit live `session/load` of a just-finished short session remains a
+  standing residual (`Invalid params` on some Grok Build builds).
 - Product→testkit race harnesses as Golden evidence
 
 ## Related

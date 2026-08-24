@@ -78,8 +78,10 @@ does **not** close D-025.
   public `TransactionLimits` field has exact+plus-one)
 - Full concurrent/race/load suites beyond named proofs (Fake multi-channel
   load landed; not exhaustive WP-12 race matrix)
-- Live Grok multi-session qualification (mock concurrent new/load landed;
-  live still open)
+- Live Grok multi-session: `live_grok_multi_session` example (concurrent
+  `session/new` + isolation; default secret on preauthorized hosts). Explicit
+  live `session/load` after short session still residual; mock concurrent
+  new/load remains
 - Refreshable MCP (deferred; do not treat as shipped)
 
 ## Sign-off

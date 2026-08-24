@@ -64,8 +64,11 @@ storms, and same-tx Cancel vs ForceTerminate:
 
 Inventory gate: `s23_race_load_inventory_present` (s23 suite).
 
-These are **named** proofs. Broader load/race and live Grok multi-session remain open
-(`GROK_AGENT_SECRET` required for live agent runs).
+These are **named** proofs. Broader load/race remains open. Live Grok
+multi-session concurrent `session/new` + isolation is exercised via
+`monoloop-testkit` example `live_grok_multi_session` (default secret
+`monoloop-live-test` on preauthorized hosts). Explicit live `session/load`
+after a short session remains a standing residual on some agent builds.
 
 ## Core §23 / gates (re-run)
 
@@ -84,7 +87,8 @@ cargo test -p monoloop-loop --test direct_llm_fake_e2e --test direct_llm_openai_
 - Sign-off table unsigned (this pack does not close it)
 - Matrix **Open** / **Partial** rows above (`doc/S23_PUBLIC_LIMIT_MATRIX.md`)
 - Full concurrent/race/load beyond named Fake proofs
-- Live Grok multi-session qualification (mock only landed)
+- Live Grok multi-session: concurrent `session/new` + isolation example landed;
+  explicit live `session/load` residual; mock concurrent new/load remains
 - Refreshable MCP deferred (DECISIONS D-042) — do not treat as shipped
 - D-054 / D-060: deprecated-only breaking cut **executed** (`TransactionRequest`,
   `TransactionRuntime`, `RuntimeToolSpill`, empty Host* markers, `reap_vault`);
