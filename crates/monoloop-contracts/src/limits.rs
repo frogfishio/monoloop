@@ -201,13 +201,15 @@ pub struct TransactionLimits {
     pub max_active_transactions: usize,
     /// Per-Channel active cap (enforced with Channel limits).
     pub max_active_per_channel: usize,
-    /// Actor command queue items.
+    /// Supervisor control queue items (`ControlCommand` / D-015 remap).
     pub max_actor_commands: usize,
-    /// Actor command queue bytes.
+    /// Reserved; not a product-enforced byte bound (D-057 — closed-enum control messages).
     pub max_actor_command_bytes: usize,
-    /// Event delivery queue items.
+    /// Runtime ceiling on caller [`crate::delivery::DeliveryLimits::max_event_items`].
+    /// Admission rejects delivery ports that exceed this item capacity.
     pub max_event_queue: usize,
-    /// Event delivery queue bytes.
+    /// Runtime ceiling on caller [`crate::delivery::DeliveryLimits::max_event_bytes`].
+    /// Admission rejects delivery ports that exceed this byte capacity.
     pub max_event_queue_bytes: usize,
     /// Maximum input aggregate bytes (admission).
     pub max_input_bytes: usize,
@@ -217,7 +219,7 @@ pub struct TransactionLimits {
     pub max_content_parts: usize,
     /// Maximum tools selected on one transaction.
     pub max_tools_per_transaction: usize,
-    /// Maximum tool schema bytes.
+    /// Maximum tool input-schema JSON bytes (enforced at `StartedRuntime::start`).
     pub max_tool_schema_bytes: usize,
     /// Maximum tool payload bytes.
     pub max_tool_payload_bytes: usize,
@@ -247,7 +249,7 @@ pub struct TransactionLimits {
     pub cleanup_deadline: Duration,
     /// Terminal `Ended` delivery budget.
     pub terminal_event_delivery_deadline: Duration,
-    /// Completion callback deadline.
+    /// Reserved callback budget (D-059 — no core wait site under M7 push completion).
     pub callback_deadline: Duration,
 }
 

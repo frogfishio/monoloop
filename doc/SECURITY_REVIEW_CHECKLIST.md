@@ -67,8 +67,9 @@ does **not** close D-025.
 ### Explicitly still open for Golden / §25 (reviewer must not waive)
 
 - This checklist’s **Sign-off** table below unsigned
-- Exhaustive public-limit exact/plus-one matrix vs §23 wording (partial cells
-  closed; not every public `TransactionLimits` / InputLimits field)
+- Exhaustive public-limit exact/plus-one matrix vs §23 wording (honest inventory
+  in `doc/S23_PUBLIC_LIMIT_MATRIX.md`; Open/Partial rows still open — not every
+  public `TransactionLimits` field has exact+plus-one)
 - Full concurrent/race/load suites beyond named proofs (Fake multi-channel
   load landed; not exhaustive WP-12 race matrix)
 - Live Grok multi-session qualification (mock concurrent new/load landed;
@@ -88,3 +89,6 @@ does **not** close D-025.
 Until this table is filled by an **independent** reviewer (not the implementing
 agent session), D-025 process residual and §23 “independent review finds no
 unresolved P0/P1/P2” remain **open** for Golden / §25.
+
+Agent-prepared (unsigned) evidence pointers for reviewers:
+`doc/D025_EVIDENCE_PACK.md`. That pack does **not** constitute Sign-off.

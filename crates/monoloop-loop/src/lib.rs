@@ -30,15 +30,13 @@ pub use tools::{
     NoToolRuntime, StartToolExecution, ToolExecutionHandle, ToolRuntime, ToolRuntimeError,
     ToolRuntimeTerminal,
 };
-#[allow(deprecated)]
-pub use transaction::RuntimeToolSpill;
 pub use transaction::{
     adapt_completion_callback, adapt_event_sink, build_completion, dispatch_ready_tool,
     dispatch_ready_tool_cancellable, tool_definitions_from_resolved, validate_tool_completion,
     validate_tool_input, AbortableAtYieldHandler, AcpPromptEncoder, AcpPromptWireShape,
     AsyncToolHandler, CapabilityToken, ChannelBinding, ChannelRegistry, DispatchOutcome,
-    DispatchRequest, DispatcherLimits, EmptyBytesEncoder, FinalizerHoldGate, HeadlessPromptEncoder,
-    HostCompletionAdapter, HostEventAdapter, HostToolRegistry, HostToolRuntime,
+    ControlHoldGate, DispatchRequest, DispatcherLimits, EmptyBytesEncoder, FinalizerHoldGate,
+    HeadlessPromptEncoder, HostToolRegistry, HostToolRuntime,
     ImmediateToolHandler, InputValidationFailure, IsolatedKillableToolHandler, JoinOnlySpillInject,
     LedgerEntry, LifecycleLedger, LinkedToolExecutionHandle, LiveChannel, LostCompletionHandler,
     McpBindingState, McpGateway, McpGatewayHandle, McpGatewayLimits, McpInstallError,

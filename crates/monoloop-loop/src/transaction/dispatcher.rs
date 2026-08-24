@@ -30,8 +30,6 @@ struct OrphanPermit {
 /// Deprecated name for [`OrphanToolPermitSet`] (M5.4 delete-vaults).
 ///
 /// This is **not** a join vault. Prefer [`OrphanToolPermitSet`].
-#[deprecated(note = "M5.4: use OrphanToolPermitSet — not a join vault")]
-pub type RuntimeToolSpill = OrphanToolPermitSet;
 
 impl OrphanToolPermitSet {
     /// Create an empty orphan-permit set.
@@ -58,9 +56,6 @@ impl OrphanToolPermitSet {
             process_lease,
         });
     }
-
-    /// No-op retained for call-site compatibility (`reap_vault`); orphans have no joins.
-    pub fn reap_finished(&self) {}
 
     /// Quiesce step: release all orphan permits (capacity + process leases).
     ///
@@ -262,8 +257,7 @@ impl TransactionToolDispatcher {
         tools: ResolvedToolSet,
         shared_capacity: Arc<SharedToolCapacity>,
         tool_spill: Arc<OrphanToolPermitSet>,
-        max_concurrent_tools: usize,
-        max_queued_tools: usize,
+        limits: DispatcherLimits,
     ) -> Arc<Self> {
         Self::with_runtime_resources(
             transaction_id,
@@ -273,8 +267,7 @@ impl TransactionToolDispatcher {
             tool_spill,
             Arc::new(AtomicU32::new(0)),
             Arc::new(OwnedProcessRegistry::new()),
-            max_concurrent_tools,
-            max_queued_tools,
+            limits,
         )
     }
 
@@ -288,24 +281,30 @@ impl TransactionToolDispatcher {
         tool_spill: Arc<OrphanToolPermitSet>,
         owned_processes: Arc<AtomicU32>,
         process_registry: Arc<OwnedProcessRegistry>,
-        max_concurrent_tools: usize,
-        max_queued_tools: usize,
+        limits: DispatcherLimits,
     ) -> Arc<Self> {
         Self::with_limits_and_spill(
             transaction_id,
             session_key,
             tools,
             shared_capacity,
-            DispatcherLimits {
-                max_concurrent_tools,
-                max_queued_tools,
-                max_tool_payload_bytes: usize::MAX,
-                max_tool_output_bytes: usize::MAX,
-            },
+            limits,
             tool_spill,
             owned_processes,
             process_registry,
         )
+    }
+
+    /// Map transaction-wide tool caps from [`TransactionLimits`](monoloop_contracts::TransactionLimits).
+    pub fn limits_from_transaction(
+        limits: &monoloop_contracts::TransactionLimits,
+    ) -> DispatcherLimits {
+        DispatcherLimits {
+            max_concurrent_tools: limits.max_concurrent_tools_per_transaction.max(1),
+            max_queued_tools: limits.max_queued_tools_per_transaction.max(1),
+            max_tool_payload_bytes: limits.max_tool_payload_bytes.max(1),
+            max_tool_output_bytes: limits.max_tool_output_bytes.max(1),
+        }
     }
 
     /// Build with an explicit runtime-scoped tool spill (D-028).
@@ -376,9 +375,14 @@ impl TransactionToolDispatcher {
         &self.tool_spill
     }
 
-    /// Reap finished parked joins so capacity can recover.
-    pub fn reap_vault(&self) {
-        self.tool_spill.reap_finished();
+    /// Active tool executions in this transaction (bounded concurrency observation).
+    pub fn active_tools(&self) -> usize {
+        self.capacity.active()
+    }
+
+    /// Queued tool starts waiting for concurrency (bounded queue observation).
+    pub fn queued_tools(&self) -> usize {
+        self.capacity.queued()
     }
 
     /// Dispatch one call end-to-end.
@@ -460,9 +464,6 @@ impl TransactionToolDispatcher {
                 }
             }
         };
-        // Orphan permits have no joins to reap; retained for call-site compatibility.
-        self.tool_spill.reap_finished();
-
         // RAII: mid-drop parks orphan capacity (not JoinHandles — M5.4).
         let mut dispatch_guard = DispatchGuard {
             permit: Some(permit),

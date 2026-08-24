@@ -27,12 +27,10 @@ mod owned_process_registry;
 
 pub use acp_encoder::{AcpPromptEncoder, AcpPromptWireShape, HeadlessPromptEncoder};
 pub use bootstrap::{
-    FinalizerHoldGate, JoinOnlySpillInject, RuntimeBootstrap, RuntimeConfig, StartHoldGate,
-    StoppedGate,
+    ControlHoldGate, FinalizerHoldGate, JoinOnlySpillInject, RuntimeBootstrap, RuntimeConfig,
+    StartHoldGate, StoppedGate,
 };
 pub use channel_registry::{ChannelBinding, ChannelRegistry, LiveChannel};
-#[allow(deprecated)]
-pub use dispatcher::RuntimeToolSpill;
 pub use dispatcher::{
     DispatchOutcome, DispatchRequest, DispatcherLimits, OrphanToolPermitSet,
     TransactionToolDispatcher,
@@ -41,11 +39,11 @@ pub use error::StartupError;
 pub use fake_support::{EmptyBytesEncoder, PanicEncoder, RejectEncoder, TestTextEncoder};
 pub use host_tools::{HostToolRegistry, RegisteredTool};
 pub use lifecycle::{
-    adapt_completion_callback, adapt_event_sink, build_completion, HostCompletionAdapter,
-    HostEventAdapter, LedgerEntry, LifecycleLedger, ReservationPool, ReservationPoolError,
-    RuntimeOwner, ShutdownTicket, SpawnReject, StartedRuntime, SupervisorCommand, TaskClass,
-    TaskExit, TaskId, TaskSupervisor, TerminalDecision, TerminalProposal, TransactionPhase,
-    TransactionReservations, TransactionRuntimeHandle, TransactionTaskSpawner,
+    adapt_completion_callback, adapt_event_sink, build_completion, LedgerEntry, LifecycleLedger,
+    ReservationPool, ReservationPoolError, RuntimeOwner, ShutdownTicket, SpawnReject,
+    StartedRuntime, SupervisorCommand, TaskClass, TaskExit, TaskId, TaskSupervisor,
+    TerminalDecision, TerminalProposal, TransactionPhase, TransactionReservations,
+    TransactionRuntimeHandle, TransactionTaskSpawner,
 };
 pub use loop_adapters::{
     dispatch_ready_tool, dispatch_ready_tool_cancellable, HostToolRuntime, ResolvedToolRegistry,

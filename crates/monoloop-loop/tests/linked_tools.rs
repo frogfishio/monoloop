@@ -404,6 +404,261 @@ async fn concurrent_dispatches_different_order() {
     }
 }
 
+/// §23: `TransactionLimits.max_queued_tools_per_transaction` via
+/// `limits_from_transaction` — hold occupies concurrency, second occupies the
+/// single queue slot, third fails closed with `tool_queue_full`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transaction_limits_max_queued_tools_plus_one_rejects() {
+    use monoloop_contracts::TransactionLimits;
+    use monoloop_loop::{AsyncToolHandler, TransactionToolDispatcher};
+    let hold = Arc::new(AsyncToolHandler::new(|_c, _x, ctl| {
+        Box::pin(async move {
+            tokio::select! {
+                _ = ctl.cancelled() => ToolCompletion::RuntimeFailed(
+                    monoloop_contracts::ToolRuntimeError::TerminationFailed
+                ),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    ToolCompletion::Succeeded(CanonicalToolOutput::Json(
+                        serde_json::json!({"ok": true}),
+                    ))
+                }
+            }
+        })
+    })) as Arc<dyn ToolHandler>;
+    let host = HostToolRegistry::build(vec![
+        RegisteredTool::new(make_spec("hold", "hold"), hold),
+        RegisteredTool::new(make_spec("echo", "echo"), ok_handler()),
+    ])
+    .unwrap();
+    let tools = vec![
+        host.get(&ToolId::try_new("hold").unwrap()).unwrap().clone(),
+        host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone(),
+    ];
+    let resolved = ResolvedToolSet::from_registered(tools);
+    let mut tx_limits = TransactionLimits::default();
+    // Concurrent=1 so the hold keeps the sole running slot; queued=1 is the cell.
+    tx_limits.max_concurrent_tools_per_transaction = 1;
+    tx_limits.max_queued_tools_per_transaction = 1;
+    let limits = TransactionToolDispatcher::limits_from_transaction(&tx_limits);
+    assert_eq!(limits.max_queued_tools, 1);
+    assert_eq!(limits.max_concurrent_tools, 1);
+    let shared = SharedToolCapacity::new(8);
+    let d = TransactionToolDispatcher::with_limits(
+        TransactionId::generate(),
+        session_key(),
+        resolved,
+        Arc::clone(&shared),
+        limits,
+    );
+
+    let blocker = tokio::spawn({
+        let d = Arc::clone(&d);
+        async move {
+            dispatch_ready_tool(
+                &d,
+                ExchangeId::generate(),
+                ToolActionId::new("h"),
+                "hold",
+                "ph",
+                0,
+                r#"{"q":"x"}"#,
+            )
+            .await
+        }
+    });
+    let started = tokio::time::Instant::now();
+    while d.active_tools() < 1 {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hold tool never acquired capacity"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Second enqueue occupies the sole queue slot and spins ≤50ms for acquire.
+    let waiter = tokio::spawn({
+        let d = Arc::clone(&d);
+        async move {
+            dispatch_ready_tool(
+                &d,
+                ExchangeId::generate(),
+                ToolActionId::new("a1"),
+                "echo",
+                "p1",
+                1,
+                r#"{"q":"x"}"#,
+            )
+            .await
+        }
+    });
+    let queued_deadline = tokio::time::Instant::now();
+    while d.queued_tools() < 1 {
+        assert!(
+            queued_deadline.elapsed() < Duration::from_millis(40),
+            "second dispatch never occupied the queue slot before capacity spin timeout"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    // Plus-one while the queue slot is held: must fail closed immediately.
+    let third = dispatch_ready_tool(
+        &d,
+        ExchangeId::generate(),
+        ToolActionId::new("a2"),
+        "echo",
+        "p2",
+        2,
+        r#"{"q":"x"}"#,
+    )
+    .await;
+    match &third {
+        DispatchOutcome::Rejected { code, .. } if *code == "tool_queue_full" => {}
+        other => panic!(
+            "expected tool_queue_full from TransactionLimits.max_queued_tools_per_transaction=1, got {other:?}"
+        ),
+    }
+
+    let second = waiter.await.expect("waiter join");
+    match &second {
+        DispatchOutcome::Rejected { code, .. } if *code == "tool_capacity_exceeded" => {}
+        other => panic!(
+            "expected second dispatch tool_capacity_exceeded after queue spin, got {other:?}"
+        ),
+    }
+    let _ = blocker.await;
+}
+
+/// §23: `TransactionLimits.max_concurrent_tools_per_transaction` via
+/// `limits_from_transaction` rejects a second concurrent start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transaction_limits_max_concurrent_tools_plus_one_rejects() {
+    use monoloop_contracts::TransactionLimits;
+    use monoloop_loop::{AsyncToolHandler, TransactionToolDispatcher};
+    let hold = Arc::new(AsyncToolHandler::new(|_c, _x, ctl| {
+        Box::pin(async move {
+            tokio::select! {
+                _ = ctl.cancelled() => ToolCompletion::RuntimeFailed(
+                    monoloop_contracts::ToolRuntimeError::TerminationFailed
+                ),
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    ToolCompletion::Succeeded(CanonicalToolOutput::Json(
+                        serde_json::json!({"ok": true}),
+                    ))
+                }
+            }
+        })
+    })) as Arc<dyn ToolHandler>;
+    let host = HostToolRegistry::build(vec![
+        RegisteredTool::new(make_spec("hold", "hold"), hold),
+        RegisteredTool::new(make_spec("echo", "echo"), ok_handler()),
+    ])
+    .unwrap();
+    let tools = vec![
+        host.get(&ToolId::try_new("hold").unwrap()).unwrap().clone(),
+        host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone(),
+    ];
+    let resolved = ResolvedToolSet::from_registered(tools);
+    let mut tx_limits = TransactionLimits::default();
+    tx_limits.max_concurrent_tools_per_transaction = 1;
+    tx_limits.max_queued_tools_per_transaction = 8;
+    let limits = TransactionToolDispatcher::limits_from_transaction(&tx_limits);
+    assert_eq!(limits.max_concurrent_tools, 1);
+    let shared = SharedToolCapacity::new(8);
+    let d = TransactionToolDispatcher::with_limits(
+        TransactionId::generate(),
+        session_key(),
+        resolved,
+        Arc::clone(&shared),
+        limits,
+    );
+
+    let blocker = tokio::spawn({
+        let d = Arc::clone(&d);
+        async move {
+            dispatch_ready_tool(
+                &d,
+                ExchangeId::generate(),
+                ToolActionId::new("h"),
+                "hold",
+                "ph",
+                0,
+                r#"{"q":"x"}"#,
+            )
+            .await
+        }
+    });
+    let started = tokio::time::Instant::now();
+    while shared.active() < 1 {
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hold tool never acquired capacity"
+        );
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let second = dispatch_ready_tool(
+        &d,
+        ExchangeId::generate(),
+        ToolActionId::new("a1"),
+        "echo",
+        "p1",
+        1,
+        r#"{"q":"x"}"#,
+    )
+    .await;
+    match &second {
+        DispatchOutcome::Rejected { code, .. } if *code == "tool_capacity_exceeded" => {}
+        other => panic!(
+            "expected tool_capacity_exceeded from TransactionLimits.max_concurrent_tools_per_transaction=1, got {other:?}"
+        ),
+    }
+    let _ = blocker.await;
+}
+
+/// D-015 / §23: transaction-wide `max_tool_output_bytes` plus-one fails closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_tool_output_bytes_plus_one_fails_closed() {
+    use monoloop_loop::DispatcherLimits;
+    let host = HostToolRegistry::build(vec![RegisteredTool::new(
+        make_spec("echo", "echo"),
+        ok_handler(),
+    )])
+    .unwrap();
+    let tools = vec![host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone()];
+    let resolved = ResolvedToolSet::from_registered(tools);
+    // Handler returns `{"ok":true}` which exceeds a 4-byte transaction-wide cap.
+    let d = TransactionToolDispatcher::with_limits(
+        TransactionId::generate(),
+        session_key(),
+        resolved,
+        SharedToolCapacity::new(4),
+        DispatcherLimits {
+            max_concurrent_tools: 4,
+            max_queued_tools: 8,
+            max_tool_payload_bytes: 1024,
+            max_tool_output_bytes: 4,
+        },
+    );
+    let outcome = dispatch_ready_tool(
+        &d,
+        ExchangeId::generate(),
+        ToolActionId::new("a1"),
+        "echo",
+        "p1",
+        0,
+        r#"{"q":"x"}"#,
+    )
+    .await;
+    match outcome {
+        DispatchOutcome::RuntimeFailed { code, .. } => {
+            assert_eq!(code, "output_contract_violated");
+        }
+        other => panic!("expected output-byte LimitExceeded path, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_limit_plus_one_rejects() {
     // Shared global capacity of 1: second concurrent start must reject.

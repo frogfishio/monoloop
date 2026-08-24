@@ -67,6 +67,47 @@ async fn scripted_output_independent_of_fragmentation() {
 }
 
 #[tokio::test]
+async fn scripted_sequence_advances_per_open_and_fails_closed_when_exhausted() {
+    let sequence = FakeEndpoint::scripted_sequence(vec![
+        vec![Bytes::from_static(b"r0")],
+        vec![Bytes::from_static(b"r1")],
+    ]);
+    let mut endpoints = HashMap::new();
+    endpoints.insert("seq".into(), sequence.clone());
+    let connector = FakeConnector::new(FakeConnectorConfig {
+        endpoints,
+        ..Default::default()
+    });
+
+    for (i, expect) in [b"r0".as_slice(), b"r1".as_slice()].into_iter().enumerate() {
+        let mut pending = connector.begin_open(OpenConnection::new(
+            ConnectionId::new(format!("seq-{i}")),
+            "seq",
+        ));
+        drive_pending(&mut pending);
+        let opened = pending.opened.await.expect("open");
+        let chunk = opened.output.receive().await.unwrap().unwrap();
+        assert_eq!(&chunk[..], expect);
+        opened.input.finish().await.unwrap();
+        let _ = opened.completion.wait().await;
+    }
+    assert_eq!(sequence.opens(), 2);
+
+    let mut pending =
+        connector.begin_open(OpenConnection::new(ConnectionId::new("seq-exhausted"), "seq"));
+    drive_pending(&mut pending);
+    let err = match pending.opened.await {
+        Err(e) => e,
+        Ok(_) => panic!("third open must fail closed"),
+    };
+    assert_eq!(
+        err.kind,
+        monoloop_connector::ConnectorErrorKind::ConnectionFailed
+    );
+    assert_eq!(sequence.opens(), 2, "exhausted open must not bump cursor");
+}
+
+#[tokio::test]
 async fn cancel_during_open_returns_cancelled() {
     let connector = FakeConnector::new(FakeConnectorConfig {
         open_delay: Duration::from_secs(5),

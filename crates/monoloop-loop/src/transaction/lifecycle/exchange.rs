@@ -33,6 +33,21 @@ pub struct DirectExchangeOutcome {
     pub exchange_id: ExchangeId,
     /// Authoritative external session when the Connector returned one (§22.6).
     pub external_session_id: Option<monoloop_contracts::ExternalSessionId>,
+    /// Encoded provider request body bytes for this exchange (0 on pre-open failure).
+    pub encoded_input_bytes: usize,
+    /// Raw provider output bytes pumped for this exchange (0 on pre-open failure).
+    pub received_output_bytes: usize,
+}
+
+fn failed_outcome(exchange_id: ExchangeId, terminal: TransactionEndKind) -> DirectExchangeOutcome {
+    DirectExchangeOutcome {
+        units: vec![],
+        terminal,
+        exchange_id,
+        external_session_id: None,
+        encoded_input_bytes: 0,
+        received_output_bytes: 0,
+    }
 }
 
 /// Failure before a successful terminal mapping.
@@ -148,6 +163,7 @@ pub async fn run_direct_llm_exchange(
     max_encoded_exchange_bytes: usize,
     max_retained_unit_bytes: usize,
     max_remaining_provider_input_bytes: usize,
+    max_remaining_provider_output_bytes: usize,
     session_attachment: Option<std::sync::Arc<SessionAttachment>>,
     prompt_ready: Option<PromptReadyGate>,
     tools: &[ToolSpec],
@@ -169,24 +185,22 @@ pub async fn run_direct_llm_exchange(
         max_encoded_exchange_bytes,
         max_retained_unit_bytes,
         max_remaining_provider_input_bytes,
+        max_remaining_provider_output_bytes,
         session_attachment,
         prompt_ready,
         tools,
     )
     .await
     {
-        Ok((units, external_session_id)) => DirectExchangeOutcome {
-            units,
+        Ok(ok) => DirectExchangeOutcome {
+            units: ok.units,
             terminal: TransactionEndKind::Completed,
             exchange_id,
-            external_session_id,
+            external_session_id: ok.external_session_id,
+            encoded_input_bytes: ok.encoded_input_bytes,
+            received_output_bytes: ok.received_output_bytes,
         },
-        Err(f) => DirectExchangeOutcome {
-            units: vec![],
-            terminal: f.to_terminal(),
-            exchange_id,
-            external_session_id: None,
-        },
+        Err(f) => failed_outcome(exchange_id, f.to_terminal()),
     }
 }
 
@@ -212,6 +226,7 @@ pub async fn run_direct_llm_continuation(
     max_encoded_exchange_bytes: usize,
     max_retained_unit_bytes: usize,
     max_remaining_provider_input_bytes: usize,
+    max_remaining_provider_output_bytes: usize,
 ) -> DirectExchangeOutcome {
     let encoded = match encoder.encode_tool_continuation(ToolContinuationEncodeRequest {
         transaction_id: &transaction_id,
@@ -223,29 +238,20 @@ pub async fn run_direct_llm_continuation(
     }) {
         Ok(e) => e,
         Err(_) => {
-            return DirectExchangeOutcome {
-                units: vec![],
-                terminal: TransactionEndKind::EncodingFailed,
-                exchange_id,
-                external_session_id: None,
-            };
+            return failed_outcome(exchange_id, TransactionEndKind::EncodingFailed);
         }
     };
     if encoded.bytes.len() > max_encoded_exchange_bytes {
-        return DirectExchangeOutcome {
-            units: vec![],
-            terminal: TransactionEndKind::EncodingFailed,
-            exchange_id,
-            external_session_id: None,
-        };
+        return failed_outcome(exchange_id, TransactionEndKind::EncodingFailed);
     }
-    if encoded.bytes.len() > max_remaining_provider_input_bytes {
-        return DirectExchangeOutcome {
-            units: vec![],
-            terminal: TransactionEndKind::LimitExceeded,
-            exchange_id,
-            external_session_id: None,
-        };
+    // Exhausted remaining budget must fail closed before open (0 > 0 would miss empty bodies).
+    if max_remaining_provider_input_bytes == 0
+        || encoded.bytes.len() > max_remaining_provider_input_bytes
+    {
+        return failed_outcome(exchange_id, TransactionEndKind::LimitExceeded);
+    }
+    if max_remaining_provider_output_bytes == 0 {
+        return failed_outcome(exchange_id, TransactionEndKind::LimitExceeded);
     }
     match run_encoded_exchange(
         transaction_id,
@@ -260,24 +266,29 @@ pub async fn run_direct_llm_continuation(
         deadline,
         cleanup_deadline,
         max_retained_unit_bytes,
+        max_remaining_provider_output_bytes,
         None,
         None,
     )
     .await
     {
-        Ok((units, external_session_id)) => DirectExchangeOutcome {
-            units,
+        Ok(ok) => DirectExchangeOutcome {
+            units: ok.units,
             terminal: TransactionEndKind::Completed,
             exchange_id,
-            external_session_id,
+            external_session_id: ok.external_session_id,
+            encoded_input_bytes: ok.encoded_input_bytes,
+            received_output_bytes: ok.received_output_bytes,
         },
-        Err(f) => DirectExchangeOutcome {
-            units: vec![],
-            terminal: f.to_terminal(),
-            exchange_id,
-            external_session_id: None,
-        },
+        Err(f) => failed_outcome(exchange_id, f.to_terminal()),
     }
+}
+
+struct EncodedExchangeOk {
+    units: Vec<CanonicalUnitEvent>,
+    external_session_id: Option<monoloop_contracts::ExternalSessionId>,
+    encoded_input_bytes: usize,
+    received_output_bytes: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -298,16 +309,11 @@ async fn run_inner(
     max_encoded_exchange_bytes: usize,
     max_retained_unit_bytes: usize,
     max_remaining_provider_input_bytes: usize,
+    max_remaining_provider_output_bytes: usize,
     session_attachment: Option<std::sync::Arc<SessionAttachment>>,
     prompt_ready: Option<PromptReadyGate>,
     tools: &[ToolSpec],
-) -> Result<
-    (
-        Vec<CanonicalUnitEvent>,
-        Option<monoloop_contracts::ExternalSessionId>,
-    ),
-    ExchangeFailure,
-> {
+) -> Result<EncodedExchangeOk, ExchangeFailure> {
     let encoded = encoder
         .encode_initial(monoloop_contracts::InitialEncodeRequest {
             transaction_id: &transaction_id,
@@ -320,7 +326,13 @@ async fn run_inner(
     if encoded.bytes.len() > max_encoded_exchange_bytes {
         return Err(ExchangeFailure::EncodingFailed);
     }
-    if encoded.bytes.len() > max_remaining_provider_input_bytes {
+    // Exhausted remaining budget must fail closed before open (0 > 0 would miss empty bodies).
+    if max_remaining_provider_input_bytes == 0
+        || encoded.bytes.len() > max_remaining_provider_input_bytes
+    {
+        return Err(ExchangeFailure::LimitExceeded);
+    }
+    if max_remaining_provider_output_bytes == 0 {
         return Err(ExchangeFailure::LimitExceeded);
     }
 
@@ -337,6 +349,7 @@ async fn run_inner(
         deadline,
         cleanup_deadline,
         max_retained_unit_bytes,
+        max_remaining_provider_output_bytes,
         session_attachment,
         prompt_ready,
     )
@@ -358,17 +371,13 @@ async fn run_encoded_exchange(
     deadline: Duration,
     cleanup_deadline: Duration,
     max_retained_unit_bytes: usize,
+    max_remaining_provider_output_bytes: usize,
     session_attachment: Option<std::sync::Arc<SessionAttachment>>,
     prompt_ready: Option<PromptReadyGate>,
-) -> Result<
-    (
-        Vec<CanonicalUnitEvent>,
-        Option<monoloop_contracts::ExternalSessionId>,
-    ),
-    ExchangeFailure,
-> {
+) -> Result<EncodedExchangeOk, ExchangeFailure> {
     let started = Instant::now();
     let remaining = || deadline.saturating_sub(started.elapsed());
+    let encoded_input_bytes = encoded.bytes.len();
 
     let connection_id = ConnectionId::generate();
     let interpretation_id = InterpretationId::generate();
@@ -464,13 +473,29 @@ async fn run_encoded_exchange(
     let output = Arc::clone(&opened.output);
     let interp_in = interpretation.input.clone();
     let (pump_done_tx, pump_done_rx) = oneshot::channel::<()>();
+    let (output_limit_tx, output_limit_rx) = oneshot::channel::<()>();
+    let received_output_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let received_for_pump = Arc::clone(&received_output_bytes);
+    let max_out = max_remaining_provider_output_bytes;
     match tasks
         .spawn(
             TaskClass::InterpreterOwner(transaction_id, exchange_id),
             async move {
+                let mut output_limit_tx = Some(output_limit_tx);
                 loop {
                     match output.receive().await {
                         Ok(Some(chunk)) => {
+                            let add = chunk.len();
+                            let total = received_for_pump
+                                .fetch_add(add, std::sync::atomic::Ordering::Relaxed)
+                                .saturating_add(add);
+                            if total > max_out {
+                                if let Some(tx) = output_limit_tx.take() {
+                                    let _ = tx.send(());
+                                }
+                                let _ = interp_in.transport_failed().await;
+                                break;
+                            }
                             if interp_in.push_bytes(chunk).await.is_err() {
                                 break;
                             }
@@ -669,6 +694,10 @@ async fn run_encoded_exchange(
             let _ = open_control.terminate(TerminationReason::CallerForced);
             Err(ExchangeFailure::LimitExceeded)
         }
+        Ok(()) = output_limit_rx => {
+            let _ = open_control.terminate(TerminationReason::CallerForced);
+            Err(ExchangeFailure::LimitExceeded)
+        }
         _ = tokio::time::sleep(remaining()) => {
             let _ = open_control.terminate(TerminationReason::CallerForced);
             Err(ExchangeFailure::DeadlineExceeded)
@@ -693,7 +722,13 @@ async fn run_encoded_exchange(
     let external_session_id = opened.external_session_id.clone();
     result?;
     let collected = units.lock().await.clone();
-    Ok((collected, external_session_id))
+    Ok(EncodedExchangeOk {
+        units: collected,
+        external_session_id,
+        encoded_input_bytes,
+        received_output_bytes: received_output_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 async fn fail_cleanup(
@@ -701,13 +736,7 @@ async fn fail_cleanup(
     children: ChildJoins,
     grace: Duration,
     err: ExchangeFailure,
-) -> Result<
-    (
-        Vec<CanonicalUnitEvent>,
-        Option<monoloop_contracts::ExternalSessionId>,
-    ),
-    ExchangeFailure,
-> {
+) -> Result<EncodedExchangeOk, ExchangeFailure> {
     let _ = control.terminate(TerminationReason::CallerForced);
     children.wait(grace).await;
     Err(err)

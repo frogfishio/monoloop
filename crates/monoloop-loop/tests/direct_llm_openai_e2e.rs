@@ -1,8 +1,9 @@
 //! DirectLlm Golden Phase A+B (partial): HTTP/OpenAI SSE through `StartedRuntime`.
 //!
 //! Phase A: text-only + concurrent admits.
-//! Phase B: CallerControlled tool path; InlineToolContinuation second exchange;
-//! call-ID reuse across sequential admits (distinct exchange-scoped action ids).
+//! Phase B: CallerControlled tool path; InlineToolContinuation one- and multi-round
+//! continuation; call-ID reuse across sequential admits (distinct exchange-scoped
+//! action ids).
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -41,17 +42,42 @@ fn suite_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-fn test_rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("test runtime")
+/// Shared suite runtime — creating/destroying multi-thread runtimes per test
+/// races under the default cargo harness and produced intermittent `Cancelled`.
+fn test_rt() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    })
+}
+
+/// Loopback SSE server with graceful shutdown (no `JoinHandle::abort`).
+struct SseServer {
+    addr: std::net::SocketAddr,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl SseServer {
+    fn endpoint(&self) -> String {
+        format!("http://{}/v1/chat/completions", self.addr)
+    }
+
+    async fn stop(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.join).await;
+    }
 }
 
 async fn bind_fragmented_openai_sse(
     script: Arc<dyn Fn(String) -> Vec<Bytes> + Send + Sync>,
-) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+) -> SseServer {
     let app = Router::new()
         .route("/healthz", axum::routing::get(|| async { StatusCode::OK }))
         .route(
@@ -76,18 +102,56 @@ async fn bind_fragmented_openai_sse(
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let join = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
     });
     let health = format!("http://{addr}/healthz");
-    for _ in 0..100 {
+    let mut ready = false;
+    for _ in 0..200 {
         let client = reqwest::Client::new();
         match client.get(&health).send().await {
-            Ok(r) if r.status().is_success() => break,
+            Ok(r) if r.status().is_success() => {
+                ready = true;
+                break;
+            }
             _ => tokio::time::sleep(Duration::from_millis(5)).await,
         }
     }
-    (addr, join)
+    assert!(ready, "SSE server healthz never became ready at {addr}");
+    SseServer {
+        addr,
+        shutdown: Some(shutdown_tx),
+        join,
+    }
+}
+
+fn finish_http_test(
+    started: StartedRuntime,
+    rt: &tokio::runtime::Runtime,
+    servers: Vec<SseServer>,
+) {
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        let stopped = owner.wait_stopped(Duration::from_secs(2)).await;
+        for server in servers {
+            server.stop().await;
+        }
+        // Let Hyper/reqwest connection closeouts settle on the shared runtime
+        // before the next suite_lock holder binds a new loopback listener.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stopped
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
 }
 
 fn fragmented_text_sse(content: &str) -> Vec<Bytes> {
@@ -294,13 +358,24 @@ fn start_openai_runtime_with_tools(
     bindings: Vec<ChannelBinding>,
     tools: HostToolRegistry,
 ) -> StartedRuntime {
-    let limits = TransactionLimits {
+    start_openai_runtime_with_tools_and_limits(bindings, tools, default_tx_limits())
+}
+
+fn default_tx_limits() -> TransactionLimits {
+    TransactionLimits {
         max_active_transactions: 8,
         max_active_per_channel: 4,
         transaction_deadline: Duration::from_secs(10),
         cleanup_deadline: Duration::from_secs(2),
         ..TransactionLimits::default()
-    };
+    }
+}
+
+fn start_openai_runtime_with_tools_and_limits(
+    bindings: Vec<ChannelBinding>,
+    tools: HostToolRegistry,
+    limits: TransactionLimits,
+) -> StartedRuntime {
     StartedRuntime::start(RuntimeBootstrap {
         config: RuntimeConfig {
             transaction_limits: limits,
@@ -318,11 +393,10 @@ fn text_only_http_openai_emits_text_and_completed() {
     let _guard = suite_lock();
     let rt = test_rt();
     let script = Arc::new(|_body: String| fragmented_text_sse("Hello from OpenAI SSE."));
-    let (addr, join) = rt.block_on(bind_fragmented_openai_sse(script));
-    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
 
     let started = start_openai_runtime(vec![openai_http_channel("openai-a", endpoint, "gpt-test")]);
-    std::thread::sleep(Duration::from_millis(50));
     let handle = started.handle.clone();
     let (delivery, receiver) =
         transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
@@ -361,16 +435,7 @@ fn text_only_http_openai_emits_text_and_completed() {
         completion.end.diagnostics
     );
 
-    let mut owner = started.owner;
-    let outcome = rt.block_on(async {
-        owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_secs(2)).await
-    });
-    assert!(
-        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
-        "expected Stopped, got {outcome:?}"
-    );
-    join.abort();
+    finish_http_test(started, rt, vec![server]);
 }
 
 #[test]
@@ -381,16 +446,15 @@ fn concurrent_http_openai_admits_are_isolated() {
     // hyper accept/stream path (keeps isolation proof about runtime routing).
     let script_a = Arc::new(|_body: String| fragmented_text_sse("reply-a."));
     let script_b = Arc::new(|_body: String| fragmented_text_sse("reply-b."));
-    let (addr_a, join_a) = rt.block_on(bind_fragmented_openai_sse(script_a));
-    let (addr_b, join_b) = rt.block_on(bind_fragmented_openai_sse(script_b));
-    let endpoint_a = format!("http://{addr_a}/v1/chat/completions");
-    let endpoint_b = format!("http://{addr_b}/v1/chat/completions");
+    let server_a = rt.block_on(bind_fragmented_openai_sse(script_a));
+    let server_b = rt.block_on(bind_fragmented_openai_sse(script_b));
+    let endpoint_a = server_a.endpoint();
+    let endpoint_b = server_b.endpoint();
 
     let started = start_openai_runtime(vec![
         openai_http_channel("c-a", endpoint_a, "m"),
         openai_http_channel("c-b", endpoint_b, "m"),
     ]);
-    std::thread::sleep(Duration::from_millis(50));
     let handle = started.handle.clone();
     let (delivery_a, receiver_a) =
         transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
@@ -472,17 +536,7 @@ fn concurrent_http_openai_admits_are_isolated() {
         "channel b must not see reply-a; got {texts_b:?}"
     );
 
-    let mut owner = started.owner;
-    let outcome = rt.block_on(async {
-        owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_secs(2)).await
-    });
-    assert!(
-        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
-        "expected Stopped, got {outcome:?}"
-    );
-    join_a.abort();
-    join_b.abort();
+    finish_http_test(started, rt, vec![server_a, server_b]);
 }
 
 /// Phase B: CallerControlled tool exchange encodes admitted tools, runs Loop,
@@ -502,14 +556,13 @@ fn caller_controlled_tool_exchange_ends_continuation_required_without_second_ope
         }
         fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#)
     });
-    let (addr, join) = rt.block_on(bind_fragmented_openai_sse(script));
-    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
 
     let started = start_openai_runtime_with_tools(
         vec![openai_http_channel("openai-tools", endpoint, "gpt-test")],
         echo_tool_registry(),
     );
-    std::thread::sleep(Duration::from_millis(50));
     let handle = started.handle.clone();
     let (delivery, receiver) =
         transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
@@ -554,16 +607,7 @@ fn caller_controlled_tool_exchange_ends_continuation_required_without_second_ope
         "expected Tool CanonicalUnit and/or ToolLifecycle after Ready dispatch; labels={labels:?}"
     );
 
-    let mut owner = started.owner;
-    let outcome = rt.block_on(async {
-        owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_secs(2)).await
-    });
-    assert!(
-        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
-        "expected Stopped, got {outcome:?}"
-    );
-    join.abort();
+    finish_http_test(started, rt, vec![server]);
 }
 
 /// InlineToolContinuation: first POST returns tool_calls; second returns text.
@@ -584,8 +628,8 @@ fn inline_tool_continuation_second_exchange_emits_text() {
             fragmented_text_sse("tool result acknowledged.")
         }
     });
-    let (addr, join) = rt.block_on(bind_fragmented_openai_sse(script));
-    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
 
     let started = start_openai_runtime_with_tools(
         vec![openai_http_channel_with_policies(
@@ -599,7 +643,6 @@ fn inline_tool_continuation_second_exchange_emits_text() {
         )],
         echo_tool_registry(),
     );
-    std::thread::sleep(Duration::from_millis(50));
     let handle = started.handle.clone();
     let (delivery, receiver) =
         transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
@@ -654,16 +697,105 @@ fn inline_tool_continuation_second_exchange_emits_text() {
         "second POST must correlate tool_call_id=call_1; body={body}"
     );
 
-    let mut owner = started.owner;
-    let outcome = rt.block_on(async {
-        owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_secs(2)).await
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// InlineToolContinuation multi-round: tool → tool → text completes after two tools.
+#[test]
+fn inline_multi_round_tool_continuation_completes_after_second_tool() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let continuation_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let continuation_bodies_c = Arc::clone(&continuation_bodies);
+    let script = Arc::new(move |body: String| {
+        let n = posts_c.fetch_add(1, Ordering::SeqCst);
+        match n {
+            0 => fragmented_tool_call_sse("call_a", "echo", r#"{"q":"a"}"#),
+            1 => {
+                continuation_bodies_c.lock().unwrap().push(body);
+                fragmented_tool_call_sse("call_b", "echo", r#"{"q":"b"}"#)
+            }
+            _ => {
+                continuation_bodies_c.lock().unwrap().push(body);
+                fragmented_text_sse("done after two tools")
+            }
+        }
     });
-    assert!(
-        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
-        "expected Stopped, got {outcome:?}"
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let started = start_openai_runtime_with_tools(
+        vec![openai_http_channel_with_policies(
+            "openai-inline-multi",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
     );
-    join.abort();
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-inline-multi").unwrap(),
+            session_id: None,
+            input: user_text_input("Use the echo tool twice.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        3,
+        "multi-round inline must open three provider exchanges; kind={:?} labels={labels:?}",
+        completion.end.kind
+    );
+    let tool_life_rounds = labels.iter().filter(|l| **l == "tool_life").count();
+    assert!(
+        tool_life_rounds >= 2,
+        "expected at least two ToolLifecycle rounds; tool_life={tool_life_rounds} labels={labels:?}"
+    );
+    let joined = texts.join("");
+    assert!(
+        joined.contains("done"),
+        "expected final text containing done; texts={texts:?} labels={labels:?}"
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::Completed,
+        "multi-round inline must Complete; got {:?} diagnostics={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+    let bodies = continuation_bodies.lock().unwrap();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "expected two continuation request bodies; got {}",
+        bodies.len()
+    );
+    for (i, body) in bodies.iter().enumerate() {
+        assert!(
+            body.contains("\"role\":\"tool\"") || body.contains("\"role\": \"tool\""),
+            "continuation POST {i} must include role:tool; body={body}"
+        );
+    }
+
+    finish_http_test(started, rt, vec![server]);
 }
 
 /// Same provider call id across sequential admits yields distinct action ids.
@@ -673,14 +805,13 @@ fn reused_provider_call_id_across_exchanges_distinct_action_ids() {
     let rt = test_rt();
     let script =
         Arc::new(|_body: String| fragmented_tool_call_sse("call_reuse", "echo", r#"{"q":"x"}"#));
-    let (addr, join) = rt.block_on(bind_fragmented_openai_sse(script));
-    let endpoint = format!("http://{addr}/v1/chat/completions");
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
 
     let started = start_openai_runtime_with_tools(
         vec![openai_http_channel("openai-reuse", endpoint, "gpt-test")],
         echo_tool_registry(),
     );
-    std::thread::sleep(Duration::from_millis(50));
     let handle = started.handle.clone();
 
     let mut action_ids = Vec::new();
@@ -745,14 +876,639 @@ fn reused_provider_call_id_across_exchanges_distinct_action_ids() {
     assert_eq!(provider_ids[0], "call_reuse");
     assert_eq!(provider_ids[1], "call_reuse");
 
-    let mut owner = started.owner;
-    let outcome = rt.block_on(async {
-        owner.begin_shutdown();
-        owner.wait_stopped(Duration::from_secs(2)).await
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// HTTP twin: context-byte ceiling fails closed before the second open.
+#[test]
+fn http_inline_continuation_context_bytes_limit_exceeded() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let script = Arc::new(move |_body: String| {
+        let n = posts_c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#)
+        } else {
+            fragmented_text_sse("should never be reached")
+        }
     });
-    assert!(
-        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
-        "expected Stopped, got {outcome:?}"
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_continuations = 8;
+    limits.max_continuation_context_bytes = 1;
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel_with_policies(
+            "openai-ctx",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
+        limits,
     );
-    join.abort();
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-ctx").unwrap(),
+            session_id: None,
+            input: user_text_input("Use the echo tool.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        1,
+        "context-byte ceiling must fail before continuation open; kind={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "max_continuation_context_bytes overflow must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
+}
+
+fn sse_byte_len(chunks: &[bytes::Bytes]) -> usize {
+    chunks.iter().map(|c| c.len()).sum()
+}
+
+/// HTTP twin: `max_provider_exchanges = 2` exact then LimitExceeded.
+#[test]
+fn http_inline_max_provider_exchanges_two_exact_then_limit_exceeded() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let script = Arc::new(move |_body: String| {
+        let n = posts_c.fetch_add(1, Ordering::SeqCst);
+        match n {
+            0 => fragmented_tool_call_sse("call_a", "echo", r#"{"q":"a"}"#),
+            1 => fragmented_tool_call_sse("call_b", "echo", r#"{"q":"b"}"#),
+            _ => fragmented_text_sse("should never be reached"),
+        }
+    });
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_continuations = 8;
+    limits.max_provider_exchanges = 2;
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel_with_policies(
+            "openai-pex2",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
+        limits,
+    );
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-pex2").unwrap(),
+            session_id: None,
+            input: user_text_input("Keep calling echo.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "max_provider_exchanges=2 allows initial+one continuation only; kind={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("should never be reached")),
+        "third POST must not run; texts={texts:?}"
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "exact exchange ceiling must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// HTTP twin: cumulative remaining-output plus-one — second open starts, then
+/// mid-pump LimitExceeded without publishing complete second-round text.
+#[test]
+fn http_inline_cumulative_output_budget_plus_one_fails_second_pump() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let round0 = fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#);
+    let round1 = fragmented_text_sse("second round text that must overflow remaining.");
+    let first_out = sse_byte_len(&round0);
+    let second_out = sse_byte_len(&round1);
+    assert!(second_out > 1, "second SSE must exceed a 1-byte remainder");
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let round0_c = round0.clone();
+    let round1_c = round1.clone();
+    let script = Arc::new(move |_body: String| {
+        let n = posts_c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            round0_c.clone()
+        } else {
+            round1_c.clone()
+        }
+    });
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_continuations = 8;
+    limits.max_total_provider_output_bytes = first_out.saturating_add(1);
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel_with_policies(
+            "openai-cum-out-plus",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
+        limits,
+    );
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-cum-out-plus").unwrap(),
+            session_id: None,
+            input: user_text_input("Use the echo tool.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "plus-one remainder must allow the second open to start; kind={:?} labels={labels:?}",
+        completion.end.kind
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("second round text")),
+        "LimitExceeded mid-pump must not publish complete second-round text; texts={texts:?}"
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "second-pump output overflow must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// HTTP twin: first exchange consumes full output ceiling; second open blocked.
+#[test]
+fn http_inline_cumulative_output_budget_exhausted_blocks_second_open() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let round0 = fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#);
+    let first_out = sse_byte_len(&round0);
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let round0_c = round0.clone();
+    let script = Arc::new(move |_body: String| {
+        let n = posts_c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            round0_c.clone()
+        } else {
+            fragmented_text_sse("should never be reached")
+        }
+    });
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_continuations = 8;
+    limits.max_total_provider_output_bytes = first_out;
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel_with_policies(
+            "openai-cum-out",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
+        limits,
+    );
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-cum-out").unwrap(),
+            session_id: None,
+            input: user_text_input("Use the echo tool.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        1,
+        "exhausted remaining_output must block continuation open; kind={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "cumulative output exhaustion must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// HTTP twin: `max_provider_exchanges = 1` blocks Inline continuation.
+#[test]
+fn http_inline_max_provider_exchanges_one_ends_limit_exceeded() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let script = Arc::new(move |_body: String| {
+        let n = posts_c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#)
+        } else {
+            fragmented_text_sse("should never be reached")
+        }
+    });
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_continuations = 8;
+    limits.max_provider_exchanges = 1;
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel_with_policies(
+            "openai-pex1",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
+        limits,
+    );
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-pex1").unwrap(),
+            session_id: None,
+            input: user_text_input("Use the echo tool.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        1,
+        "max_provider_exchanges=1 must not open a continuation; kind={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "provider exchange ceiling must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// HTTP twin: tiny total provider input fails closed before the HTTP POST.
+#[test]
+fn http_total_provider_input_bytes_limit_exceeded_before_open() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let script = Arc::new(move |_body: String| {
+        posts_c.fetch_add(1, Ordering::SeqCst);
+        fragmented_text_sse("should never be reached")
+    });
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_total_provider_input_bytes = 10;
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel("openai-pin", endpoint, "gpt-test")],
+        HostToolRegistry::empty(),
+        limits,
+    );
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-pin").unwrap(),
+            session_id: None,
+            input: user_text_input("Say hi with enough prompt to exceed ten bytes.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::CallerControlled,
+                ..Default::default()
+            },
+            tools: vec![],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        0,
+        "total provider input ceiling must fail before HTTP open; kind={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "total provider input overflow must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// HTTP twin: tiny total provider output fails closed during SSE pump.
+#[test]
+fn http_total_provider_output_bytes_limit_exceeded() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let script = Arc::new(move |_body: String| {
+        posts_c.fetch_add(1, Ordering::SeqCst);
+        fragmented_text_sse("Hello from oversized HTTP SSE output.")
+    });
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_total_provider_output_bytes = 1;
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel("openai-pout", endpoint, "gpt-test")],
+        HostToolRegistry::empty(),
+        limits,
+    );
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-pout").unwrap(),
+            session_id: None,
+            input: user_text_input("Say hi.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::CallerControlled,
+                ..Default::default()
+            },
+            tools: vec![],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        1,
+        "output ceiling is checked after open during pump; kind={:?} labels={labels:?}",
+        completion.end.kind
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "total provider output overflow must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// HTTP twin: `max_continuations = 0` ends LimitExceeded without a second open.
+#[test]
+fn http_inline_max_continuations_zero_ends_limit_exceeded() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let script = Arc::new(move |_body: String| {
+        posts_c.fetch_add(1, Ordering::SeqCst);
+        fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#)
+    });
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_continuations = 0;
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel_with_policies(
+            "openai-max0",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
+        limits,
+    );
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-max0").unwrap(),
+            session_id: None,
+            input: user_text_input("Use the echo tool.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        1,
+        "max_continuations=0 must not open a continuation; kind={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "zero continuation ceiling must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
+}
+
+/// HTTP twin: `max_continuations = 1` with a second tool response → LimitExceeded.
+#[test]
+fn http_inline_max_continuations_one_exhausted_ends_limit_exceeded() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let script = Arc::new(move |_body: String| {
+        let n = posts_c.fetch_add(1, Ordering::SeqCst);
+        match n {
+            0 => fragmented_tool_call_sse("call_a", "echo", r#"{"q":"a"}"#),
+            1 => fragmented_tool_call_sse("call_b", "echo", r#"{"q":"b"}"#),
+            _ => fragmented_text_sse("should never be reached"),
+        }
+    });
+    let server = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = server.endpoint();
+
+    let mut limits = default_tx_limits();
+    limits.max_continuations = 1;
+    let started = start_openai_runtime_with_tools_and_limits(
+        vec![openai_http_channel_with_policies(
+            "openai-max1",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
+        limits,
+    );
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-max1").unwrap(),
+            session_id: None,
+            input: user_text_input("Keep calling echo.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "max_continuations=1 allows one continuation open only; kind={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("should never be reached")),
+        "exhausted ceiling must not open a third exchange; texts={texts:?}"
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::LimitExceeded,
+        "exhausted max_continuations must be LimitExceeded; got {:?} diagnostics={:?} labels={labels:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+
+    finish_http_test(started, rt, vec![server]);
 }

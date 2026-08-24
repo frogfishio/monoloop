@@ -78,6 +78,40 @@ impl StartHoldGate {
     }
 }
 
+/// Test-only gate that pauses supervisor drain of the control queue (§23).
+///
+/// While held, Cancel / ForceTerminate / BeginShutdown remain queued so
+/// `TransactionLimits.max_actor_commands` plus-one can observe
+/// `ControlCapacityExceeded` without the preferential control drain racing.
+#[derive(Debug, Default)]
+pub struct ControlHoldGate {
+    held: AtomicBool,
+}
+
+impl ControlHoldGate {
+    /// New gate, initially not holding (control drain enabled).
+    pub fn new() -> Self {
+        Self {
+            held: AtomicBool::new(false),
+        }
+    }
+
+    /// Pause control-queue drain.
+    pub fn hold(&self) {
+        self.held.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume control-queue drain.
+    pub fn release(&self) {
+        self.held.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether control drain is currently paused.
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
+    }
+}
+
 /// Test-only gate that pauses the Finalizer between Seal and completion send (§22.2).
 ///
 /// Proves shutdown / hard-grace cannot drop the ledger row or the one completion
@@ -204,6 +238,9 @@ pub struct RuntimeConfig {
     /// When `Some`, supervisor skips draining `Start` while the gate is held.
     /// Production leaves this `None`; D-040 parked-Start proofs set it.
     pub hold_start: Option<Arc<StartHoldGate>>,
+    /// When `Some`, supervisor skips draining control while the gate is held.
+    /// Production leaves this `None`; §23 `max_actor_commands` proofs set it.
+    pub hold_control: Option<Arc<ControlHoldGate>>,
     /// Override start-queue capacity (tests). `None` ⇒ `max_active_transactions`.
     /// Use a value smaller than reservation capacity to prove start-full rollback
     /// while the reservation pool still has headroom (D-040 / §22.1).
@@ -232,6 +269,7 @@ impl Default for RuntimeConfig {
             default_shutdown_deadline: Duration::from_secs(30),
             block_stopped: None,
             hold_start: None,
+            hold_control: None,
             start_queue_capacity: None,
             hold_finalizer_after_seal: None,
             hold_executor_teardown: None,

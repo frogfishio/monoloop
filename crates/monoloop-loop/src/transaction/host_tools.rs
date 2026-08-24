@@ -177,10 +177,13 @@ impl HostToolRegistry {
                 _ => {}
             }
             // Schema root object already enforced by JsonSchema::try_new.
+            // Byte ceiling uses TransactionLimits default here; StartedRuntime
+            // re-checks against the runtime's max_tool_schema_bytes (§23 / D-056).
+            let max_schema = monoloop_contracts::TransactionLimits::default().max_tool_schema_bytes;
             let schema_bytes = serde_json::to_vec(tool.spec.input_schema.as_value())
                 .map(|b| b.len())
                 .unwrap_or(0);
-            if schema_bytes > 64 * 1024 {
+            if schema_bytes > max_schema {
                 return Err(super::StartupError::ToolRegistry("tool schema too large"));
             }
             if by_id.contains_key(&tool.spec.id) {

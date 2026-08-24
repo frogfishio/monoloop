@@ -65,6 +65,25 @@ impl StartedRuntime {
     pub fn start(bootstrap: RuntimeBootstrap) -> Result<Self, StartupError> {
         bootstrap.config.validate()?;
 
+        // §23: TransactionLimits.max_tool_schema_bytes — fail closed at start
+        // so HostToolRegistry construction with the default ceiling cannot
+        // bypass a tighter runtime limit (D-056).
+        let max_schema = bootstrap
+            .config
+            .transaction_limits
+            .max_tool_schema_bytes
+            .max(1);
+        for spec in bootstrap.tools.specs_sorted() {
+            let schema_bytes = serde_json::to_vec(spec.input_schema.as_value())
+                .map(|b| b.len())
+                .unwrap_or(usize::MAX);
+            if schema_bytes > max_schema {
+                return Err(StartupError::InvalidConfig(
+                    "tool schema exceeds max_tool_schema_bytes",
+                ));
+            }
+        }
+
         let mut live: HashMap<ChannelId, LiveChannel> = HashMap::new();
         let mut capacity_pairs: Vec<(ChannelId, usize)> = Vec::new();
         for (id, binding) in bootstrap.channels.iter() {
@@ -122,10 +141,15 @@ impl StartedRuntime {
 
         // Start queue: exactly max_active (spec §9.2), unless a test overrides
         // capacity to prove start-full rollback with reservation headroom (D-040).
-        // Control queue is separate so cancel/shutdown cannot be starved.
+        // Control queue is separate so cancel/shutdown cannot be starved; capacity
+        // comes from `TransactionLimits.max_actor_commands` (not max_active+8).
         let start_capacity = bootstrap.config.start_queue_capacity.unwrap_or(max_active);
         let (start_tx, start_rx) = mpsc::channel(start_capacity);
-        let control_capacity = max_active.saturating_add(8);
+        let control_capacity = bootstrap
+            .config
+            .transaction_limits
+            .max_actor_commands
+            .max(1);
         let (control_tx, control_rx) = mpsc::channel(control_capacity);
         let worker_capacity = max_active.saturating_add(8);
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerMessage>(worker_capacity);
@@ -161,6 +185,7 @@ impl StartedRuntime {
             mcp_cancel: Mutex::new(None),
             block_stopped: bootstrap.config.block_stopped.clone(),
             hold_start: bootstrap.config.hold_start.clone(),
+            hold_control: bootstrap.config.hold_control.clone(),
             hold_finalizer_after_seal: bootstrap.config.hold_finalizer_after_seal.clone(),
             hold_executor_teardown: bootstrap.config.hold_executor_teardown.clone(),
             inject_non_yielding_service: bootstrap.config.inject_non_yielding_service,
@@ -464,6 +489,9 @@ impl Drop for RuntimeOwner {
             gate.release();
         }
         if let Some(gate) = self.shared.hold_start.as_ref() {
+            gate.release();
+        }
+        if let Some(gate) = self.shared.hold_control.as_ref() {
             gate.release();
         }
         if let Some(gate) = self.shared.hold_finalizer_after_seal.as_ref() {

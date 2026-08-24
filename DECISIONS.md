@@ -4,6 +4,162 @@ Explicit project decisions that change contracts, MSRV, or delivery assumptions.
 Normative behavior still lives under `doc/`; this file records *why* a deliberate
 change was made.
 
+## D-060 — D-054 compatibility-alias breaking cut (deprecated surfaces removed)
+
+**Date:** 2026-08-24
+
+**Context:** D-054 Silver retained an explicit M7.3 compatibility phase:
+deprecated `TransactionRequest` / `TransactionRuntime` / `RuntimeToolSpill`,
+plus host `adapt_*` bridges. Inventory
+`doc/D054_COMPATIBILITY_ALIAS_INVENTORY.md` confirmed no live `impl` of
+`TransactionRuntime` and no production submit of `TransactionRequest`.
+
+**Decision:** Execute the **breaking cut** for deprecated-only surfaces:
+
+- **Removed:** `TransactionRequest`, `TransactionRuntime` trait,
+  `RuntimeToolSpill` type alias, empty `HostCompletionAdapter` /
+  `HostEventAdapter` markers, public `reap_vault` / orphan `reap_finished`
+  no-ops (M5.4 vault-name leftovers).
+- **Retained (documented host helpers, not deprecated):**
+  `adapt_event_sink` / `adapt_completion_callback`, and host traits
+  `TransactionEventSink` / `CompletionCallback` / `Fn*` adapters — still
+  outside the kernel executor (M1 / §22.7).
+- Production submit remains `StartedRuntime` /
+  `TransactionRuntimeHandle::submit(TransactionSubmitRequest)`.
+
+**Consequences:**
+
+- Public API break for any external crate still naming the removed symbols
+  (workspace had none). Prefer a crate major bump if published.
+- D-054 Golden residual “breaking cut” is **closed** for the declared
+  deprecated set; `adapt_*` stay until a later decision moves them out of
+  `monoloop-loop`.
+- Inventory file updated to “cut executed (D-060)”.
+
+## D-059 — `callback_deadline` deferred (no core callback wait under M7 push completion)
+
+**Date:** 2026-08-24
+
+**Context:** `TransactionLimits.callback_deadline` validates nonzero only. Core
+completion is push oneshot (`TransactionCompletionSender`); M7 removed
+host `CompletionCallback` from the core submit API. There is no production
+wait/join on a host callback that would honor this duration. Inventing a
+callback wait solely to green a Covered cell would be shaped-done.
+
+**Decision:** **Defer** `callback_deadline` as a product-enforced bound:
+
+- Field retained for validate nonzero / ABI / future host-adapter budgets.
+- Matrix row stays **Open** with this deferral note (Golden residual).
+- A superseding decision is required before Covered: a real core or
+  documented host-adapter wait site that reads the runtime field.
+
+**Consequences:**
+
+- Same honesty class as D-058 (diagnostics) — Open + DECISIONS, not Covered.
+- Host adapters outside the kernel that impose their own callback budgets
+  MUST document them separately; they are not this field until wired.
+
+## D-058 — `max_diagnostic_*` deferred until production `TransactionDiagnostic` emission
+
+**Date:** 2026-08-24
+
+**Context:** `TransactionLimits.max_diagnostic_count` / `max_diagnostic_bytes`
+exist and validate nonzero. Ledger carries `diagnostic_count` (always 0).
+`build_completion` / `end_event` always pass `diagnostics: Vec::new()`.
+Production publishes interpreter units as
+`TransactionEventPayload::CanonicalUnit` (including
+`CanonicalUnit::Diagnostic`); the separate
+`TransactionEventPayload::Diagnostic(TransactionDiagnostic)` path is
+test-injected only. `SafeDiagnostic::try_new_default` uses
+`TransactionLimits::default().max_diagnostic_bytes`, not the runtime field.
+
+**Decision:** **Defer** wiring these fields as Covered product bounds:
+
+- Do **not** invent a shaped emission path solely to green a matrix cell.
+- When Loop gains a real `TransactionDiagnostic` emission / retention path,
+  enforce count + message bytes from the runtime `TransactionLimits` and add
+  exact/plus-one Covered needles in a superseding decision.
+- Matrix rows stay **Open** with this deferral note (still Golden residuals).
+
+**Consequences:**
+
+- §23 honesty: Open ≠ Covered; D-058 records deliberate non-invention.
+- Hosts must not assume runtime truncation/count today beyond
+  `SafeDiagnostic` constructors they call themselves.
+
+## D-057 — `max_actor_command_bytes` retired (closed-enum control channel)
+
+**Date:** 2026-08-24
+
+**Context:** Spec text historically paired `max_actor_commands` with
+`max_actor_command_bytes` for an actor `command_rx`. Production maps
+`max_actor_commands` to the supervisor control `mpsc` (D-015). Control
+messages are the closed enum `ControlCommand` (`Cancel` / `ForceTerminate` /
+`BeginShutdown` / `StopSupervisor`) — fixed-size identities, no payload bytes.
+A byte capacity on that queue has no honest use site; inventing byte
+accounting would be shaped-done.
+
+**Decision:** **Retire** `TransactionLimits.max_actor_command_bytes` as a
+product-enforced bound:
+
+- Item capacity **`max_actor_commands`** remains the control-queue product limit
+  (Covered).
+- `max_actor_command_bytes` stays on the struct for validate nonzero / ABI
+  stability but **MUST NOT** be treated as an enqueue byte budget until a
+  future decision introduces payload-bearing control messages.
+- §23 matrix status **Retired** (D-057); no Covered needle required.
+
+**Consequences:**
+
+- Golden residual list treats Retired as decision-closed, not Open.
+- Reintroducing a byte bound requires a superseding DECISIONS entry and a
+  real payload-bearing control/command channel.
+
+## D-056 — `TransactionLimits.max_tool_schema_bytes` enforced at `StartedRuntime::start`
+
+**Date:** 2026-08-24
+
+**Context:** `HostToolRegistry::build` rejected schemas over a hardcoded
+`64 * 1024`, matching the `TransactionLimits` default but not reading the
+runtime field. Matrix correctly listed `max_tool_schema_bytes` as Open.
+
+**Decision:** Keep a construction hygiene check in `HostToolRegistry::build`
+against `TransactionLimits::default().max_tool_schema_bytes`. Additionally,
+`StartedRuntime::start` re-validates every registered tool schema against the
+bootstrap `transaction_limits.max_tool_schema_bytes` and fails closed with
+`StartupError::InvalidConfig("tool schema exceeds max_tool_schema_bytes")`.
+
+**Consequences:**
+
+- Tighter runtime ceilings cannot be bypassed by building the registry under
+  the default 64 KiB construction limit.
+- Covered needle:
+  `transaction_limits_max_tool_schema_bytes_exact_admits_plus_one_rejects`.
+
+## D-055 — `TransactionLimits.max_event_queue*` are runtime ceilings over caller `DeliveryLimits`
+
+**Date:** 2026-08-24
+
+**Context:** Push delivery builds the event mailbox in
+`transaction_delivery(DeliveryLimits)` before `submit`. `TransactionLimits`
+also named `max_event_queue` / `max_event_queue_bytes`, but those fields were
+validate-only while enqueue enforcement lived solely on the caller-built
+ports (`s22_6_event_*`). Matrix honesty correctly marked them Open (unwired).
+
+**Decision:** Keep caller-built mailboxes. Wire the TransactionLimits fields as
+**admission ceilings**: reject `InvalidConfiguration` when
+`delivery.event_tx.max_event_items() > max_event_queue` or
+`max_event_bytes() > max_event_queue_bytes`. Enqueue fail-closed remains on
+`DeliveryLimits` (unchanged).
+
+**Consequences:**
+
+- Hosts may choose any DeliveryLimits up to the runtime ceiling.
+- Exact/plus-one Covered cells:
+  `transaction_limits_max_event_queue_exact_admits_plus_one_rejects`,
+  `transaction_limits_max_event_queue_bytes_exact_admits_plus_one_rejects`.
+- Does not replace or retire `DeliveryLimits`; both layers remain.
+
 ## D-042 — Refreshable MCP deferred; CreationOnly is the declared initial posture
 
 **Date:** 2026-08-23
@@ -183,9 +339,11 @@ together for in-process futures.
    bounded resources, and provider-neutral tool semantics.
 5. Migrate in stages M1–M7 from the v2 spec. Obsolete uncompiled v1 modules
    (`active_registry`, `events`, `exchange`, `spawn_gate`) were **deleted** under
-   D-054 (do not restore). Host callback adapters and deprecated aliases remain
-   in an explicit **compatibility phase** until a deliberate breaking cut
-   (D-054); that is not “deferred on-disk source.”
+   D-054 (do not restore). Deprecated sink-shaped aliases
+   (`TransactionRequest`, `TransactionRuntime`, `RuntimeToolSpill`) were
+   **removed** under **D-060**. Host helpers `adapt_event_sink` /
+   `adapt_completion_callback` remain outside the kernel (optional later move
+   out of `monoloop-loop`) — that is not “deferred on-disk source.”
 
 **Consequences:**
 

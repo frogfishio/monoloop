@@ -507,8 +507,8 @@ runtime configuration. Event queues are item-bounded only.
       (`encoded_exchange_bytes_plus_one_fails`).
 - [x] `bound_diagnostics` enforces count + message bytes.
 - [x] Control channel capacity taken from `max_actor_commands`.
-- [ ] Residual: actor-command *byte* budget (messages are closed enums),
-      deeper non-responsive provider matrix.
+- [x] Actor-command byte budget retired (D-057 — closed-enum `ControlCommand`).
+- [ ] Residual: deeper non-responsive provider matrix.
 
 ## D-016: OpenAI tool calls can execute before the provider finishes declaring them
 
@@ -3464,9 +3464,146 @@ opens a second exchange via `encode_tool_continuation` + `run_encoded_exchange`
 Proofs: `caller_controlled_tool_exchange_ends_continuation_required_without_second_open`,
 `inline_tool_continuation_second_exchange_emits_text`,
 `reused_provider_call_id_across_exchanges_distinct_action_ids`.
-**Still open for full Golden:** multi-round inline (N>1 tool→model loops),
-deleted FakeConnector `direct_llm_e2e` parity coverage, full §25 / D-025.
+**Multi-round inline landed (2026-08-24):** bounded `1..=max_continuations` loop
+with cumulative transcript (`append_tool_round`),
+`max_continuation_context_bytes` fail-closed, Loop re-dispatch between rounds;
+proof `inline_multi_round_tool_continuation_completes_after_second_tool`.
+**FakeConnector parity landed (2026-08-24):** `tests/direct_llm_fake_e2e.rs` —
+Fake `ScriptedSequence` + OpenAI dialect stamp covers text, CallerControlled,
+one-/multi-round inline, concurrency, call-ID reuse without HTTP.
+**LimitExceeded / max_continuations bound e2e landed (2026-08-24):** Fake
+`fake_inline_max_continuations_zero_ends_limit_exceeded`,
+`fake_inline_max_continuations_one_exhausted_ends_limit_exceeded`,
+`fake_inline_continuation_context_bytes_limit_exceeded`; HTTP twins
+`http_inline_max_continuations_zero_ends_limit_exceeded`,
+`http_inline_max_continuations_one_exhausted_ends_limit_exceeded`
+(fake 9/9, HTTP 8/8 on this tree).
+**Expert + Advisor (2026-08-24, max_continuations / LimitExceeded bound e2e):**
+**PASS — Silver+Golden-progress** for this slice only. Fail-closed composition
+proven; D-053 stays Fixed; no Golden/§25/D-025 overclaim. Honesty residual at
+stamp time: `max_provider_exchanges` / `max_total_provider_{input,output}_bytes`
+were config-only — **closed in the follow-up provider-budget slice**.
+**Provider-budget bounds landed (2026-08-24):** coordinator reads
+`max_provider_exchanges` + cumulative `max_total_provider_{input,output}_bytes`;
+exchange reports encoded/received bytes and fails closed mid-pump on output
+overflow. Proofs: Fake+HTTP `max_provider_exchanges=1`, total input before
+open, total output during pump; HTTP context-byte twin. Suites on this tree:
+fake 12/12, HTTP 12/12.
+**Advisor (2026-08-24, provider-budget bound slice):** **PASS — Silver**
+for this slice only (Golden-progress on the DirectLlm replacement row, not
+a Golden promotion). D-053 stays **Fixed**; the named honesty residual that
+`max_provider_exchanges` / `max_total_provider_{input,output}_bytes` were
+config-only is **closed**. Enforcement is Component 3 (encode-then-compare
+input before Connector open; raw-chunk count mid-pump; continuation remaining
+budget), not Connector semantic inspection. Re-ran at stamp: fake e2e 12/12,
+HTTP/OpenAI e2e 12/12. Spec header / Loop README / D-053 map still **Not**
+Golden / §25 / D-025 — do not promote.
+**Provider-budget exact/cumulative polish landed (2026-08-24):** remaining
+input/output `== 0` fails closed before open; Fake+HTTP
+`max_provider_exchanges=2` exact; cumulative remaining-output exact + plus-one
+Fake+HTTP; Fake continuation remaining-input `== 0` (probe-encoded). Suites on
+this tree: fake **16/16**, HTTP **15/15**.
+**Still open for full Golden:** independent §25 / D-025 sign-off; remaining
+§23 extras / D-054 compatibility phase (outside this DirectLlm row).
+RuntimeOwner Drop already has a Silver PASS — do not re-pick as open.
+**Next pick:** independent Golden / D-025 review (agents must not self-sign)
+**or** remaining named §23 / D-054 residuals outside DirectLlm.
 **Not** Golden / §25 / D-025. Agents must not self-sign.
+
+**Advisor (2026-08-24, provider-budget exact/cumulative polish):** **PASS —
+Silver+Golden-progress** for this slice only (DirectLlm replacement row, not
+a Golden promotion). D-053 autodiscovery stays **Fixed**. Map honesty residual
+(HTTP plus-one overclaim) **closed** by adding
+`http_inline_cumulative_output_budget_plus_one_fails_second_pump` + Fake
+`fake_inline_cumulative_input_budget_exhausted_blocks_second_open`. Spec
+header / Loop README remain **Not** Golden / §25 / D-025. Re-ran: fake e2e
+16/16, HTTP/OpenAI e2e 15/15. Do **not** promote Golden / §25 / D-025.
+Agents must not self-sign.
+**HTTP e2e determinism harden (2026-08-24):** Advisor FAIL (honesty-closer
+review) on intermittent `Cancelled` (labels=`ended_event` only) under the
+default parallel harness. Remediation: shared suite Tokio runtime (no
+per-test runtime create/destroy), graceful axum shutdown (no
+`JoinHandle::abort`), healthz must succeed, and `finish_http_test` settles
+connection closeouts under `suite_lock`.
+
+**Advisor (2026-08-24, HTTP e2e determinism harden):** **PASS — Silver**
+for this harness slice only (not Golden). Named Cancelled flake not
+reproduced after harden; advisor re-ran **20/20** default-harness HTTP +
+**10/10** combined Fake+HTTP. Live on-disk counts this tree: Fake
+`#[test]` **16**, HTTP `#[test]` **15**; `cargo test` **16/16** + **15/15**.
+Historical agent stress (**40/40** exit-code file checks) is retained as
+supporting evidence, not a Golden DoD. D-053 stays **Fixed**. Spec header /
+Loop README remain **Not** Golden / §25 / D-025. Do **not** promote Golden /
+§25 / D-025. Agents must not self-sign.
+**Next pick:** independent Golden / D-025 review (agents prepare evidence
+only — see `doc/D025_EVIDENCE_PACK.md`) **or** remaining named §23 extras /
+D-054 compatibility outside DirectLlm. Do not re-pick RuntimeOwner Drop.
+
+**Advisor (2026-08-24, D-053 honesty closer bar check):** **FAIL — not
+Silver-closed as stamped** *(pre-harden; superseded by HTTP determinism
+harden PASS above)*. D-053 autodiscovery stays **Fixed**; do not reopen it.
+At FAIL time HTTP was flaky (`Cancelled` / 14/15); that named next pick was
+**HTTP harden**, now landed. Spec header / Loop README remain **Not** Golden
+/ §25 / D-025. Architecture gates 10/10; product crates still do not depend
+on testkit. Do **not** promote Golden / §25 / D-025. Agents must not
+self-sign.
+
+**Advisor (2026-08-24, HTTP e2e determinism harden bar check):** **PASS —
+Silver** for this **harness slice** only (Golden-progress on the DirectLlm
+row, **not** a Golden promotion). D-053 autodiscovery stays **Fixed**. Spec
+header / Loop README remain **Not** Golden / §25 / D-025. Architecture
+gates 10/10; product crates still do not depend on testkit. HTTP stays
+Connector; the harden is test-only (`direct_llm_openai_e2e.rs`).
+
+The prior FAIL's named flake is closed on this tree. Shared suite runtime +
+`suite_lock` + healthz + graceful axum shutdown (no `JoinHandle::abort` on
+the happy path) + `finish_http_test` closeout are live. On-disk counts:
+Fake **16** `#[test]`, HTTP **15** `#[test]`. This review: Fake 16/16;
+HTTP default-harness **20/20** full-suite passes; combined Fake+HTTP
+**10/10**. Named proofs
+`http_inline_max_continuations_zero_ends_limit_exceeded` and
+`inline_tool_continuation_second_exchange_emits_text` ran inside those
+suites (no `Cancelled` / 14/15 this review).
+
+Honesty (do not reopen the flake; do not treat as Golden):
+- Linear DEFECTS order had the harden **40/40** claim *above* the FAIL that
+  requested it. Treat **40/40 / 60/60** as the implementer's stress note,
+  not this review's evidence. Independently verified here: **20/20** HTTP +
+  **10/10** combined.
+- Independent-verdict polish stamp "**15/15 and 14/14**" is **stale**. Live
+  counts are Fake **16/16**, HTTP **15/15**.
+- `finish_http_test`'s 5 ms settle is harness closeout, not a product
+  Cancelled-root-cause proof. `drain_until_completed` still prefers the
+  completion channel (labels=`ended_event` can still be an observation
+  artifact if a real `Cancelled` returns).
+- `suite_lock` serializes this binary; default `--test-threads` no longer
+  races HTTP tests against each other. Product isolation remains
+  `concurrent_http_openai_admits_are_isolated`.
+- D-053 map remaining-Golden line is narrowed in the same-day map edit:
+  §23 extras + D-054 compatibility + D-025, not sign-off-only.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+**Next pick:** remaining named **§23 extras / D-054** outside DirectLlm
+(exhaustive public-limit exact/plus-one inventory, race/load, live Grok,
+or the declared compatibility-alias breaking cut). Independent Golden /
+D-025 last. Do not re-pick HTTP 15/15 or RuntimeOwner Drop.
+
+**Advisor (2026-08-24, FakeConnector DirectLlm parity bar check):**
+**PASS — Silver+Golden-progress** for this slice only. Three-component
+boundaries hold: FakeConnector remains dialect-labelled bytes + per-open
+script (no SSE/tool/prompt parse); `output_dialect` is a Connector stamp;
+encoders and inline continuation stay in Component 3; Interpreter still
+consumes complete units from labelled bytes. Product crates do not depend
+on testkit (architecture gates green). D-053 stays **Fixed** — this fills
+the named DirectLlm replacement residual, it does not reopen the autodiscovery
+defect. Proofs at stamp time: fake e2e 6/6, HTTP/OpenAI e2e 6/6,
+`scripted_sequence_advances_per_open_and_fails_closed_when_exhausted`.
+Do **not** promote Golden / §25 / D-025. Honesty leftover at stamp time:
+`LimitExceeded`/`max_continuations` bound e2e was still absent — **closed in
+the follow-up bound-e2e slice**. Workspace clippy `-D warnings` currently
+fails on pre-existing `needless_lifetimes` in
+`provider_tool_call_id_from_action` (not introduced here — do not claim
+§23 re-green from this landing).
 
 **Expert + Advisor (2026-08-24, InlineToolContinuation + call-ID reuse):**
 **PASS — Silver+Golden-progress** for this slice only. Fresh ExchangeId /
@@ -3509,7 +3646,9 @@ under D-054. Do **not** promote Golden / §25 / D-025.
 **Priority:** P2
 
 **Status:** Fixed (2026-08-23) — Silver honesty/deletion slice after WP-12 /
-D-003 retarget. Do **not** promote Golden / §25 / D-025.
+D-003 retarget. **Deprecated-alias Golden residual closed (2026-08-24)** via
+DECISIONS **D-060** after normative status retarget. Do **not** promote
+Golden / §25 / D-025.
 
 **Affected:**
 - `crates/monoloop-loop/src/transaction/active_registry.rs` (deleted)
@@ -3517,7 +3656,7 @@ D-003 retarget. Do **not** promote Golden / §25 / D-025.
 - `crates/monoloop-loop/src/transaction/exchange.rs` (deleted)
 - `crates/monoloop-loop/src/transaction/spawn_gate.rs` (deleted)
 - callback-based compatibility types/aliases in contracts and Loop exports
-  (retained — explicit compatibility phase)
+  (removed under D-060; host `adapt_*` helpers retained)
 - `doc/SECURITY_REVIEW_CHECKLIST.md`
 - `doc/TRANSACTION_RUNTIME_V2_SPEC.md`
 
@@ -3547,14 +3686,15 @@ were also open, so v2 §23 and §25 could not pass.
 **Still open for Golden / §25 / D-025 (do not claim closed here):**
 - Exhaustive public-limit / race-load / live Grok qualifications (§23 extras).
 - Unsigned independent security / acceptance review (D-025).
-- Breaking removal of compatibility aliases.
 - A subsequent independent acceptance review finding no unresolved P0/P1/P2.
+- Optional later: move `adapt_*` out of `monoloop-loop` (not a Golden blocker).
 
 **Acceptance criteria:**
 - [x] Delete obsolete uncompiled lifecycle/event modules after coverage migration.
 - [x] Remove callback-based core APIs and compatibility aliases at the declared
   breaking boundary, **or** narrow M7/status language to an explicitly incomplete
-  compatibility phase. (Chose narrow language; aliases retained.)
+  compatibility phase. (Silver chose narrow language; **D-060** executed the
+  deprecated-only breaking cut.)
 - [x] Close D-046–D-053 and rerun mandatory §23 core gates.
 - [x] Retarget remaining WP-12 Pass rows that still name deleted v1 suites
   (`hardening`, `exchange_e2e`) or the removed `CallbackService` as live
@@ -3848,10 +3988,204 @@ after fifth independent REJECT; fifth-pass parked-send proof: Expert + Advisor
 DirectLlm Phase A+B partial landed: HTTP/OpenAI text+concurrency;
 CallerControlled `ContinuationRequired`; InlineToolContinuation one-round
 second exchange (`encode_tool_continuation`); call-ID reuse across sequential
-admits. **Still open for full Golden:** multi-round inline (N>1), Fake
-parity suites, independent §25 / D-025 sign-off. **Next pick:** multi-round
-inline hardening and/or independent Golden review. Agents must not
-self-sign. Do **not** promote Golden / §25 / D-025.
+admits. **Multi-round inline landed:** bounded N>1 tool→model loops with
+cumulative context + `LimitExceeded` on bound / context overflow
+(`inline_multi_round_tool_continuation_completes_after_second_tool`).
+**FakeConnector parity landed (2026-08-24):** `tests/direct_llm_fake_e2e.rs`
+mirrors HTTP/OpenAI scenarios via FakeConnector `ScriptedSequence` +
+configurable `output_dialect` (text, CallerControlled, one-/multi-round
+inline, concurrency, call-ID reuse). Connector unit proof
+`scripted_sequence_advances_per_open_and_fails_closed_when_exhausted`.
+**LimitExceeded / max_continuations bound e2e landed (2026-08-24):** Fake
+9/9 and HTTP 8/8 on this tree include zero/one continuation ceiling and
+Fake context-byte ceiling → `LimitExceeded` without over-opening.
+**Expert + Advisor PASS — Silver+Golden-progress** (bound-e2e slice).
+**Provider-budget bounds landed (2026-08-24):**
+`max_provider_exchanges` + `max_total_provider_{input,output}_bytes` enforced
+as `LimitExceeded` (Fake+HTTP 12/12 each on this tree). DirectLlm replacement
+row independent continuation/provider bounds are now live, not config-only.
+**Advisor (2026-08-24, provider-budget bound slice):** **PASS — Silver**
+for this slice only. D-053 config-only residual **closed**.
+**Provider-budget exact/cumulative polish landed** (fake 16/16, HTTP 15/15):
+remaining==0 before open; `max_provider_exchanges=2` exact; cumulative output
+exact + plus-one Fake+HTTP; Fake continuation remaining-input `== 0`.
+HTTP harness determinism hardened (shared RT + graceful SSE shutdown);
+Advisor **PASS — Silver** on harden (20/20 + 10/10 combined in that review).
+Unsigned evidence pack for human Sign-off: `doc/D025_EVIDENCE_PACK.md`.
+**Advisor (2026-08-24, unsigned D-025 evidence pack):** **PASS — Silver,
+process readiness only.** Sign-off not self-filled; on-disk counts Fake 16 /
+HTTP 15 honest; does **not** close D-025 / Golden / §25.
+**Not** Golden / §25 / D-025.
+**§23 public-limit matrix honesty (2026-08-24):** Added
+`doc/S23_PUBLIC_LIMIT_MATRIX.md` naming every `TransactionLimits` field as
+Covered / Partial / Open; wired into
+`s23_exact_limit_plus_one_inventory_present` (matrix must list all fields;
+DirectLlm continuation/provider-budget needles registered).
+**Advisor (2026-08-24, matrix honesty):** **PASS — Silver** with honesty fix:
+`max_event_queue*` demoted to **Open (unwired)** — DeliveryLimits proofs are
+not this field. **Wiring follow-up:** `max_actor_commands` → control `mpsc`
+capacity; `DispatcherLimits` from `TransactionLimits` (concurrent/queued/payload/
+output) instead of hardcoded `8/16`/`usize::MAX`; proof
+`max_tool_output_bytes_plus_one_fails_closed`. Matrix updated.
+**Advisor (2026-08-24, Covered honesty re-check):** **FAIL — not honesty-closed
+as stamped.** `max_tool_output_bytes` / concurrent / queued were still
+**Covered** while proofs set `DispatcherLimits` or only showed wiring.
+**Honesty fix:** those three → **Partial**; added
+`fake_transaction_limits_max_tool_output_bytes_plus_one_fails_closed` which
+sets **`TransactionLimits.max_tool_output_bytes`** through `StartedRuntime` /
+`limits_from_transaction` → field **Covered**. Concurrent/queued remain
+**Partial** (wired, no field cell).
+**Advisor (2026-08-24, Covered honesty fix):** **PASS — Silver.** Legend vs
+statuses hold; Fake **17/17**; no Golden overclaim. D-053 count leftover
+(16→17) closed on next docs touch.
+**Partial→Covered follow-up:** `fake_transaction_limits_max_tool_payload_bytes_plus_one_rejects`
+sets **`TransactionLimits.max_tool_payload_bytes`** → payload **Covered**.
+Fake suite **18/18**. Concurrent/queued/actor-commands remain Partial.
+**Advisor (2026-08-24, payload Covered):** **PASS — Silver.** Matches matrix
+legend; not §23-exhaustive.
+Still Open: event-queue fields, actor-command bytes, tool schema, diagnostics,
+callback deadline. Concurrent/queued/actor-commands remain Partial pending
+field cells.
+**Partial→Covered (concurrent):** `transaction_limits_max_concurrent_tools_plus_one_rejects`
+sets **`TransactionLimits.max_concurrent_tools_per_transaction`** via
+`limits_from_transaction` → concurrent **Covered**.
+**Advisor (2026-08-24, concurrent Covered):** **PASS — Silver.** Legend holds;
+next pick was queued (same class).
+**Partial→Covered (queued):** `transaction_limits_max_queued_tools_plus_one_rejects`
+sets **`TransactionLimits.max_queued_tools_per_transaction`** → queued
+**Covered**. Actor-commands remain Partial. Fake DirectLlm **18/18**.
+**Next pick:** Partial→Covered (`max_actor_commands`) **or** Open product
+bounds **or** race/load / live Grok / D-054 **or** independent D-025 Sign-off.
+Do not re-pick HTTP 15/15, RuntimeOwner Drop, or concurrent/queued/payload
+Covered cells.
+**Still open for full Golden:** independent §25 / D-025 sign-off (agents
+must not self-sign); remaining §23 extras / D-054 compatibility phase.
+Fake+HTTP DirectLlm replacement is **not** a Golden / §25 / D-025 claim.
+RuntimeOwner Drop already Silver-passed — do not re-list as open next work.
+Do **not** promote Golden / §25 / D-025.
+**Advisor (2026-08-24, Covered honesty fix bar check):** **PASS — Silver**
+for this honesty slice. Golden / §25 / D-025 are **not** overclaimed (matrix
+header, spec, Loop README, security checklist, D-025 pack keep exhaustive
+§23 / Sign-off open). Previous shaped-Covered residual **closed**:
+`max_concurrent_tools_per_transaction` / `max_queued_tools_per_transaction`
+are **Partial** (wired via `limits_from_transaction`; no test assigns those
+`TransactionLimits` fields; `capacity_limit_plus_one_rejects` is shared
+global capacity). `max_tool_output_bytes` **Covered** cites
+`fake_transaction_limits_max_tool_output_bytes_plus_one_fails_closed`, which
+sets `TransactionLimits.max_tool_output_bytes` through `StartedRuntime` /
+`limits_from_transaction` and fails closed (`output_contract_violated`).
+DispatcherLimits-only `max_tool_output_bytes_plus_one_fails_closed` is
+correctly adjacent. Field inventory 26/26. Legend vs statuses hold:
+Covered = this field set + fail-closed; Partial = wired/adjacent; Open =
+unwired (event-queue, actor-command bytes, tool schema, diagnostics,
+callback deadline). Fake suite **17/17** on this tree (new cell included).
+Inventory gate keeps Covered needles on disk; it still does **not** codegen
+status vs proof.
+
+Standing caveat (not a fail of this slice): legend Covered is fail-closed
+at the bound (exact *and/or* plus-one), weaker than §23 “exact **and**
+plus-one”; acceptable only while the exhaustive bullet stays open.
+`max_tool_output_bytes` is plus-one fail-closed, not exact-admits.
+
+Leftover (do not reopen this honesty cut): `doc/D053_COVERAGE_REPLACEMENT.md`
+still says Fake **16/16**; on-disk / D-025 pack are **17**. Bump the map on
+the next docs touch.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+**Next pick:** dedicated `TransactionLimits` exact/plus-one on a wired
+Partial cell (`max_concurrent_tools_per_transaction` /
+`max_queued_tools_per_transaction` / `max_tool_payload_bytes` /
+`max_actor_commands`) through `StartedRuntime` — **or** wire+prove /
+spec-retire an Open product bound (event-queue vs `DeliveryLimits`, tool
+schema, diagnostics, actor-command bytes) — **or** race/load / live Grok /
+D-054 alias cut. Independent D-025 last. Do not re-pick HTTP 15/15,
+RuntimeOwner Drop, DispatcherLimits re-wire, or this Covered/Partial relabel.
+**Advisor (2026-08-24, §23 public-limit matrix honesty bar check):** **FAIL —
+not honesty-closed as stamped.** Golden / §25 / D-025 are **not** overclaimed
+(matrix header, D-025 pack, security checklist, D-053 map, spec header all
+keep the exhaustive §23 bullet open). All nine **Open** rows stay Open and
+have no dedicated exact/plus-one proofs. Field inventory matches
+`TransactionLimits` (26/26). Inventory gate names fields + keeps needles on
+disk; it does **not** codegen every public limit.
+
+Honesty residual (shaped Covered / next pick):
+- `max_event_queue` / `max_event_queue_bytes` **Covered** cites
+  `s22_6_event_{item,byte}_plus_one_*`, which exercise host
+  `DeliveryLimits`, not these `TransactionLimits` fields. The fields are
+  validate-only (no Loop use site). Status should be **Partial** or **Open
+  (unwired)** — same pattern already used for
+  `max_concurrent_tools_per_transaction`.
+- Several **Open** examples in the next pick (`max_actor_commands` /
+  `max_actor_command_bytes`, `max_tool_schema_bytes`,
+  `max_queued_tools_per_transaction`, `max_diagnostic_*`,
+  `callback_deadline`, `max_tool_{payload,output}_bytes`) are config /
+  validate-only or hardcoded on the production dispatcher
+  (`with_runtime_resources(..., 8, 16)` + `usize::MAX` payload/output).
+  Plus-one tests on those cells without wiring (or a spec deletion) would
+  be shaped-done.
+- Legend **Covered** = exact *and/or* plus-one is weaker than §23 “exact
+  **and** plus-one”; acceptable only while the exhaustive bullet stays open.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+**Next pick:** relabel event-queue rows and mark unwired Open cells as
+unwired (finish this honesty slice) **then** wire+prove a real Open bound
+(tool payload/output or actor command, if still a product limit) **or**
+race/load / live Grok / D-054 alias cut. Independent D-025 last. Do not
+re-pick HTTP 15/15 or RuntimeOwner Drop.
+**Advisor (2026-08-24, matrix honesty fix + TransactionLimits wiring bar check):**
+**FAIL — not honesty-closed as stamped.** Golden / §25 / D-025 are **not**
+overclaimed (matrix header, spec, Loop README, security checklist, D-025 pack
+keep exhaustive §23 / Sign-off open). Previous event-queue residual **closed**:
+`max_event_queue*` are **Open (unwired)**; `s22_6_event_*` remain DeliveryLimits
+needles, not these fields. Field inventory still 26/26. Wiring is real Silver
+progress: control `mpsc` uses `max_actor_commands`; production dispatchers use
+`limits_from_transaction` (no hardcoded `8/16` + `usize::MAX` on the
+coordinator path). `max_actor_commands` **Partial** and remaining Open rows
+(event-queue, actor-command **bytes**, tool schema, diagnostics, callback
+deadline) are honest.
+
+Honesty residual (shaped **Covered** vs own legend):
+- Legend **Covered** = proof sets **this** `TransactionLimits` field and fails
+  closed. **Partial** = wired or adjacent proof, not a field-exact+plus-one cell.
+- `max_tool_output_bytes` **Covered** cites
+  `max_tool_output_bytes_plus_one_fails_closed`, which constructs
+  `DispatcherLimits { max_tool_output_bytes: 4 }` — not
+  `TransactionLimits.max_tool_output_bytes`. Same adjacent-proof class as
+  payload (correctly **Partial**). Status should be **Partial**.
+- `max_concurrent_tools_per_transaction` / `max_queued_tools_per_transaction`
+  **Covered** on wiring only. No test sets those `TransactionLimits` fields.
+  `capacity_limit_plus_one_rejects` is shared global capacity, not these
+  fields. Status should be **Partial**.
+- Covered = exact *and/or* plus-one remains weaker than §23 “exact **and**
+  plus-one”; acceptable only while the exhaustive bullet stays open.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+**Next pick:** relabel the three shaped Covered rows to **Partial** (finish
+this honesty slice) **then** either a dedicated `TransactionLimits` exact+plus-one
+cell on a wired field (output / concurrent / queued / actor-commands) **or**
+wire+prove a still-Open product bound (event-queue vs DeliveryLimits, tool
+schema, diagnostics, actor-command bytes) **or** race/load / live Grok /
+D-054 alias cut. Independent D-025 last. Do not re-pick HTTP 15/15,
+RuntimeOwner Drop, or re-wire DispatcherLimits.
+**Advisor (2026-08-24, provider-budget exact/cumulative polish):** **PASS —
+Silver+Golden-progress** for this slice only. Counts re-verified 15/15 and
+14/14. D-053 map HTTP plus-one clause narrowed. Do **not** promote Golden /
+§25 / D-025.
+
+**Advisor (2026-08-24, D-053 honesty closer bar check):** **FAIL — not
+Silver-closed as stamped.** Fake 16/16 holds; HTTP 15/15 does not
+(flakes to 14/15). Map plus-one tests exist; remaining-Golden-as-sign-off-
+only is shaped-done. See D-053 record. Do **not** promote Golden / §25 /
+D-025. **Next pick:** deterministic HTTP DirectLlm e2e, then §23 extras /
+D-054. Agents must not self-sign.
+
+**Advisor (2026-08-24, HTTP e2e determinism harden bar check):** **PASS —
+Silver** for this harness slice only. Named HTTP flake closed on this tree
+(Fake **16/16**, HTTP **15/15**; this review 20/20 HTTP full-suite + 10/10
+combined). Polish stamp "15/15 and 14/14" is stale. Spec / Loop README
+**Not** Golden / §25 / D-025. **Next pick:** remaining named §23 extras /
+D-054 outside DirectLlm. Independent Golden / D-025 last. Agents must not
+self-sign.
 
 **Expert + Advisor (2026-08-23, D-046 Fixed):** **PASS — Silver** for this
 slice only.
@@ -3935,3 +4269,1051 @@ while WP-12 leftover Pass rows still cited deleted suites / `CallbackService`.
 honesty/deletion slice (see D-054 record). **Next pick:** independent
 acceptance / D-025 sign-off or named Golden work. Agents must not
 self-sign. Do **not** promote Golden / §25 / D-025.
+
+**Advisor (2026-08-24, max_tool_payload_bytes Covered promotion):** **PASS —
+Silver** for this honesty slice. Legend vs status hold: the cited
+`fake_transaction_limits_max_tool_payload_bytes_plus_one_rejects` sets
+**`TransactionLimits.max_tool_payload_bytes`** through `StartedRuntime` /
+`limits_from_transaction` (coordinator production path; binding
+`min(spec.max_input_bytes, transaction cap)`), then fail-closes before
+handler start (`validate_tool_input` → `DispatchOutcome::Rejected` /
+`oversized_input`). Not a DispatcherLimits-only or wiring-only cell.
+Fake DirectLlm **18/18** on this tree. Concurrent/queued remain **Partial**;
+event-queue / actor-command bytes / schema / diagnostics / callback stay
+**Open**. Do **not** promote Golden / §25 / D-025.
+
+Standing caveats (not a fail of this relabel): legend Covered is fail-closed
+at the bound (exact *and/or* plus-one), weaker than §23 “exact **and**
+plus-one”. The payload cell is oversize fail-closed (cap `5` vs
+`{"q":"hello-world"}`), not exact-admits. The assertion matches
+`Completed`/`DomainFailed` message substring because `DispatchRejected`
+is remapped to `tool_execution_failed` + `oversized_input:…`; the
+`RuntimeFailed` arm is unused. Same class as `max_tool_output_bytes`.
+
+**Next pick:** dedicated `TransactionLimits` field cell on a remaining
+wired **Partial** (`max_concurrent_tools_per_transaction` /
+`max_queued_tools_per_transaction` / `max_actor_commands`) through
+`StartedRuntime` — **or** wire+prove / spec-retire an **Open** product
+bound (event-queue vs `DeliveryLimits`, `max_actor_command_bytes`, tool
+schema, diagnostics, `callback_deadline`) — **or** race/load / live Grok /
+D-054 alias cut. Independent D-025 last. Do not re-pick this payload
+Covered relabel, `max_tool_output_bytes` Covered, HTTP 15/15,
+RuntimeOwner Drop, or DispatcherLimits re-wire.
+
+**Advisor (2026-08-24, max_queued_tools_per_transaction Covered promotion):**
+**FAIL — not honesty-closed as Covered.** Golden / §25 / D-025 are **not**
+overclaimed. Concurrent / payload / output Covered cells are **not** reopened.
+
+Legend **Covered** = proof sets **this** `TransactionLimits` field and fails
+closed **at the bound**. The cited
+`transaction_limits_max_queued_tools_plus_one_rejects` does set
+`TransactionLimits.max_queued_tools_per_transaction = 1` and maps through
+`limits_from_transaction` (same dispatcher layer as concurrent — that part
+matches the concurrent PASS). It does **not** prove the bound:
+
+- `try_enqueue` occupies the queue slot only until `try_acquire` succeeds,
+  then dequeues. Echo is `ImmediateToolHandler`; txn concurrent is 32, so
+  acquire is immediate when the scheduler serializes.
+- The cell is a 16-task barrier stampede asserting `queue_full >= 1`. That
+  is a load/race interleaving, not exact-admit of 1 queued start and
+  plus-one reject of the 2nd. Per-tool `max_concurrent: 2` (from `make_spec`)
+  may make overlap common (30/30 green on this tree) — still not a bound cell.
+- No exact-admit assertion. `>= 1` under parallel enqueue is the shaped-
+  qualification pattern (Law/style: deterministic fixtures over scheduler
+  races). Adjacent concurrent cell is the contrast: hold one running, second
+  deterministically `tool_capacity_exceeded`.
+
+Status should stay **Partial** (wired + reject code can fire) until a
+deterministic plus-one exists. Do **not** skip to `max_actor_commands` while
+this row is Covered on a stampede.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** relabel `max_queued_tools_per_transaction` → **Partial** **or**
+replace the stampede with a deterministic field cell (hold 1 running so a
+second dispatch stays queued, then plus-one `tool_queue_full`; optionally
+exact-admit) — then re-ask Covered. After that: Partial→Covered
+`max_actor_commands` **or** wire+prove / spec-retire an Open product bound
+(event-queue vs `DeliveryLimits`, `max_actor_command_bytes`, tool schema,
+diagnostics, `callback_deadline`) **or** race/load / live Grok / D-054 alias
+cut. Independent D-025 last. Do not re-pick concurrent/payload/output Covered,
+HTTP 15/15, RuntimeOwner Drop, or DispatcherLimits re-wire.
+
+**Agent (2026-08-24, max_queued_tools_per_transaction deterministic rewrite):**
+Replaced the 16-way barrier stampede with a hold-plus-one field cell matching
+the concurrent Covered pattern and the Advisor FAIL next pick:
+
+- Sets `TransactionLimits.max_queued_tools_per_transaction = 1` (and
+  `max_concurrent_tools_per_transaction = 1`) through
+  `TransactionToolDispatcher::limits_from_transaction`.
+- Hold tool occupies the sole concurrent slot (`active_tools() == 1`).
+- Second echo enqueue occupies the sole queue slot (`queued_tools() == 1`)
+  while spinning ≤50ms for acquire (exact-admit of bound=1).
+- Third echo → deterministic `tool_queue_full` (plus-one fail-closed).
+- Second then → `tool_capacity_exceeded` after the spin window.
+- Observation: `TransactionToolDispatcher::{active_tools,queued_tools}`
+  forward to existing `TransactionToolCapacity` counters (bounded-resource
+  observation only; no ambient identity).
+
+Needle unchanged: `transaction_limits_max_queued_tools_plus_one_rejects`.
+Matrix row stays **Covered** with updated proof note. linked_tools 17/17;
+queued cell 10/10 consecutive; s23 inventory 4/4.
+
+Do **not** promote Golden / §25 / D-025. Awaiting Expert/Advisor Covered PASS
+on this deterministic cell before Partial→Covered `max_actor_commands`.
+
+**Advisor (2026-08-24, max_queued_tools_per_transaction Covered after rewrite):**
+**PASS — Covered** for this cell only. Golden / §25 / D-025 are **not**
+claimed. Concurrent / payload / output Covered cells are **not** reopened.
+
+Prior FAIL residual **closed**: the 16-way barrier stampede (`queue_full >= 1`)
+is gone. Cited
+`transaction_limits_max_queued_tools_plus_one_rejects` now:
+
+- Sets **`TransactionLimits.max_queued_tools_per_transaction = 1`** (and
+  concurrent=1 so the hold occupies the only running slot) through
+  `limits_from_transaction` (production dispatcher mapping).
+- Hold until `active_tools() == 1`; second dispatch until
+  `queued_tools() == 1` (exact occupancy of bound=1).
+- Sequential third → `tool_queue_full` (plus-one fail-closed). Waiter then
+  `tool_capacity_exceeded` after the bounded spin. Missed occupancy fails
+  the test (40ms wait vs 50ms spin), not green.
+
+Same dispatcher-layer class as concurrent Covered PASS. Observation APIs
+`active_tools` / `queued_tools` wrap existing `TransactionToolCapacity`
+counters — not ambient identity, not testkit bleed. Inventory needle
+unchanged. Re-verified this tree: linked_tools **17/17**, cell **10/10**,
+s23 inventory **4/4**.
+
+Standing caveats (not a fail of this relabel): legend Covered is fail-closed
+at the bound (exact *and/or* plus-one), weaker than §23 “exact **and**
+plus-one”; this cell has occupancy + plus-one. `max(1)` floor on mapping
+is out of cell scope.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** Partial→Covered `max_actor_commands` — set
+`TransactionLimits.max_actor_commands` on `StartedRuntime` / owner control
+`mpsc` (`owner.rs` already wires capacity); exact-admit then plus-one
+`ControlCapacityExceeded` (not a generic Full/AlreadyTerminal lie). **Or**
+wire+prove / spec-retire an Open product bound (event-queue vs
+`DeliveryLimits`, `max_actor_command_bytes`, tool schema, diagnostics,
+`callback_deadline`) **or** race/load / live Grok / D-054 alias cut.
+Independent D-025 last. Do not re-pick queued/concurrent/payload/output
+Covered, HTTP 15/15, RuntimeOwner Drop, or DispatcherLimits re-wire.
+
+**Agent (2026-08-24, max_actor_commands Partial→Covered candidate):**
+Sets **`TransactionLimits.max_actor_commands = 1`** on `StartedRuntime`
+(`owner.rs` already sizes control `mpsc` from that field). Test-only
+`ControlHoldGate` / `RuntimeConfig.hold_control` pauses preferential + select
+control drain (same class as `StartHoldGate` / `hold_start`; production
+default `None`). Hang admit stays non-terminal:
+
+- First `terminate(Cancel)` → `Accepted` (exact-admit of bound=1).
+- Second `terminate(Cancel)` same live tx → `ControlCapacityExceeded`
+  (plus-one fail-closed; not Full→AlreadyTerminal).
+- Needle: `transaction_limits_max_actor_commands_plus_one_rejects`.
+- Matrix → **Covered**; s23 inventory needle added.
+- Re-verify: cell **10/10**; s23 **4/4**; adjacent D-039/D-040 control/start
+  tests still green.
+
+Do **not** promote Golden / §25 / D-025. Awaiting Expert/Advisor Covered PASS.
+
+**Advisor (2026-08-24, max_actor_commands Partial→Covered):** **PASS —
+Covered** for this cell only. Golden / §25 / D-025 are **not** claimed.
+Queued / concurrent / payload / output Covered cells are **not** reopened.
+
+Legend **Covered** = proof sets **this** `TransactionLimits` field and fails
+closed at the bound. Cited
+`transaction_limits_max_actor_commands_plus_one_rejects` does that:
+
+- Sets **`TransactionLimits.max_actor_commands = 1`** on `StartedRuntime`
+  (`RuntimeConfig.transaction_limits`).
+- Owner sizes the supervisor control `mpsc` from that field (`owner.rs`;
+  not `max_active+8`). Production `hold_control` is `None`; test-only
+  `ControlHoldGate` pauses preferential `try_recv` **and** `select` recv
+  (`control_drain_enabled`) so occupancy is deterministic — same class as
+  `hold_start` / D-040.
+- First `terminate(Cancel)` on a live Hang tx → `Accepted` (exact-admit of
+  bound=1). Second same live tx → `ControlCapacityExceeded` (plus-one
+  fail-closed; D-039 ledger check still runs first — not Full→AlreadyTerminal).
+- Needle in `s23_exact_limit_plus_one_inventory_present`. Matrix row
+  **Covered**. No ambient identity; Loop-owned; no product→testkit bleed.
+
+Re-verified this tree: needle **ok**; s23 inventory **4/4**;
+`terminate_after_cancel_is_ledger_honest` (D-039) **ok**;
+`start_queue_full_rolls_back_all_permits` (D-040) **ok**. Agent “cell 10/10”
+not reproduced as a named filter here; the field cell itself is green.
+
+Standing caveats (not a fail of this relabel): legend Covered is weaker than
+§23 exhaustive exact-**and**-plus-one of every public limit. Spec §6 still
+names per-actor `command_rx` for child results; production maps this field
+to the supervisor control queue (D-015 accepted wiring; no `ActorCommand`
+channel in-tree). `.max(1)` is defensive — `TransactionLimits::validate`
+already rejects zero. `max_actor_command_bytes` stays **Open** (item
+capacity only; control messages are closed enums).
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** wire+prove or spec-retire an **Open** product bound —
+prefer `max_event_queue` / `max_event_queue_bytes` vs caller
+`DeliveryLimits` (unwired TransactionLimits fields; existing s22.6 proofs
+are the wrong type) — **or** `max_actor_command_bytes` / `max_tool_schema_bytes`
+/ diagnostics / `callback_deadline` — **or** Partial deadline cells
+(`transaction_deadline` / `cleanup_deadline` /
+`terminal_event_delivery_deadline`) — **or** race/load / live Grok / D-054
+alias cut. Independent D-025 last. Do not re-pick
+queued/concurrent/payload/output/`max_actor_commands` Covered, HTTP 15/15,
+RuntimeOwner Drop, or DispatcherLimits re-wire.
+
+**Agent (2026-08-24, max_event_queue* Open→Covered candidate):**
+Wired `TransactionLimits.max_event_queue` / `max_event_queue_bytes` as
+**admission ceilings** over caller `DeliveryLimits` (D-055). Enqueue
+fail-closed stays on DeliveryLimits (`s22_6_event_*` unchanged).
+
+- `delivery.event_tx` exposes `max_event_items()` (installed at
+  `transaction_delivery`) alongside existing `max_event_bytes()`.
+- Admission rejects `InvalidConfiguration` when items/bytes exceed the
+  runtime ceiling (before reservations/ledger).
+- Needles:
+  `transaction_limits_max_event_queue_exact_admits_plus_one_rejects`,
+  `transaction_limits_max_event_queue_bytes_exact_admits_plus_one_rejects`.
+- Matrix → **Covered**; s23 inventory updated; DECISIONS D-055;
+  IMPLEMENTATION comment.
+- Re-verify: both cells green (10× filter); s23 **4/4**; contracts delivery
+  **8/8**; adjacent `capacity_plus_one` / `max_messages` green.
+
+Do **not** promote Golden / §25 / D-025. Awaiting Expert/Advisor Covered PASS.
+Do not re-pick max_actor_commands / queued / concurrent / payload / output.
+
+**Advisor (2026-08-24, max_event_queue* Open→Covered via D-055):** **PASS —
+Covered both** for these two cells only. Golden / §25 / D-025 are **not**
+claimed. `max_actor_commands` / queued / concurrent / payload / output
+Covered cells are **not** reopened.
+
+Legend **Covered** = proof sets **this** `TransactionLimits` field and fails
+closed at the bound. Cited needles do that:
+
+- Sets **`TransactionLimits.max_event_queue = 1`** /
+  **`max_event_queue_bytes = 1024`** on `StartedRuntime`
+  (`RuntimeConfig.transaction_limits`).
+- `StartedRuntime` copies limits onto `RuntimeShared`; `handle.submit` →
+  `admit` **before** reservations. Rejects `InvalidConfiguration` when
+  `delivery.event_tx.max_event_items() > max_event_queue` or
+  `max_event_bytes() > max_event_queue_bytes` (D-055). Accessors are the
+  capacities installed at `transaction_delivery`, not ambient defaults.
+- Exact admits (`items=1` / `bytes=1024`); plus-one rejects (`items=2` /
+  `bytes=1025`) with the field name in the error. Equality uses `>` so the
+  ceiling is inclusive.
+- Needles in `s23_exact_limit_plus_one_inventory_present`. Matrix rows
+  **Covered**. Adjacent `s22_6_event_{item,byte}_plus_one_fails_closed`
+  remain DeliveryLimits enqueue proofs (not this field). Loop-owned; explicit
+  `SessionId`; no product→testkit bleed.
+
+Re-verified this tree: both cells **10/10**; s23 inventory **4/4**; adjacent
+`s22_6_event_*` **ok**; contracts `delivery` **8/8**.
+
+Standing caveats (not a fail of this relabel): D-055 is an **admission
+ceiling** over caller-built mailboxes — it does not size the queue; enqueue
+fail-closed stays on `DeliveryLimits`. Legend Covered is weaker than §23
+exhaustive exact-**and**-plus-one of every public limit (these two cells
+happen to have both). Field inventory still 26/26.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** wire+prove or spec-retire an **Open** product bound —
+`max_actor_command_bytes` / `max_tool_schema_bytes` / `max_diagnostic_count` /
+`max_diagnostic_bytes` / `callback_deadline` — **or** Partial deadline cells
+(`transaction_deadline` / `cleanup_deadline` /
+`terminal_event_delivery_deadline`) — **or** race/load / live Grok / D-054
+alias cut. Independent D-025 last. Do not re-pick
+queued/concurrent/payload/output/`max_actor_commands`/`max_event_queue*`
+Covered.
+
+**Advisor (2026-08-24, max_event_queue* Open→Covered via D-055):** **PASS —
+Covered** for both cells only. Golden / §25 / D-025 are **not** claimed.
+Queued / concurrent / payload / output / `max_actor_commands` Covered cells
+are **not** reopened.
+
+Legend **Covered** = proof sets **this** `TransactionLimits` field and fails
+closed at the bound. Cited needles do that:
+
+- Sets **`TransactionLimits.max_event_queue` / `max_event_queue_bytes`** on
+  `StartedRuntime`; admission rejects `InvalidConfiguration` when caller
+  `DeliveryLimits` exceed the ceiling (before reservations) — D-055.
+- Exact-admit + plus-one for items (1/2) and bytes (1024/1025).
+- Enqueue fail-closed remains on DeliveryLimits (`s22_6_event_*` adjacent).
+- Same class as `max_messages` admit ceilings. No ambient identity;
+  Loop-owned; no product→testkit bleed.
+
+Re-verified this tree: both cells **10×**; s23 **4/4**; contracts delivery
+**8/8**. Expert PASS aligns.
+
+Standing caveats (not a fail): Covered legend is weaker than exhaustive §23
+exact-**and**-plus-one of every public limit. Design §13 “enforces event
+queue” under push delivery means runtime ceiling over caller ports, not
+runtime-allocated mailbox.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** wire+prove or spec-retire an **Open** product bound —
+`max_actor_command_bytes` / `max_tool_schema_bytes` / diagnostics /
+`callback_deadline` — **or** Partial deadline cells — **or** race/load /
+live Grok / D-054 alias cut. Independent D-025 last. Do not re-pick
+queued/concurrent/payload/output/`max_actor_commands`/`max_event_queue*`
+Covered, HTTP 15/15, RuntimeOwner Drop, or DispatcherLimits re-wire.
+
+**Agent (2026-08-24, max_tool_schema_bytes Open→Covered candidate):**
+Wired `TransactionLimits.max_tool_schema_bytes` at `StartedRuntime::start`
+(D-056). Replaced hardcoded `64 * 1024` in `HostToolRegistry::build` with
+`TransactionLimits::default().max_tool_schema_bytes`; start re-checks against
+the runtime field so tighter ceilings cannot be bypassed.
+
+- Needle: `transaction_limits_max_tool_schema_bytes_exact_admits_plus_one_rejects`
+  (exact schema size admits; size−1 → `InvalidConfig`).
+- Matrix → **Covered**; s23 inventory; DECISIONS D-056.
+- Re-verify: cell **10×**; s23 **4/4**; linked_tools green.
+
+Do **not** promote Golden / §25 / D-025. Awaiting Expert/Advisor Covered PASS.
+Do not re-pick event-queue / max_actor_commands / queued / concurrent /
+payload / output Covered.
+
+**Expert (2026-08-24, max_tool_schema_bytes Open→Covered via D-056):** **PASS —
+Covered** for this cell only. `max_event_queue*` / `max_actor_commands` Covered
+cells are **not** reopened.
+
+Legend **Covered** = proof sets **this** `TransactionLimits` field and fails
+closed at the bound. Cited needle does that:
+
+- Sets **`TransactionLimits.max_tool_schema_bytes`** on `StartedRuntime`.
+- `StartedRuntime::start` measures `serde_json::to_vec(input_schema)` **before**
+  executor spawn; `>` ceiling → `InvalidConfig("tool schema exceeds
+  max_tool_schema_bytes")`. Inclusive exact size. Same `ToolSpec` for both
+  sides.
+- Needle: exact `schema_bytes` admits; `schema_bytes-1` rejects at start.
+- Build-under-default then tighter start is **closed** (D-056). Registry is
+  immutable; no post-start insert; no ambient identity; no lock-across-await.
+- Empty registry: loop is a no-op; does not start `ToolRuntime`.
+
+Re-verified this tree: cell **ok**; s23 inventory **ok**.
+
+Standing caveats (not a fail of this relabel): construction hygiene in
+`HostToolRegistry::build` remains pinned to `TransactionLimits::default()`
+(cannot raise above 64 KiB via the runtime field). `.max(1)` is defensive —
+`validate` already rejects zero. Build `unwrap_or(0)` on serialize failure is
+dead for `serde_json::Value`. Output-contract schemas are not this field.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** wire+prove or spec-retire an **Open** product bound —
+`max_actor_command_bytes` / diagnostics / `callback_deadline` — **or** Partial
+deadline cells — **or** race/load / live Grok / D-054 alias cut. Independent
+D-025 last. Do not re-pick queued / concurrent / payload / output /
+`max_actor_commands` / `max_event_queue*` / `max_tool_schema_bytes` Covered.
+
+**Advisor (2026-08-24, max_tool_schema_bytes Open→Covered via D-056):** **PASS —
+Covered** for this cell only. Golden / §25 / D-025 are **not** claimed.
+Queued / concurrent / payload / output / `max_actor_commands` /
+`max_event_queue*` Covered cells are **not** reopened.
+
+Legend **Covered** = proof sets **this** `TransactionLimits` field and fails
+closed at the bound. Cited needle does that:
+
+- Sets **`TransactionLimits.max_tool_schema_bytes`** on `StartedRuntime`.
+- `StartedRuntime::start` re-validates `serde_json::to_vec(input_schema)`
+  against the bootstrap field **before** executor spawn; `>` ceiling →
+  `InvalidConfig("tool schema exceeds max_tool_schema_bytes")` (D-056).
+- Exact schema size admits; `schema_bytes - 1` (one byte over) rejects.
+  Same `ToolSpec` both sides. Inclusive exact.
+- Loop-owned (`monoloop-loop` lifecycle); no ambient session/run identity;
+  no product→testkit bleed (`monoloop-loop` Cargo.toml has no testkit dep).
+- Empty registry: start loop is a no-op; does not start `ToolRuntime`.
+
+Re-verified this tree: cell **10/10**; s23 inventory **4/4**; linked_tools
+**17/17**. Expert PASS aligns.
+
+Standing caveats (not a fail): construction hygiene in
+`HostToolRegistry::build` stays pinned to `TransactionLimits::default()`
+(cannot raise above 64 KiB via the runtime field). Covered legend is weaker
+than exhaustive §23 exact-**and**-plus-one of every public limit.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** wire+prove or spec-retire an **Open** product bound —
+`max_actor_command_bytes` (likely spec-retire; closed-enum control msgs) /
+`max_diagnostic_*` / `callback_deadline` — **or** Partial deadline cells —
+**or** race/load / live Grok / D-054 alias cut. Independent D-025 last.
+Do not re-pick event-queue / `max_actor_commands` / queued / concurrent /
+payload / output / `max_tool_schema_bytes` Covered.
+
+**Agent (2026-08-24, max_actor_command_bytes Open→Retired candidate):**
+Spec-retired via **D-057**. Supervisor `ControlCommand` is a closed enum
+(Cancel / ForceTerminate / BeginShutdown / StopSupervisor); product control
+bound remains item capacity **`max_actor_commands`** (already Covered). Field
+retained for validate nonzero / ABI; no byte accounting use site invented.
+
+- Matrix legend adds **Retired**; row → Retired citing D-057.
+- `limits.rs` / IMPLEMENTATION comments updated.
+- Golden residual note: Retired is decision-closed, not Open.
+
+Do **not** promote Golden / §25 / D-025. Awaiting Expert/Advisor Retired PASS.
+Do not re-pick max_tool_schema_bytes / event-queue / max_actor_commands /
+queued / concurrent / payload / output Covered.
+
+**Advisor (2026-08-24, max_actor_command_bytes Open→Retired):** **PASS —
+Retired (D-057).** Not Covered.
+
+Re-verified this tree:
+
+- `ControlCommand` is a closed four-variant enum (`Cancel` / `ForceTerminate` /
+  `BeginShutdown` / `StopSupervisor`); payloads are `TransactionId` or unit —
+  no variable command bytes to budget.
+- Production control `mpsc` is sized from `TransactionLimits.max_actor_commands`
+  (Covered needle `transaction_limits_max_actor_commands_plus_one_rejects`).
+  `max_actor_command_bytes` has **no** enqueue / accounting use site (validate
+  nonzero + ABI only, as D-057 states).
+- `DECISIONS.md` D-057; matrix legend includes **Retired**; row cites D-057;
+  Golden residual treats Retired as decision-closed, not Open. Field comments
+  in `limits.rs` and IMPLEMENTATION §12 match.
+- s23 inventory **4/4**. Loop-owned; no ambient session/run identity; no
+  product→testkit bleed (`monoloop-loop` has no testkit dep).
+
+Standing caveats (not a fail of Retired): IMPLEMENTATION §6 still names
+per-actor `command_rx` / `ActorCommand` for child results — historical target
+architecture; production remaps via D-015/D-057 to the supervisor control
+queue (no in-tree `ActorCommand`). Reintroducing payload-bearing control
+messages requires a superseding decision plus a real byte bound. Covered
+legend remains weaker than exhaustive §23 of every public limit.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** wire+prove or spec-retire an **Open** product bound —
+prefer `max_diagnostic_count` / `max_diagnostic_bytes` (no production
+`TransactionEventPayload::Diagnostic` emission path yet — `SafeDiagnostic`
+construction uses `TransactionLimits::default()`, not the runtime field;
+wire a real emission path **or** defer with a DECISIONS entry) —
+**or** `callback_deadline` (validate-only; no production wait site) —
+**or** Partial deadline cells (`transaction_deadline` / `cleanup_deadline` /
+`terminal_event_delivery_deadline`) — **or** race/load / live Grok / D-054
+alias cut. Independent D-025 last.
+Do not re-pick schema / event-queue / `max_actor_commands` / queued /
+concurrent / payload / output Covered, and do not re-pick this Retired cell.
+
+**Agent (2026-08-24, diagnostics defer D-058 + transaction_deadline Covered candidate):**
+
+1. **`max_diagnostic_count` / `max_diagnostic_bytes`:** Deferred via **D-058**.
+   No production `TransactionDiagnostic` emission (`CanonicalUnit` path only;
+   completion diagnostics always empty; ledger count unused). Matrix rows stay
+   **Open** with D-058 note — not Covered, not invented emission.
+
+2. **`transaction_deadline` Partial→Covered candidate:**
+   `transaction_limits_transaction_deadline_hang_ends_deadline_exceeded` sets
+   `TransactionLimits.transaction_deadline = 80ms` on `StartedRuntime`; Hang
+   exchange → `TransactionEndKind::DeadlineExceeded`. Needle + matrix Covered.
+   Re-verify: cell **10×**; s23 **4/4**.
+
+Do **not** promote Golden / §25 / D-025. Awaiting Expert/Advisor on both
+(D-058 deferral honesty + deadline Covered). Do not re-pick Retired
+max_actor_command_bytes / schema / event-queue / max_actor_commands /
+queued / concurrent / payload / output Covered.
+
+**Advisor (2026-08-24, §23 matrix honesty dual gate):** **PASS** on both
+(D-058 deferral honesty + `transaction_deadline` Covered). Not Golden / §25 /
+D-025.
+
+1. **D-058 — PASS deferral.** `max_diagnostic_count` / `max_diagnostic_bytes`
+   stay **Open**. `DECISIONS.md` D-058; matrix notes cite it. Production does
+   not emit `TransactionEventPayload::Diagnostic` (coordinator publishes
+   `CanonicalUnit` only; `build_completion` / `end_event` pass empty
+   diagnostics; ledger `diagnostic_count` is admission `0` with no increment).
+   `SafeDiagnostic::try_new_default` uses `TransactionLimits::default()`, not
+   the runtime field. No shaped Covered; no invented emission path.
+
+2. **`transaction_deadline` Partial→Covered — PASS Covered.** Needle
+   `transaction_limits_transaction_deadline_hang_ends_deadline_exceeded` sets
+   `TransactionLimits.transaction_deadline = 80ms` on `StartedRuntime`.
+   Production maps that field to `RuntimeShared.default_deadline` → exchange
+   `remaining()`; Fake Hang stays open until local cancel/terminate; elapsed
+   remaining → `ExchangeFailure::DeadlineExceeded` →
+   `TransactionEndKind::DeadlineExceeded`. `cleanup_deadline` in the cell is
+   500ms (distinct). Inventory needle present. Re-verified this tree: cell
+   **10/10** (~0.09s each, consistent with 80ms not the 2s wait cap); s23
+   inventory **4/4**. Loop-owned (`monoloop-loop` lifecycle); no ambient
+   session/run identity; no product→testkit bleed (`monoloop-loop` has no
+   testkit dep).
+
+Standing caveats (not a fail): Covered legend remains weaker than exhaustive
+§23 exact-**and**-plus-one of every public limit. Duration cell is fail-closed
+at the bound (not a count exact/plus-one). Open/Partial residuals remain:
+`max_diagnostic_*` (D-058), `callback_deadline`, `cleanup_deadline`,
+`terminal_event_delivery_deadline`.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** Partial→Covered on `cleanup_deadline` /
+`terminal_event_delivery_deadline` **or** wire+prove / spec-retire
+`callback_deadline` **or** race/load / live Grok / D-054 alias cut.
+Independent D-025 last. Do not re-pick Retired `max_actor_command_bytes` or
+schema / event-queue / `max_actor_commands` / queued / concurrent / payload /
+output Covered, and do not invent diagnostic emission to green D-058.
+
+**Agent (2026-08-24, terminal_event_delivery_deadline Partial→Covered candidate):**
+Sets **`TransactionLimits.terminal_event_delivery_deadline = 1ms`** on
+`StartedRuntime` (production Finalizer Seal budget). Fake echo + host mailbox
+capacity 1 (undrained) so Seal waits; completion reports
+`TerminalEventDelivery::DeadlineExceeded` and
+`TransactionEndKind::EventDeliveryFailed` (sticky remap). Long
+`transaction_deadline` (5s) so the cell is Seal budget, not tx deadline.
+
+Needle: `transaction_limits_terminal_event_delivery_deadline_seal_fails_closed`.
+Matrix → **Covered**; adjacent D-047 unit proofs retained. Re-verify: cell
+**10×**; Hang `transaction_deadline` still green; D-047 adjacent green; s23
+**4/4**.
+
+Do **not** promote Golden / §25 / D-025. Awaiting Expert/Advisor Covered PASS.
+Do not re-pick transaction_deadline Covered / D-058 deferral / Retired
+actor-command-bytes / schema / event-queue / max_actor_commands / queued /
+concurrent / payload / output Covered.
+
+**Expert (2026-08-24, terminal_event_delivery_deadline Partial→Covered):** **PASS —
+Covered** for this cell only.
+
+1. **Wire.** `StartedRuntime` copies
+   `TransactionLimits.terminal_event_delivery_deadline` onto
+   `RuntimeShared`. Finalizer Seal sets
+   `seal_budget = shared.terminal_event_delivery_deadline` and
+   `SealCommand.deadline = now + seal_budget`. Not `cleanup_deadline`, not
+   `default_deadline` / `transaction_deadline`, no 50ms floor. Reply wait is
+   `seal_budget + 100ms` slack only; Ended enqueue uses the Instant.
+
+2. **Proof.** Needle
+   `transaction_limits_terminal_event_delivery_deadline_seal_fails_closed`
+   sets the field to **1ms** on `StartedRuntime`; `transaction_deadline=5s`,
+   `cleanup_deadline=500ms`; Fake echo; `DeliveryLimits` items=1 undrained.
+   Completion: `TerminalEventDelivery::DeadlineExceeded` + sticky
+   `EventDeliveryFailed`. Re-verified **10/10** (~0.01s, not 500ms/5s);
+   Hang `transaction_deadline` still green; D-047 adjacent green; s23 **4/4**.
+
+3. **Races / distinctness.** Coordinator awaits ordinary `Publish` onto the
+   publisher cmd queue **before** `TerminalProposal`; Finalizer Seals after
+   coordinator exit — not Seal-before-first-queued-unit. Fake echo of `hi`
+   via `TestTextEncoder` (`hi. `) is a complete Text unit (sibling
+   `fake_echo_exchange_emits_canonical_text_unit`). Cap-1 undrained mailbox
+   then blocks `Ended` under the Seal Instant. D-047 needles construct
+   `run_event_publisher` with a **local** Instant and do **not** set this
+   `TransactionLimits` field — they stay adjacent Partial Instant proofs.
+
+Standing caveats (not a fail): Covered legend is fail-closed at the duration
+bound, not count exact/plus-one. 1ms Instant can theoretically expire from
+scheduling; 10/10 plus coordinator-before-Seal + echo unit make occupancy
+the production path. Open/Partial residuals unchanged:
+`max_diagnostic_*` (D-058), `callback_deadline`, `cleanup_deadline`.
+
+Do not re-pick `transaction_deadline` Covered or D-058.
+
+**Advisor (2026-08-24, terminal_event_delivery_deadline Partial→Covered):** **PASS —
+Covered** for this cell only. Not Golden / §25 / D-025.
+
+1. **Wire.** `StartedRuntime` copies
+   `TransactionLimits.terminal_event_delivery_deadline` onto `RuntimeShared`
+   (`owner.rs`). Finalizer Seal (`supervisor.rs`) uses
+   `seal_budget = shared.terminal_event_delivery_deadline` and
+   `SealCommand.deadline = now + seal_budget`. Publisher
+   `enqueue_under_deadline` / fence drain share that Instant. Not
+   `cleanup_deadline`, not `transaction_deadline`, no 50ms floor. Reply wait
+   slack (`+100ms`) does not extend Ended enqueue.
+
+2. **Proof.** Needle
+   `transaction_limits_terminal_event_delivery_deadline_seal_fails_closed`
+   sets the field to **1ms** on `StartedRuntime`; `transaction_deadline=5s`,
+   `cleanup_deadline=500ms`; Fake echo; host mailbox items=1 undrained.
+   Completion: `TerminalEventDelivery::DeadlineExceeded` + sticky
+   `TransactionEndKind::EventDeliveryFailed`. Re-verified this tree: cell
+   **10/10** (~0.01s, not 500ms/5s); Hang
+   `transaction_limits_transaction_deadline_hang_ends_deadline_exceeded`
+   **3/3** (~0.09s); s23 inventory **4/4**. Inventory needle present. Matrix
+   row **Covered**. Loop-owned (`monoloop-loop` lifecycle); no ambient
+   session/run identity; no product→testkit bleed.
+
+3. **Adjacent D-047.** Named matrix adjacent
+   `d047_seal_uses_terminal_deadline_not_transaction_deadline` green;
+   `d047_terminal_deadline_uses_configured_value_exactly` and
+   `d047_full_queue_seal_reports_deadline_not_published` green. Those D-047
+   needles construct `run_event_publisher` with a local Instant and do **not**
+   set this `TransactionLimits` field. They stay adjacent Instant proofs.
+
+Standing caveats (not a fail): Covered legend is fail-closed at the duration
+bound, not count exact/plus-one. `d047_seal_priority_when_ordinary_cmd_queue_full`
+is racy in isolation (1/10 here: ordinary queue drained before the Full
+assert) — it does not set this field and is **not** the Covered cell. Open /
+Partial residuals: `max_diagnostic_*` (D-058), `callback_deadline`,
+`cleanup_deadline`.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** Partial→Covered on `cleanup_deadline` **or** wire+prove /
+spec-retire `callback_deadline` **or** race/load / live Grok / D-054 alias
+cut. Independent D-025 last. Do not re-pick `transaction_deadline` Covered /
+D-058 deferral / Retired actor-command-bytes / schema / event-queue /
+`max_actor_commands` / queued / concurrent / payload / output Covered /
+this `terminal_event_delivery_deadline` Covered. Do not invent diagnostic
+emission to green D-058.
+
+**Agent (2026-08-24, callback_deadline D-059 deferral + cleanup_deadline honesty):**
+
+1. **`callback_deadline`:** Deferred via **D-059**. Validate-only; M7 push
+   completion has no core host-callback wait. Matrix stays **Open** with
+   D-059 note — not Covered, not invented wait.
+
+2. **`cleanup_deadline`:** Remains **Partial**. Wired to exchange
+   `children.wait(cleanup_deadline)` (exact) and quiesce hard-grace
+   (`cleanup_deadline.max(2s)` floor on that path). No distinct fail-closed
+   completion code suitable for a Covered duration cell without inventing
+   observability. Matrix note updated.
+
+Do **not** promote Golden / §25 / D-025. Awaiting Expert/Advisor on D-059
+deferral honesty (+ cleanup Partial note). Do not re-pick
+terminal_event_delivery_deadline / transaction_deadline Covered or D-058.
+
+**Expert (2026-08-24, D-059 callback_deadline + cleanup_deadline Partial):** **PASS**
+on both. Not a self-sign of remaining Open/Partial rows.
+
+1. **A `callback_deadline` D-059 — PASS deferral.** Field is validate-nonzero
+   only (`TransactionLimits::validate`). Production completion is M7 push
+   oneshot (`TransactionCompletionSender`); core MUST NOT invoke
+   `CompletionCallback` (v2 §6.1–6.3). Host `adapt_completion_callback` is
+   unbounded `recv` on the caller task and does not read this field.
+   Inventing a core wait/timeout solely to green Covered would contradict
+   non-blocking completion send and put host-callback execution back on the
+   kernel. Open + D-059 (same honesty class as D-058) is correct; not
+   Covered; not Retired unless a later decision deletes the product bound.
+
+2. **B `cleanup_deadline` stay Partial — PASS honesty.** Exchange
+   `ChildJoins::wait` uses the field exactly (`tokio::time::timeout`, result
+   discarded). Quiesce hard-grace uses `cleanup_deadline.max(2s)` (D-045:
+   never abort Finalizer; EventPublisher only after grace). Completion always
+   publishes `CleanupStatus::Pending { counts }` — timeout does not rewrite
+   terminal cause (v2 §13.1) and has no distinct fail-closed completion
+   code. **Do not remove the 2s floor to claim Covered via hard-grace:**
+   that path is shutdown residual abort, not a field-exact fail-closed
+   transaction cell; shrinking grace races Seal/completion (D-045). Stay
+   Partial until a real cleanup-timeout observation exists (e.g. distinct
+   `CleanupStatus` / join-timeout proof that still does not rewrite cause).
+
+Do **not** reopen `terminal_event_delivery_deadline` Covered.
+
+**Next pick:** remaining Open/Partial (`max_diagnostic_*` D-058,
+`callback_deadline` D-059, `cleanup_deadline` Partial) **or** race/load /
+live Grok / D-054 alias cut. Independent D-025 last. Do not invent a
+callback wait or strip the quiesce floor to green Covered.
+
+**Advisor (2026-08-24, §23 matrix honesty dual gate):** **PASS** on both
+(D-059 deferral + `cleanup_deadline` Partial). Not Golden / §25 / D-025.
+
+1. **D-059 `callback_deadline` — PASS deferral.** Field stays **Open**, not
+   Covered. `DECISIONS.md` D-059; matrix cites it. Production use is
+   validate-nonzero only (`TransactionLimits::validate`). Core completion is
+   M7 push oneshot (`TransactionCompletionSender`); v2 §6.1–6.3 **MUST NOT**
+   invoke `CompletionCallback`. `callback_deadline` has **no** production
+   wait/join in product crates (contracts field + validate only). Host
+   `adapt_completion_callback` is unbounded `recv` on the caller task and does
+   not read this field. Same honesty class as D-058: Open + DECISIONS, not
+   invented wait, not Retired (product bound retained until a superseding
+   decision wires a real core or documented host-adapter wait).
+
+2. **`cleanup_deadline` stay Partial — PASS honesty.** Exchange
+   `ChildJoins::wait` applies the field exactly (`tokio::time::timeout`;
+   result discarded). Supervisor quiesce hard-grace uses
+   `cleanup_deadline.max(Duration::from_secs(2))` (D-045: do not abort
+   Finalizer; EventPublisher only after grace). Completion always publishes
+   `CleanupStatus::Pending { live counts }` — join timeout does not rewrite
+   terminal cause (v2 §13.1) and has no distinct fail-closed completion code.
+   **Do not require Covered** without an observable cleanup-timeout signal.
+   **Do not require floor removal** to fake a duration cell: shrinking grace
+   races Seal/completion. Covered later only if floor removal **and** a
+   fail-closed observation are explicitly agreed (still must not rewrite
+   cause).
+
+Re-verified this tree: s23 **4/4**;
+`transaction_limits_terminal_event_delivery_deadline_seal_fails_closed`
+green (~0.06s). Loop-owned (`monoloop-loop` lifecycle); no ambient
+session/run identity; no product→testkit bleed (`monoloop-loop` has no
+testkit dep).
+
+Standing caveats (not a fail): Covered legend remains weaker than exhaustive
+§23 exact-and-plus-one of every public limit. Open/Partial residuals remain
+Golden blockers: `max_diagnostic_*` (D-058), `callback_deadline` (D-059),
+`cleanup_deadline` (Partial). `TRANSACTION_RUNTIME_IMPLEMENTATION.md` §7
+still describes v1 callback reservation/deadline steps; v2 + D-059 supersede
+that path — do not treat the old numbered list as a Covered obligation.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** race/load / live Grok / D-054 alias cut. Independent D-025
+last. `cleanup_deadline` Covered **only** if floor removal + observable
+fail-closed signal are agreed. Do not invent diagnostic emission (D-058) or
+a callback wait (D-059). Do not re-pick `terminal_event_delivery_deadline`
+Covered, `transaction_deadline` Covered, or D-058.
+
+**Agent (2026-08-24, Golden residual handoff — D-054 inventory + D-025 pack refresh):**
+After D-059 / cleanup Partial honesty PASS, next pick was race/load / live
+Grok / D-054 / independent D-025 last (no self-sign).
+
+Landed (evidence prep only — **not** Golden / §25 / D-025 / breaking cut):
+
+1. **`doc/D054_COMPATIBILITY_ALIAS_INVENTORY.md`** — enumerated retained
+   deprecated surfaces (`TransactionRequest`, `TransactionRuntime`,
+   `RuntimeToolSpill`, `adapt_*`) and a breaking-cut checklist. Cut **not**
+   executed.
+2. **`doc/D025_EVIDENCE_PACK.md`** refreshed to current §23 matrix honesty
+   (Covered / Retired D-057 / Open D-058–D-059 / Partial cleanup), named Fake
+   race needles, and D-054 inventory pointer. Sign-off table **still unsigned**.
+3. Matrix “Still open for Golden” updated to cite inventory + named-vs-exhaustive
+   race wording.
+
+Re-verify: s23 **4/4**; `multi_channel_multi_session_concurrent_load` green.
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+Awaiting Expert/Advisor on handoff honesty (inventory complete? pack unsigned?).
+
+**Expert (2026-08-24, Golden residual handoff honesty):** **PASS** — inventory
+complete for the declared M7.3 set; D-025 pack unsigned and matrix-honest.
+**Not** Golden / §25 / D-025. Breaking cut **not** executed.
+
+1. **D-054 aliases.** Workspace `#[deprecated]` is exactly three symbols:
+   `TransactionRequest`, `TransactionRuntime`, `RuntimeToolSpill` — all
+   inventoried. `StartedRuntime` / `TransactionRuntimeHandle::submit` take
+   `TransactionSubmitRequest` only; **no** `impl TransactionRuntime`.
+   Production fields use `OrphanToolPermitSet`; `RuntimeToolSpill` is
+   re-export + type alias. `adapt_*` live only in `lifecycle/delivery.rs`
+   plus `tests/s22_7_host_adapters.rs` (kernel does not invoke). In-tree
+   examples use `TransactionSubmitRequest`. No missed live production
+   caller that would block a future breaking cut of those surfaces.
+   Checklist matches M7.3; item 3 (adapt_* stay vs move) is the host
+   decision; item 4 grep is the in-tree caller sweep.
+
+2. **D-025 pack vs `S23_PUBLIC_LIMIT_MATRIX.md`.** Covered/Retired/Open/Partial
+   summary matches the matrix (including D-055 event-queue, D-056 schema,
+   D-057 retired bytes, D-058 diagnostics, D-059 callback, cleanup Partial
+   with `max(2s)` floor). Named Fake needles exist
+   (`concurrent_global_capacity_exhaustion_admits_exactly_max`,
+   `concurrent_per_channel_capacity_exhaustion_admits_exactly_channel_max`,
+   `multi_channel_multi_session_concurrent_load`,
+   `submit_versus_shutdown_barrier_race_two_outcomes`) and are labelled
+   **not exhaustive**. Pack header + Sign-off pointer remain unsigned;
+   DirectLlm on-disk `#[test]` counts are Fake **18** / HTTP **15**.
+
+Standing caveats (not a fail): `HostCompletionAdapter` / `HostEventAdapter`
+are empty public markers beside `adapt_*` (cut with item 3, not a fourth
+deprecated alias). Dispatcher `reap_vault` / `reap_finished` no-op are
+M5.4 vault-name leftovers, not M7 callback aliases. Checklist item 4 should
+also grep non-deprecated `adapt_*` when the cut runs.
+
+Do **not** promote Golden / §25 / D-025. Do not re-pick D-059 or
+`terminal_event_delivery_deadline` Covered.
+
+**Advisor (2026-08-24, Golden residual handoff honesty):** **PASS** — accept
+D-054 alias inventory + unsigned D-025 pack refresh as next-pick delivery.
+**Not** Golden / §25 / D-025. Breaking cut **not** executed. This is **not**
+a Sign-off self-sign.
+
+Independently re-checked:
+
+| Claim | Verdict |
+|---|---|
+| Inventory complete for declared M7.3 set | Workspace `#[deprecated]` is exactly `TransactionRequest`, `TransactionRuntime`, `RuntimeToolSpill` — all inventoried. **No** `impl TransactionRuntime`. `StartedRuntime` / `TransactionRuntimeHandle::submit` take `TransactionSubmitRequest`. `adapt_*` invoked only from `tests/s22_7_host_adapters.rs` (kernel does not call). Host traits `TransactionEventSink` / `CompletionCallback` listed. Cut checklist present and unmarked-done. |
+| D-025 pack unsigned + matrix-honest | Pack header forbids Sign-off / Golden. `SECURITY_REVIEW_CHECKLIST.md` Sign-off still `_TBD_`. Covered / Retired (D-057) / Open (D-058, D-059) / Partial (`cleanup_deadline`, `max(2s)` floor) match `doc/S23_PUBLIC_LIMIT_MATRIX.md`. DirectLlm on-disk `#[test]` counts Fake **18** / HTTP **15**. Named Fake race needles labelled **not exhaustive**. |
+| Matrix still-open cites inventory | `S23_PUBLIC_LIMIT_MATRIX.md` “Still open for Golden” names D-054 inventory + unsigned D-025 pack; Open/Partial not waived. |
+| s23 4/4 + multi-channel load | Re-ran this tree: `s23_forbidden_patterns` **4/4**; `multi_channel_multi_session_concurrent_load` green (~0.03s). |
+
+Standing caveats (not a fail): `HostCompletionAdapter` / `HostEventAdapter`
+are empty public markers beside `adapt_*` (cut with checklist item 3).
+Dispatcher `reap_finished` no-op is M5.4 vault-name leftover, not an M7
+callback alias. When the cut runs, grep non-deprecated `adapt_*` plus those
+markers. `cleanup_deadline` stays Partial; D-058 / D-059 stay Open.
+
+Do **not** promote Golden / §25 / D-025. Do not invent diagnostic emission
+(D-058) or a callback wait (D-059). Do not re-pick
+`terminal_event_delivery_deadline` Covered, `transaction_deadline` Covered,
+or D-058 / D-059.
+
+**Next pick:** execute D-054 breaking cut (**deliberate**) **or** expand
+named race/load **or** live Grok (if env allows) **or** human/contracted
+D-025 Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md` (agents must not
+self-sign). Independent D-025 last unless a human is actually signing.
+
+**Agent (2026-08-24, D-054 / D-060 breaking cut executed):**
+Deliberate cut of deprecated-only compatibility surfaces (Advisor next pick
+after handoff PASS). **Not** Golden / §25 / D-025 Sign-off.
+
+Removed:
+- `TransactionRequest`, `TransactionRuntime` (contracts)
+- `RuntimeToolSpill` alias
+- Empty `HostCompletionAdapter` / `HostEventAdapter`
+- `reap_vault` / orphan `reap_finished` no-ops
+
+Retained (host helpers, outside kernel executor): `adapt_event_sink` /
+`adapt_completion_callback` + host sink/callback traits.
+
+DECISIONS **D-060**; inventory + D-025 pack + matrix still-open updated.
+Re-verify: contracts+loop lib/tests green; s23 **4/4**; s22_7 **5/5**;
+s22_4_tools **9/9**.
+
+Awaiting Expert/Advisor on cut honesty (no live callers missed; adapt_*
+retention OK). Agents must not self-sign D-025.
+
+**Advisor (2026-08-24, D-060 as close of D-054 deprecated-alias breaking cut):**
+**FAIL — do not close** the D-054 Golden residual yet. The **code cut is
+sound**; current-status language still claims a compatibility phase. That is
+the same inaccurate-completion class D-054 was opened for.
+
+Independently re-checked (not a Sign-off self-sign of D-025 / §25 / Golden):
+
+| Claim | Verdict |
+|---|---|
+| Deprecated-only surfaces gone | Workspace has **zero** `#[deprecated]`. No `TransactionRequest` / `trait TransactionRuntime` / `RuntimeToolSpill` / `HostCompletionAdapter` / `HostEventAdapter` / dispatcher `reap_vault` / `OrphanToolPermitSet::reap_finished` in `*.rs`. Production submit remains `StartedRuntime` / `TransactionRuntimeHandle::submit(TransactionSubmitRequest)`. `TaskSupervisor::reap_finished` is a real join helper — not the removed no-op. |
+| `adapt_*` retained as host helpers | `adapt_event_sink` / `adapt_completion_callback` live in `lifecycle/delivery.rs`; crate re-export only. Kernel does not invoke. Callers: `tests/s22_7_host_adapters.rs`. Host traits `TransactionEventSink` / `CompletionCallback` retained. Matches D-060 / M1 / §22.7. Optional move out of `monoloop-loop` is **not** this cut. |
+| D-060 + inventory + pack + matrix | `DECISIONS.md` D-060 records the cut. Inventory “cut executed”. D-025 pack notes executed + `adapt_*` retained; Sign-off **unsigned**. Matrix Open (D-058/D-059) / Partial (`cleanup_deadline`) untouched. |
+| Suites | Re-ran this tree: s23 **4/4**; s22_7 **5/5**; s22_4_tools **9/9**; contracts lib+architecture **28+10**; loop lib+tests green (incl. empty-registry `empty_registry_unavailable_zero_effects`). Architecture gates **10/10**. |
+| Honesty leftover (blocks close) | Normative v2 spec **header** + **M7.3** + §20 delete list still say **Incomplete — compatibility phase** and that deprecated aliases **remain**. Loop README **D-054 (partial)** still says `RuntimeToolSpill` / `TransactionRequest` remain. `DECISIONS.md` D-003 still says aliases remain until a D-054 breaking cut (D-060 **is** that cut). Matrix “Still open for Golden” still lists the executed cut as if it were an open residual. |
+
+Three-component shape intact. Product crates ↛ testkit. No ambient session
+heuristic. No invented diagnostic emission (D-058) or callback wait (D-059).
+`callback_deadline` / `max_diagnostic_*` stay **Open**; `cleanup_deadline`
+stays **Partial**. Do **not** re-pick terminal/transaction Covered.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** retarget current-status claims to D-060 (spec header, M7.3,
+§20 delete list, Loop README D-054 paragraph, D-003 last sentence; drop
+executed cut from matrix “still open”; contracts README “deprecated
+`TransactionRequest`” wording). Then re-present D-060 as close of the D-054
+deprecated-alias residual (`adapt_*` stay). After that: expand race/load /
+live Grok (if env) / human D-025 Sign-off.
+
+**Agent (2026-08-24, D-060 close — normative status retarget after Advisor FAIL):**
+Retargeted present-tense “compatibility phase / aliases remain” claims to
+**D-060 executed**:
+
+- `doc/TRANSACTION_RUNTIME_V2_SPEC.md` status header, §20 delete list, M7.3;
+  §6.2 example renamed to `TransactionSubmitRequest`.
+- Loop README: D-054/D-060 executed; no `RuntimeToolSpill` / partial phase.
+- `DECISIONS.md` D-003 bullet 5 → D-060 removed aliases; `adapt_*` retained.
+- Contracts README: removed shapes gone (D-060), not “deprecated still exist.”
+- Matrix still-open: dropped executed cut as open residual; optional `adapt_*`
+  crate move noted as non-blocker.
+
+Code cut unchanged. Re-verify: s23 **4/4**; s22_7 **5/5**.
+**Not** Golden / §25 / D-025. Awaiting Expert/Advisor re-present of D-054
+close via D-060 + doc honesty.
+
+**Advisor (2026-08-24, D-054 deprecated-alias residual via D-060 after status retarget):**
+**PASS** — close the named D-054 Golden residual (deprecated-alias breaking
+cut) via D-060. **Not** Golden / §25 / D-025. This is **not** a Sign-off
+self-sign.
+
+Independently re-checked (prior FAIL leftover superseded):
+
+| Claim | Verdict |
+|---|---|
+| V2 header / M7.3 / §20 / §6.2 | Header: M7 deletion / deprecated-alias cut **executed** (D-054 Silver + D-060); aliases removed; `adapt_*` retained outside kernel. M7.3 **Done for deprecated-only surfaces**. §20 delete list: aliases **removed** (D-060). §6.2 example is `TransactionSubmitRequest` (not sink-shaped `TransactionRequest`). No present-tense “Incomplete — compatibility phase.” |
+| Loop README / D-003 / contracts README | Loop: D-054/D-060 aliases **removed**; **Not Golden / §25**. D-003 bullet 5: aliases **removed** under D-060; `adapt_*` remain host helpers. Contracts README: former sink-shaped types **removed** (D-060); host traits remain. |
+| Matrix still-open | Executed cut **not** listed as open. Open: D-058/D-059; Partial: `cleanup_deadline`; race/load named-not-exhaustive; live Grok; unsigned D-025; optional `adapt_*` crate move as non-blocker. |
+| Inventory + D-025 pack | Inventory “cut executed”; `adapt_*` retained. Pack notes executed cut; Sign-off **unsigned** (`SECURITY_REVIEW_CHECKLIST.md` `_TBD_`). |
+| Suites | Re-ran this tree: s23 **4/4**; s22_7 **5/5**; architecture **10/10**. |
+| `adapt_*` host helpers | Defined in `lifecycle/delivery.rs`; crate re-export only. Kernel does not invoke. Callers: `tests/s22_7_host_adapters.rs`. Host traits `TransactionEventSink` / `CompletionCallback` retained. Workspace **zero** `#[deprecated]`. No `TransactionRequest` / `trait TransactionRuntime` / `RuntimeToolSpill` / Host* markers / dispatcher `reap_vault` / `OrphanToolPermitSet::reap_finished` in `*.rs`. `TaskSupervisor::reap_finished` is the real join helper. Production submit remains `StartedRuntime` / `TransactionRuntimeHandle::submit(TransactionSubmitRequest)`. |
+
+Three-component shape intact. Product crates ↛ testkit. No ambient session
+heuristic. No invented diagnostic emission (D-058) or callback wait (D-059).
+Do **not** re-pick terminal/transaction Covered or D-058/D-059.
+
+Standing caveats (not a fail): D-054’s remaining Golden boxes (exhaustive
+§23 extras; independent review) stay open as **program-level** residuals,
+not as an unexecuted alias cut. Optional `adapt_*` crate move is a later
+decision. `doc/D053_COVERAGE_REPLACEMENT.md` DirectLlm Golden-still-open
+sentence retargeted in the same honesty pass (drop executed cut).
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** expand race/load / live Grok (if env) / human D-025 Sign-off
+on `doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025 last unless a
+human is actually signing.
+
+**Agent (2026-08-24, race/load expansion after D-054/D-060 PASS):**
+Live Grok blocked (`GROK_AGENT_SECRET` unset). Expanded named Fake race/load:
+
+1. Needle `concurrent_hang_terminate_storm_all_cancelled` — 8 Hang admits,
+   barrier concurrent Cancel → all `Accepted`, all `Cancelled`, shutdown
+   `completions_published == 8`.
+2. `doc/S23_RACE_LOAD_INVENTORY.md` — named proof table (not exhaustive).
+3. Matrix still-open + D-025 pack cite the inventory; live Grok still open.
+
+Re-verify: terminate-storm green; multi_channel load green; s23 **4/4**.
+**Not** Golden / §25 / D-025. Awaiting Expert/Advisor. Agents must not
+self-sign. Do not invent diagnostic/callback waits. Do not re-pick D-060 /
+terminal Covered / D-058 / D-059.
+
+**Advisor (2026-08-24, named Fake race/load expansion — terminate storm + inventory; live Grok blocked):**
+**PASS — Silver** for this named expansion only. **Not** Golden / §25 / D-025.
+This is **not** a Sign-off self-sign. Live Grok remaining blocked is **correct**
+(env `GROK_AGENT_SECRET` unset on this tree; do not invent a live session).
+
+Independently re-checked:
+
+| Claim | Verdict |
+|---|---|
+| Needle | `concurrent_hang_terminate_storm_all_cancelled` exists; 8 distinct Hang `SessionKey`s; barrier concurrent `terminate(Cancel)`; all `Accepted`; all completions `Cancelled`; shutdown `completions_published == 8`. EmptyToolRegistry. This review: **ok**. |
+| Inventory | `doc/S23_RACE_LOAD_INVENTORY.md` lists named Fake/Hang proofs and explicitly does **not** claim exhaustive load, live Grok, or product→testkit Golden evidence. |
+| Matrix / D-025 pack | Still-open lists race/load **beyond** named proofs + live Grok + unsigned Sign-off. Pack cites the storm needle. `SECURITY_REVIEW_CHECKLIST.md` Sign-off `_TBD_`. |
+| s23 | This review: `s23_forbidden_patterns` **4/4**. `multi_channel_multi_session_concurrent_load` **ok**. |
+| Untouched | D-060 not re-opened. Deadline Covered cells / D-058 / D-059 not re-picked. No invented `TransactionDiagnostic` emission or core callback wait. Spec header, Loop README, matrix: **Not** Golden / §25. |
+
+Three-component shape intact. Product crates ↛ testkit. No ambient session
+heuristic. Named Fake proofs are **not** live Grok multi-session.
+
+Standing caveats (not a fail of this slice):
+- Named table ≠ exhaustive §23 race/load extras; matrix still-open stays honest.
+- Storm is concurrent **Cancel**, not `ForceTerminate`.
+- `s23_exact_limit_plus_one_inventory_present` does not yet require
+  `S23_RACE_LOAD_INVENTORY.md` or the storm needle on disk (unlike several
+  older race needles). Optional later: gate the race inventory the same way
+  the public-limit matrix is gated.
+- Checklist “Recent load/race proofs” does not yet name the storm (pack does).
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` (or agent
+env) is actually present — **or** further named Fake race expansion
+(`ForceTerminate` storm / ungated inventory needles) — **or** human D-025
+Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025 last unless
+a human is actually signing. Do not invent diagnostic/callback waits. Do not
+re-pick D-060, Covered deadline cells, or D-058 / D-059.
+
+**Expert (2026-08-24, race/load expansion after D-060 — terminate storm soundness):**
+**PASS expansion** (named Fake/Hang proof only). **Not** Golden / §25 / D-025.
+Do **not** reopen D-060. Do **not** self-sign Sign-off.
+
+Re-ran `concurrent_hang_terminate_storm_all_cancelled` this tree: **ok** (~0.08s).
+
+| Edge | Verdict |
+|---|---|
+| Cancel before Hang `ConnectorOwner` registered | **Product sound, proof does not pin this edge.** `terminate` is ledger-first enqueue (`Accepted` while `terminal` is none). Supervisor `Cancel` → `accept_terminal` (first decision `Cancelled`, sticky cancel, one Finalizer). `finalize_after_terminal` takes `delivery` when `handle_start` has not moved the completion sender. `handle_start` no-ops unless phase is still `Queued`. Lost-completion / `AlreadyTerminal` from this race is not the observed path. The test’s `sleep(30ms)` only biases toward a live Hang owner; it is **not** a happens-before. `StartHoldGate` already exists (`parked_starts_reach_stopped_on_shutdown`) and is unused here. Standing caveat, not a fail of the stated “N distinct Hang Cancels → Accepted / Cancelled / N completions” claim: the Queued-cancel path would still satisfy those asserts if the product remains honest. |
+| `AlreadyTerminal` lie | **Not this needle.** D-039 still maps `try_send` `Full` → `ControlCapacityExceeded`, not `AlreadyTerminal`. Default `max_actor_commands` is 256; N=8 cannot fill the control queue. Distinct `TransactionId`s; one `terminate` each; Hang pins `conn_completion` until local cancel (dropped `out_tx` is not connection end). Assert is **strict** `Accepted` (unlike `s22_3_runtime_cancel_path_counts_to_zero`, which allows `AlreadyTerminal` because Echo may finish). Premature terminal would fail, not go green. |
+| Completion count | **Sound.** One Finalizer per first terminal decision; later `WorkerExited` does not spawn a second. Shutdown skips already-terminal rows (no extra `RuntimeShutdown` publish). Test waits for N `Cancelled` receivers **then** asserts `completions_published == N`. ReceiverDropped still counts as published; missing sender would increment `completions_invariant_failed` and fail the receiver wait. |
+| Inventory honesty | **Named, not exhaustive — honest.** Table lists in-tree Fake/Hang needles including this storm; “Explicitly not claimed” covers OS-load fuzz, live Grok, product→testkit Golden. Matrix still-open + unsigned D-025 pack match. Spec header / Loop README still **Not** Golden / §25. Checklist “Recent load/race proofs” not naming the storm is stale wording, not a close. |
+| Holey async / ambient identity / Golden overclaim | 30ms sleep is holey (pre-existing Hang-harness pattern) — caveat above. No ambient session: distinct `term-storm-{i}` keys and `TransactionSelector::Transaction(id)`. EmptyToolRegistry; no `ToolRuntime.start`. No Golden / §25 / D-025 close. D-060 untouched. |
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** env is present — **or** optional named follow-up (`StartHoldGate` cancel-before-Start / `ForceTerminate` storm / inventory file gate) — **or** human D-025 Sign-off. Independent D-025 last unless a human is actually signing. Do not invent diagnostic/callback waits. Do not re-pick D-060, Covered deadline cells, or D-058 / D-059.
+
+**Agent (2026-08-24, race/load gate + ForceTerminate storm after Advisor PASS):**
+Addressed standing caveats from the prior race/load PASS:
+
+1. **`s23_race_load_inventory_present`** — requires `doc/S23_RACE_LOAD_INVENTORY.md`
+   and named storm needles on disk (s23 suite now **5** tests).
+2. Limit-inventory needles also list Cancel + ForceTerminate storms +
+   `duplicate_session_race_admits_exactly_one`.
+3. **`concurrent_hang_force_terminate_storm_all_terminated`** — Cancel twin:
+   barrier ForceTerminate → all Accepted / Terminated / N completions.
+4. Race inventory table updated.
+
+Re-verify: ForceTerminate storm green; s23 **5/5**. **Not** Golden / §25 /
+D-025 / live Grok. Awaiting Expert/Advisor. Agents must not self-sign.
+
+**Expert (2026-08-24, race/load follow-up after Advisor PASS caveats):**
+**PASS** for this named follow-up only (inventory file gate + ForceTerminate
+storm). **Not** Golden / §25 / D-025. Do **not** reopen D-060. Do **not**
+self-sign Sign-off. This is **not** a Golden residual close.
+
+Independently re-checked this tree: `s23_forbidden_patterns` **5/5**;
+`concurrent_hang_force_terminate_storm_all_terminated` **ok**;
+`concurrent_hang_terminate_storm_all_cancelled` **ok**.
+
+| Question | Verdict |
+|---|---|
+| 1. `s23_race_load_inventory_present` | **Sound for the asked bar.** Requires `doc/S23_RACE_LOAD_INVENTORY.md` and substring needles for both storms (+ `multi_channel_multi_session_concurrent_load`) in `lifecycle/tests.rs`; inventory markdown must name the eight listed proofs. Same honesty-gate class as `s23_exact_limit_plus_one_inventory_present` (file + `contains`, not a live runner). Limit-inventory also lists both storms, so deleting a storm fn fails two gates. EmptyToolRegistry / no `ToolRuntime.start` is the Hang storm fixture, not this paper gate. |
+| 2. ForceTerminate storm | **Sound twin of Cancel storm.** N=8 distinct Hang `SessionKey`s; barrier concurrent `terminate(ForceTerminate)`; strict `Accepted`; completions `Terminated`; shutdown `completions_published == 8`. Product path: ledger-first enqueue (D-039 `Full` → `ControlCapacityExceeded`, not `AlreadyTerminal`); default `max_actor_commands` 256 cannot fill at N=8; `accept_terminal(..., force_upgrade=true)` first decision spawns one Finalizer; later `WorkerExited` does not spawn a second; `begin_shutdown_inner` skips already-terminal (no extra `RuntimeShutdown`). Hang `drop(out_tx)` is not connection end (`run_hang_owner` waits local control; exchange joins `conn_completion`). Strict `Accepted`/`Terminated` would fail on a premature terminal, not go green. |
+| 3. Golden residual close | **No overclaim.** Agent stamp, inventory “Explicitly not claimed”, matrix still-open, spec header, Loop README, unsigned D-025 pack, and Sign-off `_TBD_` all keep race/load-beyond-named, live Grok, and independent review **open**. D-060 untouched. |
+
+ForceTerminate edges (asked):
+
+| Edge | Verdict |
+|---|---|
+| `AlreadyTerminal` lie | **Not this needle.** Same D-039 mapping as Cancel storm. ForceTerminate upgrades **only** ledger `Cancelled` → enqueue; Hang never self-terminals, so the storm never takes that branch. Distinct `TransactionId`s, one terminate each. |
+| Completion count | **Sound.** One Finalizer per first terminal; `completion_tx` taken once; ReceiverDropped still counts published; missing sender increments `completions_invariant_failed` and fails the receiver wait. Test waits for N `Terminated` **then** asserts `completions_published == N`. |
+| Hang register `sleep(30ms)` | **Same standing caveat as Cancel storm, not a fail of the stated claim.** Sleep biases toward a live Hang owner; it is **not** happens-before. Queued ForceTerminate is still `Accepted` → `Terminated` → one completion (`handle_start` no-ops unless `Queued`; Finalizer takes `delivery`). `StartHoldGate` unused here. |
+
+Standing caveats (not a fail of this slice):
+
+- Named table ≠ exhaustive §23 race/load; matrix still-open stays honest.
+- Gate is `contains`, not `fn` / not `#[test]`-live. Table row `submit_versus_begin_shutdown_two_outcomes` is **not** in this gate’s required needle list (nor the exact-limit required list) — deleting that fn would not fail `s23_race_load_inventory_present`. Storms **are** dual-gated.
+- `SECURITY_REVIEW_CHECKLIST.md` “Recent load/race proofs” still omits both storms; D-025 pack prose still names only the Cancel storm. Stale pointers, not a close.
+- 30ms Hang sleep remains holey (pre-existing Hang-harness pattern).
+
+Three-component shape intact. Product crates ↛ testkit. No ambient session
+heuristic. EmptyToolRegistry. Independent subscriptions N/A (lifecycle unit
+tests, not Driver). No Golden / §25 / D-025 close.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** env is present — **or** optional
+honesty leftovers (checklist/pack name ForceTerminate storm; gate
+`submit_versus_begin_shutdown_two_outcomes`) — **or** human D-025 Sign-off.
+Independent D-025 last unless a human is actually signing. Do not invent
+diagnostic/callback waits. Do not re-pick D-060, Covered deadline cells, or
+D-058 / D-059.
+
+**Advisor (2026-08-24, race inventory gate + ForceTerminate storm twin; live Grok blocked):**
+**PASS — Silver** for this named follow-up only. **Not** Golden / §25 / D-025.
+This is **not** a Sign-off self-sign. Live Grok remaining blocked is **correct**
+(`GROK_AGENT_SECRET` unset on this tree; `GROK_AGENT`/`GROK_SESSION_ID` present
+do not substitute). Do not invent a live session.
+
+Independently re-checked this tree:
+
+| Claim | Verdict |
+|---|---|
+| `s23_race_load_inventory_present` | Present; s23 suite **5/5**. Requires inventory file + both storm needles (and `multi_channel_multi_session_concurrent_load`) in lifecycle tests; inventory markdown names the eight listed proofs. Same honesty-gate class as the public-limit matrix (`contains`, not a live runner). Exact-limit inventory also lists both storms. |
+| ForceTerminate storm | Needle `concurrent_hang_force_terminate_storm_all_terminated`: 8 distinct Hang `SessionKey`s; barrier concurrent `terminate(ForceTerminate)`; all `Accepted`; completions `Terminated`; shutdown `completions_published == 8`. EmptyToolRegistry. Product path is the closed `ControlCommand::ForceTerminate` → `accept_terminal(..., Terminated, force_upgrade=true)`, not a Cancel copy. This review: **ok** (~0.05s). Cancel twin still **ok**. |
+| Inventory / matrix / D-025 | Inventory lists **both** storms and explicitly does **not** claim exhaustive load, live Grok, or product→testkit Golden evidence. Matrix still-open cites the inventory (beyond named proofs) + live Grok + unsigned Sign-off. Pack cites inventory as the full table. `SECURITY_REVIEW_CHECKLIST.md` Sign-off `_TBD_`. |
+| Untouched | D-060 not re-opened. Deadline Covered cells / D-058 / D-059 not re-picked. No invented `TransactionDiagnostic` emission or core callback wait. Spec header, Loop README, matrix: **Not** Golden / §25. |
+
+Architecture gates **10/10**. Three-component shape intact. Product crates ↛
+testkit. No ambient session heuristic (distinct `force-storm-{i}` keys +
+`TransactionSelector::Transaction(id)`). Named Fake proofs are **not** live
+Grok multi-session.
+
+Standing caveats (not a fail of this slice):
+- Named table ≠ exhaustive §23 race/load extras; matrix still-open stays honest.
+- Gate is `contains`, not `fn` / not `#[test]`-live. Inventory row
+  `submit_versus_begin_shutdown_two_outcomes` is not in this gate’s required
+  needle list — deleting that fn would not fail `s23_race_load_inventory_present`.
+  Storms are dual-gated.
+- Checklist “Recent load/race proofs” still omits both storms; D-025 pack
+  prose still names only the Cancel storm (full table pointer is the inventory).
+  Stale pointers, not a close.
+- 30ms Hang sleep remains holey (same standing caveat as the Cancel storm).
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` (or agent
+env) is actually present — **or** further named Fake race expansion — **or**
+human D-025 Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`. Optional honesty
+leftovers (checklist/pack name ForceTerminate storm; gate
+`submit_versus_begin_shutdown_two_outcomes`) are not Golden closers.
+Independent D-025 last unless a human is actually signing. Do not invent
+diagnostic/callback waits. Do not re-pick D-060, Covered deadline cells, or
+D-058 / D-059.
+
+**Agent (2026-08-24, race/load honesty caveats after Advisor PASS):**
+Closed standing caveats without claiming Golden / live Grok / D-025:
+
+1. Race inventory gate now requires `submit_versus_begin_shutdown_two_outcomes`.
+2. D-025 pack prose names **both** Cancel and ForceTerminate Hang storms + gate.
+3. Hang storms wait `owned_task_count() >= N` (bounded poll) instead of fixed
+   30ms sleep before the terminate barrier.
+4. Race inventory documents that wait.
+
+Re-verify: Cancel storm, ForceTerminate storm, s23 **5/5** green.
+`GROK_AGENT_SECRET` still unset. Awaiting Expert/Advisor. Agents must not
+self-sign D-025.

@@ -1401,14 +1401,19 @@ with different endpoint/default configuration and no provider-name branch.
 pub struct TransactionLimits {
     pub max_active_transactions: usize,
     pub max_active_per_channel: usize,
+    /// Supervisor control `mpsc` item capacity (D-015 remap of this field).
     pub max_actor_commands: usize,
+    /// Reserved; not enforced (D-057 — `ControlCommand` is a closed enum).
     pub max_actor_command_bytes: usize,
+    /// Runtime ceiling over caller `DeliveryLimits.max_event_items` (D-055).
     pub max_event_queue: usize,
+    /// Runtime ceiling over caller `DeliveryLimits.max_event_bytes` (D-055).
     pub max_event_queue_bytes: usize,
     pub max_input_bytes: usize,
     pub max_messages: usize,
     pub max_content_parts: usize,
     pub max_tools_per_transaction: usize,
+    /// Tool input-schema JSON byte ceiling at `StartedRuntime::start` (D-056).
     pub max_tool_schema_bytes: usize,
     pub max_tool_payload_bytes: usize,
     pub max_tool_output_bytes: usize,

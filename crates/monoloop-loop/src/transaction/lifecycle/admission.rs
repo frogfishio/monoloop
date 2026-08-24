@@ -81,6 +81,20 @@ pub(crate) fn admit(
         ));
     }
     let limits = &shared.transaction_limits;
+    // Event mailbox is caller-built (`transaction_delivery`); TransactionLimits
+    // are the runtime ceiling over those DeliveryLimits (design §13).
+    if request.delivery.event_tx.max_event_items() > limits.max_event_queue {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::InvalidConfiguration,
+            "delivery max_event_items exceeds max_event_queue",
+        ));
+    }
+    if request.delivery.event_tx.max_event_bytes() > limits.max_event_queue_bytes {
+        return Err(AdmissionError::new(
+            AdmissionErrorKind::InvalidConfiguration,
+            "delivery max_event_bytes exceeds max_event_queue_bytes",
+        ));
+    }
     let messages = request.input.messages();
     if messages.len() > limits.max_messages {
         return Err(AdmissionError::new(

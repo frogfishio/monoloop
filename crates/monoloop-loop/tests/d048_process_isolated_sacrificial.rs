@@ -93,8 +93,12 @@ fn run_child() {
             spill,
             Arc::clone(&owned),
             Arc::clone(&registry),
-            4,
-            8,
+            monoloop_loop::DispatcherLimits {
+                max_concurrent_tools: 4,
+                max_queued_tools: 8,
+                max_tool_payload_bytes: usize::MAX,
+                max_tool_output_bytes: usize::MAX,
+            },
         );
 
         let mut tasks = TaskSupervisor::new();

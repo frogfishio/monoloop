@@ -2,8 +2,8 @@
 
 use super::{StartedRuntime, TransactionRuntimeHandle};
 use crate::transaction::bootstrap::{
-    FinalizerHoldGate, JoinOnlySpillInject, RuntimeBootstrap, RuntimeConfig, StartHoldGate,
-    StoppedGate,
+    ControlHoldGate, FinalizerHoldGate, JoinOnlySpillInject, RuntimeBootstrap, RuntimeConfig,
+    StartHoldGate, StoppedGate,
 };
 use crate::transaction::channel_registry::{ChannelBinding, ChannelRegistry};
 use crate::transaction::fake_support::PanicEncoder;
@@ -2072,6 +2072,216 @@ fn duplicate_session_race_admits_exactly_one() {
     let _ = rt.block_on(winner_recv.expect("winner").completion.recv());
 }
 
+/// Race/load expansion: barrier-concurrent Cancel on N distinct Hang sessions.
+/// Every terminate is Accepted (ledger non-terminal); every admission completes
+/// once as Cancelled; shutdown publishes exactly N completions.
+#[test]
+fn concurrent_hang_terminate_storm_all_cancelled() {
+    let n = 8usize;
+    let limits = TransactionLimits {
+        max_active_transactions: n,
+        max_active_per_channel: n,
+        transaction_deadline: Duration::from_secs(30),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", n)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let mut receivers = Vec::new();
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let (receipt, recv) = submit(&handle, Some(&format!("term-storm-{i}"))).expect("admit Hang");
+        ids.push(receipt.transaction_id);
+        receivers.push(recv);
+    }
+    assert_eq!(started.owner.ledger_len(), n);
+    // Wait until supervisor owns at least one task per Hang admit (Coordinator /
+    // ConnectorOwner), instead of a fixed sleep heuristic.
+    let ready = Instant::now();
+    while started.owner.owned_task_count() < n as u32 {
+        assert!(
+            ready.elapsed() < Duration::from_secs(2),
+            "Hang storm: expected owned_tasks>={n} before cancel barrier, got {}",
+            started.owner.owned_task_count()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let barrier = Arc::new(Barrier::new(n));
+    let mut joins = Vec::new();
+    for id in ids {
+        let h = handle.clone();
+        let b = Arc::clone(&barrier);
+        joins.push(std::thread::spawn(move || {
+            b.wait();
+            h.terminate(
+                TransactionSelector::Transaction(id),
+                TerminationMode::Cancel {
+                    reason: CancellationReason {
+                        code: CancellationReasonCode::CallerRequested,
+                        detail: None,
+                    },
+                },
+            )
+        }));
+    }
+    let mut accepted = 0usize;
+    for j in joins {
+        let disp = j.join().unwrap();
+        assert_eq!(
+            disp,
+            TerminationDisposition::Accepted,
+            "distinct Hang cancel under headroom must Accepted, got {disp:?}"
+        );
+        accepted += 1;
+    }
+    assert_eq!(accepted, n);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for recv in receivers {
+        let completion = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), recv.completion.recv()).await
+            })
+            .expect("Hang cancel must complete within 3s")
+            .expect("completion channel closed");
+        assert_eq!(
+            completion.end.kind,
+            TransactionEndKind::Cancelled,
+            "expected Cancelled after concurrent Hang terminate storm"
+        );
+    }
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    assert!(
+        matches!(
+            outcome,
+            ShutdownWaitOutcome::Stopped(ref r) if r.completions_published == n as u64
+        ),
+        "exactly one completion per Hang admission, got {outcome:?}"
+    );
+}
+
+/// Race/load expansion: barrier-concurrent ForceTerminate on N distinct Hang
+/// sessions — twin of the Cancel storm (Accepted → Terminated → N completions).
+#[test]
+fn concurrent_hang_force_terminate_storm_all_terminated() {
+    let n = 8usize;
+    let limits = TransactionLimits {
+        max_active_transactions: n,
+        max_active_per_channel: n,
+        transaction_deadline: Duration::from_secs(30),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", n)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let mut receivers = Vec::new();
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let (receipt, recv) =
+            submit(&handle, Some(&format!("force-storm-{i}"))).expect("admit Hang");
+        ids.push(receipt.transaction_id);
+        receivers.push(recv);
+    }
+    assert_eq!(started.owner.ledger_len(), n);
+    let ready = Instant::now();
+    while started.owner.owned_task_count() < n as u32 {
+        assert!(
+            ready.elapsed() < Duration::from_secs(2),
+            "Hang ForceTerminate storm: expected owned_tasks>={n} before barrier, got {}",
+            started.owner.owned_task_count()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let barrier = Arc::new(Barrier::new(n));
+    let mut joins = Vec::new();
+    for id in ids {
+        let h = handle.clone();
+        let b = Arc::clone(&barrier);
+        joins.push(std::thread::spawn(move || {
+            b.wait();
+            h.terminate(
+                TransactionSelector::Transaction(id),
+                TerminationMode::ForceTerminate {
+                    reason: TerminationReason {
+                        code: TerminationReasonCode::CallerRequested,
+                        detail: None,
+                    },
+                },
+            )
+        }));
+    }
+    let mut accepted = 0usize;
+    for j in joins {
+        let disp = j.join().unwrap();
+        assert_eq!(
+            disp,
+            TerminationDisposition::Accepted,
+            "distinct Hang ForceTerminate under headroom must Accepted, got {disp:?}"
+        );
+        accepted += 1;
+    }
+    assert_eq!(accepted, n);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for recv in receivers {
+        let completion = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), recv.completion.recv()).await
+            })
+            .expect("Hang ForceTerminate must complete within 3s")
+            .expect("completion channel closed");
+        assert_eq!(
+            completion.end.kind,
+            TransactionEndKind::Terminated,
+            "expected Terminated after concurrent Hang ForceTerminate storm"
+        );
+    }
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    assert!(
+        matches!(
+            outcome,
+            ShutdownWaitOutcome::Stopped(ref r) if r.completions_published == n as u64
+        ),
+        "exactly one completion per Hang admission, got {outcome:?}"
+    );
+}
+
 /// D-039: unknown transaction id is NotFound — never AlreadyTerminal from a missed send.
 #[test]
 fn terminate_unknown_transaction_is_not_found() {
@@ -2097,6 +2307,406 @@ fn terminate_unknown_transaction_is_not_found() {
         owner.begin_shutdown();
         owner.wait_stopped(Duration::from_secs(2)).await
     });
+}
+
+/// §23: `TransactionLimits.terminal_event_delivery_deadline` sizes Seal budget
+/// on `StartedRuntime` — full host mailbox + short Seal budget →
+/// `TerminalEventDelivery::DeadlineExceeded` (D-047 path through the field).
+#[test]
+fn transaction_limits_terminal_event_delivery_deadline_seal_fails_closed() {
+    use monoloop_contracts::TerminalEventDelivery;
+
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        // Long tx deadline so Fake echo can finish; Seal budget is the cell.
+        transaction_deadline: Duration::from_secs(5),
+        cleanup_deadline: Duration::from_millis(500),
+        terminal_event_delivery_deadline: Duration::from_millis(1),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    // Capacity 1: first ordinary event occupies the host mailbox so Seal waits.
+    let (delivery, mut recv) =
+        transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: Some(SessionId::try_new("seal-deadline").unwrap()),
+            input: user_text_input("hi").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect("admit");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt
+        .block_on(async {
+            // Do not drain events — keep the host mailbox full for Seal.
+            tokio::time::timeout(Duration::from_secs(3), recv.completion.recv()).await
+        })
+        .expect("completion within 3s")
+        .expect("completion channel closed");
+    assert_eq!(
+        completion.terminal_event_delivery,
+        TerminalEventDelivery::DeadlineExceeded,
+        "expected Seal DeadlineExceeded from TransactionLimits.terminal_event_delivery_deadline=1ms with full host mailbox, got {:?}",
+        completion.terminal_event_delivery
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::EventDeliveryFailed,
+        "sticky Seal DeadlineExceeded must remap Completed → EventDeliveryFailed, got {:?}",
+        completion.end.kind
+    );
+    // Drain after assertion so Drop does not strand the publisher.
+    while recv.events.try_recv().is_ok() {}
+    shutdown_owner(started);
+}
+
+/// §23: `TransactionLimits.transaction_deadline` — Hang exchange fails closed
+/// with `DeadlineExceeded` when the configured deadline elapses.
+#[test]
+fn transaction_limits_transaction_deadline_hang_ends_deadline_exceeded() {
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        // Short but above open/spawn noise; Hang never completes until terminate.
+        transaction_deadline: Duration::from_millis(80),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (_receipt, receiver) = submit(&handle, Some("tx-deadline")).expect("admit Hang");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), receiver.completion.recv()).await
+        })
+        .expect("Hang must terminalize under transaction_deadline within 2s")
+        .expect("completion channel closed");
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::DeadlineExceeded,
+        "expected DeadlineExceeded from TransactionLimits.transaction_deadline on Hang, got {:?}",
+        completion.end.kind
+    );
+
+    shutdown_owner(started);
+}
+
+/// §23: `TransactionLimits.max_tool_schema_bytes` enforced at `StartedRuntime::start`
+/// — exact schema size admits; one byte under rejects (D-056).
+#[test]
+fn transaction_limits_max_tool_schema_bytes_exact_admits_plus_one_rejects() {
+    use crate::transaction::host_tools::RegisteredTool;
+    use crate::transaction::tool_handler::ImmediateToolHandler;
+    use crate::StartupError;
+    use monoloop_contracts::{
+        JsonSchema, ToolCompletion, ToolExecutionClass, ToolId, ToolLimits, ToolName,
+        ToolOutputContract, ToolSpec, ToolSuccessContract,
+    };
+
+    let schema = JsonSchema::try_new(serde_json::json!({
+        "type": "object",
+        "properties": { "q": { "type": "string" } },
+        "required": ["q"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let schema_bytes = serde_json::to_vec(schema.as_value()).unwrap().len();
+    assert!(
+        schema_bytes >= 2,
+        "fixture schema must be at least 2 bytes for exact/plus-one"
+    );
+    let out = JsonSchema::try_new(serde_json::json!({
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" } },
+        "required": ["ok"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    let spec = ToolSpec::try_new(
+        ToolId::try_new("schema_probe").unwrap(),
+        ToolName::try_new("schema_probe").unwrap(),
+        "schema byte ceiling probe",
+        schema,
+        ToolOutputContract {
+            success: ToolSuccessContract::json(out),
+            error_data_schema: None,
+        },
+        ToolLimits::default(),
+        ToolExecutionClass::CooperativeInProcess {
+            grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    let tools = HostToolRegistry::build(vec![RegisteredTool::new(
+        spec,
+        Arc::new(ImmediateToolHandler::new(|_, _| {
+            Ok(ToolCompletion::Succeeded(
+                monoloop_contracts::CanonicalToolOutput::Json(serde_json::json!({"ok": true})),
+            ))
+        })),
+    )])
+    .expect("registry build under default schema ceiling");
+
+    let exact_limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        max_tool_schema_bytes: schema_bytes,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: exact_limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: tools.clone(),
+    })
+    .expect("exact-admit: schema_bytes under max_tool_schema_bytes must start");
+    shutdown_owner(started);
+
+    let plus_limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        max_tool_schema_bytes: schema_bytes - 1,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    match StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: plus_limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools,
+    }) {
+        Ok(_) => panic!("plus-one: schema_bytes-1 must reject at start"),
+        Err(err) => assert_eq!(
+            err,
+            StartupError::InvalidConfig("tool schema exceeds max_tool_schema_bytes")
+        ),
+    }
+}
+
+/// §23: `TransactionLimits.max_event_queue` is the runtime ceiling over caller
+/// `DeliveryLimits.max_event_items` — exact admits, plus-one rejects at admit.
+#[test]
+fn transaction_limits_max_event_queue_exact_admits_plus_one_rejects() {
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        max_event_queue: 1,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let (delivery_ok, recv_ok) =
+        transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
+    let ok = handle.submit(TransactionSubmitRequest {
+        channel_id: ChannelId::try_new("llm").unwrap(),
+        session_id: Some(SessionId::try_new("eq-ok").unwrap()),
+        input: user_text_input("hi").unwrap(),
+        session_config: None,
+        invocation_config: InvocationConfig::default(),
+        tools: vec![],
+        delivery: delivery_ok,
+    });
+    assert!(
+        ok.is_ok(),
+        "exact-admit: DeliveryLimits items=1 under max_event_queue=1 must admit, got {ok:?}"
+    );
+    drop(recv_ok);
+
+    let (delivery_plus, recv_plus) =
+        transaction_delivery(DeliveryLimits::try_new(2, 64 * 1024).unwrap()).unwrap();
+    let (err, _) = (
+        handle.submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: Some(SessionId::try_new("eq-plus").unwrap()),
+            input: user_text_input("hi").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery: delivery_plus,
+        }),
+        recv_plus,
+    );
+    let err = err.expect_err("plus-one: DeliveryLimits items=2 must exceed max_event_queue=1");
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidConfiguration);
+    assert!(
+        err.message.contains("max_event_queue"),
+        "expected max_event_queue message, got {:?}",
+        err.message
+    );
+
+    shutdown_owner(started);
+}
+
+/// §23: `TransactionLimits.max_event_queue_bytes` ceiling over caller
+/// `DeliveryLimits.max_event_bytes` — exact admits, plus-one rejects at admit.
+#[test]
+fn transaction_limits_max_event_queue_bytes_exact_admits_plus_one_rejects() {
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        max_event_queue_bytes: 1024,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let (delivery_ok, recv_ok) =
+        transaction_delivery(DeliveryLimits::try_new(8, 1024).unwrap()).unwrap();
+    let ok = handle.submit(TransactionSubmitRequest {
+        channel_id: ChannelId::try_new("llm").unwrap(),
+        session_id: Some(SessionId::try_new("eqb-ok").unwrap()),
+        input: user_text_input("hi").unwrap(),
+        session_config: None,
+        invocation_config: InvocationConfig::default(),
+        tools: vec![],
+        delivery: delivery_ok,
+    });
+    assert!(
+        ok.is_ok(),
+        "exact-admit: DeliveryLimits bytes=1024 under max_event_queue_bytes=1024 must admit, got {ok:?}"
+    );
+    drop(recv_ok);
+
+    let (delivery_plus, recv_plus) =
+        transaction_delivery(DeliveryLimits::try_new(8, 1025).unwrap()).unwrap();
+    let err = handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("llm").unwrap(),
+            session_id: Some(SessionId::try_new("eqb-plus").unwrap()),
+            input: user_text_input("hi").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery: delivery_plus,
+        })
+        .expect_err("plus-one: DeliveryLimits bytes=1025 must exceed max_event_queue_bytes=1024");
+    drop(recv_plus);
+    assert_eq!(err.kind, AdmissionErrorKind::InvalidConfiguration);
+    assert!(
+        err.message.contains("max_event_queue_bytes"),
+        "expected max_event_queue_bytes message, got {:?}",
+        err.message
+    );
+
+    shutdown_owner(started);
+}
+
+/// §23: `TransactionLimits.max_actor_commands` sizes the control `mpsc`;
+/// exact-admit one Cancel while drain is held, plus-one → `ControlCapacityExceeded`.
+#[test]
+fn transaction_limits_max_actor_commands_plus_one_rejects() {
+    let hold = Arc::new(ControlHoldGate::new());
+    hold.hold();
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        max_actor_commands: 1,
+        transaction_deadline: Duration::from_secs(5),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            hold_control: Some(Arc::clone(&hold)),
+            ..RuntimeConfig::default()
+        },
+        // Hang keeps the admit non-terminal so a second terminate is not
+        // AlreadyTerminal before the control queue fills.
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (receipt, _recv) = submit(&handle, Some("actor-cmd")).expect("admit Hang");
+
+    let cancel = TerminationMode::Cancel {
+        reason: CancellationReason {
+            code: CancellationReasonCode::CallerRequested,
+            detail: None,
+        },
+    };
+    let first = handle.terminate(
+        TransactionSelector::Transaction(receipt.transaction_id),
+        cancel.clone(),
+    );
+    assert_eq!(
+        first,
+        TerminationDisposition::Accepted,
+        "exact-admit: max_actor_commands=1 must accept the first control command"
+    );
+
+    let second = handle.terminate(
+        TransactionSelector::Transaction(receipt.transaction_id),
+        cancel,
+    );
+    assert_eq!(
+        second,
+        TerminationDisposition::ControlCapacityExceeded,
+        "plus-one: control mpsc sized from TransactionLimits.max_actor_commands=1 must fail closed"
+    );
+
+    hold.release();
+    shutdown_owner(started);
 }
 
 /// D-039: terminate dispositions are ledger-honest — never Full→AlreadyTerminal.

@@ -89,13 +89,78 @@ fn s23_no_undocumented_ambient_tokio_spawn_in_production_src() {
 /// §23 exact-limit / plus-one inventory (documentation gate — not exhaustive codegen).
 ///
 /// Lists high-value public limits that already have exact/plus-one proofs in-tree.
-/// Remaining gaps are documented in DEFECTS (optional exhaustive D-035 variant
-/// matrix). This test fails if a listed proof file disappears.
+/// Remaining gaps are named in `doc/S23_PUBLIC_LIMIT_MATRIX.md` (Open/Partial).
+/// This test fails if a listed proof file disappears or the matrix omits a
+/// `TransactionLimits` field.
 #[test]
 fn s23_exact_limit_plus_one_inventory_present() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = root
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crate dir under workspace");
+    let matrix = workspace.join("doc/S23_PUBLIC_LIMIT_MATRIX.md");
+    assert!(
+        matrix.is_file(),
+        "missing doc/S23_PUBLIC_LIMIT_MATRIX.md for §23 public-limit honesty"
+    );
+    let matrix_text =
+        fs::read_to_string(&matrix).unwrap_or_else(|e| panic!("read limit matrix: {e}"));
+    for field in [
+        "max_active_transactions",
+        "max_active_per_channel",
+        "max_actor_commands",
+        "max_actor_command_bytes",
+        "max_event_queue",
+        "max_event_queue_bytes",
+        "max_input_bytes",
+        "max_messages",
+        "max_content_parts",
+        "max_tools_per_transaction",
+        "max_tool_schema_bytes",
+        "max_tool_payload_bytes",
+        "max_tool_output_bytes",
+        "max_concurrent_tools_per_transaction",
+        "max_queued_tools_per_transaction",
+        "max_continuations",
+        "max_provider_exchanges",
+        "max_continuation_context_bytes",
+        "max_total_provider_input_bytes",
+        "max_total_provider_output_bytes",
+        "max_diagnostic_count",
+        "max_diagnostic_bytes",
+        "transaction_deadline",
+        "cleanup_deadline",
+        "terminal_event_delivery_deadline",
+        "callback_deadline",
+    ] {
+        assert!(
+            matrix_text.contains(field),
+            "S23_PUBLIC_LIMIT_MATRIX.md must name TransactionLimits field `{field}`"
+        );
+    }
     let required = [
         ("tests/linked_tools.rs", "capacity_limit_plus_one_rejects"),
+        (
+            "tests/linked_tools.rs",
+            "max_tool_output_bytes_plus_one_fails_closed",
+        ),
+        (
+            "tests/linked_tools.rs",
+            "transaction_limits_max_concurrent_tools_plus_one_rejects",
+        ),
+        (
+            "tests/linked_tools.rs",
+            "transaction_limits_max_queued_tools_plus_one_rejects",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_transaction_limits_max_tool_output_bytes_plus_one_fails_closed",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_transaction_limits_max_tool_payload_bytes_plus_one_rejects",
+        ),
         ("tests/mcp_gateway.rs", "http_oversized_body_fails_closed"),
         (
             "tests/mcp_gateway.rs",
@@ -108,6 +173,30 @@ fn s23_exact_limit_plus_one_inventory_present() {
         (
             "tests/mcp_gateway.rs",
             "mcp_request_duration_plus_one_fails_closed",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "transaction_limits_max_actor_commands_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "transaction_limits_terminal_event_delivery_deadline_seal_fails_closed",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "transaction_limits_transaction_deadline_hang_ends_deadline_exceeded",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "transaction_limits_max_tool_schema_bytes_exact_admits_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "transaction_limits_max_event_queue_exact_admits_plus_one_rejects",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "transaction_limits_max_event_queue_bytes_exact_admits_plus_one_rejects",
         ),
         (
             "src/transaction/lifecycle/tests.rs",
@@ -211,6 +300,18 @@ fn s23_exact_limit_plus_one_inventory_present() {
             "multi_channel_multi_session_concurrent_load",
         ),
         (
+            "src/transaction/lifecycle/tests.rs",
+            "concurrent_hang_terminate_storm_all_cancelled",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "concurrent_hang_force_terminate_storm_all_terminated",
+        ),
+        (
+            "src/transaction/lifecycle/tests.rs",
+            "duplicate_session_race_admits_exactly_one",
+        ),
+        (
             "../monoloop-connector-grok/tests/grok_connector.rs",
             "concurrent_session_new_and_explicit_load",
         ),
@@ -234,6 +335,47 @@ fn s23_exact_limit_plus_one_inventory_present() {
             "src/transaction/lifecycle/tests.rs",
             "s22_6_concurrent_producers_contiguous_sequence",
         ),
+        // DirectLlm provider-budget / continuation ceilings (D-053 replacement row).
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_inline_max_continuations_zero_ends_limit_exceeded",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_inline_max_continuations_one_exhausted_ends_limit_exceeded",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_inline_max_provider_exchanges_one_ends_limit_exceeded",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_inline_max_provider_exchanges_two_exact_then_limit_exceeded",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_inline_continuation_context_bytes_limit_exceeded",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_total_provider_input_bytes_limit_exceeded_before_open",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_total_provider_output_bytes_limit_exceeded",
+        ),
+        (
+            "tests/direct_llm_fake_e2e.rs",
+            "fake_inline_cumulative_output_budget_plus_one_fails_second_pump",
+        ),
+        (
+            "tests/direct_llm_openai_e2e.rs",
+            "http_inline_max_continuations_zero_ends_limit_exceeded",
+        ),
+        (
+            "tests/direct_llm_openai_e2e.rs",
+            "http_inline_cumulative_output_budget_plus_one_fails_second_pump",
+        ),
         // D-042: Refreshable deferred — profile gate must keep asserting it.
         (
             "../monoloop-testkit/tests/profile_bindings.rs",
@@ -247,6 +389,51 @@ fn s23_exact_limit_plus_one_inventory_present() {
         assert!(
             text.contains(needle),
             "limit-proof `{needle}` missing from {rel}"
+        );
+    }
+}
+
+/// §23 named Fake race/load inventory gate (not exhaustive; not live Grok).
+#[test]
+fn s23_race_load_inventory_present() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = root
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crate dir under workspace");
+    let inv = workspace.join("doc/S23_RACE_LOAD_INVENTORY.md");
+    assert!(
+        inv.is_file(),
+        "missing doc/S23_RACE_LOAD_INVENTORY.md for §23 named race/load honesty"
+    );
+    let inv_text = fs::read_to_string(&inv).unwrap_or_else(|e| panic!("read race inventory: {e}"));
+    for needle in [
+        "concurrent_global_capacity_exhaustion_admits_exactly_max",
+        "concurrent_per_channel_capacity_exhaustion_admits_exactly_channel_max",
+        "multi_channel_multi_session_concurrent_load",
+        "submit_versus_shutdown_barrier_race_two_outcomes",
+        "submit_versus_shutdown_hang_barrier_both_outcomes",
+        "submit_versus_begin_shutdown_two_outcomes",
+        "duplicate_session_race_admits_exactly_one",
+        "concurrent_hang_terminate_storm_all_cancelled",
+        "concurrent_hang_force_terminate_storm_all_terminated",
+    ] {
+        assert!(
+            inv_text.contains(needle),
+            "S23_RACE_LOAD_INVENTORY.md must name race needle `{needle}`"
+        );
+    }
+    let lifecycle = root.join("src/transaction/lifecycle/tests.rs");
+    let life_text =
+        fs::read_to_string(&lifecycle).unwrap_or_else(|e| panic!("read lifecycle tests: {e}"));
+    for needle in [
+        "concurrent_hang_terminate_storm_all_cancelled",
+        "concurrent_hang_force_terminate_storm_all_terminated",
+        "multi_channel_multi_session_concurrent_load",
+    ] {
+        assert!(
+            life_text.contains(needle),
+            "lifecycle tests missing race needle `{needle}`"
         );
     }
 }

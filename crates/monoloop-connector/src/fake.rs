@@ -16,13 +16,14 @@ use monoloop_contracts::{
     ExternalSessionId,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 /// Behaviour of a fake endpoint.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum FakeEndpoint {
     /// Echo each input chunk back on output; finish closes output after drain.
     Echo,
@@ -31,6 +32,18 @@ pub enum FakeEndpoint {
         /// Chunks to emit on output in order.
         chunks: Vec<Bytes>,
     },
+    /// Each successful open emits the next round's chunks (fail-closed when exhausted).
+    ///
+    /// Used for DirectLlm FakeConnector parity of multi-exchange continuation without
+    /// a network HTTP server. `opens()` reports how many opens succeeded.
+    ScriptedSequence {
+        /// Per-open chunk sequences, consumed in order.
+        rounds: Arc<Vec<Vec<Bytes>>>,
+        /// Shared open cursor (number of successful opens so far).
+        next: Arc<AtomicUsize>,
+        /// Optional capture of accepted input bytes per successful open (concatenated).
+        input_log: Option<Arc<Mutex<Vec<Bytes>>>>,
+    },
     /// Pair two connection opens with the same `pair_key`: A's input → B's output.
     Pair {
         /// Shared pairing key.
@@ -38,6 +51,61 @@ pub enum FakeEndpoint {
     },
     /// Accept input but never produce output until cancel/terminate (D-012 response-wait).
     Hang,
+}
+
+impl std::fmt::Debug for FakeEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Echo => f.write_str("Echo"),
+            Self::Scripted { chunks } => f
+                .debug_struct("Scripted")
+                .field("chunks", &chunks.len())
+                .finish(),
+            Self::ScriptedSequence {
+                rounds,
+                next,
+                input_log,
+            } => f
+                .debug_struct("ScriptedSequence")
+                .field("rounds", &rounds.len())
+                .field("next", &next.load(Ordering::Relaxed))
+                .field("input_log", &input_log.is_some())
+                .finish(),
+            Self::Pair { pair_key } => f.debug_struct("Pair").field("pair_key", pair_key).finish(),
+            Self::Hang => f.write_str("Hang"),
+        }
+    }
+}
+
+impl FakeEndpoint {
+    /// Build a [`FakeEndpoint::ScriptedSequence`] from ordered per-open chunk lists.
+    pub fn scripted_sequence(rounds: Vec<Vec<Bytes>>) -> Self {
+        Self::ScriptedSequence {
+            rounds: Arc::new(rounds),
+            next: Arc::new(AtomicUsize::new(0)),
+            input_log: None,
+        }
+    }
+
+    /// [`Self::scripted_sequence`] that also records accepted input per open.
+    pub fn scripted_sequence_with_input_log(
+        rounds: Vec<Vec<Bytes>>,
+        input_log: Arc<Mutex<Vec<Bytes>>>,
+    ) -> Self {
+        Self::ScriptedSequence {
+            rounds: Arc::new(rounds),
+            next: Arc::new(AtomicUsize::new(0)),
+            input_log: Some(input_log),
+        }
+    }
+
+    /// Successful open count for a [`FakeEndpoint::ScriptedSequence`] (else `0`).
+    pub fn opens(&self) -> usize {
+        match self {
+            Self::ScriptedSequence { next, .. } => next.load(Ordering::SeqCst),
+            _ => 0,
+        }
+    }
 }
 
 /// Configuration for [`FakeConnector`].
@@ -53,6 +121,11 @@ pub struct FakeConnectorConfig {
     pub fail_open: bool,
     /// When true, create_mode open returns no external session id (D-026 tests).
     pub omit_created_session_id: bool,
+    /// Dialect stamped on opened connections (default: `test_raw`).
+    ///
+    /// DirectLlm Fake parity suites set this to OpenAI chat-completions so the
+    /// Interpreter consumes scripted SSE without StreamingHttp.
+    pub output_dialect: DialectDescriptor,
 }
 
 impl Default for FakeConnectorConfig {
@@ -63,6 +136,7 @@ impl Default for FakeConnectorConfig {
             open_delay: Duration::ZERO,
             fail_open: false,
             omit_created_session_id: false,
+            output_dialect: DialectDescriptor::test_raw(),
         }
     }
 }
@@ -258,7 +332,30 @@ async fn open_fake(
             out_tx,
             end_tx,
             chunks,
+            None,
         )),
+        FakeEndpoint::ScriptedSequence {
+            rounds,
+            next,
+            input_log,
+        } => {
+            let idx = next.fetch_add(1, Ordering::SeqCst);
+            let chunks = rounds.get(idx).cloned().ok_or_else(|| {
+                // Roll back the cursor so exhausted count stays honest for asserts.
+                next.fetch_sub(1, Ordering::SeqCst);
+                ConnectorError::connection_failed("scripted sequence exhausted")
+                    .with_connection_id(connection_id.as_str())
+            })?;
+            ConnectionOwnerWork::new(run_scripted_owner(
+                connection_id.clone(),
+                control_state,
+                in_rx,
+                out_tx,
+                end_tx,
+                chunks,
+                input_log,
+            ))
+        }
         FakeEndpoint::Pair { pair_key } => {
             let peer_tx = register_pair(&pairs, &pair_key, out_tx.clone()).await?;
             ConnectionOwnerWork::new(run_pair_owner(
@@ -286,7 +383,7 @@ async fn open_fake(
         OpenedRawConnection {
             connection_id,
             external_session_id,
-            dialect: DialectBinding::fixed(DialectDescriptor::test_raw()),
+            dialect: DialectBinding::fixed(config.output_dialect),
             input,
             output,
             control,
@@ -382,6 +479,7 @@ async fn run_scripted_owner(
     out_tx: mpsc::Sender<Bytes>,
     end_tx: oneshot::Sender<crate::handles::ConnectionEnd>,
     chunks: Vec<Bytes>,
+    input_log: Option<Arc<Mutex<Vec<Bytes>>>>,
 ) {
     let mut owner = ConnectionOwner::new(connection_id, Arc::clone(&control), end_tx);
     for chunk in chunks {
@@ -401,6 +499,7 @@ async fn run_scripted_owner(
     }
     // Drain input until finish/cancel while leaving output closed after script.
     drop(out_tx);
+    let mut accepted = Vec::<u8>::new();
     loop {
         tokio::select! {
             biased;
@@ -417,8 +516,16 @@ async fn run_scripted_owner(
                 match msg {
                     Some(RawInputMessage::Bytes(bytes)) => {
                         owner.bytes_accepted += bytes.len() as u64;
+                        if input_log.is_some() {
+                            accepted.extend_from_slice(&bytes);
+                        }
                     }
                     Some(RawInputMessage::Finish) | None => {
+                        if let Some(log) = &input_log {
+                            if let Ok(mut guard) = log.lock() {
+                                guard.push(Bytes::from(accepted));
+                            }
+                        }
                         owner.finish(
                             ConnectionEndKind::RemoteEof,
                             EndInitiator::Remote,

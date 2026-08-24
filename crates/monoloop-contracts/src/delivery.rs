@@ -91,6 +91,8 @@ pub struct TransactionEventSender {
     queued_bytes: Arc<AtomicU64>,
     /// Wakes waiters when queued bytes are released (D-047 wait-for-capacity).
     byte_freed: Arc<Notify>,
+    /// Item capacity installed at [`transaction_delivery`] (mpsc buffer).
+    max_event_items: usize,
     max_event_bytes: usize,
 }
 
@@ -145,6 +147,7 @@ pub fn transaction_delivery(
                 tx: event_tx,
                 queued_bytes,
                 byte_freed,
+                max_event_items: limits.max_event_items,
                 max_event_bytes: limits.max_event_bytes,
             },
             completion_tx: TransactionCompletionSender {
@@ -159,6 +162,11 @@ pub fn transaction_delivery(
 }
 
 impl TransactionEventSender {
+    /// Maximum queued event items installed at construction.
+    pub fn max_event_items(&self) -> usize {
+        self.max_event_items
+    }
+
     /// Maximum event payload bytes accepted by this mailbox.
     pub fn max_event_bytes(&self) -> usize {
         self.max_event_bytes

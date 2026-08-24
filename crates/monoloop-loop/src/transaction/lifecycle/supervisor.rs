@@ -11,7 +11,7 @@ use super::task_spawner::{SpawnRequest, TransactionTaskSpawner};
 use super::task_supervisor::{TaskClass, TaskExit, TaskSupervisor};
 use super::terminal::{build_completion, end_event, TerminalDecision, TerminalProposal};
 use crate::transaction::bootstrap::{
-    FinalizerHoldGate, JoinOnlySpillInject, StartHoldGate, StoppedGate,
+    ControlHoldGate, FinalizerHoldGate, JoinOnlySpillInject, StartHoldGate, StoppedGate,
 };
 use crate::transaction::channel_registry::LiveChannel;
 use crate::transaction::dispatcher::OrphanToolPermitSet;
@@ -103,6 +103,8 @@ pub(crate) struct RuntimeShared {
     pub block_stopped: Option<Arc<StoppedGate>>,
     /// When `Some` and held, supervisor does not drain the start queue (D-040).
     pub hold_start: Option<Arc<StartHoldGate>>,
+    /// When `Some` and held, supervisor does not drain the control queue (§23).
+    pub hold_control: Option<Arc<ControlHoldGate>>,
     /// When `Some`, Finalizer waits after Seal before completion send (§22.2).
     pub hold_finalizer_after_seal: Option<Arc<FinalizerHoldGate>>,
     /// When `Some`, executor thread waits after drain before teardown (D-049).
@@ -131,6 +133,10 @@ pub(crate) struct RuntimeShared {
 impl RuntimeShared {
     fn start_drain_enabled(&self) -> bool {
         !self.hold_start.as_ref().is_some_and(|g| g.is_held())
+    }
+
+    fn control_drain_enabled(&self) -> bool {
+        !self.hold_control.as_ref().is_some_and(|g| g.is_held())
     }
 
     pub fn runtime_state(&self) -> super::super::state::RuntimeState {
@@ -240,33 +246,36 @@ pub(crate) async fn run_supervisor(
 
         // Preferential control drain (D-039): process BeginShutdown/StopSupervisor
         // and Cancels without waiting behind a biased select recv, so a terminate
-        // flood cannot delay observing Quiescing.
-        while let Ok(cmd) = control_rx.try_recv() {
-            match cmd {
-                ControlCommand::Cancel(tx) => {
-                    accept_terminal(
-                        &shared,
-                        &mut tasks,
-                        tx,
-                        TerminalProposal::new(TransactionEndKind::Cancelled),
-                        false,
-                    );
-                }
-                ControlCommand::ForceTerminate(tx) => {
-                    accept_terminal(
-                        &shared,
-                        &mut tasks,
-                        tx,
-                        TerminalProposal::new(TransactionEndKind::Terminated),
-                        true,
-                    );
-                }
-                ControlCommand::BeginShutdown => {
-                    begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
-                }
-                ControlCommand::StopSupervisor => {
-                    begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
-                    tasks.abort_all();
+        // flood cannot delay observing Quiescing. Skipped while `hold_control`
+        // is held so §23 max_actor_commands plus-one can fill the bound.
+        if shared.control_drain_enabled() {
+            while let Ok(cmd) = control_rx.try_recv() {
+                match cmd {
+                    ControlCommand::Cancel(tx) => {
+                        accept_terminal(
+                            &shared,
+                            &mut tasks,
+                            tx,
+                            TerminalProposal::new(TransactionEndKind::Cancelled),
+                            false,
+                        );
+                    }
+                    ControlCommand::ForceTerminate(tx) => {
+                        accept_terminal(
+                            &shared,
+                            &mut tasks,
+                            tx,
+                            TerminalProposal::new(TransactionEndKind::Terminated),
+                            true,
+                        );
+                    }
+                    ControlCommand::BeginShutdown => {
+                        begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
+                    }
+                    ControlCommand::StopSupervisor => {
+                        begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
+                        tasks.abort_all();
+                    }
                 }
             }
         }
@@ -398,7 +407,7 @@ pub(crate) async fn run_supervisor(
             biased;
             // Control / worker / start before join_next so Accepting is not
             // starved when many tasks complete in a burst.
-            ctrl = control_rx.recv() => {
+            ctrl = control_rx.recv(), if shared.control_drain_enabled() => {
                 match ctrl {
                     None => {
                         begin_shutdown_inner(&shared, &mut tasks, &mut stopping);
@@ -441,8 +450,9 @@ pub(crate) async fn run_supervisor(
                     }
                 }
             }
-            // While start drain is held, poll so release is observed without a notify.
-            _ = tokio::time::sleep(Duration::from_millis(5)), if !shared.start_drain_enabled() => {}
+            // While start/control drain is held, poll so release is observed without a notify.
+            _ = tokio::time::sleep(Duration::from_millis(5)),
+                if !shared.start_drain_enabled() || !shared.control_drain_enabled() => {}
             spawn = spawn_rx.recv() => {
                 match spawn {
                     Some(req) => {
