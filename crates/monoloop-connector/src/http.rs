@@ -631,7 +631,9 @@ async fn run_http_owner(
 
 async fn wait_control(control: &ControlState) {
     loop {
-        if control.cancel_requested() || control.terminate_requested() || control.is_terminal() {
+        // Do not treat `is_terminal` as an interrupt: finish() marks terminal
+        // before task exit, and mapping that to Cancelled races clean RemoteEof.
+        if control.cancel_requested() || control.terminate_requested() {
             return;
         }
         control.notify().notified().await;

@@ -12,9 +12,10 @@ Host helpers `adapt_event_sink` / `adapt_completion_callback` **retained**
 (outside the kernel executor; M1 / §22.7) — optional later move out of
 `monoloop-loop`. **§23 core commands** (fmt / clippy / test / doc -D warnings)
 observed green after D-052 via `make gates`. D-053 Fixed (`autotests` /
-`autoexamples`; `doc/D053_COVERAGE_REPLACEMENT.md`). Remaining §23 extras
-(Open/Partial limits, race/load, live Grok) + §25 DoD + independent review
-still open. **Not** Golden / §25. D-039 / D-040 / D-041 Fixed.
+`autoexamples`; `doc/D053_COVERAGE_REPLACEMENT.md`). Remaining Golden gates: matrix Open (D-058/D-059) + Partial `cleanup_deadline`;
+race/load beyond named proofs; live `session/load` residual (D-061); **independent
+D-025 / §25 Sign-off** (`doc/SECURITY_REVIEW_CHECKLIST.md` unsigned). Agent work
+is **Golden-ready Silver** — **Not** Golden until Sign-off. D-039 / D-040 / D-041 Fixed.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 

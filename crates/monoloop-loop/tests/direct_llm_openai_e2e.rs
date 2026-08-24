@@ -368,16 +368,14 @@ async fn drain_until_completed_detailed(
                 }
             }
         }
-        // Grace drain: absorb trailing CanonicalUnits that land after Ended/completion.
-        let grace = tokio::time::Instant::now() + Duration::from_millis(50);
-        while tokio::time::Instant::now() < grace {
-            match events.try_recv() {
-                Ok(ev) => push_event(&mut labels, &mut texts, &mut payloads, &mut saw_ended, ev),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
+        // Terminal fence: after Ended∧completion, any further event is a violation.
+        match events.try_recv() {
+            Ok(ev) => panic!(
+                "post-terminal event after Ended+completion: {:?}",
+                ev.payload
+            ),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
         }
         completion.expect("completion")
     })
@@ -848,6 +846,7 @@ fn inline_multi_round_tool_continuation_completes_after_second_tool() {
     let a_res = b1[a_call..]
         .find("\"tool_call_id\":\"call_a\"")
         .or_else(|| b1[a_call..].find("\"tool_call_id\": \"call_a\""))
+        .map(|o| a_call + o)
         .expect("second continuation must retain tool result for call_a");
     let b_call = b1
         .find("\"id\":\"call_b\"")
@@ -856,10 +855,12 @@ fn inline_multi_round_tool_continuation_completes_after_second_tool() {
     let b_res = b1[b_call..]
         .find("\"tool_call_id\":\"call_b\"")
         .or_else(|| b1[b_call..].find("\"tool_call_id\": \"call_b\""))
+        .map(|o| b_call + o)
         .expect("second continuation must include tool result for call_b");
     assert!(
-        a_call < a_res + a_call && a_call < b_call && b_call < b_res + b_call,
-        "expected call_a < result_a < call_b < result_b ordering; body={b1}"
+        a_call < a_res && a_res < b_call && b_call < b_res,
+        "expected call_a < result_a < call_b < result_b absolute order; \
+         a_call={a_call} a_res={a_res} b_call={b_call} b_res={b_res}; body={b1}"
     );
 
     finish_http_test(started, rt, vec![server]);

@@ -25,6 +25,7 @@ use monoloop_contracts::{
     TransactionId,
 };
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Report from one supervised Loop pass over exchange units.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -44,6 +45,8 @@ pub struct LoopDispatchReport {
 pub enum LoopDispatchError {
     /// Cancelled.
     Cancelled,
+    /// Absolute transaction deadline elapsed during Loop/tool wait.
+    DeadlineExceeded,
     /// Publish / feed failed.
     PublishFailed,
     /// Loop start/prepare failed.
@@ -121,6 +124,7 @@ pub async fn run_supervised_empty_loop(
     units: Vec<CanonicalUnitEvent>,
     publish_tx: OrdinaryCmdAdmit,
     cancel: Arc<StickyCancel>,
+    deadline: Instant,
 ) -> Result<LoopDispatchReport, LoopDispatchError> {
     run_supervised_loop(
         tasks,
@@ -131,6 +135,7 @@ pub async fn run_supervised_empty_loop(
         units,
         publish_tx,
         cancel,
+        deadline,
         Arc::new(EmptyToolRegistry::new()),
         Arc::new(NoToolRuntime::new()),
     )
@@ -148,6 +153,7 @@ pub async fn run_supervised_tool_loop(
     units: Vec<CanonicalUnitEvent>,
     publish_tx: OrdinaryCmdAdmit,
     cancel: Arc<StickyCancel>,
+    deadline: Instant,
     tool_registry: Arc<dyn ToolRegistry>,
     tool_runtime: Arc<dyn ToolRuntime>,
 ) -> Result<LoopDispatchReport, LoopDispatchError> {
@@ -160,6 +166,7 @@ pub async fn run_supervised_tool_loop(
         units,
         publish_tx,
         cancel,
+        deadline,
         tool_registry,
         tool_runtime,
     )
@@ -176,6 +183,7 @@ async fn run_supervised_loop(
     units: Vec<CanonicalUnitEvent>,
     publish_tx: OrdinaryCmdAdmit,
     cancel: Arc<StickyCancel>,
+    deadline: Instant,
     tool_registry: Arc<dyn ToolRegistry>,
     tool_runtime: Arc<dyn ToolRuntime>,
 ) -> Result<LoopDispatchReport, LoopDispatchError> {
@@ -212,6 +220,9 @@ async fn run_supervised_loop(
                 biased;
                 _ = cancel.cancelled() => {
                     return Err(LoopDispatchError::Cancelled);
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                    return Err(LoopDispatchError::DeadlineExceeded);
                 }
                 res = pub_.publish(InterpreterOutputEvent::Unit(Box::new(unit.clone()))) => {
                     if res.is_err() {
@@ -269,6 +280,11 @@ async fn run_supervised_loop(
         }
     }
 
+    if Instant::now() >= deadline {
+        handle.control.cancel();
+        let _ = await_loop_end(&handle, &cancel).await;
+        return Err(LoopDispatchError::DeadlineExceeded);
+    }
     if cancel.is_cancelled() {
         handle.control.cancel();
         let _ = await_loop_end(&handle, &cancel).await;
@@ -286,6 +302,11 @@ async fn run_supervised_loop(
                 handle.control.cancel();
                 let _ = await_loop_end(&handle, &cancel).await;
                 return Err(LoopDispatchError::Cancelled);
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                handle.control.cancel();
+                let _ = await_loop_end(&handle, &cancel).await;
+                return Err(LoopDispatchError::DeadlineExceeded);
             }
             ev = out.recv() => ev,
         };

@@ -124,6 +124,9 @@ pub struct DispatchRequest {
     pub request_ordinal: u32,
     /// Complete JSON argument payload.
     pub arguments_json: String,
+    /// Absolute transaction deadline — tool budget is `min(tool_limit, remaining)`.
+    /// Use a far-future Instant when the caller has no transaction Instant.
+    pub transaction_deadline: Instant,
 }
 
 /// Outcome of a dispatch attempt.
@@ -485,17 +488,30 @@ impl TransactionToolDispatcher {
             arguments,
             request_ordinal: request.request_ordinal,
         };
+        // Cap tool execution to the remaining transaction Instant (acceptance P1).
+        let now = Instant::now();
+        if now >= request.transaction_deadline {
+            drop(dispatch_guard);
+            return DispatchOutcome::RuntimeFailed {
+                tool_action_id: action,
+                tool_id: Some(tool_id),
+                code: "transaction_deadline_exceeded".into(),
+                lifecycle: vec![],
+            };
+        }
+        let tool_cap = now + spec.limits.execution_deadline;
+        let absolute_tool_deadline = tool_cap.min(request.transaction_deadline);
         let context = ToolCallContext {
             transaction_id: self.transaction_id,
             session_key: self.session_key(),
             exchange_id: Some(request.exchange_id),
             tool_action_id: action.clone(),
             tool_id: tool_id.clone(),
-            deadline: Instant::now() + spec.limits.execution_deadline,
+            deadline: absolute_tool_deadline,
         };
 
         // Bounded execution: deadline / external cancel → grace → kill → join (D-024 / D-028).
-        let deadline = spec.limits.execution_deadline;
+        let deadline = absolute_tool_deadline.saturating_duration_since(now);
         let policy = spec.execution_class.clone();
 
         // Structural termination support must be confirmed *before* start so a

@@ -600,13 +600,19 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         let selected_tools = entry.tools.clone();
         // One absolute transaction deadline: invocation may shorten, not exceed
         // RuntimeShared.default_deadline (== TransactionLimits.transaction_deadline).
-        let ceiling = shared.default_deadline;
+        // Cap duration so Instant::checked_add cannot panic on Duration::MAX-class values.
+        const MAX_TX_DEADLINE: std::time::Duration =
+            std::time::Duration::from_secs(365 * 24 * 3600);
+        let ceiling = shared.default_deadline.min(MAX_TX_DEADLINE);
         let base = entry
             .effective_config
             .deadline
             .unwrap_or(ceiling)
-            .min(ceiling);
-        let absolute_deadline = std::time::Instant::now() + base;
+            .min(ceiling)
+            .min(MAX_TX_DEADLINE);
+        let absolute_deadline = std::time::Instant::now()
+            .checked_add(base)
+            .expect("MAX_TX_DEADLINE is Instant-representable");
         (
             Arc::clone(&entry.resources.cancel),
             entry.channel_id.clone(),

@@ -4,6 +4,27 @@ Explicit project decisions that change contracts, MSRV, or delivery assumptions.
 Normative behavior still lives under `doc/`; this file records *why* a deliberate
 change was made.
 
+## D-061 — Live Grok `session/load` after short sessions (agent residual)
+
+**Date:** 2026-08-24
+
+**Context:** `live_grok_multi_session` proves concurrent `session/new` + marker
+isolation on preauthorized hosts (default secret `monoloop-live-test`). Explicit
+`session/load` of a just-finished short session returns ACP `-32602 Invalid
+params` on current Grok Build, even with `cwd` set. Mock
+`concurrent_session_new_and_explicit_load` remains green.
+
+**Decision:** Treat live `session/load` after ephemeral short prompts as an
+**agent precondition residual**, not a monoloop encoding defect, until a
+durable-session load fixture succeeds against live Grok. Concurrent new +
+isolation remains the landed live multi-session qualification. Do not claim
+live load Golden.
+
+**Consequences:**
+
+- Evidence pack / checklist name the residual honestly.
+- Follow-up: longer-lived session + load, or agent-side param clarification.
+
 ## D-060 — D-054 compatibility-alias breaking cut (deprecated surfaces removed)
 
 **Date:** 2026-08-24

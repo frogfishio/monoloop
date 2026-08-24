@@ -185,10 +185,15 @@ impl RawOutputHandle {
                 match guard.try_recv() {
                     Ok(bytes) => Ok(Some(bytes)),
                     Err(mpsc::error::TryRecvError::Empty) => {
-                        Err(self.control_interrupt_if_no_data().unwrap_or_else(|| {
-                            ConnectorError::cancelled()
-                                .with_connection_id(self.connection_id.as_str())
-                        }))
+                        // Cancel/terminate only — never invent Cancelled because
+                        // `is_terminal` raced ahead of channel disconnect after a
+                        // clean RemoteEof (multi-round HTTP Cancelled flake).
+                        if let Some(err) = self.control_interrupt_if_no_data() {
+                            Err(err)
+                        } else {
+                            // Spurious wake or terminal-without-control: keep draining.
+                            Ok(guard.recv().await)
+                        }
                     }
                     Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
                 }
@@ -198,10 +203,10 @@ impl RawOutputHandle {
 
     async fn wait_interrupt(&self) {
         loop {
-            if self.control.cancel_requested()
-                || self.control.terminate_requested()
-                || self.control.is_terminal()
-            {
+            // Do **not** wake on `is_terminal` alone: `ConnectionOwner::finish`
+            // marks terminal before dropping `out_tx`, which raced receive into
+            // a false Cancelled when the channel was still Empty.
+            if self.control.cancel_requested() || self.control.terminate_requested() {
                 return;
             }
             self.control.notify().notified().await;

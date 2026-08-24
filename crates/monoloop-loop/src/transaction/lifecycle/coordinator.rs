@@ -242,11 +242,12 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
                 Arc::clone(&process_registry),
                 TransactionToolDispatcher::limits_from_transaction(&shared.transaction_limits),
             );
-            match gw.install_pending(
+            match gw.install_pending_with_deadline(
                 transaction_id,
                 resolved,
                 Arc::clone(&dispatcher),
                 exchange_id,
+                deadline,
             ) {
                 Ok(pending) => {
                     mcp_token = Some(pending.token.clone());
@@ -454,6 +455,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             process_registry,
             Some(inline),
             TransactionToolDispatcher::limits_from_transaction(&shared.transaction_limits),
+            deadline,
         )
         .await;
 
@@ -540,6 +542,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         process_registry,
         Some(inline),
         TransactionToolDispatcher::limits_from_transaction(&shared.transaction_limits),
+        deadline,
     )
     .await
 }
@@ -564,6 +567,7 @@ async fn finish_after_exchange(
     process_registry: Arc<crate::transaction::owned_process_registry::OwnedProcessRegistry>,
     inline: Option<InlineContinuationDeps<'_>>,
     dispatcher_limits: crate::transaction::DispatcherLimits,
+    deadline: Instant,
 ) -> TerminalProposal {
     // §22.6: establish external session before ordinary events when not done
     // at the prompt-ready gate (DirectLlm / late discovery).
@@ -627,6 +631,7 @@ async fn finish_after_exchange(
                 scoped_units.clone(),
                 publish_tx.clone(),
                 Arc::clone(cancel),
+                deadline,
             )
             .await
         } else {
@@ -650,6 +655,7 @@ async fn finish_after_exchange(
                 first_exchange_id,
                 transaction_id,
                 tasks.clone(),
+                deadline,
             );
             run_supervised_tool_loop(
                 tasks,
@@ -660,6 +666,7 @@ async fn finish_after_exchange(
                 scoped_units.clone(),
                 publish_tx.clone(),
                 Arc::clone(cancel),
+                deadline,
                 Arc::new(ResolvedToolRegistry::new(resolved)),
                 Arc::new(runtime),
             )
@@ -702,6 +709,9 @@ async fn finish_after_exchange(
             }
             Err(LoopDispatchError::Cancelled) => {
                 terminal = TransactionEndKind::Cancelled;
+            }
+            Err(LoopDispatchError::DeadlineExceeded) => {
+                terminal = TransactionEndKind::DeadlineExceeded;
             }
             Err(LoopDispatchError::PublishFailed) => {
                 terminal = TransactionEndKind::EventDeliveryFailed;
@@ -833,6 +843,7 @@ async fn run_inline_tool_continuation(
                 scoped.clone(),
                 publish_tx.clone(),
                 Arc::clone(cancel),
+                deps.deadline,
             )
             .await
         } else {
@@ -856,6 +867,7 @@ async fn run_inline_tool_continuation(
                 continuation_exchange_id,
                 transaction_id,
                 tasks.clone(),
+                deps.deadline,
             );
             run_supervised_tool_loop(
                 tasks,
@@ -866,6 +878,7 @@ async fn run_inline_tool_continuation(
                 scoped.clone(),
                 publish_tx.clone(),
                 Arc::clone(cancel),
+                deps.deadline,
                 Arc::new(ResolvedToolRegistry::new(resolved)),
                 Arc::new(runtime),
             )
@@ -881,6 +894,9 @@ async fn run_inline_tool_continuation(
             }
             Err(LoopDispatchError::Cancelled) => {
                 return Err(TransactionEndKind::Cancelled);
+            }
+            Err(LoopDispatchError::DeadlineExceeded) => {
+                return Err(TransactionEndKind::DeadlineExceeded);
             }
             Err(LoopDispatchError::PublishFailed) => {
                 return Err(TransactionEndKind::EventDeliveryFailed);

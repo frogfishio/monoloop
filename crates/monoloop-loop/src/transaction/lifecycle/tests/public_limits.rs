@@ -896,3 +896,33 @@ async fn event_publisher_prefers_authoritative_session_on_seal() {
     }
     let _ = pub_task.await;
 }
+
+/// Absolute deadline construction must not panic: absurd durations fail at start.
+#[test]
+fn transaction_deadline_unrepresentable_rejected_at_start() {
+    use crate::StartupError;
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(u64::MAX / 2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    match StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    }) {
+        Ok(_) => panic!("absurd transaction_deadline must reject at start"),
+        Err(StartupError::InvalidConfig(msg)) => {
+            assert!(
+                msg.contains("transaction_deadline") || msg.contains("Instant"),
+                "unexpected message {msg}"
+            );
+        }
+        Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+    }
+}

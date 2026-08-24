@@ -47,6 +47,8 @@ pub struct TransactionMcpHandler {
     transaction_id: TransactionId,
     exchange_id: ExchangeId,
     tool_defs: Vec<Tool>,
+    /// Absolute transaction Instant — caps MCP tool dispatch budget.
+    transaction_deadline: std::time::Instant,
 }
 
 impl TransactionMcpHandler {
@@ -57,6 +59,7 @@ impl TransactionMcpHandler {
         dispatcher: Arc<TransactionToolDispatcher>,
         transaction_id: TransactionId,
         exchange_id: ExchangeId,
+        transaction_deadline: std::time::Instant,
     ) -> Self {
         let tool_defs = tool_definitions_from_resolved(&tools);
         Self {
@@ -66,6 +69,7 @@ impl TransactionMcpHandler {
             transaction_id,
             exchange_id,
             tool_defs,
+            transaction_deadline,
         }
     }
 
@@ -115,6 +119,7 @@ impl TransactionMcpHandler {
                 provider_tool_call_id: format!("mcp-{}", uuid::Uuid::new_v4()),
                 request_ordinal: 0,
                 arguments_json,
+                transaction_deadline: self.transaction_deadline,
             })
             .await;
         map_dispatch_to_call_result(outcome)

@@ -215,6 +215,26 @@ impl McpRouteTable {
         exchange_id: ExchangeId,
         base_url: &str,
     ) -> Result<PendingMcpBinding, McpInstallError> {
+        self.install_pending_with_deadline(
+            transaction_id,
+            tools,
+            dispatcher,
+            exchange_id,
+            base_url,
+            std::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 3600),
+        )
+    }
+
+    /// Install with the live transaction absolute Instant (caps MCP tool budgets).
+    pub fn install_pending_with_deadline(
+        self: &Arc<Self>,
+        transaction_id: TransactionId,
+        tools: ResolvedToolSet,
+        dispatcher: Arc<TransactionToolDispatcher>,
+        exchange_id: ExchangeId,
+        base_url: &str,
+        transaction_deadline: std::time::Instant,
+    ) -> Result<PendingMcpBinding, McpInstallError> {
         let token = CapabilityToken::generate()?;
         let state = Arc::new(AtomicU8::new(STATE_PENDING));
         let handler = TransactionMcpHandler::new(
@@ -223,6 +243,7 @@ impl McpRouteTable {
             Arc::clone(&dispatcher),
             transaction_id,
             exchange_id,
+            transaction_deadline,
         );
         let binding = Arc::new(McpBinding {
             token: token.clone(),

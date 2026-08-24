@@ -115,12 +115,31 @@ impl McpGatewayHandle {
         dispatcher: Arc<TransactionToolDispatcher>,
         exchange_id: ExchangeId,
     ) -> Result<PendingMcpBinding, McpInstallError> {
-        self.routes.install_pending(
+        self.install_pending_with_deadline(
+            transaction_id,
+            tools,
+            dispatcher,
+            exchange_id,
+            std::time::Instant::now() + std::time::Duration::from_secs(365 * 24 * 3600),
+        )
+    }
+
+    /// Install with the live transaction absolute Instant.
+    pub fn install_pending_with_deadline(
+        &self,
+        transaction_id: TransactionId,
+        tools: ResolvedToolSet,
+        dispatcher: Arc<TransactionToolDispatcher>,
+        exchange_id: ExchangeId,
+        transaction_deadline: std::time::Instant,
+    ) -> Result<PendingMcpBinding, McpInstallError> {
+        self.routes.install_pending_with_deadline(
             transaction_id,
             tools,
             dispatcher,
             exchange_id,
             &self.base_url,
+            transaction_deadline,
         )
     }
 

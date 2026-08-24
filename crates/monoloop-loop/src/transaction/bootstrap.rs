@@ -295,6 +295,19 @@ impl RuntimeConfig {
                 "default_shutdown_deadline",
             ));
         }
+        // Reject durations that cannot form an Instant absolute deadline
+        // (`Instant + Duration` would panic for Duration::MAX-class values).
+        const MAX_TX_DEADLINE: std::time::Duration =
+            std::time::Duration::from_secs(365 * 24 * 3600);
+        if self.transaction_limits.transaction_deadline > MAX_TX_DEADLINE
+            || std::time::Instant::now()
+                .checked_add(self.transaction_limits.transaction_deadline)
+                .is_none()
+        {
+            return Err(super::StartupError::InvalidConfig(
+                "transaction_deadline exceeds Instant-representable bound",
+            ));
+        }
         if let Some(cap) = self.start_queue_capacity {
             if cap == 0 {
                 return Err(super::StartupError::InvalidConfig(

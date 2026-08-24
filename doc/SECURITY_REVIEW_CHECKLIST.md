@@ -80,8 +80,8 @@ does **not** close D-025.
   load landed; not exhaustive WP-12 race matrix)
 - Live Grok multi-session: `live_grok_multi_session` example (concurrent
   `session/new` + isolation; default secret on preauthorized hosts). Explicit
-  live `session/load` after short session still residual; mock concurrent
-  new/load remains
+  live `session/load` after short session still residual (**DECISIONS D-061**);
+  mock concurrent new/load remains
 - Refreshable MCP (deferred; do not treat as shipped)
 
 ## Sign-off
@@ -98,5 +98,9 @@ Until this table is filled by an **independent** reviewer (not the implementing
 agent session), D-025 process residual and §23 “independent review finds no
 unresolved P0/P1/P2” remain **open** for Golden / §25.
 
-Agent-prepared (unsigned) evidence pointers for reviewers:
-`doc/D025_EVIDENCE_PACK.md`. That pack does **not** constitute Sign-off.
+### Agent Golden-ready (unsigned)
+
+Agents prepared evidence for Sign-off (`doc/D025_EVIDENCE_PACK.md`). Closable
+residuals (cancel race, Instant tools/MCP, mixed text, context exact−1, Loop
+Instant needle, live concurrent new) are landed. **Sign-off table above remains
+`_TBD_`.** Filling it is the remaining Golden gate agents must not self-perform.

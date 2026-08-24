@@ -5830,3 +5830,66 @@ Explicit live `session/load` residual honest. Testkit-only; no Golden overclaim.
 
 **Next pick:** human D-025 Sign-off — or further Fake race — or optional live
 `session/load` follow-up. Do not re-pick concurrent new+isolation as open.
+
+**Acceptance REJECT closeout (cancel race + Instant tools, 2026-08-24):**
+
+P1 Cancelled flake root cause: `RawOutputHandle::receive` woke on `is_terminal`
+(set by `ConnectionOwner::finish` before `out_tx` drop) and invented
+`ConnectorError::cancelled` when the channel was still Empty — Interpretation
+Cancelled → exchange Cancelled after tool rounds. Fixed by interrupting receive
+only on cancel/terminate and not inventing Cancelled on terminal-only wakes.
+HTTP `wait_control` similarly no longer treats `is_terminal` as Cancelled.
+
+Also: Loop/tool waits race absolute Instant (`DeadlineExceeded`); tool budget
+`min(execution_deadline, remaining tx Instant)`; startup rejects Instant-
+unrepresentable `transaction_deadline`; harness fails on post-Ended events;
+absolute transcript order offsets.
+
+Verified: openai e2e **10×** full suite green; Fake 18/18; lifecycle 94 ok.
+**Not** Golden / §25 / D-025.
+
+**Expert (2026-08-24, cancel race + Instant tools):** **PASS — Silver.**
+Receive invent-Cancelled race fixed; Instant through Loop/Host tools; startup
+Instant reject; harness fence. openai e2e 10× green. **Not** Golden / §25 / D-025.
+
+**Advisor (2026-08-24, cancel race + Instant tools acceptance closeout):** **PASS — Silver.**
+Product Connector fix (not harness-only); Instant Loop path; docs honest.
+Standing: MCP far Instant; mixed exact-context deferred. **Not** Golden / §25 / D-025.
+
+**Next pick:** optional MCP Instant / mixed fixture / human D-025. Do not re-pick
+this closeout as open.
+
+**Golden pursuit (2026-08-24):** Closable residuals for Golden-ready Silver:
+
+- MCP `TransactionMcpHandler` carries live tx Instant (`install_pending_with_deadline`)
+- `fake_inline_mixed_text_and_tool_call_preserved_in_continuation`
+- `fake_inline_continuation_context_bytes_exact_admits_plus_one_rejects`
+- `supervised_empty_loop_past_instant_is_deadline_exceeded`
+- Live `session/load` residual recorded as **DECISIONS D-061**
+- D025 pack / checklist / V2 spec status: Golden-ready pending human Sign-off
+
+**Not** Golden / §25 — Sign-off table still `_TBD_`. Do not invent D-058/D-059.
+
+**Verified (2026-08-24, Golden-ready closeout):** Fake **20/20**, OpenAI e2e
+**16/16**, MCP gateway **18/18**, s23 **6/6**, Instant needle ok, clippy
+`-D warnings` on loop+connector green. D053 map counts synced to 20/16.
+`cleanup_deadline` stays Partial; D-058 / D-059 stay Open; Sign-off `_TBD_`.
+
+**Expert (2026-08-24, Golden-ready leftover):** **PASS — Silver / Golden-ready
+(Not Golden).** MCP/Host/Loop Instant sound; cancel invent-Cancelled prior fix
+holds; mixed + context needles present (context is exact−1 / padded-exact as
+documented); no unbounded queues in this slice. Standing (not must-fix): no
+dedicated MCP Instant-exceed e2e; broader race/load; D-061; human Sign-off.
+**Not** Golden / §25 / D-025.
+
+**Advisor (2026-08-24, Golden-ready Silver handoff):** **PASS — Silver /
+Golden-ready (Not Golden).** Bar met for unsigned human Sign-off handoff.
+Three-component + product↛testkit + empty-tool intact; Open/Partial/D-061
+honest; no Sign-off self-sign; no Golden overclaim. **Not** Golden / §25 /
+D-025.
+
+**Next pick:** human D-025 Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`
+(agents must not self-sign) — **or** optional MCP Instant-exceed needle /
+further named Fake race. Do not invent D-058/D-059; do not promote
+`cleanup_deadline` Covered; do not re-pick this Golden-ready residual set as
+open.

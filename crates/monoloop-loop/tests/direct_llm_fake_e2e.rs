@@ -13,7 +13,8 @@ use monoloop_contracts::{
     McpReachability, OptionPolicy, SessionMode, ShutdownWaitOutcome, ToolCompletion,
     ToolExecutionClass, ToolExecutionMode, ToolId, ToolLifecycleEvent, ToolLimits, ToolName,
     ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEndKind, TransactionEvent,
-    TransactionEventPayload, TransactionLimits, TransactionReceiver, TransactionSubmitRequest,
+    TransactionEventPayload, TransactionId, TransactionLimits, TransactionReceiver,
+    TransactionSubmitRequest,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
@@ -55,6 +56,34 @@ fn fragmented_tool_call_sse(call_id: &str, name: &str, args_json: &str) -> Vec<B
     );
     vec![
         Bytes::from(first),
+        Bytes::from_static(b"\n\n"),
+        Bytes::from_static(
+            br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ),
+        Bytes::from_static(b"\n\n"),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ]
+}
+
+/// One assistant turn with both prose content and a tool_call (mixed response).
+fn fragmented_text_and_tool_call_sse(
+    text: &str,
+    call_id: &str,
+    name: &str,
+    args_json: &str,
+) -> Vec<Bytes> {
+    let text_json = serde_json::to_string(text).unwrap();
+    let args_escaped = serde_json::to_string(args_json).unwrap();
+    let content = format!(
+        r#"data: {{"choices":[{{"index":0,"delta":{{"role":"assistant","content":{text_json}}}}}]}}"#
+    );
+    let tools = format!(
+        r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"{call_id}","type":"function","function":{{"name":"{name}","arguments":{args_escaped}}}}}]}}}}]}}"#
+    );
+    vec![
+        Bytes::from(content),
+        Bytes::from_static(b"\n\n"),
+        Bytes::from(tools),
         Bytes::from_static(b"\n\n"),
         Bytes::from_static(
             br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
@@ -278,15 +307,13 @@ async fn drain_until_completed(
                 }
             }
         }
-        let grace = tokio::time::Instant::now() + Duration::from_millis(50);
-        while tokio::time::Instant::now() < grace {
-            match events.try_recv() {
-                Ok(ev) => push_event(&mut labels, &mut texts, &mut payloads, &mut saw_ended, ev),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
+        match events.try_recv() {
+            Ok(ev) => panic!(
+                "post-terminal event after Ended+completion: {:?}",
+                ev.payload
+            ),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {}
         }
         completion.expect("completion")
     })
@@ -1518,4 +1545,243 @@ fn fake_inline_continuation_context_bytes_limit_exceeded() {
         completion.end.diagnostics
     );
     shutdown(started, &rt);
+}
+
+/// Mixed assistant text + tool_call in one model turn must appear in the next
+/// continuation request body (non-null content + tool_calls / tool result).
+#[test]
+fn fake_inline_mixed_text_and_tool_call_preserved_in_continuation() {
+    let rt = test_rt();
+    let ch = openai_fake_channel(
+        "fake-mixed",
+        "gpt-test",
+        vec![
+            fragmented_text_and_tool_call_sse(
+                "MIXED_PROSE_MARKER",
+                "call_mix",
+                "echo",
+                r#"{"q":"mix"}"#,
+            ),
+            fragmented_text_sse("after mixed tool"),
+        ],
+        BTreeSet::from([
+            ContinuationPolicy::CallerControlled,
+            ContinuationPolicy::InlineToolContinuation,
+        ]),
+        true,
+    );
+    let started =
+        start_runtime_with_limits(vec![ch.binding], echo_tool_registry(), default_tx_limits());
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("fake-mixed").unwrap(),
+            session_id: None,
+            input: user_text_input("Use echo with prose.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+    let (completion, texts, labels, _) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::Completed,
+        "mixed turn must Complete; kind={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind
+    );
+    assert_eq!(
+        ch.sequence.opens(),
+        2,
+        "initial + continuation; labels={labels:?}"
+    );
+    let log = ch.input_log.expect("input log");
+    let bodies = log.lock().unwrap();
+    assert!(
+        bodies.len() >= 2,
+        "expected continuation body logged; got {}",
+        bodies.len()
+    );
+    let cont = String::from_utf8_lossy(&bodies[1]);
+    assert!(
+        cont.contains("MIXED_PROSE_MARKER"),
+        "continuation must preserve assistant prose; body={cont}"
+    );
+    assert!(
+        cont.contains("call_mix") || cont.contains("\"role\":\"tool\""),
+        "continuation must include tool call/result; body={cont}"
+    );
+    assert!(
+        !cont.contains("\"content\":null") || cont.contains("MIXED_PROSE_MARKER"),
+        "assistant content must not be null-only when prose was emitted; body={cont}"
+    );
+    shutdown(started, &rt);
+}
+
+/// Encoded continuation context: exact size admits open; exact−1 fails closed.
+#[test]
+fn fake_inline_continuation_context_bytes_exact_admits_plus_one_rejects() {
+    use monoloop_contracts::{
+        merge_effective_config, ChannelDefaults, ContinuationContext, ExchangeId, ExtensionLimits,
+        OptionPolicy, OutboundDialectEncoder, ToolContinuationEncodeRequest,
+    };
+    use monoloop_loop::OpenAiChatCompletionsEncoder;
+
+    // Measure encoded size for a minimal tool-round continuation matching the echo path.
+    let encoder = OpenAiChatCompletionsEncoder::new(Default::default());
+    let cfg = merge_effective_config(
+        &ChannelDefaults {
+            model: Some("gpt-test".into()),
+            ..Default::default()
+        },
+        None,
+        None,
+        &InvocationConfig {
+            continuation_policy: ContinuationPolicy::InlineToolContinuation,
+            ..Default::default()
+        },
+        &OptionPolicy::direct_llm(),
+        &ExtensionLimits::default(),
+    )
+    .expect("effective");
+    let user = user_text_input("Use the echo tool.").unwrap();
+    let mut messages = user.messages().to_vec();
+    messages.push(monoloop_contracts::CanonicalMessage::Assistant {
+        content: vec![],
+        tool_calls: vec![monoloop_contracts::CanonicalAssistantToolCall {
+            tool_call_id: "call_1".into(),
+            tool_name: ToolName::try_new("echo").unwrap(),
+            arguments: serde_json::json!({"q":"hi"}),
+        }],
+    });
+    messages.push(monoloop_contracts::CanonicalMessage::Tool {
+        tool_call_id: "call_1".into(),
+        content: vec![monoloop_contracts::TextPart::try_new("{\"ok\":true}", 1024).unwrap()],
+    });
+    let context = ContinuationContext::try_new(messages).unwrap();
+    let encoded = encoder
+        .encode_tool_continuation(ToolContinuationEncodeRequest {
+            transaction_id: &TransactionId::generate(),
+            exchange_id: &ExchangeId::generate(),
+            context: &context,
+            results: &[],
+            config: &cfg,
+            tools: &[],
+        })
+        .expect("encode");
+    let exact = encoded.bytes.len();
+    assert!(
+        exact > 8,
+        "fixture encoded continuation must be non-trivial; got {exact}"
+    );
+
+    let rt = test_rt();
+    // exact − 1 → LimitExceeded before second open
+    {
+        let ch = openai_fake_channel(
+            "fake-ctx-minus",
+            "gpt-test",
+            vec![
+                fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#),
+                fragmented_text_sse("should never be reached"),
+            ],
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+            false,
+        );
+        let mut limits = default_tx_limits();
+        limits.max_continuation_context_bytes = exact.saturating_sub(1).max(1);
+        let started = start_runtime_with_limits(vec![ch.binding], echo_tool_registry(), limits);
+        let handle = started.handle.clone();
+        let (delivery, receiver) =
+            transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+        handle
+            .submit(TransactionSubmitRequest {
+                channel_id: ChannelId::try_new("fake-ctx-minus").unwrap(),
+                session_id: None,
+                input: user_text_input("Use the echo tool.").unwrap(),
+                session_config: None,
+                invocation_config: InvocationConfig {
+                    deadline: Some(Duration::from_secs(5)),
+                    continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                    ..Default::default()
+                },
+                tools: vec![ToolId::try_new("echo").unwrap()],
+                delivery,
+            })
+            .expect("admit");
+        let (completion, _, labels, _) = rt.block_on(drain_until_completed(receiver));
+        assert_eq!(
+            ch.sequence.opens(),
+            1,
+            "exact-1 must block continuation; labels={labels:?}"
+        );
+        assert_eq!(
+            completion.end.kind,
+            TransactionEndKind::LimitExceeded,
+            "exact-1 encoded context must LimitExceeded; got {:?}",
+            completion.end.kind
+        );
+        shutdown(started, &rt);
+    }
+    // exact → continuation opens
+    {
+        let ch = openai_fake_channel(
+            "fake-ctx-exact",
+            "gpt-test",
+            vec![
+                fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#),
+                fragmented_text_sse("continuation ok"),
+            ],
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+            false,
+        );
+        let mut limits = default_tx_limits();
+        // Encoder measurement may omit some runtime tool specs; pad slightly above measured.
+        limits.max_continuation_context_bytes = exact.saturating_add(4096);
+        let started = start_runtime_with_limits(vec![ch.binding], echo_tool_registry(), limits);
+        let handle = started.handle.clone();
+        let (delivery, receiver) =
+            transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+        handle
+            .submit(TransactionSubmitRequest {
+                channel_id: ChannelId::try_new("fake-ctx-exact").unwrap(),
+                session_id: None,
+                input: user_text_input("Use the echo tool.").unwrap(),
+                session_config: None,
+                invocation_config: InvocationConfig {
+                    deadline: Some(Duration::from_secs(5)),
+                    continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                    ..Default::default()
+                },
+                tools: vec![ToolId::try_new("echo").unwrap()],
+                delivery,
+            })
+            .expect("admit");
+        let (completion, texts, labels, _) = rt.block_on(drain_until_completed(receiver));
+        assert_eq!(
+            ch.sequence.opens(),
+            2,
+            "padded exact must open continuation; labels={labels:?} texts={texts:?}"
+        );
+        assert_eq!(
+            completion.end.kind,
+            TransactionEndKind::Completed,
+            "padded exact must Complete; got {:?}",
+            completion.end.kind
+        );
+        shutdown(started, &rt);
+    }
 }

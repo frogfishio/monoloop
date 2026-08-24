@@ -601,6 +601,7 @@ async fn supervised_empty_loop_ready_under_task_spawner() {
         vec![ready_tool_unit()],
         publish_tx,
         cancel,
+        Instant::now() + Duration::from_secs(30),
     )
     .await
     .expect("supervised empty loop");
@@ -722,8 +723,13 @@ async fn supervised_non_empty_loop_dispatches_registered_tool() {
         completed_ok
     });
 
-    let runtime =
-        HostToolRuntime::with_spawner(Arc::clone(&dispatcher), exchange_id, tx_id, spawner.clone());
+    let runtime = HostToolRuntime::with_spawner(
+        Arc::clone(&dispatcher),
+        exchange_id,
+        tx_id,
+        spawner.clone(),
+        Instant::now() + Duration::from_secs(30),
+    );
     let cancel = Arc::new(StickyCancel::new());
     let report = run_supervised_tool_loop(
         &spawner,
@@ -734,6 +740,7 @@ async fn supervised_non_empty_loop_dispatches_registered_tool() {
         vec![ready_tool_unit()],
         publish_tx,
         cancel,
+        Instant::now() + Duration::from_secs(30),
         Arc::new(ResolvedToolRegistry::new(resolved)),
         Arc::new(runtime),
     )
@@ -786,11 +793,64 @@ async fn supervised_empty_loop_cancel_before_waiter_is_cancelled() {
         vec![ready_tool_unit()],
         publish_tx,
         Arc::clone(&cancel),
+        Instant::now() + Duration::from_secs(30),
     )
     .await
     .expect_err("pre-cancel must not succeed");
 
     assert_eq!(err, LoopDispatchError::Cancelled);
+
+    drop(spawner);
+    let _ = drain_pub.await;
+    pump.await.expect("spawn pump");
+}
+
+/// Absolute Instant elapsed during supervised Loop wait → DeadlineExceeded (not Cancelled).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_empty_loop_past_instant_is_deadline_exceeded() {
+    use super::super::event_publisher::OrdinaryCmdAdmit;
+    use super::super::loop_dispatch::{run_supervised_empty_loop, LoopDispatchError};
+    use super::super::task_spawner::TransactionTaskSpawner;
+    use super::super::task_supervisor::TaskSupervisor;
+    use crate::transaction::sticky_cancel::StickyCancel;
+    use monoloop_contracts::{ChannelId, ExchangeId, TransactionId};
+
+    let (spawner, mut spawn_rx) = TransactionTaskSpawner::channel(8);
+    let pump = tokio::spawn(async move {
+        let mut tasks = TaskSupervisor::new();
+        while let Some(req) = spawn_rx.recv().await {
+            let id = tasks.spawn(req.class, req.future);
+            let _ = req.reply.send(id);
+        }
+        let _ = tasks.abort_and_drain().await;
+    });
+
+    let (publish_tx, mut publish_rx) = OrdinaryCmdAdmit::channel(8);
+    let drain_pub = tokio::spawn(async move { while publish_rx.recv().await.is_some() {} });
+
+    let cancel = Arc::new(StickyCancel::new());
+    let past = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("past Instant");
+    let err = run_supervised_empty_loop(
+        &spawner,
+        TransactionId::generate(),
+        ChannelId::try_new("llm").unwrap(),
+        None,
+        ExchangeId::generate(),
+        vec![ready_tool_unit()],
+        publish_tx,
+        cancel,
+        past,
+    )
+    .await
+    .expect_err("past Instant must fail closed");
+
+    assert_eq!(
+        err,
+        LoopDispatchError::DeadlineExceeded,
+        "past tx Instant must be DeadlineExceeded, got {err:?}"
+    );
 
     drop(spawner);
     let _ = drain_pub.await;

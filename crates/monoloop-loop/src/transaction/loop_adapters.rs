@@ -64,6 +64,8 @@ pub struct HostToolRuntime {
     exchange_id: ExchangeId,
     spawner: TransactionTaskSpawner,
     transaction_id: TransactionId,
+    /// Absolute transaction Instant — caps each tool's execution budget.
+    transaction_deadline: std::time::Instant,
 }
 
 impl HostToolRuntime {
@@ -73,12 +75,14 @@ impl HostToolRuntime {
         exchange_id: ExchangeId,
         transaction_id: TransactionId,
         spawner: TransactionTaskSpawner,
+        transaction_deadline: std::time::Instant,
     ) -> Self {
         Self {
             dispatcher,
             exchange_id,
             spawner,
             transaction_id,
+            transaction_deadline,
         }
     }
 }
@@ -97,6 +101,7 @@ impl ToolRuntime for HostToolRuntime {
         let payload = request.request_payload;
         let ordinal = request.request_generation as u32;
         let execution_id = request.execution_id.clone();
+        let transaction_deadline = self.transaction_deadline;
         let (tx, rx) = oneshot::channel();
         let work = async move {
             let outcome = dispatcher
@@ -107,6 +112,7 @@ impl ToolRuntime for HostToolRuntime {
                     provider_tool_call_id: provider_id,
                     request_ordinal: ordinal,
                     arguments_json: payload,
+                    transaction_deadline,
                 })
                 .await;
             let _ = tx.send(map_outcome(outcome));
@@ -207,6 +213,9 @@ pub async fn dispatch_ready_tool_cancellable(
                 provider_tool_call_id: provider_tool_call_id.into(),
                 request_ordinal,
                 arguments_json: arguments_json.into(),
+                // No transaction Instant on this helper — use a far ceiling.
+                transaction_deadline: std::time::Instant::now()
+                    + std::time::Duration::from_secs(365 * 24 * 3600),
             },
             cancel,
         )
