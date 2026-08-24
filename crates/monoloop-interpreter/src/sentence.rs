@@ -167,12 +167,10 @@ fn find_sentence_end(s: &str) -> Option<usize> {
             // Hard break: double newline closes a paragraph-like unit when stable.
             // Do not seal if the only content so far is an ordered-list marker
             // ("1." / "2.") — keep it for the following item text.
-            '\n' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                    let before = s[..i].trim();
-                    if !before.is_empty() && !is_only_list_marker(before) {
-                        return Some(i);
-                    }
+            '\n' if i + 1 < bytes.len() && bytes[i + 1] == b'\n' => {
+                let before = s[..i].trim();
+                if !before.is_empty() && !is_only_list_marker(before) {
+                    return Some(i);
                 }
             }
             _ => {}

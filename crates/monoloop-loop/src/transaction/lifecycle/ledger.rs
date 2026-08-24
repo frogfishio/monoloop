@@ -189,14 +189,26 @@ impl LifecycleLedger {
     /// that would exceed the bound fails with `DistinctSessionsExceeded`.
     /// Replacing an existing key on the same channel does not consume an extra
     /// distinct slot.
+    ///
+    /// D-063: admission (`insert_queued`) already reserves `SessionKey` in
+    /// `by_session` for a resumed transaction (`session_id: Some(..)` on
+    /// `TransactionSubmitRequest`), bound to that transaction's own id, before
+    /// the claim below ever runs. If the existing holder *is* `id`, this call
+    /// is that same transaction re-confirming its own admission-time
+    /// reservation once the external session is established — not a new
+    /// distinct-session slot — so it must succeed as a no-op rather than
+    /// reject its own resume with `SessionAlreadyActive`.
     pub fn bind_session(
         &mut self,
         id: &TransactionId,
         key: SessionKey,
         max_distinct_sessions: Option<usize>,
     ) -> Result<(), LedgerInsertError> {
-        if self.by_session.contains_key(&key) {
-            return Err(LedgerInsertError::SessionAlreadyActive);
+        if let Some(holder) = self.by_session.get(&key) {
+            if holder != id {
+                return Err(LedgerInsertError::SessionAlreadyActive);
+            }
+            return Ok(());
         }
         let replacing_same_channel = self
             .by_transaction

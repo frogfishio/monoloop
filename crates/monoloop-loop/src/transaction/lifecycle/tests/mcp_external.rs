@@ -358,6 +358,96 @@ fn external_agent_empty_tools_establishes_session_and_completes() {
     assert!(matches!(stopped, ShutdownWaitOutcome::Stopped(_)));
 }
 
+/// D-063: a resumed ExternalAgent transaction (`session_id: Some(..)` on
+/// `TransactionSubmitRequest`, for a session the provider already knows
+/// about — e.g. loaded from a prior conversation) must complete, not fail
+/// closed on its own admission-time SessionKey reservation.
+///
+/// Admission (`insert_queued`, `admission.rs`) reserves `SessionKey` in
+/// `by_session` for a resume up front, bound to the *new* transaction's own
+/// id, before the coordinator ever runs. The coordinator's claim-time
+/// `bind_session` call — once the external session is actually established —
+/// used to find that same key already present and reject with
+/// `SessionAlreadyActive` regardless of whether the holder was itself,
+/// collapsing to `TransactionEndKind::InvariantFailed` before any prompt body
+/// was ever sent. Reproduced live against Grok Build 1.0.5: `session/load`
+/// RPC succeeds, the transaction still fails `InvariantFailed` with zero
+/// delay *and* a real 10s delay between turns — proving it is not a teardown
+/// race. Fixed in `LifecycleLedger::bind_session` by only rejecting when the
+/// existing holder is a *different* transaction.
+///
+/// Uses `FakeSessionAdapterConfig::pre_registered_sessions` rather than a
+/// live create-then-resume pair: the Fake adapter's own create path only
+/// ever registers a *provisional* placeholder id in its session table (see
+/// `run_attach`'s create branch) and has no step that re-registers the real
+/// provider-assigned id afterward, so a literal create-then-resume through
+/// this harness would fail at `begin_attach`'s "known" lookup for an
+/// unrelated reason. Pre-registering isolates the ledger defect this test
+/// targets from that separate gap.
+#[test]
+fn external_agent_resume_of_known_session_completes() {
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(2),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let session_config = monoloop_connector::FakeSessionAdapterConfig {
+        pre_registered_sessions: vec![("resume-known".into(), Default::default())],
+        ..Default::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            enable_mcp_listener: false,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![external_agent_binding_with_session(
+            "agent",
+            2,
+            session_config,
+        )])
+        .unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+    let (delivery, mut recv) =
+        transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("agent").unwrap(),
+            session_id: Some(SessionId::try_new("resume-known").unwrap()),
+            input: user_text_input("hi").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig::default(),
+            tools: vec![],
+            delivery,
+        })
+        .expect("admit");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let kind = rt.block_on(async {
+        while let Some(ev) = recv.events.recv().await {
+            let _ = ev;
+        }
+        recv.completion.recv().await.expect("completion").end.kind
+    });
+    assert_eq!(
+        kind,
+        TransactionEndKind::Completed,
+        "resume of a session the provider already knows about must complete, not InvariantFailed"
+    );
+
+    let mut owner = started.owner;
+    let stopped = rt.block_on(owner.wait_stopped(Duration::from_secs(3)));
+    assert!(matches!(stopped, ShutdownWaitOutcome::Stopped(_)));
+}
+
 /// §17: spawn Rejected (closed mailbox) fail closed with 503 (no ambient inline drive).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_mcp_owner_returns_503_when_spawn_rejected() {

@@ -4,6 +4,68 @@ Explicit project decisions that change contracts, MSRV, or delivery assumptions.
 Normative behavior still lives under `doc/`; this file records *why* a deliberate
 change was made.
 
+## D-063 — `bind_session` rejected a transaction's own admission-time SessionKey
+
+**Date:** 2026-08-25
+
+**Context:** Discovered downstream of D-061, in a Tinker (frogfish.io product)
+debugging session against real Grok Build 1.0.5. After the D-061-adjacent
+`session/load` field fix landed product-side (matching `session/new`'s
+`mcpServers` + `_meta.yoloMode`), `session/load` started returning `ok`, but
+the *second* turn of any resumed ExternalAgent conversation still ended
+`TransactionEndKind::InvariantFailed`, with no `session/prompt` ever sent.
+Confirmed via an isolated `LoopHost`-only spike (no product integration code)
+that the failure is instant and does **not** clear with a real 10s delay
+between turns — ruling out a teardown race.
+
+Root cause: `admission::admit` (`insert_queued`) already reserves the
+`SessionKey` in `LifecycleLedger::by_session` for any resumed submission
+(`TransactionSubmitRequest.session_id: Some(..)`), bound to the *new*
+transaction's own id, before the coordinator ever runs. The coordinator's
+claim-time `LifecycleLedger::bind_session` call — once the external session
+is actually established — found that same key already present and rejected
+with `SessionAlreadyActive` unconditionally, never checking whether the
+existing holder was itself. Every resumed ExternalAgent transaction rejected
+its own admission-time reservation, deterministically, every time.
+
+**Decision:** Fix `bind_session` to treat "already bound to this same
+transaction" as a no-op success; only reject when the existing holder is a
+*different* transaction. This preserves every existing protection
+(concurrent-duplicate-session admission rejection, claim-time
+`DistinctSessionsExceeded`, cross-transaction `SessionAlreadyActive`) — none
+of those paths involve a transaction re-confirming its own reservation.
+
+**Consequences:**
+
+- `crates/monoloop-loop/src/transaction/lifecycle/ledger.rs`: `bind_session`
+  now compares the existing holder against `id` before rejecting.
+- New regression test:
+  `transaction::lifecycle::tests::mcp_external::external_agent_resume_of_known_session_completes`.
+  Uses a new `FakeSessionAdapterConfig::pre_registered_sessions` hook rather
+  than a live create-then-resume pair — the Fake adapter's create path only
+  ever registers a *provisional* placeholder id (see `run_attach`'s create
+  branch in `monoloop-connector/src/fake_session.rs`) and has no step that
+  re-registers the real provider-assigned id afterward, so a literal
+  create-then-resume through the Fake harness fails at `begin_attach`'s
+  "known" lookup for an unrelated reason (untouched by this fix — see the gap
+  noted below).
+- Verified: full `make test` (`cargo test --workspace --all-targets
+  --all-features`) green (62/62 binaries) after the fix; the new test fails
+  with `InvariantFailed` against the pre-fix code and passes after.
+- Also live-verified against real Grok Build 1.0.5 through Tinker's own
+  `LoopHost` (product wiring, not this repo) once this fix was applied
+  locally.
+- **Adjacent gap noted, not fixed here:** the Fake `SessionAdapter`'s create
+  path (`monoloop-connector/src/fake_session.rs`, `run_attach`) never
+  re-registers the real provider-assigned session id after a successful
+  create — only a provisional placeholder ever lands in the session table.
+  This mirrors a separate, also-unfixed gap in
+  `monoloop-connector-grok`'s `GrokSessionAdapter::remember()` (dead code,
+  `#[allow(dead_code)]`, never called): the "known" map for resumed loads is
+  never actually populated from a real create either. Neither gap caused
+  this defect (this fix does not depend on either), but both are honest
+  residuals worth a follow-up decision.
+
 ## D-062 — crates.io 0.1.2 Silver / Golden-ready package
 
 **Date:** 2026-08-24

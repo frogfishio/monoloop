@@ -211,10 +211,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
 /// Drain complete NDJSON lines from a growing buffer.
 pub fn drain_ndjson_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut out = Vec::new();
-    loop {
-        let Some(pos) = buffer.iter().position(|&b| b == b'\n') else {
-            break;
-        };
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
         let line = String::from_utf8_lossy(&line_bytes).into_owned();
         let trimmed = line.trim();

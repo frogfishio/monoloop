@@ -150,6 +150,13 @@ pub struct FakeSessionAdapterConfig {
     pub max_in_flight: usize,
     /// When true, `begin_refresh_mcp` is unsupported.
     pub mcp_refresh_unsupported: bool,
+    /// Sessions known to the adapter before any attach — equivalent to
+    /// calling `register_existing` for each entry at construction. Lets a
+    /// test submit a resume (`session_id: Some(..)`) without first driving a
+    /// real create through this adapter's own provisional-id table (which
+    /// has no automatic "register the real id after create" step — see
+    /// `run_attach`'s create branch).
+    pub pre_registered_sessions: Vec<(String, SessionConfig)>,
 }
 
 impl Default for FakeSessionAdapterConfig {
@@ -160,6 +167,7 @@ impl Default for FakeSessionAdapterConfig {
             reject_begin_attach: false,
             max_in_flight: 64,
             mcp_refresh_unsupported: false,
+            pre_registered_sessions: Vec::new(),
         }
     }
 }
@@ -184,13 +192,12 @@ pub struct FakeSessionAdapter {
 impl FakeSessionAdapter {
     /// Create an adapter owned by `owner`.
     pub fn new(owner: ConnectorInstanceId, config: FakeSessionAdapterConfig) -> Self {
+        let by_id = config.pre_registered_sessions.iter().cloned().collect();
         Self {
             state: Arc::new(AdapterState {
                 owner,
                 config,
-                table: Mutex::new(SessionTable {
-                    by_id: HashMap::new(),
-                }),
+                table: Mutex::new(SessionTable { by_id }),
                 in_flight: AtomicUsize::new(0),
                 completed_attaches: AtomicUsize::new(0),
             }),

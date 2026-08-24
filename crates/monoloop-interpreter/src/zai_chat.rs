@@ -133,10 +133,7 @@ fn map_tool_result(value: &Value) -> Vec<AcpFragment> {
 /// Drain complete NDJSON lines from a growing buffer (UTF-8 safe at newlines).
 pub fn drain_ndjson_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut out = Vec::new();
-    loop {
-        let Some(pos) = buffer.iter().position(|&b| b == b'\n') else {
-            break;
-        };
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
         let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
         let line = String::from_utf8_lossy(&line_bytes).into_owned();
         let trimmed = line.trim();

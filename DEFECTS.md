@@ -5898,3 +5898,44 @@ open.
 **0.1.2** (`VERSION`/`BUILD` → `0.1.2`+build-3; **D-062**). `make dist` gates
 passed; all publishable crates uploaded; `main` pushed (`0960c7e`). **Not**
 Golden / §25 / D-025 Sign-off.
+
+**D-063 fix (2026-08-25, `bind_session` self-claim rejection):** Found live
+against real Grok Build 1.0.5 in a Tinker product debugging session, *after*
+the D-061-adjacent `session/load` field fix was already applied product-side
+and confirmed working (`session/load` returns `ok`). Every second-turn resume
+of an ExternalAgent conversation still ended `InvariantFailed` with no
+`session/prompt` ever sent — reproduced instantly and deterministically via
+an isolated `LoopHost`-only spike with zero product integration code, and
+shown *not* to be a teardown race (still failed after a real 10s delay
+between turns).
+
+Root cause: `LifecycleLedger::bind_session` rejected a resumed transaction's
+claim-time `SessionKey` bind as `SessionAlreadyActive` because admission
+(`insert_queued`) had already reserved that same key for that same
+transaction at submit time — `bind_session` never checked whether the
+existing holder was itself before rejecting. See **DECISIONS D-063** for the
+full root-cause trace and fix. This is a distinct defect from D-061 — D-061
+was the `session/load` RPC schema issue (fixed product-side, not yet ported
+into this repo's `monoloop-connector-grok`); D-063 is a `monoloop-loop`
+ledger defect one layer downstream, reachable only once `session/load`
+itself succeeds.
+
+Fix: `bind_session` now succeeds as a no-op when the existing holder is the
+calling transaction itself; still rejects a genuinely different holder.
+Proof: new `external_agent_resume_of_known_session_completes`
+(`monoloop-loop/src/transaction/lifecycle/tests/mcp_external.rs`) — fails
+`InvariantFailed` pre-fix, passes post-fix. Full `make test` (62/62 test
+binaries, all existing session/race/claim-time coverage including
+`duplicate_session_race_admits_exactly_one` and
+`external_agent_claim_time_distinct_sessions_plus_one_limit_exceeded`) green
+after the fix — no regression to concurrent-duplicate-session or
+distinct-sessions-limit enforcement.
+
+Noted, not fixed here: `monoloop-connector`'s `FakeSessionAdapter` and
+`monoloop-connector-grok`'s `GrokSessionAdapter::remember()` both have the
+same class of gap — a real create's provider-assigned session id is never
+registered into the adapter's own "known sessions" table, only a
+provisional placeholder is. Neither caused D-063 (confirmed: this fix does
+not depend on either), but both are honest residuals for a follow-up pass.
+This log entry does not claim Golden / §25 / D-025 Sign-off and is not an
+Expert/Advisor review — plain defect-fix record only.
