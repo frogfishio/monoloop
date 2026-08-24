@@ -5939,3 +5939,14 @@ provisional placeholder is. Neither caused D-063 (confirmed: this fix does
 not depend on either), but both are honest residuals for a follow-up pass.
 This log entry does not claim Golden / §25 / D-025 Sign-off and is not an
 Expert/Advisor review — plain defect-fix record only.
+
+**Release (2026-08-25):** D-063 fix packaged as crates.io **0.1.3**
+(`VERSION`/`BUILD` → `0.1.3`+build-5). `make dist` gates passed (fmt / clippy
+`-D warnings` / test --all-targets / rustdoc -D warnings), release build,
+package dry-run, CLI checks. All 12 workspace crates published in
+`PUBLISHING.md` order (`monoloop-contracts` → `monoloop-connector` +
+`monoloop-interpreter` → `monoloop-loop` → six connector crates →
+`monoloop-testkit` → `monoloop`); `main` pushed (`7cd4abd`). Quality tier
+unchanged from D-062 (**Silver / Golden-ready — Not Golden**); this is a
+defect-fix patch release, not a new Golden-ready acceptance pass. **Not**
+Golden / §25 / D-025 Sign-off.
