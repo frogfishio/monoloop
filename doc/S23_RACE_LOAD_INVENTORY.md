@@ -17,13 +17,17 @@ multi-session qualification.
 | `duplicate_session_race_admits_exactly_one` | Concurrent duplicate `SessionKey` → exactly one admit |
 | `concurrent_hang_terminate_storm_all_cancelled` | Barrier concurrent Cancel on N distinct Hang sessions → all `Accepted`, all `Cancelled`, N completions |
 | `concurrent_hang_force_terminate_storm_all_terminated` | Barrier concurrent ForceTerminate on N distinct Hang sessions → all `Accepted`, all `Terminated`, N completions |
+| `concurrent_hang_cancel_versus_force_terminate_one_terminal` | Barrier Cancel vs ForceTerminate on **one** Hang id → dispositions `{Accepted, AlreadyTerminal}` (≥1 Accepted); exactly one completion in `{Cancelled, Terminated}` |
 
-Hang storms wait for `RuntimeOwner::owned_task_count() >= N` before the barrier
-(supervisor-owned work present), not a fixed sleep.
+Hang storms and the Cancel×Force race wait for
+`RuntimeOwner::live_connector_owners() >= N` (storms) / `>= 1` (same-tx race)
+before the barrier (per-class ConnectorOwner count; D-051 register-before-I/O).
+Aggregate `owned_task_count` is **not** used — InterpreterOwner inflation made
+`>= 3N` an early-fire hole.
 
 Inventory gate: `crates/monoloop-loop/tests/s23_forbidden_patterns.rs` →
-`s23_race_load_inventory_present` requires this file and the named storm /
-shutdown-race needles to remain on disk.
+`s23_race_load_inventory_present` requires this file **and** the named race
+needles to remain in `lifecycle/tests.rs` (deleting a listed fn fails the gate).
 
 ## Explicitly not claimed
 

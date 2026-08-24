@@ -5317,3 +5317,320 @@ Closed standing caveats without claiming Golden / live Grok / D-025:
 Re-verify: Cancel storm, ForceTerminate storm, s23 **5/5** green.
 `GROK_AGENT_SECRET` still unset. Awaiting Expert/Advisor. Agents must not
 self-sign D-025.
+
+**Expert (2026-08-24, race/load honesty caveat follow-up):**
+**FAIL — not honesty-closed as stamped.** Named storms remain sound. This
+slice did **not** close the Hang-register pin or the begin-shutdown **fn**
+gate. **Not** Golden / §25 / D-025. Do **not** reopen D-060. Do **not**
+self-sign Sign-off.
+
+Independently re-checked this tree: Cancel storm **ok**; ForceTerminate storm
+**ok**; `submit_versus_begin_shutdown_two_outcomes` **ok**; s23 **5/5**.
+
+| Question | Verdict |
+|---|---|
+| 1. `owned_task_count() >= N` before barrier | **Sound vs `AlreadyTerminal`. Not sound as a Hang-register happens-before.** `owned_tasks` is `TaskSupervisor::registered_count()` (SeqCst) after each supervisor lap. `handle_start` registers **two** tasks per Start (`EventPublisher` + `TransactionCoordinator`) on the supervisor thread; `ConnectorOwner` registers later via `spawn_rx` (D-051). Select drains **one** Start per wakeup. `>= N` (N=8) can therefore fire after ~4 Starts — **aggregate work present, not one task per admit, not N ConnectorOwners.** Test comment overstates “at least one task per Hang admit.” Inventory wording (“supervisor-owned work present”) is the honest bound. Product path if cancel/force hits Queued: ledger-first `Accepted` (D-039 `Full` → `ControlCapacityExceeded`, default `max_actor_commands` 256; N=8 cannot fill); `handle_start` no-ops unless `Queued`; Finalizer takes `delivery`; one completion. Hang never self-terminals; one `terminate` per distinct id → **`AlreadyTerminal` is not this needle** (strict `Accepted` would fail, not go green). `StartHoldGate` still unused. Replacing 30ms sleep with this poll is **not** a pin; it can proceed *earlier* than the sleep on the Queued path. |
+| 2. `s23_race_load_inventory_present` + begin_shutdown needle | **Not complete enough to close the prior caveat.** Gate now requires `submit_versus_begin_shutdown_two_outcomes` in `doc/S23_RACE_LOAD_INVENTORY.md` (`contains`, not `fn` / not `#[test]`-live). Lifecycle required list is still only the two storms + `multi_channel_multi_session_concurrent_load`. Exact-limit tests.rs needle list still omits this fn (it *does* list the shutdown-barrier twins). **Deleting the fn from `tests.rs` still would not fail `s23_race_load_inventory_present`.** Sequential D-040 two-outcome test is on disk and green; that is not dual-gated. |
+| 3. D-025 prose both storms | **Pack honest on this point.** `doc/D025_EVIDENCE_PACK.md` names both Hang storms + inventory gate; header still **unsigned**; does **not** claim Golden / §25 / D-025 complete; Sign-off deferred to checklist `_TBD_`. Checklist “Recent load/race proofs” **still omits both storms** (stale pointer, not a pack overclaim). |
+
+Storms themselves (not reopened): EmptyToolRegistry / no `ToolRuntime.start`;
+distinct `SessionKey`s; no ambient identity; completions_published == N after
+receiver wait. Named table ≠ exhaustive §23 race/load. Matrix still-open +
+unsigned pack + spec / Loop README keep Golden open.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** pin Hang register honestly (`StartHoldGate`, or wait for **N
+`ConnectorOwner`** / `owned_task_count() >= 2N` only if that is actually the
+invariant — do not treat aggregate `>= N` as per-admit) **and/or** add
+`submit_versus_begin_shutdown_two_outcomes` to the race-gate **lifecycle**
+needle list — **or** live Grok when `GROK_AGENT_SECRET` is present — **or**
+human D-025 Sign-off. Independent D-025 last unless a human is actually
+signing. Do not invent diagnostic/callback waits. Do not re-pick D-060,
+Covered deadline cells, or D-058 / D-059.
+
+**Advisor (2026-08-24, race honesty caveats closed? gate begin_shutdown, D025 both storms, owned_task_count wait):**
+**FAIL — not honesty-closed as stamped.** Named storms remain sound. This
+slice did **not** close the Hang-register pin or the begin-shutdown **fn**
+gate. **Not** Golden / §25 / D-025. Do **not** reopen D-060. Do **not**
+self-sign Sign-off. This is **not** a Sign-off self-sign. Live Grok remaining
+blocked is **correct** (`GROK_AGENT_SECRET` unset on this tree; `GROK_AGENT` /
+`GROK_SESSION_ID` present do not substitute).
+
+Independently re-checked this tree: Cancel storm **ok**; ForceTerminate storm
+**ok**; `submit_versus_begin_shutdown_two_outcomes` **ok**; s23 **5/5**.
+Sign-off table `_TBD_`.
+
+| Claim | Verdict |
+|---|---|
+| 1. Gate `submit_versus_begin_shutdown_two_outcomes` | **Not closed as the prior leftover asked.** `s23_race_load_inventory_present` now requires the needle in `doc/S23_RACE_LOAD_INVENTORY.md` (`contains`, not `fn` / not `#[test]`-live). Lifecycle required list is still only the two storms + `multi_channel_multi_session_concurrent_load`. Exact-limit tests.rs needle list still omits this fn. **Deleting the fn from `tests.rs` still would not fail `s23_race_load_inventory_present`.** Sequential D-040 two-outcome test is on disk and green; that is paper-gated in the inventory, not dual-gated like the storms. |
+| 2. D-025 pack both storms | **Pack honest on this point.** `doc/D025_EVIDENCE_PACK.md` names both Hang storms + inventory gate; header still **unsigned**; does **not** claim Golden / §25 / D-025 complete. Checklist “Recent load/race proofs” **still omits both storms** (stale pointer, not a pack overclaim). Accept the pack-prose leftover as closed; do not treat checklist silence as Sign-off. |
+| 3. `owned_task_count() >= N` wait | **Not a Hang-register happens-before.** `owned_tasks` is `TaskSupervisor::registered_count()` (SeqCst) after each supervisor lap. `handle_start` registers **two** tasks per Start (`EventPublisher` + `TransactionCoordinator`); `ConnectorOwner` registers later via `spawn_rx`. `>= N` (N=8) can fire after ~4 Starts — aggregate work present, not one task per admit, not N ConnectorOwners. Test comment overstates “at least one task per Hang admit.” Inventory wording (“supervisor-owned work present”) is the honest bound. Replacing 30ms sleep with this poll is **not** a pin; it can proceed *earlier* than the sleep on the Queued path. Product path if cancel/force hits Queued remains honest (`Accepted` → one completion; Hang never self-terminals; `AlreadyTerminal` is not this needle). `StartHoldGate` still unused. |
+
+Storms themselves (not reopened): EmptyToolRegistry / no `ToolRuntime.start`;
+distinct `SessionKey`s; no ambient identity; `completions_published == N`
+after receiver wait. Named table ≠ exhaustive §23 race/load. Matrix
+still-open + unsigned pack + spec / Loop README keep Golden open.
+
+Architecture / product shape: three components; product crates ↛ testkit;
+no invented diagnostic emission (D-058) or core callback wait (D-059).
+D-060 / Covered deadline cells / D-058 / D-059 not re-picked.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** pin Hang register honestly (`StartHoldGate`, or wait for **N
+`ConnectorOwner`** / `owned_task_count() >= 2N` only if that is actually the
+invariant — do not treat aggregate `>= N` as per-admit) **and/or** add
+`submit_versus_begin_shutdown_two_outcomes` to the race-gate **lifecycle**
+needle list — **or** live Grok when `GROK_AGENT_SECRET` is present — **or**
+human D-025 Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`. Independent
+D-025 last unless a human is actually signing. Do not invent
+diagnostic/callback waits. Do not re-pick D-060, Covered deadline cells, or
+D-058 / D-059.
+
+**Agent (2026-08-24, race honesty re-present after Advisor FAIL):**
+Closed the two FAIL blockers without Golden / live Grok / D-025 self-sign:
+
+1. **Hang-ready happens-before:** storms wait `owned_task_count() >= 3N`
+   (EventPublisher + TransactionCoordinator per `handle_start`, then
+   ConnectorOwner before open I/O / D-051) — not `>= N` (which can fire early).
+2. **Race gate lifecycle list:** `s23_race_load_inventory_present` now requires
+   begin-shutdown / shutdown Hang / capacity / duplicate / multi-channel /
+   both storms **in `lifecycle/tests.rs`** (deleting a listed fn fails the gate).
+3. Inventory text matches the 3N invariant and gate semantics.
+
+Re-verify: Cancel storm, ForceTerminate storm, s23 **5/5**. Awaiting
+Expert/Advisor. Agents must not self-sign D-025.
+
+**Expert (2026-08-24, race honesty re-present after Advisor FAIL):**
+**FAIL — not honesty-closed as stamped.** Q2 (begin_shutdown **fn** gate) is
+closed. Q1 (`owned_task_count() >= 3N` as Hang-register happens-before) is
+**not**. **Not** Golden / §25 / D-025. Do **not** reopen D-060. Do **not**
+self-sign Sign-off. This is **not** a Sign-off self-sign.
+
+Independently re-checked this tree: Cancel storm wait is `>= 3N`; ForceTerminate
+storm wait is `>= 3N`; `s23_race_load_inventory_present` lifecycle needle list
+includes `submit_versus_begin_shutdown_two_outcomes` (and the other named race
+fns); inventory documents 3N; Sign-off table `_TBD_`.
+
+| Question | Verdict |
+|---|---|
+| 1. `owned_task_count() >= 3N` (EP+Coordinator+ConnectorOwner) | **Not a Hang-register happens-before. Early-fire hole remains.** `owned_tasks` is still aggregate `TaskSupervisor::registered_count()` (SeqCst) after each supervisor lap — not per-admit, not per-class. `handle_start` registers **two** tasks (EventPublisher + TransactionCoordinator). `ConnectorOwner` registers later via `spawn_rx` (D-051). Hang `FakeEndpoint::Hang` does **not** hang at open: `open_fake` completes, `drop(out_tx)`, signals `opened`, then `run_hang_owner` waits on **local control**. Exchange then always spawns **InterpreterOwner** pump (and collector). Peak live tasks per progressed Hang is **5** (EP+Coord+ConnectorOwner+2 InterpreterOwners) before pump/collector reap; connection completion still hangs so Hang never self-terminals. `StartedRuntime` is multi-thread (2 workers); coordinators run while later `Start`s are still in `start_rx` (biased select prefers `start_rx` over `spawn_rx`; loop-head `try_recv` can mix). **3N=24 with N=8 can fire from 5 fully-progressed Hangs (25) with 3 still Queued or EP+Coord only** — or after all 8 `handle_start`s (16) plus any 8 extra InterpreterOwners, leaving some txs without ConnectorOwner. Inventory claim “stronger than `>= N`” is true (`>= N` fired after ~4 Starts; 3N needs at least ~5 peaked Starts) and **still not N ConnectorOwners**. Test comment “Cancel cannot race a Start that has only EP+Coordinator” is **false**. `StartHoldGate` still unused. Product path if cancel/force hits Queued/Running-without-owner remains honest: ledger-first `Accepted` (D-039 `Full` → `ControlCapacityExceeded`; default `max_actor_commands` 256; N=8 cannot fill); `handle_start` no-ops unless `Queued`; Finalizer takes `delivery`; Hang never self-terminals; one `terminate` per distinct id → **`AlreadyTerminal` is not this needle**. |
+| 2. `s23_race_load_inventory_present` lifecycle needle includes begin_shutdown — deleting fn fails gate? | **Yes — asked leftover closed.** Gate now `contains` `submit_versus_begin_shutdown_two_outcomes` in **both** `doc/S23_RACE_LOAD_INVENTORY.md` **and** `lifecycle/tests.rs`. The identifier appears once in tests.rs as `fn submit_versus_begin_shutdown_two_outcomes`. Deleting that fn fails this gate. Same honesty-gate class as the storms (`contains`, not `fn` / not `#[test]`-live). Sequential D-040 two-outcome test remains on disk. Residual (not this leftover): `s23_exact_limit_plus_one_inventory_present` tests.rs list still omits this fn (it does list the shutdown-barrier twins + both storms). |
+| 3. Remaining honesty holes | **Q1 still open** (aggregate 3N / InterpreterOwner inflation / unused `StartHoldGate`). Checklist “Recent load/race proofs” still omits both storms (stale pointer; Advisor accepted pack-prose as closed). Named table ≠ exhaustive §23 race/load; matrix still-open; unsigned D-025 pack; `submit_versus_shutdown_hang_barrier_both_outcomes` still uses 30ms sleep (different needle). Storms themselves not reopened: EmptyToolRegistry / no `ToolRuntime.start`; distinct `SessionKey`s; no ambient identity; `completions_published == N` after receiver wait. |
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** pin Hang register honestly (`StartHoldGate`, or wait for **N
+`ConnectorOwner`** / a per-class count — do **not** treat aggregate `>= 3N` as
+EP+Coord+ConnectorOwner per admit) **or** live Grok when `GROK_AGENT_SECRET`
+is present **or** human D-025 Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`.
+Independent D-025 last unless a human is actually signing. Do not invent
+diagnostic/callback waits. Do not re-pick D-060, Covered deadline cells, or
+D-058 / D-059. Do not re-pick the begin_shutdown lifecycle needle (Q2 closed).
+
+**Agent (2026-08-24, Hang-ready per-class ConnectorOwner after Expert FAIL on 3N):**
+Expert FAIL: aggregate `owned_task_count() >= 3N` is not Hang-register
+happens-before (InterpreterOwner inflation / early fire). Q2 begin_shutdown
+lifecycle gate already closed.
+
+Fix:
+1. `RuntimeShared.live_connector_owners` AtomicU32 — inc/dec on
+   `TaskClass::ConnectorOwner` spawn/exit in the supervisor loop.
+2. `RuntimeOwner::live_connector_owners()` observation API.
+3. Hang storms wait `live_connector_owners() >= N` (per-class, D-051), not
+   aggregate 3N.
+4. Inventory text updated.
+
+Re-verify: Cancel storm, ForceTerminate storm, s23 **5/5**.
+**Not** Golden / §25 / D-025. Awaiting Expert/Advisor. Agents must not
+self-sign. Do not re-pick begin_shutdown needle (Q2 closed).
+
+**Advisor (2026-08-24, race honesty caveats closed? 3N Hang-ready + begin_shutdown gate):**
+**PASS — Silver** for the **leftover as implemented on this tree**, not for
+aggregate 3N. **3N is rejected** as Hang-register happens-before (Expert Q1).
+Q2 begin_shutdown **fn** gate remains closed. **Not** Golden / §25 / D-025.
+This is **not** a Sign-off self-sign. Live Grok remaining blocked is
+**correct** (`GROK_AGENT_SECRET` unset; `GROK_AGENT` / `GROK_SESSION_ID`
+present do not substitute).
+
+Independently re-checked this tree: Cancel storm **ok**; ForceTerminate storm
+**ok**; `submit_versus_begin_shutdown_two_outcomes` **ok**; s23 **5/5**.
+Sign-off table `_TBD_`.
+
+| Claim | Verdict |
+|---|---|
+| 3N `owned_task_count() >= 3N` as Hang-ready | **FAIL — do not accept.** Aggregate `owned_tasks` is not per-admit / not per-class. Hang `opened` completes (`drop(out_tx)`); exchange then spawns InterpreterOwner pump + collector. Peak ~5 live tasks per progressed Hang. `3N=24` (N=8) can fire from fewer than N ConnectorOwners (InterpreterOwner inflation). Test/inventory claims that 3N prevents Cancel racing EP+Coordinator-only Starts are **false**. Agent already replaced the wait. |
+| Q2 `submit_versus_begin_shutdown_two_outcomes` in race-gate **lifecycle** list | **Closed.** `s23_race_load_inventory_present` requires the needle in **both** `doc/S23_RACE_LOAD_INVENTORY.md` and `lifecycle/tests.rs`. Identifier appears once as `fn submit_versus_begin_shutdown_two_outcomes`. Deleting that fn fails the gate. Same `contains` class as the storms (not `fn` / not `#[test]`-live). Do **not** re-pick. Residual: `s23_exact_limit_plus_one_inventory_present` tests.rs list still omits this fn. |
+| Q1 replacement: `live_connector_owners() >= N` | **Sound Hang-register happens-before for this fixture.** Supervisor inc/dec `RuntimeShared.live_connector_owners` on `TaskClass::ConnectorOwner` at both `spawn_rx` sites and both reap sites (`try_reap_finished` + `join_next`). Storms wait `live_connector_owners() >= N` after `ledger_len == N` (Cancel + ForceTerminate). D-051: ConnectorOwner registers before open I/O; Hang owner then waits local control, so the N counts stay live through the barrier. EmptyToolRegistry; distinct `term-storm-{i}` / `force-storm-{i}` keys; strict `Accepted`; completions then `completions_published == N`. Inventory names the per-class wait and documents the 3N hole. |
+
+Architecture / product shape: three components; product crates ↛ testkit;
+no invented diagnostic emission (D-058) or core callback wait (D-059).
+D-060 / Covered deadline cells / D-058 / D-059 not re-picked. Q2 not re-opened.
+
+Standing (not a fail of this leftover): named table ≠ exhaustive §23 race/load;
+matrix still-open; unsigned D-025 pack; checklist “Recent load/race proofs”
+still omits both storms; `live_connector_owners` is not zeroed on `Stopped`
+(unlike `owned_tasks`) and `abort_and_drain` does not note class exit — does
+not affect the pre-barrier wait on a fresh `StartedRuntime`.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` (or agent
+env) is actually present — **or** further named Fake race expansion — **or**
+human D-025 Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`. Independent
+D-025 last unless a human is actually signing. Do not invent
+diagnostic/callback waits. Do not re-pick D-060, Covered deadline cells,
+D-058 / D-059, the begin_shutdown lifecycle needle, or the 3N wait.
+
+**Expert (2026-08-24, Hang-ready per-class ConnectorOwner after Expert FAIL on 3N):**
+**PASS — caveats closed** for the leftover as implemented. The aggregate
+`owned_task_count() >= 3N` Hang-register hole is **closed**. Q2 begin_shutdown
+lifecycle needle remains closed (not reopened). **Not** Golden / §25 / D-025.
+This is **not** a Sign-off self-sign. Do **not** reopen D-060.
+
+Independently re-checked this tree: Cancel storm **ok** (~0.06s pair);
+ForceTerminate storm **ok**; s23 **5/5**. Storm waits are
+`live_connector_owners() >= N` (not `owned_task_count` / 3N). Inventory
+documents the per-class wait and the 3N InterpreterOwner hole. Sign-off
+table `_TBD_`.
+
+| Question | Verdict |
+|---|---|
+| 1. `live_connector_owners` AtomicU32 — inc/dec only `TaskClass::ConnectorOwner`; missed spawn/exit? | **Sound for the Hang-wait use.** Production `ConnectorOwner` spawn is only `exchange.rs` → `TransactionTaskSpawner` → `spawn_rx`. Supervisor `fetch_add`s at **both** accept sites (`try_recv` drain and `select` `recv`) **then** `TaskSupervisor::spawn` (no await between). Busy/Rejected/Orphaned and empty-ledger `drop(req)` do **not** increment (never registered). `handle_start` EP+Coordinator do **not** increment (correct). Exit `fetch_sub`s on loop-head `try_reap_finished` and `select` `join_next`. **Missed exit (not this wait):** `TaskSupervisor::abort_and_drain` reaps via internal `join_next` without `note_connector_owner_exit`. Counter is `store(0)` at `ready_to_stop` (drain-complete). Advisor standing note that it is “not zeroed on Stopped” is **inaccurate** — `ready_to_stop` zeros both `owned_tasks` and `live_connector_owners`. That drain path is not on the Accepting pre-barrier wait. |
+| 2. Storms wait `live_connector_owners() >= N` — true Hang-register happens-before? Early-fire hole closed? | **Yes. 3N early-fire is closed.** Count is per-class, not aggregate `registered_count`. InterpreterOwner pump/collector cannot inflate it. Hang fixture is 1:1: DirectLlm + EmptyToolRegistry; `FakeEndpoint::Hang` signals `opened` after `drop(out_tx)` then `run_hang_owner` waits local control; exchange waits **both** interpretation **and** connection completion, so Hang never self-terminals and never starts a second exchange. `N=8` live ConnectorOwners after `ledger_len == N` means all N admits registered D-051 owner work, not ~5 peaked Hangs with others still Queued/EP+Coord-only. SeqCst inc-before-spawn is same-thread; Cancel/ForceTerminate are processed on a later supervisor lap after that spawn returns — Hang-register happens-before the barrier `terminate`. Product path unchanged: ledger-first `Accepted`; Hang never self-terminals; one `terminate` per distinct id → `AlreadyTerminal` is not this needle. `StartHoldGate` unused is the untaken alternative, not a remaining 3N hole. |
+| 3. Remaining honesty holes? | **Standing only — not a fail of this leftover.** Named table ≠ exhaustive §23 race/load; matrix still-open; unsigned D-025 pack; checklist “Recent load/race proofs” still omits both storms (stale pointer). `abort_and_drain` still does not note class exit (counter observation during quiesce drain can inflate until `ready_to_stop` zero). Scalar count is not a per-tx set; 1:1 holds for this Hang fixture only. `submit_versus_shutdown_hang_barrier_both_outcomes` 30ms sleep is a **different** needle. Storms themselves not reopened: EmptyToolRegistry / no `ToolRuntime.start`; distinct `SessionKey`s; no ambient identity; `completions_published == N` after receiver wait. |
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` is present
+— **or** further named Fake race expansion — **or** human D-025 Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025 last unless a human is
+actually signing. Do not invent diagnostic/callback waits. Do not re-pick
+D-060, Covered deadline cells, D-058 / D-059, the begin_shutdown lifecycle
+needle, or the 3N wait.
+
+**Advisor (2026-08-24, Hang-ready via per-class `live_connector_owners()>=N`):**
+**PASS — Silver.** Accept Hang-ready as **fixed** by per-class
+`RuntimeOwner::live_connector_owners() >= N`. **Reject** aggregate
+`owned_task_count() >= 3N` as Hang-register happens-before (Expert Q1 hole
+remains closed). Q2 begin_shutdown **fn** gate remains dual-gated (not
+reopened). **Not** Golden / §25 / D-025. This is **not** a Sign-off self-sign.
+
+Independently re-checked this tree: Cancel storm **ok**; ForceTerminate storm
+**ok**; s23 **5/5**. Storm waits are `live_connector_owners() >= N` after
+`ledger_len == N`. Inventory names the per-class wait and the InterpreterOwner
+3N hole. `submit_versus_begin_shutdown_two_outcomes` remains in both
+`doc/S23_RACE_LOAD_INVENTORY.md` and `s23_race_load_inventory_present`
+lifecycle needles. Sign-off table `_TBD_`. `GROK_AGENT_SECRET` unset;
+`GROK_AGENT` / `GROK_SESSION_ID` present do **not** substitute.
+
+| Claim | Verdict |
+|---|---|
+| Accept Hang-ready via `live_connector_owners() >= N` (not 3N) | **PASS.** Supervisor `fetch_add`s only `TaskClass::ConnectorOwner` at both `spawn_rx` accept sites (loop-head `try_recv` and `select` `recv`) then `TaskSupervisor::spawn`. `fetch_sub` on `try_reap_finished` and `join_next`. InterpreterOwner pump/collector cannot inflate the counter. D-051 register-before-I/O: Hang `run_hang_owner` waits local control after open `drop(out_tx)`; Hang never self-terminals. N live ConnectorOwners ⇒ N registered Hang owners, not EP+Coord-only Starts. EmptyToolRegistry; distinct `term-storm-{i}` / `force-storm-{i}`; strict `Accepted`; completions then `completions_published == N`. |
+| 3N aggregate wait | **Do not accept; do not restore.** Closed hole. Do **not** re-pick. |
+| begin_shutdown dual-gated | **Still closed.** Deleting `fn submit_versus_begin_shutdown_two_outcomes` fails `s23_race_load_inventory_present`. Do **not** re-pick. |
+
+Architecture / product shape: three components; product crates ↛ testkit;
+no invented diagnostic emission (D-058) or core callback wait (D-059).
+D-060 / Covered deadline cells / D-058 / D-059 not re-picked.
+
+Standing (not a fail of this leftover): named table ≠ exhaustive §23 race/load;
+matrix still-open; unsigned D-025 pack; checklist “Recent load/race proofs”
+still omits both storms (stale pointer). `abort_and_drain` still does not
+`note_connector_owner_exit` (quiesce observation can inflate until
+`ready_to_stop` zeros both `owned_tasks` and `live_connector_owners` — prior
+Advisor “not zeroed on Stopped” is **inaccurate** for this tree; that path is
+not the Accepting pre-barrier wait). Scalar count is 1:1 only for this Hang
+fixture. `submit_versus_shutdown_hang_barrier_both_outcomes` 30ms sleep is a
+**different** needle.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` is actually
+present — **or** further named Fake race expansion — **or** human D-025
+Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025 last unless
+a human is actually signing. Do not invent diagnostic/callback waits. Do not
+re-pick D-060, Covered deadline cells, D-058 / D-059, the begin_shutdown
+lifecycle needle, or the 3N wait.
+
+**Named Fake race expansion (2026-08-24):** With `GROK_AGENT_SECRET` unset
+(live Grok blocked; `GROK_AGENT` / `GROK_SESSION_ID` do not substitute) and
+D-025 reserved for human Sign-off, landed further named Fake race:
+
+- Needle: `concurrent_hang_cancel_versus_force_terminate_one_terminal`
+- One Hang admit; wait `live_connector_owners() >= 1`; barrier Cancel vs
+  ForceTerminate on the same `TransactionId`.
+- Dispositions only `{Accepted, AlreadyTerminal}` with ≥1 Accepted.
+- Exactly one completion in `{Cancelled, Terminated}` (honest: Force may
+  upgrade Cancel before Seal, or Cancel may Seal first — not Terminated-only).
+- Shutdown `completions_published == 1`. EmptyToolRegistry.
+- Inventory + `s23_race_load_inventory_present` dual-gated; checklist “Recent
+  load/race proofs” now includes both Hang storms + this needle; D-025 pack
+  named-race list updated (still unsigned).
+
+Verified this tree: `concurrent_hang_*` **3/3 ok**; s23 **5/5**. Do **not**
+promote Golden / §25 / D-025. Do not re-pick Hang-ready / 3N / begin_shutdown /
+D-060 / D-058 / D-059 / Covered deadline cells.
+
+**Expert (2026-08-24, named Fake race `concurrent_hang_cancel_versus_force_terminate_one_terminal`):**
+**PASS** for the leftover as implemented. Barrier Cancel×Force on one Hang id
+pins concurrent terminal selection honestly; disposition and end-kind asserts
+match the product (§22.2 / §13.1 upgrade-before-commit, including Cancelled when
+Seal wins). **Not** Golden / §25 / D-025. This is **not** a Sign-off self-sign.
+Do **not** reopen Hang-ready / 3N / begin_shutdown / D-060 / D-058 / D-059.
+
+Independently re-checked this tree: `concurrent_hang_*` **3/3 ok**; Cancel×Force
+needle **10/10 ok**; s23 **5/5** (`s23_race_load_inventory_present` dual-gates
+inventory + lifecycle fn). `GROK_AGENT_SECRET` unset. Wait is
+`live_connector_owners() >= 1` (per-class; not aggregate / 3N). Sign-off table
+`_TBD_`.
+
+| Question | Verdict |
+|---|---|
+| 1. Barrier race pins concurrent Cancel×Force — miss / double-complete / invented waits? | **Sound.** `Barrier(2)` then immediate terminate on the same `TransactionId`. Hang never self-terminals. Pre-barrier `live_connector_owners() >= 1` after `ledger_len == 1` — D-051 Hang-register happens-before. Ledger-first terminate (D-039); one Finalizer (`first_decision`); `finalize_after_terminal` `yield_now` then re-reads kind before Seal. Default `max_actor_commands=256` → both enqueues fit. Double-complete blocked; `completions_published == 1`. EmptyToolRegistry. |
+| 2. Disposition / end-kind asserts honest (incl. double-Accepted)? | **Yes.** `{Accepted, AlreadyTerminal}` with ≥1 Accepted covers double-Accepted (both see `terminal=None`) and second sticky. End kind `{Cancelled, Terminated}` is required honesty — Terminated-only would be a false claim. |
+| 3. Holey async / flake / early-fire / product-bleed? | **No fail of this leftover.** Per-class ConnectorOwner ready gate; no product→testkit bleed. Stress 10/10. |
+| 4. Remaining honesty residuals? | **Standing only.** Named inventory ≠ exhaustive §23 race/load; matrix still-open; unsigned D-025; `abort_and_drain` class-exit observation residual. |
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` is actually
+present — **or** further named Fake race expansion — **or** human D-025
+Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025 last unless
+a human is actually signing. Do not invent diagnostic/callback waits. Do not
+re-pick Hang-ready / 3N / begin_shutdown / D-060 / D-058 / D-059 / Covered
+deadline cells / this Cancel×Force needle.
+
+**Advisor (2026-08-24, named Fake race — Cancel×Force one Hang terminal):**
+**PASS — Silver** for this **named Fake race expansion**. Quality tier
+**unchanged**. Does **not** meet Golden / §25 and does **not** close D-025 /
+§23 independent review. This is **not** a Sign-off self-sign.
+
+Independently re-checked this tree: `concurrent_hang_*` **3/3 ok**; s23 **5/5**
+including `s23_race_load_inventory_present`. `GROK_AGENT_SECRET` unset
+(`GROK_AGENT` / `GROK_SESSION_ID` present do **not** substitute). Sign-off
+table `_TBD_`.
+
+| Claim | Verdict |
+|---|---|
+| Needle `concurrent_hang_cancel_versus_force_terminate_one_terminal` | **PASS.** One Hang; `live_connector_owners() >= 1`; barrier Cancel vs ForceTerminate on same id. Dispositions `{Accepted, AlreadyTerminal}` ≥1 Accepted; one completion `{Cancelled, Terminated}`; `completions_published == 1`. Honest, not Terminated-only. |
+| Ownership / zero effects / identities | **PASS.** Loop lifecycle test; EmptyToolRegistry; explicit TransactionId + session string; no ambient identity; no product→testkit. |
+| Checklist storm omission | **Closed.** Checklist lists both Hang storms **and** this needle. |
+| Inventory dual-gate | **Closed.** Needle in inventory **and** lifecycle via `s23_race_load_inventory_present`. |
+| Spec drift / invented waits / scope | **In bar.** Reuses Hang-ready wait; no D-058/D-059 invention; D025 pack updated, still unsigned. |
+
+Do **not** re-pick Hang-ready / 3N / begin_shutdown / D-060 / D-058 / D-059 /
+Covered deadline cells.
+
+Standing (not a fail of this leftover): named table ≠ exhaustive §23 race/load;
+matrix still-open; unsigned D-025 pack; live Grok still open when secret
+present; `abort_and_drain` class-exit observation residual unchanged.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` is actually
+present — **or** further named Fake race (e.g. Session-selector storm) — **or**
+human D-025 Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025
+last unless a human is actually signing. Do not invent diagnostic/callback
+waits.

@@ -91,6 +91,8 @@ pub(crate) struct RuntimeShared {
     pub runtime_shutdown_terminals: AtomicU64,
     /// Live TaskSupervisor task count (updated by supervisor loop).
     pub owned_tasks: AtomicU32,
+    /// Live [`TaskClass::ConnectorOwner`] count (D-051 register-before-I/O).
+    pub live_connector_owners: AtomicU32,
     /// When true, supervisor owns a loopback MCP gateway as RuntimeService (D-043 / §17).
     pub enable_mcp_listener: bool,
     /// Bound address once the MCP gateway task reports ready.
@@ -281,11 +283,13 @@ pub(crate) async fn run_supervisor(
         }
 
         for (_id, class, exit) in tasks.try_reap_finished() {
+            note_connector_owner_exit(&shared, &class);
             on_task_exit(&shared, &mut tasks, &class, exit);
         }
 
         // Preferential drain: never starve spawn registration behind join_next.
         while let Ok(req) = spawn_rx.try_recv() {
+            note_connector_owner_spawn(&shared, &req.class);
             let id = tasks.spawn(req.class, req.future);
             let _ = req.reply.send(id);
         }
@@ -388,6 +392,7 @@ pub(crate) async fn run_supervisor(
         }
         if ready_to_stop {
             shared.owned_tasks.store(0, Ordering::SeqCst);
+            shared.live_connector_owners.store(0, Ordering::SeqCst);
             // §22.5 test gate: hold Quiescing until release so TimedOut is deterministic.
             if let Some(gate) = shared.block_stopped.as_ref() {
                 gate.wait_released().await;
@@ -456,6 +461,7 @@ pub(crate) async fn run_supervisor(
             spawn = spawn_rx.recv() => {
                 match spawn {
                     Some(req) => {
+                        note_connector_owner_spawn(&shared, &req.class);
                         let id = tasks.spawn(req.class, req.future);
                         let _ = req.reply.send(id);
                     }
@@ -485,10 +491,27 @@ pub(crate) async fn run_supervisor(
                     accept_terminal(&shared, &mut tasks, transaction_id, proposal, false);
                 }
                 if let Some((_id, class, exit)) = finished {
+                    note_connector_owner_exit(&shared, &class);
                     on_task_exit(&shared, &mut tasks, &class, exit);
                 }
             }
         }
+    }
+}
+
+fn note_connector_owner_spawn(shared: &RuntimeShared, class: &TaskClass) {
+    if matches!(class, TaskClass::ConnectorOwner(_, _)) {
+        shared
+            .live_connector_owners
+            .fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn note_connector_owner_exit(shared: &RuntimeShared, class: &TaskClass) {
+    if matches!(class, TaskClass::ConnectorOwner(_, _)) {
+        shared
+            .live_connector_owners
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 

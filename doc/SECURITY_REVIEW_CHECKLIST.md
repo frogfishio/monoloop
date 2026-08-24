@@ -53,6 +53,12 @@ does **not** close D-025.
   (Hang; N+1 at exact `max_active_per_channel`)
 - `multi_channel_multi_session_concurrent_load` (Hang; ≥3 Channels; shared
   session-string SessionKey isolation + duplicate / capacity rejects)
+- `concurrent_hang_terminate_storm_all_cancelled` (Hang; N concurrent Cancel →
+  all `Cancelled`)
+- `concurrent_hang_force_terminate_storm_all_terminated` (Hang; N concurrent
+  ForceTerminate → all `Terminated`)
+- `concurrent_hang_cancel_versus_force_terminate_one_terminal` (Hang; barrier
+  Cancel vs ForceTerminate on one id → one `{Cancelled, Terminated}`)
 - `max_content_parts_exact_admits_plus_one_rejects` (D-035 matrix cell)
 - `max_tools_per_transaction_exact_admits_plus_one_rejects` (StartedRuntime
   port of unregistered v1 hardening cell; `InvalidConfiguration`)

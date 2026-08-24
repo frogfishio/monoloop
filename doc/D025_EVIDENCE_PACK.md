@@ -53,12 +53,14 @@ SSE shutdown (`finish_http_test`).
 Full table: `doc/S23_RACE_LOAD_INVENTORY.md`.
 
 Includes capacity races, multi-channel multi-session load, submit-vs-shutdown
-races (including begin-shutdown), duplicate-session race, and Hang terminate
-storms:
+races (including begin-shutdown), duplicate-session race, Hang terminate
+storms, and same-tx Cancel vs ForceTerminate:
 
 - `concurrent_hang_terminate_storm_all_cancelled` (Cancel → `Cancelled`)
 - `concurrent_hang_force_terminate_storm_all_terminated` (ForceTerminate →
   `Terminated`)
+- `concurrent_hang_cancel_versus_force_terminate_one_terminal` (one Hang id;
+  barrier Cancel×Force → one `{Cancelled, Terminated}`)
 
 Inventory gate: `s23_race_load_inventory_present` (s23 suite).
 

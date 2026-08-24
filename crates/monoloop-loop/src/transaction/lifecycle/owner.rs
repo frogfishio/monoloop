@@ -179,6 +179,7 @@ impl StartedRuntime {
             completions_invariant_failed: AtomicU64::new(0),
             runtime_shutdown_terminals: AtomicU64::new(0),
             owned_tasks: AtomicU32::new(0),
+            live_connector_owners: AtomicU32::new(0),
             enable_mcp_listener: bootstrap.config.enable_mcp_listener,
             mcp_listen_addr: Mutex::new(None),
             mcp_gateway: Mutex::new(None),
@@ -350,6 +351,13 @@ impl RuntimeOwner {
     /// Supervisor-owned task count (§22.3 stopped proof).
     pub fn owned_task_count(&self) -> u32 {
         self.shared.owned_tasks.load(Ordering::SeqCst)
+    }
+
+    /// Live ConnectorOwner tasks (register-before-I/O; Hang-ready observation).
+    pub fn live_connector_owners(&self) -> u32 {
+        self.shared
+            .live_connector_owners
+            .load(Ordering::SeqCst)
     }
 
     /// Runtime-scoped tool spill pending count (joins + orphans; §22.4 / Stopped gate).

@@ -2104,14 +2104,14 @@ fn concurrent_hang_terminate_storm_all_cancelled() {
         receivers.push(recv);
     }
     assert_eq!(started.owner.ledger_len(), n);
-    // Wait until supervisor owns at least one task per Hang admit (Coordinator /
-    // ConnectorOwner), instead of a fixed sleep heuristic.
+    // Per-class Hang-ready: wait for N live ConnectorOwners (D-051
+    // register-before-I/O). Aggregate owned_task_count is not per-admit.
     let ready = Instant::now();
-    while started.owner.owned_task_count() < n as u32 {
+    while started.owner.live_connector_owners() < n as u32 {
         assert!(
             ready.elapsed() < Duration::from_secs(2),
-            "Hang storm: expected owned_tasks>={n} before cancel barrier, got {}",
-            started.owner.owned_task_count()
+            "Hang Cancel storm: expected live_connector_owners>={n} before barrier, got {}",
+            started.owner.live_connector_owners()
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -2211,11 +2211,11 @@ fn concurrent_hang_force_terminate_storm_all_terminated() {
     }
     assert_eq!(started.owner.ledger_len(), n);
     let ready = Instant::now();
-    while started.owner.owned_task_count() < n as u32 {
+    while started.owner.live_connector_owners() < n as u32 {
         assert!(
             ready.elapsed() < Duration::from_secs(2),
-            "Hang ForceTerminate storm: expected owned_tasks>={n} before barrier, got {}",
-            started.owner.owned_task_count()
+            "Hang ForceTerminate storm: expected live_connector_owners>={n} before barrier, got {}",
+            started.owner.live_connector_owners()
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -2279,6 +2279,124 @@ fn concurrent_hang_force_terminate_storm_all_terminated() {
             ShutdownWaitOutcome::Stopped(ref r) if r.completions_published == n as u64
         ),
         "exactly one completion per Hang admission, got {outcome:?}"
+    );
+}
+
+/// Race/load expansion: barrier-concurrent Cancel vs ForceTerminate on **one**
+/// Hang admission — §22.2 terminal selection under true concurrency.
+/// Exactly one completion in `{Cancelled, Terminated}` (Force may upgrade Cancel
+/// before Seal, or Cancel may Seal first). Dispositions only
+/// `{Accepted, AlreadyTerminal}` with ≥1 Accepted.
+#[test]
+fn concurrent_hang_cancel_versus_force_terminate_one_terminal() {
+    let limits = TransactionLimits {
+        max_active_transactions: 2,
+        max_active_per_channel: 2,
+        transaction_deadline: Duration::from_secs(30),
+        cleanup_deadline: Duration::from_millis(500),
+        ..TransactionLimits::default()
+    };
+    let started = StartedRuntime::start(RuntimeBootstrap {
+        config: RuntimeConfig {
+            transaction_limits: limits,
+            ..RuntimeConfig::default()
+        },
+        channels: ChannelRegistry::build(vec![hang_llm_binding("llm", 2)]).unwrap(),
+        tools: HostToolRegistry::empty(),
+    })
+    .expect("start");
+    let handle = started.handle.clone();
+
+    let (receipt, recv) = submit(&handle, Some("cancel-force-race")).expect("admit Hang");
+    let id = receipt.transaction_id;
+    assert_eq!(started.owner.ledger_len(), 1);
+    let ready = Instant::now();
+    while started.owner.live_connector_owners() < 1 {
+        assert!(
+            ready.elapsed() < Duration::from_secs(2),
+            "Hang Cancel×Force race: expected live_connector_owners>=1 before barrier, got {}",
+            started.owner.live_connector_owners()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let barrier = Arc::new(Barrier::new(2));
+    let h_cancel = handle.clone();
+    let b_cancel = Arc::clone(&barrier);
+    let cancel_join = std::thread::spawn(move || {
+        b_cancel.wait();
+        h_cancel.terminate(
+            TransactionSelector::Transaction(id),
+            TerminationMode::Cancel {
+                reason: CancellationReason {
+                    code: CancellationReasonCode::CallerRequested,
+                    detail: None,
+                },
+            },
+        )
+    });
+    let h_force = handle.clone();
+    let b_force = Arc::clone(&barrier);
+    let force_join = std::thread::spawn(move || {
+        b_force.wait();
+        h_force.terminate(
+            TransactionSelector::Transaction(id),
+            TerminationMode::ForceTerminate {
+                reason: TerminationReason {
+                    code: TerminationReasonCode::CallerRequested,
+                    detail: None,
+                },
+            },
+        )
+    });
+
+    let cancel_disp = cancel_join.join().unwrap();
+    let force_disp = force_join.join().unwrap();
+    for (label, disp) in [("Cancel", cancel_disp), ("ForceTerminate", force_disp)] {
+        assert!(
+            matches!(
+                disp,
+                TerminationDisposition::Accepted | TerminationDisposition::AlreadyTerminal
+            ),
+            "{label} disposition must be Accepted|AlreadyTerminal, got {disp:?}"
+        );
+    }
+    assert!(
+        matches!(cancel_disp, TerminationDisposition::Accepted)
+            || matches!(force_disp, TerminationDisposition::Accepted),
+        "at least one terminate must Accepted (got Cancel={cancel_disp:?}, Force={force_disp:?})"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let completion = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), recv.completion.recv()).await
+        })
+        .expect("Hang Cancel×Force must complete within 3s")
+        .expect("completion channel closed");
+    assert!(
+        matches!(
+            completion.end.kind,
+            TransactionEndKind::Cancelled | TransactionEndKind::Terminated
+        ),
+        "exactly one documented terminal in {{Cancelled, Terminated}}, got {:?}",
+        completion.end.kind
+    );
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(3)).await
+    });
+    assert!(
+        matches!(
+            outcome,
+            ShutdownWaitOutcome::Stopped(ref r) if r.completions_published == 1
+        ),
+        "exactly one completion for the Hang admission, got {outcome:?}"
     );
 }
 

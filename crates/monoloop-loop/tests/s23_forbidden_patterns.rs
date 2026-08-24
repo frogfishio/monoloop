@@ -417,6 +417,7 @@ fn s23_race_load_inventory_present() {
         "duplicate_session_race_admits_exactly_one",
         "concurrent_hang_terminate_storm_all_cancelled",
         "concurrent_hang_force_terminate_storm_all_terminated",
+        "concurrent_hang_cancel_versus_force_terminate_one_terminal",
     ] {
         assert!(
             inv_text.contains(needle),
@@ -426,10 +427,18 @@ fn s23_race_load_inventory_present() {
     let lifecycle = root.join("src/transaction/lifecycle/tests.rs");
     let life_text =
         fs::read_to_string(&lifecycle).unwrap_or_else(|e| panic!("read lifecycle tests: {e}"));
+    // Deleting these fns from tests.rs must fail this gate (not inventory-only).
     for needle in [
         "concurrent_hang_terminate_storm_all_cancelled",
         "concurrent_hang_force_terminate_storm_all_terminated",
+        "concurrent_hang_cancel_versus_force_terminate_one_terminal",
         "multi_channel_multi_session_concurrent_load",
+        "submit_versus_begin_shutdown_two_outcomes",
+        "submit_versus_shutdown_barrier_race_two_outcomes",
+        "submit_versus_shutdown_hang_barrier_both_outcomes",
+        "duplicate_session_race_admits_exactly_one",
+        "concurrent_global_capacity_exhaustion_admits_exactly_max",
+        "concurrent_per_channel_capacity_exhaustion_admits_exactly_channel_max",
     ] {
         assert!(
             life_text.contains(needle),
