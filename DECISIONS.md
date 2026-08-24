@@ -4,6 +4,25 @@ Explicit project decisions that change contracts, MSRV, or delivery assumptions.
 Normative behavior still lives under `doc/`; this file records *why* a deliberate
 change was made.
 
+## D-062 — crates.io 0.1.2 Silver / Golden-ready package
+
+**Date:** 2026-08-24
+
+**Context:** Transaction Runtime Golden-ready Silver residuals were accepted as
+Silver (Expert+Advisor PASS; Sign-off / §25 / D-025 still unsigned). Workspace
+was already at crates.io `0.1.1`; a new registry version is required to ship the
+accepted tree.
+
+**Decision:** Publish workspace **0.1.2** as the Silver / Golden-ready package.
+Quality tier remains **Silver / Golden-ready — Not Golden**. Do not treat this
+publish as D-025 Sign-off or §25 complete.
+
+**Consequences:**
+
+- `VERSION` / workspace Cargo.toml → `0.1.2`; `BUILD` incremented by `make dist`.
+- Open residuals unchanged: D-025 Sign-off, D-058, D-059, `cleanup_deadline`
+  Partial, D-061 live `session/load`.
+
 ## D-061 — Live Grok `session/load` after short sessions (agent residual)
 
 **Date:** 2026-08-24

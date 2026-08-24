@@ -30,7 +30,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["Alexander R. Croft"]
@@ -71,14 +71,14 @@ rand = { version = "0.9", default-features = false, features = ["std", "std_rng"
 getrandom = "0.3"
 
 # Internal crates (path + version required for crates.io publish).
-monoloop-contracts = { path = "crates/monoloop-contracts", version = "0.1.1" }
-monoloop-connector = { path = "crates/monoloop-connector", version = "0.1.1" }
-monoloop-connector-grok = { path = "crates/monoloop-connector-grok", version = "0.1.1" }
-monoloop-connector-cursor = { path = "crates/monoloop-connector-cursor", version = "0.1.1" }
-monoloop-connector-agy = { path = "crates/monoloop-connector-agy", version = "0.1.1" }
-monoloop-connector-codex = { path = "crates/monoloop-connector-codex", version = "0.1.1" }
-monoloop-connector-zai = { path = "crates/monoloop-connector-zai", version = "0.1.1" }
-monoloop-connector-claude = { path = "crates/monoloop-connector-claude", version = "0.1.1" }
-monoloop-interpreter = { path = "crates/monoloop-interpreter", version = "0.1.1" }
-monoloop-loop = { path = "crates/monoloop-loop", version = "0.1.1" }
-monoloop-testkit = { path = "crates/monoloop-testkit", version = "0.1.1" }
+monoloop-contracts = { path = "crates/monoloop-contracts", version = "0.1.2" }
+monoloop-connector = { path = "crates/monoloop-connector", version = "0.1.2" }
+monoloop-connector-grok = { path = "crates/monoloop-connector-grok", version = "0.1.2" }
+monoloop-connector-cursor = { path = "crates/monoloop-connector-cursor", version = "0.1.2" }
+monoloop-connector-agy = { path = "crates/monoloop-connector-agy", version = "0.1.2" }
+monoloop-connector-codex = { path = "crates/monoloop-connector-codex", version = "0.1.2" }
+monoloop-connector-zai = { path = "crates/monoloop-connector-zai", version = "0.1.2" }
+monoloop-connector-claude = { path = "crates/monoloop-connector-claude", version = "0.1.2" }
+monoloop-interpreter = { path = "crates/monoloop-interpreter", version = "0.1.2" }
+monoloop-loop = { path = "crates/monoloop-loop", version = "0.1.2" }
+monoloop-testkit = { path = "crates/monoloop-testkit", version = "0.1.2" }
