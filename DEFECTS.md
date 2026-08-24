@@ -5893,3 +5893,8 @@ D-025.
 further named Fake race. Do not invent D-058/D-059; do not promote
 `cleanup_deadline` Covered; do not re-pick this Golden-ready residual set as
 open.
+
+**Release (2026-08-24):** Accepted Silver / Golden-ready packaged as crates.io
+**0.1.2** (`VERSION`/`BUILD` → `0.1.2`+build-3; **D-062**). `make dist` gates
+passed; all publishable crates uploaded; `main` pushed (`0960c7e`). **Not**
+Golden / §25 / D-025 Sign-off.
