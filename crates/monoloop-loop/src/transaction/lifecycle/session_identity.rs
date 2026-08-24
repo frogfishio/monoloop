@@ -5,15 +5,25 @@ use monoloop_contracts::{
 };
 
 /// Exchange-scoped tool action id so reused provider call ids stay distinct (§22.6).
-///
-/// Used by §22.6 proofs today; interpreter/loop feed paths should adopt this
-/// when assigning action ids from provider tool-call ids.
-#[allow(dead_code)]
 pub(crate) fn tool_action_id_for_exchange(
     exchange_id: ExchangeId,
     provider_tool_call_id: &str,
 ) -> ToolActionId {
     ToolActionId::new(format!("{exchange_id}:{provider_tool_call_id}"))
+}
+
+/// Inverse of [`tool_action_id_for_exchange`]: strip `{exchange_id}:` prefix.
+///
+/// Returns `None` when the action id is not scoped to this exchange.
+pub(crate) fn provider_tool_call_id_from_action<'a>(
+    exchange_id: ExchangeId,
+    tool_action_id: &'a ToolActionId,
+) -> Option<&'a str> {
+    let prefix = format!("{exchange_id}:");
+    tool_action_id
+        .as_str()
+        .strip_prefix(&prefix)
+        .filter(|s| !s.is_empty())
 }
 
 /// Transaction-scoped SessionId for sessionless DirectLlm tool/event envelopes.
@@ -113,5 +123,17 @@ mod tests {
         let key = session_key_for(ch.clone(), None, tx);
         assert_eq!(key.session_id, transaction_scoped_session_id(tx));
         assert_eq!(key.channel_id, ch);
+    }
+
+    #[test]
+    fn exchange_scoped_action_round_trips_provider_id() {
+        let exchange = ExchangeId::generate();
+        let action = tool_action_id_for_exchange(exchange, "call_reuse");
+        assert_eq!(
+            provider_tool_call_id_from_action(exchange, &action),
+            Some("call_reuse")
+        );
+        let other = ExchangeId::generate();
+        assert!(provider_tool_call_id_from_action(other, &action).is_none());
     }
 }

@@ -13,9 +13,10 @@ use monoloop_connector::{
     SessionAttachment, TerminationReason,
 };
 use monoloop_contracts::{
-    CanonicalUnitEvent, ConnectionId, EffectiveConfig, ExchangeId, ExchangeInputPolicy,
-    InterpretationEnd, InterpretationEndKind, InterpretationId, InterpretationLimits,
-    OutboundDialectEncoder, ToolSpec, TransactionEndKind, TransactionId,
+    CanonicalUnitEvent, ConnectionId, ContinuationContext, EffectiveConfig, EncodedExchange,
+    ExchangeId, ExchangeInputPolicy, InterpretationEnd, InterpretationEndKind, InterpretationId,
+    InterpretationLimits, OutboundDialectEncoder, ToolContinuationEncodeRequest, ToolSpec,
+    TransactionEndKind, TransactionId,
 };
 use monoloop_interpreter::{InterpreterFactory, StartInterpretation};
 use std::sync::Arc;
@@ -189,6 +190,96 @@ pub async fn run_direct_llm_exchange(
     }
 }
 
+/// Run a tool-continuation exchange: encode via `encode_tool_continuation`, then
+/// open/pump/collect with a fresh ConnectionId + InterpretationId.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_direct_llm_continuation(
+    transaction_id: TransactionId,
+    exchange_id: ExchangeId,
+    tasks: &TransactionTaskSpawner,
+    connector: &dyn Connector,
+    encoder: &dyn OutboundDialectEncoder,
+    interpreter: &dyn InterpreterFactory,
+    endpoint_ref: &str,
+    credential_ref: Option<&str>,
+    context: &ContinuationContext,
+    results: &[monoloop_contracts::CanonicalToolResult],
+    config: &EffectiveConfig,
+    tools: &[ToolSpec],
+    cancel: Arc<StickyCancel>,
+    deadline: Duration,
+    cleanup_deadline: Duration,
+    max_encoded_exchange_bytes: usize,
+    max_retained_unit_bytes: usize,
+    max_remaining_provider_input_bytes: usize,
+) -> DirectExchangeOutcome {
+    let encoded = match encoder.encode_tool_continuation(ToolContinuationEncodeRequest {
+        transaction_id: &transaction_id,
+        exchange_id: &exchange_id,
+        context,
+        results,
+        config,
+        tools,
+    }) {
+        Ok(e) => e,
+        Err(_) => {
+            return DirectExchangeOutcome {
+                units: vec![],
+                terminal: TransactionEndKind::EncodingFailed,
+                exchange_id,
+                external_session_id: None,
+            };
+        }
+    };
+    if encoded.bytes.len() > max_encoded_exchange_bytes {
+        return DirectExchangeOutcome {
+            units: vec![],
+            terminal: TransactionEndKind::EncodingFailed,
+            exchange_id,
+            external_session_id: None,
+        };
+    }
+    if encoded.bytes.len() > max_remaining_provider_input_bytes {
+        return DirectExchangeOutcome {
+            units: vec![],
+            terminal: TransactionEndKind::LimitExceeded,
+            exchange_id,
+            external_session_id: None,
+        };
+    }
+    match run_encoded_exchange(
+        transaction_id,
+        exchange_id,
+        tasks,
+        connector,
+        interpreter,
+        endpoint_ref,
+        credential_ref,
+        encoded,
+        cancel,
+        deadline,
+        cleanup_deadline,
+        max_retained_unit_bytes,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok((units, external_session_id)) => DirectExchangeOutcome {
+            units,
+            terminal: TransactionEndKind::Completed,
+            exchange_id,
+            external_session_id,
+        },
+        Err(f) => DirectExchangeOutcome {
+            units: vec![],
+            terminal: f.to_terminal(),
+            exchange_id,
+            external_session_id: None,
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_inner(
     transaction_id: TransactionId,
@@ -233,6 +324,49 @@ async fn run_inner(
         return Err(ExchangeFailure::LimitExceeded);
     }
 
+    run_encoded_exchange(
+        transaction_id,
+        exchange_id,
+        tasks,
+        connector,
+        interpreter,
+        endpoint_ref,
+        credential_ref,
+        encoded,
+        cancel,
+        deadline,
+        cleanup_deadline,
+        max_retained_unit_bytes,
+        session_attachment,
+        prompt_ready,
+    )
+    .await
+}
+
+/// Open/pump/collect one provider exchange from pre-encoded bytes (no encode_initial).
+#[allow(clippy::too_many_arguments)]
+async fn run_encoded_exchange(
+    transaction_id: TransactionId,
+    exchange_id: ExchangeId,
+    tasks: &TransactionTaskSpawner,
+    connector: &dyn Connector,
+    interpreter: &dyn InterpreterFactory,
+    endpoint_ref: &str,
+    credential_ref: Option<&str>,
+    encoded: EncodedExchange,
+    cancel: Arc<StickyCancel>,
+    deadline: Duration,
+    cleanup_deadline: Duration,
+    max_retained_unit_bytes: usize,
+    session_attachment: Option<std::sync::Arc<SessionAttachment>>,
+    prompt_ready: Option<PromptReadyGate>,
+) -> Result<
+    (
+        Vec<CanonicalUnitEvent>,
+        Option<monoloop_contracts::ExternalSessionId>,
+    ),
+    ExchangeFailure,
+> {
     let started = Instant::now();
     let remaining = || deadline.saturating_sub(started.elapsed());
 

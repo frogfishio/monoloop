@@ -1,6 +1,7 @@
 //! ToolRegistry / ToolRuntime adapters that delegate to TransactionToolDispatcher.
 
 use super::dispatcher::{DispatchOutcome, DispatchRequest, TransactionToolDispatcher};
+use super::lifecycle::session_identity::provider_tool_call_id_from_action;
 use super::lifecycle::{TaskClass, TransactionTaskSpawner};
 use crate::registry::{
     ResolveToolRequest, ToolDescriptorRef, ToolRegistry, ToolRegistryError, ToolResolution,
@@ -87,10 +88,13 @@ impl ToolRuntime for HostToolRuntime {
         let name = ToolName::try_new(&request.tool_name)
             .map_err(|_| ToolRuntimeError("invalid tool name".into()))?;
         let action_id = ToolActionId::new(request.tool_action_id.clone());
+        // Prefer exchange-scoped strip; fall back to raw action id (unscoped units).
+        let provider_id = provider_tool_call_id_from_action(self.exchange_id, &action_id)
+            .unwrap_or(action_id.as_str())
+            .to_string();
         let dispatcher = Arc::clone(&self.dispatcher);
         let exchange_id = self.exchange_id;
         let payload = request.request_payload;
-        let provider_id = request.execution_id.as_str().to_string();
         let ordinal = request.request_generation as u32;
         let execution_id = request.execution_id.clone();
         let (tx, rx) = oneshot::channel();

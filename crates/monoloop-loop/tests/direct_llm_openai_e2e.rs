@@ -1,9 +1,8 @@
 //! DirectLlm Golden Phase A+B (partial): HTTP/OpenAI SSE through `StartedRuntime`.
 //!
 //! Phase A: text-only + concurrent admits.
-//! Phase B (CallerControlled): admitted tools encoded; Ready tool Loop ends
-//! `ContinuationRequired` without a second provider open.
-//! Inline model/tool/model + call-ID reuse e2e remain open Golden residuals.
+//! Phase B: CallerControlled tool path; InlineToolContinuation second exchange;
+//! call-ID reuse across sequential admits (distinct exchange-scoped action ids).
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -20,9 +19,9 @@ use monoloop_contracts::{
     ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy, DeliveryLimits,
     DialectBinding, DialectDescriptor, ExchangeMode, InvocationConfig, JsonSchema,
     McpConfigurationCapability, McpReachability, OptionPolicy, SessionMode, ShutdownWaitOutcome,
-    ToolCompletion, ToolExecutionClass, ToolExecutionMode, ToolId, ToolLimits, ToolName,
-    ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEndKind, TransactionEventPayload,
-    TransactionLimits, TransactionReceiver, TransactionSubmitRequest,
+    ToolCompletion, ToolExecutionClass, ToolExecutionMode, ToolId, ToolLifecycleEvent, ToolLimits,
+    ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEndKind,
+    TransactionEventPayload, TransactionLimits, TransactionReceiver, TransactionSubmitRequest,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
@@ -160,6 +159,20 @@ fn echo_tool_registry() -> HostToolRegistry {
 }
 
 fn openai_http_channel(id: &str, endpoint: String, model: &str) -> ChannelBinding {
+    openai_http_channel_with_policies(
+        id,
+        endpoint,
+        model,
+        BTreeSet::from([ContinuationPolicy::CallerControlled]),
+    )
+}
+
+fn openai_http_channel_with_policies(
+    id: &str,
+    endpoint: String,
+    model: &str,
+    continuation_policies: BTreeSet<ContinuationPolicy>,
+) -> ChannelBinding {
     let d = DialectDescriptor::openai_chat_completions("v1");
     let defaults = ChannelDefaults {
         model: Some(model.into()),
@@ -193,7 +206,7 @@ fn openai_http_channel(id: &str, endpoint: String, model: &str) -> ChannelBindin
             mcp_configuration: McpConfigurationCapability::None,
             mcp_reachability: McpReachability::None,
             exchange_mode: ExchangeMode::RequestResponse,
-            continuation_policies: BTreeSet::from([ContinuationPolicy::CallerControlled]),
+            continuation_policies,
             supports_distinct_session_concurrency: true,
             input_dialect: d.clone(),
             output_dialect: d,
@@ -210,11 +223,24 @@ async fn drain_until_completed(
     Vec<String>,
     Vec<&'static str>,
 ) {
+    let (completion, texts, labels, _) = drain_until_completed_detailed(receiver).await;
+    (completion, texts, labels)
+}
+
+async fn drain_until_completed_detailed(
+    receiver: TransactionReceiver,
+) -> (
+    monoloop_contracts::TransactionCompletion,
+    Vec<String>,
+    Vec<&'static str>,
+    Vec<TransactionEventPayload>,
+) {
     let mut events = receiver.events;
     let completion_fut = receiver.completion.recv();
     tokio::pin!(completion_fut);
     let mut texts = Vec::new();
     let mut labels = Vec::new();
+    let mut payloads = Vec::new();
     let push_label = |labels: &mut Vec<&'static str>, ev: &TransactionEventPayload| {
         labels.push(match ev {
             TransactionEventPayload::SessionEstablished { .. } => "session",
@@ -240,6 +266,7 @@ async fn drain_until_completed(
                                 texts.push(t.content.clone());
                             }
                         }
+                        payloads.push(ev.payload);
                     }
                 }
             }
@@ -254,8 +281,9 @@ async fn drain_until_completed(
                 texts.push(t.content.clone());
             }
         }
+        payloads.push(ev.payload);
     }
-    (completion, texts, labels)
+    (completion, texts, labels, payloads)
 }
 
 fn start_openai_runtime(bindings: Vec<ChannelBinding>) -> StartedRuntime {
@@ -525,6 +553,197 @@ fn caller_controlled_tool_exchange_ends_continuation_required_without_second_ope
         labels.iter().any(|l| *l == "tool_life" || *l == "tool"),
         "expected Tool CanonicalUnit and/or ToolLifecycle after Ready dispatch; labels={labels:?}"
     );
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(2)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
+    join.abort();
+}
+
+/// InlineToolContinuation: first POST returns tool_calls; second returns text.
+#[test]
+fn inline_tool_continuation_second_exchange_emits_text() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let posts = Arc::new(AtomicUsize::new(0));
+    let posts_c = Arc::clone(&posts);
+    let second_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let second_bodies_c = Arc::clone(&second_bodies);
+    let script = Arc::new(move |body: String| {
+        let n = posts_c.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            fragmented_tool_call_sse("call_1", "echo", r#"{"q":"hi"}"#)
+        } else {
+            second_bodies_c.lock().unwrap().push(body);
+            fragmented_text_sse("tool result acknowledged.")
+        }
+    });
+    let (addr, join) = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+
+    let started = start_openai_runtime_with_tools(
+        vec![openai_http_channel_with_policies(
+            "openai-inline",
+            endpoint,
+            "gpt-test",
+            BTreeSet::from([
+                ContinuationPolicy::CallerControlled,
+                ContinuationPolicy::InlineToolContinuation,
+            ]),
+        )],
+        echo_tool_registry(),
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let handle = started.handle.clone();
+    let (delivery, receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+    handle
+        .submit(TransactionSubmitRequest {
+            channel_id: ChannelId::try_new("openai-inline").unwrap(),
+            session_id: None,
+            input: user_text_input("Use the echo tool.").unwrap(),
+            session_config: None,
+            invocation_config: InvocationConfig {
+                deadline: Some(Duration::from_secs(5)),
+                continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                ..Default::default()
+            },
+            tools: vec![ToolId::try_new("echo").unwrap()],
+            delivery,
+        })
+        .expect("admit");
+
+    let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+    assert_eq!(
+        posts.load(Ordering::SeqCst),
+        2,
+        "InlineToolContinuation must open a second provider exchange; kind={:?} labels={labels:?}",
+        completion.end.kind
+    );
+    assert!(
+        labels.iter().any(|l| *l == "tool_life"),
+        "expected ToolLifecycle after Ready dispatch; labels={labels:?}"
+    );
+    let joined = texts.join("");
+    assert!(
+        joined.contains("tool result") || joined.contains("acknowledged"),
+        "expected final Text unit from second exchange; texts={texts:?} labels={labels:?}"
+    );
+    assert_eq!(
+        completion.end.kind,
+        TransactionEndKind::Completed,
+        "inline text continuation must Complete; got {:?} diagnostics={:?} labels={labels:?} texts={texts:?}",
+        completion.end.kind,
+        completion.end.diagnostics
+    );
+    let bodies = second_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "expected exactly one second-exchange body");
+    let body = &bodies[0];
+    assert!(
+        body.contains("\"role\":\"tool\"") || body.contains("\"role\": \"tool\""),
+        "second POST must include role:tool; body={body}"
+    );
+    assert!(
+        body.contains("tool_call_id") && body.contains("call_1"),
+        "second POST must correlate tool_call_id=call_1; body={body}"
+    );
+
+    let mut owner = started.owner;
+    let outcome = rt.block_on(async {
+        owner.begin_shutdown();
+        owner.wait_stopped(Duration::from_secs(2)).await
+    });
+    assert!(
+        matches!(outcome, ShutdownWaitOutcome::Stopped(_)),
+        "expected Stopped, got {outcome:?}"
+    );
+    join.abort();
+}
+
+/// Same provider call id across sequential admits yields distinct action ids.
+#[test]
+fn reused_provider_call_id_across_exchanges_distinct_action_ids() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let script =
+        Arc::new(|_body: String| fragmented_tool_call_sse("call_reuse", "echo", r#"{"q":"x"}"#));
+    let (addr, join) = rt.block_on(bind_fragmented_openai_sse(script));
+    let endpoint = format!("http://{addr}/v1/chat/completions");
+
+    let started = start_openai_runtime_with_tools(
+        vec![openai_http_channel("openai-reuse", endpoint, "gpt-test")],
+        echo_tool_registry(),
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let handle = started.handle.clone();
+
+    let mut action_ids = Vec::new();
+    let mut provider_ids = Vec::new();
+    for i in 0..2 {
+        let (delivery, receiver) =
+            transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+        handle
+            .submit(TransactionSubmitRequest {
+                channel_id: ChannelId::try_new("openai-reuse").unwrap(),
+                session_id: None,
+                input: user_text_input(format!("reuse round {i}")).unwrap(),
+                session_config: None,
+                invocation_config: InvocationConfig {
+                    deadline: Some(Duration::from_secs(5)),
+                    continuation_policy: ContinuationPolicy::CallerControlled,
+                    ..Default::default()
+                },
+                tools: vec![ToolId::try_new("echo").unwrap()],
+                delivery,
+            })
+            .expect("admit");
+        let (completion, _texts, labels, payloads) =
+            rt.block_on(drain_until_completed_detailed(receiver));
+        assert_eq!(
+            completion.end.kind,
+            TransactionEndKind::ContinuationRequired,
+            "round {i}: expected ContinuationRequired; got {:?} labels={labels:?}",
+            completion.end.kind
+        );
+        let mut found = false;
+        for payload in payloads {
+            if let TransactionEventPayload::ToolLifecycle(ToolLifecycleEvent::Completed {
+                result,
+            }) = payload
+            {
+                assert_eq!(
+                    result.provider_tool_call_id, "call_reuse",
+                    "provider id must be preserved exactly"
+                );
+                assert!(
+                    result.tool_action_id.as_str().contains("call_reuse"),
+                    "action id must contain provider id; got {}",
+                    result.tool_action_id.as_str()
+                );
+                provider_ids.push(result.provider_tool_call_id);
+                action_ids.push(result.tool_action_id.as_str().to_string());
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "round {i}: expected ToolLifecycle Completed; labels={labels:?}"
+        );
+    }
+
+    assert_eq!(action_ids.len(), 2);
+    assert_ne!(
+        action_ids[0], action_ids[1],
+        "same provider id across exchanges must yield distinct tool_action_id; got {action_ids:?}"
+    );
+    assert_eq!(provider_ids[0], "call_reuse");
+    assert_eq!(provider_ids[1], "call_reuse");
 
     let mut owner = started.owner;
     let outcome = rt.block_on(async {

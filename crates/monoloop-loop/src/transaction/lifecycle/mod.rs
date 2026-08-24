@@ -17,7 +17,7 @@ mod loop_dispatch;
 mod mcp_listener;
 mod mcp_request_owner;
 mod owner;
-mod session_identity;
+pub(crate) mod session_identity;
 mod shutdown;
 mod supervisor;
 mod task_spawner;

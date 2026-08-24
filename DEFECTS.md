@@ -3457,12 +3457,23 @@ composition was an open Golden residual.
 **Golden residual progress (Phase A+B partial, 2026-08-24):**
 `tests/direct_llm_openai_e2e.rs` — HTTP/OpenAI text-only + concurrency;
 CallerControlled tool path encodes admitted tools and ends
-`ContinuationRequired` without a second provider open (product wiring:
-`exchange.rs` tools slice + coordinator remap). Proofs include
-`caller_controlled_tool_exchange_ends_continuation_required_without_second_open`.
-**Still open for full Golden:** inline `encode_tool_continuation` model/tool/model;
-call-ID reuse across exchanges e2e. **Not** Golden / §25 / D-025. Agents must
-not self-sign.
+`ContinuationRequired` without a second provider open; InlineToolContinuation
+opens a second exchange via `encode_tool_continuation` + `run_encoded_exchange`
+(one continuation round; text second response → Completed); exchange-scoped
+`tool_action_id` + preserved `provider_tool_call_id` across sequential admits.
+Proofs: `caller_controlled_tool_exchange_ends_continuation_required_without_second_open`,
+`inline_tool_continuation_second_exchange_emits_text`,
+`reused_provider_call_id_across_exchanges_distinct_action_ids`.
+**Still open for full Golden:** multi-round inline (N>1 tool→model loops),
+deleted FakeConnector `direct_llm_e2e` parity coverage, full §25 / D-025.
+**Not** Golden / §25 / D-025. Agents must not self-sign.
+
+**Expert + Advisor (2026-08-24, InlineToolContinuation + call-ID reuse):**
+**PASS — Silver+Golden-progress** for this slice only. Fresh ExchangeId /
+ConnectionId / InterpretationId on continuation; `encode_tool_continuation`
+without double-append; CallerControlled stays one-open; provider call ids
+preserved with exchange-scoped action ids. Proofs green (e2e 15× serial).
+Do **not** promote Golden / §25 / D-025.
 
 **Acceptance criteria:**
 - [x] Port every retained integration suite to the v2 public API and register it,
@@ -3834,11 +3845,13 @@ Expert **PASS — Silver**; Advisor **PASS — Silver** (this record).
 **Re-review `b82c763` named P1/P2:** fourth-pass Silver PASS **withdrawn**
 after fifth independent REJECT; fifth-pass parked-send proof: Expert + Advisor
 **PASS — Silver**. D-048 sacrificial PID proofs closed (see D-048 record).
-DirectLlm Phase A HTTP/OpenAI text+concurrency landed; Phase B (tool
-second-exchange / continuation / call-ID reuse) still open for Golden.
-**Next pick:** Phase B product wiring + proofs, then independent Golden /
-D-025 review. Agents must not self-sign. Do **not** promote Golden / §25 /
-D-025.
+DirectLlm Phase A+B partial landed: HTTP/OpenAI text+concurrency;
+CallerControlled `ContinuationRequired`; InlineToolContinuation one-round
+second exchange (`encode_tool_continuation`); call-ID reuse across sequential
+admits. **Still open for full Golden:** multi-round inline (N>1), Fake
+parity suites, independent §25 / D-025 sign-off. **Next pick:** multi-round
+inline hardening and/or independent Golden review. Agents must not
+self-sign. Do **not** promote Golden / §25 / D-025.
 
 **Expert + Advisor (2026-08-23, D-046 Fixed):** **PASS — Silver** for this
 slice only.

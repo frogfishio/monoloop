@@ -2,13 +2,15 @@
 
 use super::event_publisher::{EventPublisherCommand, OrdinaryCmdAdmit};
 use super::exchange::{
-    run_direct_llm_exchange, DirectExchangeOutcome, PromptProceedError, PromptReadyGate,
+    run_direct_llm_continuation, run_direct_llm_exchange, DirectExchangeOutcome,
+    PromptProceedError, PromptReadyGate,
 };
 use super::ledger::LedgerInsertError;
 use super::loop_dispatch::{
-    needs_loop_dispatch, run_supervised_empty_loop, run_supervised_tool_loop, LoopDispatchError,
+    needs_loop_dispatch, run_supervised_empty_loop, run_supervised_tool_loop,
+    scope_tool_units_for_exchange, LoopDispatchError, LoopDispatchReport,
 };
-use super::session_identity::session_key_for;
+use super::session_identity::{provider_tool_call_id_from_action, session_key_for};
 use super::supervisor::RuntimeShared;
 use super::task_spawner::TransactionTaskSpawner;
 use super::terminal::TerminalProposal;
@@ -20,17 +22,38 @@ use crate::transaction::mcp::{CapabilityToken, McpGatewayHandle};
 use crate::transaction::resolved_tools::ResolvedToolSet;
 use crate::transaction::sticky_cancel::StickyCancel;
 use crate::transaction::tool_capacity::SharedToolCapacity;
-use monoloop_connector::SessionAttachRequest;
+use monoloop_connector::{Connector, SessionAttachRequest};
 use monoloop_contracts::{
-    merge_effective_config, CanonicalInput, ChannelId, ChannelKind, ContinuationPolicy, ExchangeId,
-    ExtensionLimits, InvocationConfig, McpConfigurationCapability, SessionConfig, SessionId,
-    SessionKey, ToolExecutionMode, ToolId, TransactionEndKind, TransactionEventPayload,
+    merge_effective_config, CanonicalAssistantToolCall, CanonicalInput, CanonicalMessage,
+    CanonicalToolOutput, CanonicalToolResult, CanonicalToolResultOutcome, CanonicalUnit, ChannelId,
+    ChannelKind, ContinuationContext, ContinuationPolicy, EffectiveConfig, ExchangeId,
+    ExtensionLimits, InputLimits, InvocationConfig, McpConfigurationCapability,
+    OutboundDialectEncoder, SessionConfig, SessionId, SessionKey, TextPart, ToolExecutionMode,
+    ToolId, ToolName, ToolRequestState, ToolSpec, TransactionEndKind, TransactionEventPayload,
     TransactionId,
 };
+use monoloop_interpreter::InterpreterFactory;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+
+/// DirectLlm pieces needed for one inline tool continuation exchange.
+struct InlineContinuationDeps<'a> {
+    input: &'a CanonicalInput,
+    config: &'a EffectiveConfig,
+    connector: &'a dyn Connector,
+    encoder: &'a dyn OutboundDialectEncoder,
+    interpreter: &'a dyn InterpreterFactory,
+    endpoint_ref: &'a str,
+    credential_ref: Option<&'a str>,
+    tool_specs: &'a [ToolSpec],
+    deadline: Duration,
+    cleanup_deadline: Duration,
+    max_encoded: usize,
+    max_retained: usize,
+    max_provider_input: usize,
+}
 
 /// Message from coordinator workers to the supervisor.
 #[derive(Debug)]
@@ -390,6 +413,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             tool_spill,
             owned_processes,
             process_registry,
+            None,
         )
         .await;
 
@@ -429,6 +453,21 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
     )
     .await;
 
+    let inline = InlineContinuationDeps {
+        input: &input,
+        config: &config,
+        connector: live.instance.connector.as_ref(),
+        encoder: live.binding.encoder.as_ref(),
+        interpreter: live.binding.interpreter.as_ref(),
+        endpoint_ref: &live.binding.endpoint_ref,
+        credential_ref: live.binding.credential_ref.as_deref(),
+        tool_specs: &tool_specs,
+        deadline,
+        cleanup_deadline,
+        max_encoded,
+        max_retained,
+        max_provider_input,
+    };
     finish_after_exchange(
         outcome,
         false,
@@ -446,6 +485,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         tool_spill,
         owned_processes,
         process_registry,
+        Some(inline),
     )
     .await
 }
@@ -468,6 +508,7 @@ async fn finish_after_exchange(
     tool_spill: Arc<OrphanToolPermitSet>,
     owned_processes: Arc<std::sync::atomic::AtomicU32>,
     process_registry: Arc<crate::transaction::owned_process_registry::OwnedProcessRegistry>,
+    inline: Option<InlineContinuationDeps<'_>>,
 ) -> TerminalProposal {
     // §22.6: establish external session before ordinary events when not done
     // at the prompt-ready gate (DirectLlm / late discovery).
@@ -488,8 +529,10 @@ async fn finish_after_exchange(
         }
     }
 
+    let first_exchange_id = outcome.exchange_id;
     let mut terminal = outcome.terminal;
-    for unit in &outcome.units {
+    let scoped_units = scope_tool_units_for_exchange(outcome.units, first_exchange_id);
+    for unit in &scoped_units {
         let send = publish_tx.send(EventPublisherCommand::Publish(Box::new(
             TransactionEventPayload::CanonicalUnit(unit.clone()),
         )));
@@ -517,16 +560,16 @@ async fn finish_after_exchange(
     if matches!(
         terminal,
         TransactionEndKind::Completed | TransactionEndKind::ContinuationRequired
-    ) && needs_loop_dispatch(&outcome.units)
+    ) && needs_loop_dispatch(&scoped_units)
     {
         let loop_result = if selected_tools.is_empty() {
             run_supervised_empty_loop(
                 tasks,
                 transaction_id,
-                channel_id,
-                session_id,
-                outcome.exchange_id,
-                outcome.units,
+                channel_id.clone(),
+                session_id.clone(),
+                first_exchange_id,
+                scoped_units.clone(),
                 publish_tx.clone(),
                 Arc::clone(cancel),
             )
@@ -541,26 +584,26 @@ async fn finish_after_exchange(
                 transaction_id,
                 session_key_for(channel_id.clone(), session_id.clone(), transaction_id),
                 resolved.clone(),
-                shared_tool_capacity,
-                tool_spill,
-                owned_processes,
-                process_registry,
+                Arc::clone(&shared_tool_capacity),
+                Arc::clone(&tool_spill),
+                Arc::clone(&owned_processes),
+                Arc::clone(&process_registry),
                 8,
                 16,
             );
             let runtime = HostToolRuntime::with_spawner(
                 Arc::clone(&dispatcher),
-                outcome.exchange_id,
+                first_exchange_id,
                 transaction_id,
                 tasks.clone(),
             );
             run_supervised_tool_loop(
                 tasks,
                 transaction_id,
-                channel_id,
-                session_id,
-                outcome.exchange_id,
-                outcome.units,
+                channel_id.clone(),
+                session_id.clone(),
+                first_exchange_id,
+                scoped_units.clone(),
                 publish_tx.clone(),
                 Arc::clone(cancel),
                 Arc::new(ResolvedToolRegistry::new(resolved)),
@@ -569,7 +612,7 @@ async fn finish_after_exchange(
             .await
         };
         match loop_result {
-            Ok(_report) => {
+            Ok(report) => {
                 // WP-10 / Phase B: CallerControlled tool exchange ends without a
                 // second provider open — host continues via ContinuationRequired.
                 if matches!(terminal, TransactionEndKind::Completed)
@@ -579,8 +622,20 @@ async fn finish_after_exchange(
                 } else if matches!(terminal, TransactionEndKind::Completed)
                     && continuation_policy == ContinuationPolicy::InlineToolContinuation
                 {
-                    // Inline model/tool/model not wired yet — fail closed (honest).
-                    terminal = TransactionEndKind::InvariantFailed;
+                    terminal = match run_inline_tool_continuation(
+                        &report,
+                        &scoped_units,
+                        inline.as_ref(),
+                        publish_tx,
+                        cancel,
+                        tasks,
+                        transaction_id,
+                    )
+                    .await
+                    {
+                        Ok(kind) => kind,
+                        Err(kind) => kind,
+                    };
                 }
             }
             Err(LoopDispatchError::Cancelled) => {
@@ -596,4 +651,143 @@ async fn finish_after_exchange(
     }
 
     TerminalProposal::new(terminal)
+}
+
+/// Phase B first cut: one inline continuation round, then Completed (text) or
+/// ContinuationRequired (second response still has Ready tools).
+async fn run_inline_tool_continuation(
+    report: &LoopDispatchReport,
+    first_units: &[monoloop_contracts::CanonicalUnitEvent],
+    inline: Option<&InlineContinuationDeps<'_>>,
+    publish_tx: &OrdinaryCmdAdmit,
+    cancel: &Arc<StickyCancel>,
+    tasks: &TransactionTaskSpawner,
+    transaction_id: TransactionId,
+) -> Result<TransactionEndKind, TransactionEndKind> {
+    let Some(deps) = inline else {
+        return Err(TransactionEndKind::InvariantFailed);
+    };
+    if report.tool_results.is_empty() {
+        return Err(TransactionEndKind::InvariantFailed);
+    }
+    let context = build_continuation_context(deps.input, first_units, &report.tool_results)
+        .map_err(|_| TransactionEndKind::EncodingFailed)?;
+    let continuation_exchange_id = ExchangeId::generate();
+    let second = run_direct_llm_continuation(
+        transaction_id,
+        continuation_exchange_id,
+        tasks,
+        deps.connector,
+        deps.encoder,
+        deps.interpreter,
+        deps.endpoint_ref,
+        deps.credential_ref,
+        &context,
+        &report.tool_results,
+        deps.config,
+        deps.tool_specs,
+        Arc::clone(cancel),
+        deps.deadline,
+        deps.cleanup_deadline,
+        deps.max_encoded,
+        deps.max_retained,
+        deps.max_provider_input,
+    )
+    .await;
+    if !matches!(second.terminal, TransactionEndKind::Completed) {
+        return Err(second.terminal);
+    }
+    let scoped = scope_tool_units_for_exchange(second.units, continuation_exchange_id);
+    for unit in &scoped {
+        let send = publish_tx.send(EventPublisherCommand::Publish(Box::new(
+            TransactionEventPayload::CanonicalUnit(unit.clone()),
+        )));
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(TransactionEndKind::Cancelled);
+            }
+            res = send => {
+                if res.is_err() {
+                    return Err(TransactionEndKind::EventDeliveryFailed);
+                }
+            }
+        }
+    }
+    if needs_loop_dispatch(&scoped) {
+        // First-cut: one continuation round only — host may continue.
+        Ok(TransactionEndKind::ContinuationRequired)
+    } else {
+        Ok(TransactionEndKind::Completed)
+    }
+}
+
+fn build_continuation_context(
+    input: &CanonicalInput,
+    units: &[monoloop_contracts::CanonicalUnitEvent],
+    results: &[CanonicalToolResult],
+) -> Result<ContinuationContext, ()> {
+    let limits = InputLimits::default();
+    let mut messages = input.messages().to_vec();
+    let mut tool_calls = Vec::new();
+    for unit in units {
+        let snap = unit.snapshot();
+        let CanonicalUnit::Tool(t) = &snap.unit else {
+            continue;
+        };
+        if t.request_state != ToolRequestState::Ready {
+            continue;
+        }
+        let Some(name) = t.tool_name.as_deref() else {
+            return Err(());
+        };
+        let Some(payload) = t.request_payload.as_deref() else {
+            return Err(());
+        };
+        let exchange_id = results.first().map(|r| r.exchange_id);
+        let provider_id = results
+            .iter()
+            .find(|r| r.tool_action_id == t.tool_action_id)
+            .map(|r| r.provider_tool_call_id.clone())
+            .or_else(|| {
+                exchange_id.and_then(|eid| {
+                    provider_tool_call_id_from_action(eid, &t.tool_action_id).map(str::to_string)
+                })
+            })
+            .unwrap_or_else(|| t.tool_action_id.as_str().to_string());
+        let arguments = serde_json::from_str(payload).map_err(|_| ())?;
+        let tool_name = ToolName::try_new(name).map_err(|_| ())?;
+        tool_calls.push(CanonicalAssistantToolCall {
+            tool_call_id: provider_id,
+            tool_name,
+            arguments,
+        });
+    }
+    if tool_calls.is_empty() {
+        return Err(());
+    }
+    messages.push(CanonicalMessage::Assistant {
+        content: vec![],
+        tool_calls,
+    });
+    for result in results {
+        let text = match &result.outcome {
+            CanonicalToolResultOutcome::Succeeded(CanonicalToolOutput::Json(v)) => {
+                serde_json::to_string(v).map_err(|_| ())?
+            }
+            CanonicalToolResultOutcome::Succeeded(CanonicalToolOutput::Text(t)) => t.clone(),
+            CanonicalToolResultOutcome::DomainFailed(err) => {
+                serde_json::to_string(&serde_json::json!({
+                    "error": { "code": err.code, "message": err.message, "data": err.data },
+                }))
+                .map_err(|_| ())?
+            }
+        };
+        let part = TextPart::try_new(text, limits.max_text_part_bytes).map_err(|_| ())?;
+        messages.push(CanonicalMessage::Tool {
+            tool_call_id: result.provider_tool_call_id.clone(),
+            content: vec![part],
+        });
+    }
+    ContinuationContext::try_new(messages).map_err(|_| ())
 }
