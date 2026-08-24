@@ -311,6 +311,19 @@ impl ToolKillHandle {
         matches!(&*self.inner, KillInner::Process { .. })
     }
 
+    /// OS PID of a live ProcessIsolated child, if still owned.
+    ///
+    /// Used by sacrificial proofs (D-048) to assert kill/reap without ambient heuristics.
+    pub fn os_pid(&self) -> Option<u32> {
+        match &*self.inner {
+            KillInner::Process { child, .. } => {
+                let guard = child.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().and_then(|c| c.id())
+            }
+            KillInner::CancelOnly { .. } => None,
+        }
+    }
+
     /// True when the body is driven inline on the caller task (no nested JoinHandle).
     pub fn is_cancel_only(&self) -> bool {
         matches!(&*self.inner, KillInner::CancelOnly { .. })

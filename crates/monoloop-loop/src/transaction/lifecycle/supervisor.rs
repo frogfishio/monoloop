@@ -5,7 +5,7 @@
 //! worker queue so coordinators cannot starve start or control.
 
 use super::coordinator::{run_coordinator, CoordinatorParams, WorkerMessage};
-use super::event_publisher::{run_event_publisher, EventPublisherCommand};
+use super::event_publisher::run_event_publisher;
 use super::ledger::{LifecycleLedger, TransactionPhase};
 use super::task_spawner::{SpawnRequest, TransactionTaskSpawner};
 use super::task_supervisor::{TaskClass, TaskExit, TaskSupervisor};
@@ -464,6 +464,16 @@ pub(crate) async fn run_supervisor(
                 }
             }
             finished = tasks.join_next(), if !tasks.is_empty() => {
+                // Re-drain WorkerExited before inventing terminals. A coordinator
+                // can try_send + complete in the same wakeup as join_next; the
+                // loop-head try_recv alone does not cover that race under load.
+                while let Ok(msg) = worker_rx.try_recv() {
+                    let WorkerMessage::WorkerExited {
+                        transaction_id,
+                        proposal,
+                    } = msg;
+                    accept_terminal(&shared, &mut tasks, transaction_id, proposal, false);
+                }
                 if let Some((_id, class, exit)) = finished {
                     on_task_exit(&shared, &mut tasks, &class, exit);
                 }
@@ -497,17 +507,28 @@ fn on_task_exit(
             }
         };
         if missing {
-            let kind = if matches!(exit, TaskExit::Panicked) {
-                // §22.2: coordinator panic → one InvariantFailed completion.
-                TransactionEndKind::InvariantFailed
-            } else if quiescing {
-                TransactionEndKind::RuntimeShutdown
-            } else if cancelled || matches!(exit, TaskExit::Cancelled) {
-                TransactionEndKind::Cancelled
-            } else {
-                TransactionEndKind::InvariantFailed
+            let stashed = {
+                let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                ledger
+                    .get_mut(&tx)
+                    .and_then(|e| e.pending_worker_proposal.take())
             };
-            accept_terminal(shared, tasks, tx, TerminalProposal::new(kind), false);
+            let proposal = if let Some(p) = stashed {
+                p
+            } else {
+                let kind = if matches!(exit, TaskExit::Panicked) {
+                    // §22.2: coordinator panic → one InvariantFailed completion.
+                    TransactionEndKind::InvariantFailed
+                } else if quiescing {
+                    TransactionEndKind::RuntimeShutdown
+                } else if cancelled || matches!(exit, TaskExit::Cancelled) {
+                    TransactionEndKind::Cancelled
+                } else {
+                    TransactionEndKind::InvariantFailed
+                };
+                TerminalProposal::new(kind)
+            };
+            accept_terminal(shared, tasks, tx, proposal, false);
         }
     }
 
@@ -561,13 +582,13 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         )
     };
 
-    let (pub_tx, pub_rx) = mpsc::channel::<EventPublisherCommand>(64);
+    let (pub_admit, pub_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(64);
     // D-047: Seal never shares the ordinary command queue — capacity 1 priority path.
     let (seal_tx, seal_rx) = mpsc::channel::<super::event_publisher::SealCommand>(1);
     {
         let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = ledger.get_mut(&tx) {
-            entry.publisher_cmd_tx = Some(pub_tx.clone());
+            entry.publisher_cmd_tx = Some(pub_admit.clone());
             entry.publisher_seal_tx = Some(seal_tx);
         }
     }
@@ -576,6 +597,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
     let session_id_pub = session_id.clone();
     let cancel_pub = Arc::clone(&cancel);
     let deadline_pub = std::time::Instant::now() + deadline;
+    let admit_pub = pub_admit.clone();
     // Do not retain a Sender inside the publisher task — that prevented natural
     // channel closure after Finalizer took the seal sender (D-047).
     tasks.spawn(TaskClass::EventPublisher(tx), async move {
@@ -585,6 +607,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
             session_id_pub,
             event_tx,
             pub_rx,
+            admit_pub,
             seal_rx,
             cancel_pub,
             deadline_pub,
@@ -602,7 +625,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         invocation_config,
         session_config,
         channels: Arc::clone(&shared.channels),
-        publish_tx: pub_tx,
+        publish_tx: pub_admit,
         worker_tx: shared.worker_tx.clone(),
         tasks: shared.task_spawner.clone(),
         deadline,
@@ -634,6 +657,7 @@ fn accept_terminal(
             return;
         };
         let first = entry.terminal.is_none();
+        entry.pending_worker_proposal = None;
         if let Some(existing) = entry.terminal.as_ref() {
             if force_upgrade
                 && existing.kind == TransactionEndKind::Cancelled
@@ -701,6 +725,11 @@ async fn finalize_after_terminal(
             }
         }
         entry.phase = TransactionPhase::CleanupPending;
+        // Close ordinary admission before Seal so parked/new sends cannot cross
+        // the fence after the publisher begins draining (D-047 linearization).
+        if let Some(admit) = entry.publisher_cmd_tx.take() {
+            admit.close();
+        }
         (
             entry.channel_id.clone(),
             entry.session_key.as_ref().map(|k| k.session_id.clone()),
@@ -718,10 +747,9 @@ async fn finalize_after_terminal(
         let terminal = end_event(tx, channel_id.clone(), session_id.clone(), kind, 0);
         // Dedicated seal channel (cap 1): not blocked by a full ordinary cmd queue.
         // One authoritative terminal-delivery Instant for Finalizer + publisher
-        // (`terminal_event_delivery_deadline` — never cleanup/tx deadline).
-        let seal_budget = shared
-            .terminal_event_delivery_deadline
-            .max(Duration::from_millis(50));
+        // (`terminal_event_delivery_deadline` exactly — never cleanup/tx deadline,
+        // never a silent floor).
+        let seal_budget = shared.terminal_event_delivery_deadline;
         let seal_deadline = std::time::Instant::now() + seal_budget;
         match seal_tx.try_send(super::event_publisher::SealCommand {
             terminal,
@@ -729,9 +757,9 @@ async fn finalize_after_terminal(
             deadline: seal_deadline,
         }) {
             Ok(()) => {
-                // Publisher uses the same Instant for enqueue_seal. Wait slightly
-                // past it so a DeadlineExceeded reply can land before we record.
-                let wait_budget = seal_budget + Duration::from_millis(100);
+                // Publisher uses the same Instant. Small reply slack only — does
+                // not extend the configured terminal delivery budget itself.
+                let wait_budget = seal_budget.saturating_add(Duration::from_millis(100));
                 match tokio::time::timeout(wait_budget, reply_rx).await {
                     Ok(Ok(res)) => {
                         terminal_delivery = res.delivery;

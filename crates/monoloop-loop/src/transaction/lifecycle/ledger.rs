@@ -38,15 +38,16 @@ pub struct LedgerEntry {
     pub phase: TransactionPhase,
     /// Immutable terminal decision once selected.
     pub terminal: Option<TerminalDecision>,
+    /// Coordinator proposal parked before `WorkerExited` notify (join_next recovery).
+    pub pending_worker_proposal: Option<super::terminal::TerminalProposal>,
     /// Last allocated event sequence (0 = none yet).
     pub event_sequence: u64,
     /// Full delivery ports at admit; taken at Start (split into publisher + completion).
     pub delivery: Option<TransactionDelivery>,
     /// Completion sender retained until Seal + publish.
     pub completion_tx: Option<TransactionCompletionSender>,
-    /// Ordinary Publish/Establish sender to this transaction's event publisher.
-    pub publisher_cmd_tx:
-        Option<tokio::sync::mpsc::Sender<super::event_publisher::EventPublisherCommand>>,
+    /// Ordinary Publish/Establish admit gate into this transaction's event publisher.
+    pub publisher_cmd_tx: Option<super::event_publisher::OrdinaryCmdAdmit>,
     /// Dedicated Seal sender (D-047 priority path; capacity 1).
     pub publisher_seal_tx: Option<tokio::sync::mpsc::Sender<super::event_publisher::SealCommand>>,
     /// Canonical input captured at admission.

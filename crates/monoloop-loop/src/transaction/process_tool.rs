@@ -51,17 +51,28 @@ pub enum ProcessToolCommand {
 #[derive(Clone, Debug)]
 pub struct ProcessIsolatedToolHandler {
     command: ProcessToolCommand,
+    /// Optional slot written with the child PID immediately after spawn (D-048 proofs).
+    pid_slot: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl ProcessIsolatedToolHandler {
     /// Construct from a command recipe.
     pub fn new(command: ProcessToolCommand) -> Self {
-        Self { command }
+        Self {
+            command,
+            pid_slot: None,
+        }
     }
 
     /// Qualification helper: child sleeps until OS kill.
     pub fn sleep_until_killed(seconds: u64) -> Self {
         Self::new(ProcessToolCommand::SleepUntilKilled { seconds })
+    }
+
+    /// Record the OS child PID into `slot` as soon as spawn succeeds (tests / sacrificial).
+    pub fn with_pid_slot(mut self, slot: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        self.pid_slot = Some(slot);
+        self
     }
 }
 
@@ -91,6 +102,12 @@ impl ToolHandler for ProcessIsolatedToolHandler {
                 .spawn()
                 .map_err(|_| ToolStartError::Rejected("process spawn failed"))?,
         };
+
+        if let Some(slot) = &self.pid_slot {
+            if let Some(id) = child.id() {
+                slot.store(id, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
 
         // D-048: take stdin before ownership; never block `start` on write_all.
         let stdin = if matches!(self.command, ProcessToolCommand::Program { .. }) {

@@ -3106,6 +3106,21 @@ deadline. Now both sides share `SealCommand.deadline =
 now + terminal_event_delivery_deadline`. Proof:
 `d047_seal_uses_terminal_deadline_not_transaction_deadline`.
 
+**Third REJECT + close (same day):** Biased Seal preempt dropped pre-accepted
+ordinary Publish (lossless fence violation). Seal became an ordering fence
+(in-flight under Seal deadline; backlog drain before `Ended`). Exact configured
+terminal deadline (no 50ms floor).
+
+**Fourth REJECT + close (same day):** Fence used `try_recv` until Empty without
+closing admission — a parked `send` could complete after Empty and be dropped.
+Now: `OrdinaryCmdAdmit::close` (Finalizer before Seal + publisher on Seal);
+async `recv` to Disconnected under Seal deadline. Proofs:
+`d047_seal_fence_drains_queued_ordinary_before_ended`, lossless
+`d047_seal_priority_when_ordinary_cmd_queue_full`,
+`d047_terminal_deadline_uses_configured_value_exactly`.
+Parked-send proof corrected in fifth pass
+(`d047_seal_fence_parked_send_delivered_before_ended`).
+
 **Acceptance criteria:**
 - [x] A temporarily full but draining host queue loses no ordinary events before
   the transaction deadline (`s22_2_failed_enqueue_consumes_no_sequence`).
@@ -3115,12 +3130,20 @@ now + terminal_event_delivery_deadline`. Proof:
 - [x] `SessionEstablished` publication failure becomes sticky and blocks further
   ordinary publishes (same sticky_fail path).
 - [x] Seal racing a full ordinary command queue permits no event after terminal
-  attempt (`d047_seal_priority_when_ordinary_cmd_queue_full`; dedicated seal
-  channel + preempt).
+  attempt; pre-fence ordinary is drained before Ended (lossless)
+  (`d047_seal_priority_when_ordinary_cmd_queue_full`,
+  `d047_seal_fence_drains_queued_ordinary_before_ended`).
+- [x] Parked ordinary `send` that holds a pre-fence Sender clone while the
+  ordinary queue is full at Seal time completes `Ok` and is delivered before
+  Ended (`d047_seal_fence_parked_send_delivered_before_ended` with
+  `send_after_pre_fence_hold` sync).
 - [x] Seal terminal enqueue and Finalizer reply wait share one authoritative
-  `terminal_event_delivery_deadline` Instant (not cleanup / tx deadline)
-  (`d047_seal_uses_terminal_deadline_not_transaction_deadline`).
-- [x] Tests assert delivered sequences after wait/drain (contiguous + count).
+  `terminal_event_delivery_deadline` Instant exactly (not cleanup / tx deadline,
+  no silent floor)
+  (`d047_seal_uses_terminal_deadline_not_transaction_deadline`,
+  `d047_terminal_deadline_uses_configured_value_exactly`).
+- [x] Tests assert delivered sequences after wait/drain (contiguous + count +
+  Ended last).
 
 ## D-048: Process-isolated tool handles are discarded before wait/reap
 
@@ -3167,9 +3190,16 @@ only then. Proofs:
 `process_isolated_program_owns_before_stdin_and_is_killable`,
 `process_isolated_stdin_timeout_reaps_only_after_observed_exit`.
 
+**Golden residual close (2026-08-23):** Sacrificial harness
+`tests/d048_process_isolated_sacrificial.rs` aborts `ToolWorker` after spawn
+(park path), then quiesces until `kill -0` fails **before**
+`registry.is_empty()`. Inventory registered in
+`s23_adversarial_lifecycle_subprocess_harness_inventory`.
+
 **Acceptance criteria:**
-- [ ] Abort the supervising `ToolWorker` immediately after process spawn;
-  sacrificial end-to-end PID proof still residual (unit registry proof landed).
+- [x] Abort the supervising `ToolWorker` immediately after process spawn;
+  sacrificial end-to-end PID proof
+  (`d048_process_isolated_sacrificial_abort_park_then_pid_not_waitable`).
 - [x] Kill/wait timeout can retain the handle in the registry (`park` path);
   Stopped blocked while `live_count > 0`.
 - [x] Later reap empties the registry (`registry_retains_until_reap_then_empties`).
@@ -3180,7 +3210,8 @@ only then. Proofs:
 - [x] Stdin delivery is owned (async on drive); no ambient `spawn_blocking`;
   reap only after observed exit
   (`process_isolated_stdin_timeout_reaps_only_after_observed_exit` + §23).
-- [ ] Sacrificial PID-not-waitable proof still residual (next hardening optional).
+- [x] Sacrificial PID-not-waitable proof before claiming registry empty
+  (`d048_process_isolated_sacrificial_abort_park_then_pid_not_waitable`).
 
 ## D-049: `wait_stopped` deadline excludes executor-thread join
 
@@ -3421,8 +3452,17 @@ excluded unless explicitly registered.
 
 **Honesty follow-up (independent review `b82c763`):** DirectLlm replacement
 map **narrowed** — Fake echo + empty_loop are smoke only; HTTP/OpenAI SSE
-composition, continuation, tool second-exchange, call-ID reuse, and
-concurrency remain an open Golden residual (not claimed covered).
+composition was an open Golden residual.
+
+**Golden residual progress (Phase A+B partial, 2026-08-24):**
+`tests/direct_llm_openai_e2e.rs` — HTTP/OpenAI text-only + concurrency;
+CallerControlled tool path encodes admitted tools and ends
+`ContinuationRequired` without a second provider open (product wiring:
+`exchange.rs` tools slice + coordinator remap). Proofs include
+`caller_controlled_tool_exchange_ends_continuation_required_without_second_open`.
+**Still open for full Golden:** inline `encode_tool_continuation` model/tool/model;
+call-ID reuse across exchanges e2e. **Not** Golden / §25 / D-025. Agents must
+not self-sign.
 
 **Acceptance criteria:**
 - [x] Port every retained integration suite to the v2 public API and register it,
@@ -3689,10 +3729,77 @@ Sacrificial PID residual under D-048 remains. DirectLlm vertical e2e remains a
 Golden residual. **Not** Golden / §25 / D-025. Agents must not self-sign.
 
 **Expert + Advisor (2026-08-23, second-pass remediations Silver bar):**
-**PASS — Silver** for this slice only. Named proofs + `s23_forbidden_patterns`
-re-run green on this tree. Premature first-pass PASS remains withdrawn; this
-stamp covers only the second-REJECT closures (async stdin + honest reap;
-shared `terminal_event_delivery_deadline`; §23; DEFECTS honesty).
+**WITHDRAWN** — superseded by third independent REJECT (Seal fence dropped
+pre-accepted ordinary events; `chat_projection_from_transaction_events_only`
+failed; priority proof did not assert losslessness; silent 50ms terminal
+deadline floor).
+
+### Third-pass findings (independent REJECT)
+
+1. **P1 D-047** Seal biased-preempt discarded queued / in-flight ordinary
+   Publish — `EndedEvent` without preceding CanonicalUnit (suite flake
+   `chat_projection_from_transaction_events_only`).
+2. **P1 test** `d047_seal_priority_when_ordinary_cmd_queue_full` asserted only
+   Seal Published, permitting silent ordinary loss.
+3. **P2** `terminal_event_delivery_deadline.max(50ms)` silently raised exact
+   configured budgets.
+4. **P2** Sacrificial abort-after-spawn PID proof still unchecked (residual).
+
+### Remediation (same day, after third REJECT)
+
+| Finding | Fix | Proof |
+|---|---|---|
+| P1 Seal drops pre-fence ordinary | Seal is an ordering fence: finish in-flight ordinary under Seal deadline (commit or sticky-fail); `try_recv` drain ordinary backlog before `Ended` | `d047_seal_fence_drains_queued_ordinary_before_ended`, strengthened `d047_seal_priority_when_ordinary_cmd_queue_full`; `chat_projection_from_transaction_events_only` 30× green |
+| P1 weak priority proof | Assert diagnostic before Ended, contiguous sequences, `last_sequence` matches | same |
+| P2 silent 50ms floor | Use configured `terminal_event_delivery_deadline` exactly | `d047_terminal_deadline_uses_configured_value_exactly` |
+| P2 sacrificial PID | Still residual (unchecked) | — |
+
+**Expert + Advisor (2026-08-23, third-pass remediations Silver bar):**
+**WITHDRAWN** — superseded by fourth independent REJECT (Seal fence not
+linearizable: `try_recv` until Empty allowed a parked `send` to complete after
+drain and be dropped; `coordinator_publishes_sequenced_unit_and_completed`
+flaked; parked-send proof absent; premature PASS before human review).
+
+### Fourth-pass findings (independent REJECT)
+
+1. **P1** Seal drain used `try_recv` until Empty without closing admission — a
+   blocking `send` parked on a full ordinary queue could complete after Empty
+   and be lost when the publisher exited.
+2. **P1** Full workspace gate: `coordinator_publishes_sequenced_unit_and_completed`
+   missing CanonicalUnit (scheduling-sensitive).
+3. **P2** Priority proof used `try_send`/`Full` only — no parked `send()` proof.
+4. **P2** Premature Silver PASS stamp (withdrawn above).
+
+### Remediation (same day, after fourth REJECT)
+
+| Finding | Fix | Proof |
+|---|---|---|
+| P1 non-linearizable fence | `OrdinaryCmdAdmit::close` at Seal (Finalizer + publisher); async `recv` to Disconnected under Seal deadline | fence/priority proofs; production close+drain |
+| P1 flake | Same close+drain linearization | `coordinator_publishes_sequenced_unit_and_completed` + lib suite |
+| P2 parked-send proof (first attempt) | Insufficient — see fifth REJECT | — |
+| P2 premature PASS | Withdrawn | (this record) |
+
+**Expert + Advisor (2026-08-23, fourth-pass remediations Silver bar):**
+**WITHDRAWN** — superseded by fifth independent REJECT: the parked-send test
+did not force a send blocked across Seal (publisher drained before Seal;
+`Ok`/`Err` both allowed). Production close+drain remains sound.
+
+### Fifth-pass finding (independent REJECT — proof only)
+
+**P2** `d047_seal_fence_parked_send_*` started the publisher before filling the
+queue and slept 20ms before Seal, so both ordinary commands usually completed
+pre-Seal. Fix: fill queue with publisher stopped; `send_after_pre_fence_hold`
+signals after Sender clone; assert still Full; queue Seal; then start
+publisher; require parked `Ok` and `queued`→`parked`→`Ended`.
+
+**Proof:** `d047_seal_fence_parked_send_delivered_before_ended` (50× green).
+
+**Expert + Advisor (2026-08-23, fifth-pass parked-send proof Silver bar):**
+**PASS — Silver** for this proof slice only. Production close+drain was already
+sound; this stamp covers only the forced pre-Seal park + `Ok` +
+`queued`→`parked`→`Ended` proof. Fourth-pass PASS remains withdrawn.
+Sacrificial PID residual under D-048 remains. DirectLlm vertical e2e remains
+Golden residual.
 
 **Next pick:** independent human re-review of this Silver remediation slice.
 Do **not** promote Golden / §25 / D-025.
@@ -3724,11 +3831,14 @@ complete while any of these records remain open.
 **Remediation progress (2026-08-23):** D-046–D-054 Fixed for their named Silver
 slices (see each defect). D-054 honesty/deletion + WP-12/D-003 retarget:
 Expert **PASS — Silver**; Advisor **PASS — Silver** (this record).
-**Re-review `b82c763` named P1/P2:** prior Silver PASS **withdrawn** after
-second independent REJECT; second-pass remediations: Expert + Advisor
-**PASS — Silver** (see re-review section). Sacrificial PID residual remains
-under D-048. **Next pick:** independent human re-review. Agents must not
-self-sign. Do **not** promote Golden / §25 / D-025.
+**Re-review `b82c763` named P1/P2:** fourth-pass Silver PASS **withdrawn**
+after fifth independent REJECT; fifth-pass parked-send proof: Expert + Advisor
+**PASS — Silver**. D-048 sacrificial PID proofs closed (see D-048 record).
+DirectLlm Phase A HTTP/OpenAI text+concurrency landed; Phase B (tool
+second-exchange / continuation / call-ID reuse) still open for Golden.
+**Next pick:** Phase B product wiring + proofs, then independent Golden /
+D-025 review. Agents must not self-sign. Do **not** promote Golden / §25 /
+D-025.
 
 **Expert + Advisor (2026-08-23, D-046 Fixed):** **PASS — Silver** for this
 slice only.

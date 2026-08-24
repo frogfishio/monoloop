@@ -2416,7 +2416,7 @@ async fn event_publisher_prefers_authoritative_session_on_seal() {
     let channel = ChannelId::try_new("llm").unwrap();
     let (delivery, mut receiver) =
         transaction_delivery(DeliveryLimits::try_new(16, 64 * 1024).unwrap()).unwrap();
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
     let (seal_tx, seal_rx) = mpsc::channel(1);
     let pub_task = tokio::spawn(run_event_publisher(
         tx_id,
@@ -2424,13 +2424,14 @@ async fn event_publisher_prefers_authoritative_session_on_seal() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
         std::time::Instant::now() + Duration::from_secs(30),
     ));
 
     // First ordinary event invents tx-{id}.
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(
             TransactionEventPayload::Diagnostic(TransactionDiagnostic {
                 diagnostic: SafeDiagnostic::try_new("noop", Some("x"), 64).unwrap(),
@@ -4103,7 +4104,7 @@ async fn s22_2_no_event_after_terminal_attempt() {
     let channel = ChannelId::try_new("llm").unwrap();
     let (delivery, mut receiver) =
         transaction_delivery(DeliveryLimits::try_new(16, 64 * 1024).unwrap()).unwrap();
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
     let (seal_tx, seal_rx) = mpsc::channel(1);
     let pub_task = tokio::spawn(run_event_publisher(
         tx_id,
@@ -4111,6 +4112,7 @@ async fn s22_2_no_event_after_terminal_attempt() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
         std::time::Instant::now() + Duration::from_secs(30),
@@ -4142,7 +4144,7 @@ async fn s22_2_no_event_after_terminal_attempt() {
     ));
 
     // Post-Seal Publish must be ignored (no further events).
-    let _ = cmd_tx
+    let _ = admit
         .send(EventPublisherCommand::Publish(Box::new(
             TransactionEventPayload::Diagnostic(TransactionDiagnostic {
                 diagnostic: SafeDiagnostic::try_new("late", Some("x"), 64).unwrap(),
@@ -4154,7 +4156,7 @@ async fn s22_2_no_event_after_terminal_attempt() {
         receiver.events.try_recv().is_err(),
         "no event after terminal attempt"
     );
-    drop(cmd_tx);
+    drop(admit);
     drop(seal_tx);
     let _ = pub_task.await;
 }
@@ -4174,7 +4176,7 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
     let channel = ChannelId::try_new("llm").unwrap();
     let (delivery, mut receiver) =
         transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
     let (_seal_tx, seal_rx) = mpsc::channel(1);
     let pub_task = tokio::spawn(run_event_publisher(
         tx_id,
@@ -4182,6 +4184,7 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
         std::time::Instant::now() + Duration::from_secs(30),
@@ -4192,12 +4195,12 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
             diagnostic: SafeDiagnostic::try_new("noop", Some(tag), 64).unwrap(),
         })
     };
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(diag("a"))))
         .await
         .unwrap();
     // Fill capacity 1 without draining — second publish waits (D-047), does not drop.
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(diag("b"))))
         .await
         .unwrap();
@@ -4206,13 +4209,13 @@ async fn s22_2_failed_enqueue_consumes_no_sequence() {
     assert_eq!(first.sequence, 1);
     let second = receiver.events.recv().await.expect("second after wait");
     assert_eq!(second.sequence, 2);
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(diag("c"))))
         .await
         .unwrap();
     let third = receiver.events.recv().await.expect("third");
     assert_eq!(third.sequence, 3, "contiguous after waited enqueue");
-    drop(cmd_tx);
+    drop(admit);
     drop(_seal_tx);
     let _ = pub_task.await;
 }
@@ -4235,7 +4238,7 @@ async fn d047_full_queue_seal_reports_deadline_not_published() {
     let channel = ChannelId::try_new("llm").unwrap();
     let (delivery, _receiver) =
         transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
     let (seal_tx, seal_rx) = mpsc::channel(1);
     let cancel = Arc::new(crate::transaction::sticky_cancel::StickyCancel::new());
     // Short deadline so the waiting second publish fails closed.
@@ -4245,6 +4248,7 @@ async fn d047_full_queue_seal_reports_deadline_not_published() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::clone(&cancel),
         std::time::Instant::now() + Duration::from_millis(80),
@@ -4255,12 +4259,12 @@ async fn d047_full_queue_seal_reports_deadline_not_published() {
             diagnostic: SafeDiagnostic::try_new("noop", Some("x"), 64).unwrap(),
         })
     };
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(diag())))
         .await
         .unwrap();
     // Do not drain — second publish waits until deadline.
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(diag())))
         .await
         .unwrap();
@@ -4291,13 +4295,13 @@ async fn d047_full_queue_seal_reports_deadline_not_published() {
         res.delivery
     );
     assert_eq!(res.last_sequence, 1, "only the first event committed");
-    drop(cmd_tx);
+    drop(admit);
     drop(seal_tx);
     let _ = pub_task.await;
 }
 
 /// D-047: Seal on the dedicated channel succeeds even when the ordinary
-/// command mpsc is Full (priority path).
+/// command mpsc is Full — and pre-fence ordinary Publish is not lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn d047_seal_priority_when_ordinary_cmd_queue_full() {
     use super::event_publisher::{
@@ -4315,7 +4319,7 @@ async fn d047_seal_priority_when_ordinary_cmd_queue_full() {
     // Roomy host mailbox so ordinary publishes can wait without sticky fail.
     let (delivery, mut receiver) =
         transaction_delivery(DeliveryLimits::try_new(64, 1024 * 1024).unwrap()).unwrap();
-    let (cmd_tx, cmd_rx) = mpsc::channel(1);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(1);
     let (seal_tx, seal_rx) = mpsc::channel(1);
     let cancel = Arc::new(crate::transaction::sticky_cancel::StickyCancel::new());
     let pub_task = tokio::spawn(run_event_publisher(
@@ -4324,6 +4328,7 @@ async fn d047_seal_priority_when_ordinary_cmd_queue_full() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::clone(&cancel),
         std::time::Instant::now() + Duration::from_secs(30),
@@ -4335,11 +4340,11 @@ async fn d047_seal_priority_when_ordinary_cmd_queue_full() {
         })
     };
     // Fill ordinary capacity-1 queue and park a second send.
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(diag())))
         .await
         .unwrap();
-    let blocked = cmd_tx.try_send(EventPublisherCommand::Publish(Box::new(diag())));
+    let blocked = admit.try_send(EventPublisherCommand::Publish(Box::new(diag())));
     assert!(
         matches!(
             blocked,
@@ -4365,22 +4370,390 @@ async fn d047_seal_priority_when_ordinary_cmd_queue_full() {
         })
         .expect("Seal must enqueue on dedicated channel while ordinary is Full");
 
-    // Drain host so publisher can finish first ordinary then Seal.
-    while receiver.events.try_recv().is_ok() {}
-    let _ = receiver.events.recv().await;
-    while receiver.events.try_recv().is_ok() {}
+    // Collect the full stream: accepted ordinary must appear before Ended.
+    let mut evs = Vec::new();
+    let res: TerminalPublicationResult = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::pin!(reply_rx);
+        loop {
+            tokio::select! {
+                biased;
+                reply = &mut reply_rx => break reply.expect("seal reply"),
+                ev = receiver.events.recv() => {
+                    evs.push(ev.expect("host event"));
+                }
+            }
+        }
+    })
+    .await
+    .expect("seal reply timeout");
+    // Drain any events that raced after the reply.
+    while let Ok(ev) = receiver.events.try_recv() {
+        evs.push(ev);
+    }
 
-    let res: TerminalPublicationResult = tokio::time::timeout(Duration::from_secs(2), reply_rx)
-        .await
-        .expect("seal reply timeout")
-        .expect("seal reply");
     assert_eq!(
         res.delivery,
         TerminalEventDelivery::Published,
         "Seal via priority channel must publish, got {:?}",
         res.delivery
     );
-    drop(cmd_tx);
+    assert!(
+        evs.len() >= 2,
+        "need ordinary + Ended, got {} events: {:?}",
+        evs.len(),
+        evs.iter().map(|e| e.sequence).collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(
+            evs.first().map(|e| &e.payload),
+            Some(TransactionEventPayload::Diagnostic(_))
+        ),
+        "first committed event must be the accepted ordinary diagnostic"
+    );
+    assert!(
+        matches!(
+            evs.last().map(|e| &e.payload),
+            Some(TransactionEventPayload::EndedEvent(_))
+        ),
+        "last event must be EndedEvent"
+    );
+    for (i, ev) in evs.iter().enumerate() {
+        assert_eq!(
+            ev.sequence,
+            (i as u64).saturating_add(1),
+            "sequences must be contiguous starting at 1"
+        );
+    }
+    assert_eq!(
+        res.last_sequence,
+        evs.len() as u64,
+        "Seal last_sequence must match delivered count"
+    );
+    drop(admit);
+    drop(seal_tx);
+    let _ = pub_task.await;
+}
+
+/// D-047: a `send` that holds a pre-fence Sender clone and is blocked on capacity
+/// when Seal closes admission MUST complete `Ok` and appear before `Ended`.
+///
+/// Schedule (forced): fill ordinary queue with publisher stopped → park second
+/// send (sync after Sender clone) → queue Seal → start publisher. Biased Seal
+/// closes admit, drain frees capacity, parked send completes into the drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d047_seal_fence_parked_send_delivered_before_ended() {
+    use super::event_publisher::{
+        run_event_publisher, EventPublisherCommand, SealCommand, TerminalPublicationResult,
+    };
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, SafeDiagnostic, TerminalEventDelivery,
+        TransactionDiagnostic, TransactionEndEvent, TransactionEndKind, TransactionEventPayload,
+        TransactionId, TransactionUsage,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 1024 * 1024).unwrap()).unwrap();
+    // Cap 1; publisher is NOT started until the second send is proven parked.
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(1);
+    let (seal_tx, seal_rx) = mpsc::channel(1);
+    let cancel = Arc::new(crate::transaction::sticky_cancel::StickyCancel::new());
+
+    let diag = |label: &str| {
+        TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+            diagnostic: SafeDiagnostic::try_new(label, Some(label), 64).unwrap(),
+        })
+    };
+
+    admit
+        .try_send(EventPublisherCommand::Publish(Box::new(diag("queued"))))
+        .expect("fill ordinary capacity while publisher is stopped");
+    assert!(
+        matches!(
+            admit.try_send(EventPublisherCommand::Publish(Box::new(diag("extra")))),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ),
+        "ordinary queue must be full before parking"
+    );
+
+    let (holding_tx, holding_rx) = oneshot::channel();
+    let parked_admit = admit.clone();
+    let parked = tokio::spawn(async move {
+        parked_admit
+            .send_after_pre_fence_hold(
+                EventPublisherCommand::Publish(Box::new(diag("parked"))),
+                holding_tx,
+            )
+            .await
+    });
+    // Critical sync: Sender cloned under open admit before any Seal/close.
+    tokio::time::timeout(Duration::from_secs(1), holding_rx)
+        .await
+        .expect("parked send must signal pre-fence hold")
+        .expect("holding oneshot");
+    // Still Full — parked future is waiting on capacity, not finished.
+    assert!(
+        matches!(
+            admit.try_send(EventPublisherCommand::Publish(Box::new(diag("probe")))),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ),
+        "parked send must still be blocked on a full queue at Seal time"
+    );
+    assert!(admit.is_open(), "admit must still be open when parked");
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    seal_tx
+        .try_send(SealCommand {
+            terminal: TransactionEndEvent {
+                transaction_id: tx_id,
+                session_id: None,
+                channel_id: channel.clone(),
+                kind: TransactionEndKind::Completed,
+                emitted_events: 0,
+                usage: TransactionUsage::default(),
+                diagnostics: vec![],
+            },
+            reply: reply_tx,
+            deadline: std::time::Instant::now() + Duration::from_secs(2),
+        })
+        .expect("queue Seal before starting publisher");
+
+    // Start publisher with Seal + backlog already pending (biased Seal wins).
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel,
+        None,
+        delivery.event_tx,
+        cmd_rx,
+        admit.clone(),
+        seal_rx,
+        Arc::clone(&cancel),
+        std::time::Instant::now() + Duration::from_secs(30),
+    ));
+
+    let mut evs = Vec::new();
+    let res: TerminalPublicationResult = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::pin!(reply_rx);
+        loop {
+            tokio::select! {
+                biased;
+                reply = &mut reply_rx => break reply.expect("seal reply"),
+                ev = receiver.events.recv() => evs.push(ev.expect("event")),
+            }
+        }
+    })
+    .await
+    .expect("timeout");
+    while let Ok(ev) = receiver.events.try_recv() {
+        evs.push(ev);
+    }
+
+    let parked_result = tokio::time::timeout(Duration::from_secs(1), parked)
+        .await
+        .expect("parked join")
+        .expect("parked task");
+    assert_eq!(
+        parked_result,
+        Ok(()),
+        "pre-fence parked send must complete Ok after drain frees capacity"
+    );
+
+    assert_eq!(res.delivery, TerminalEventDelivery::Published);
+    assert_eq!(evs.len(), 3, "queued + parked + Ended, got {}", evs.len());
+    let code0 = match &evs[0].payload {
+        TransactionEventPayload::Diagnostic(d) => d.diagnostic.code.as_str().to_string(),
+        other => panic!("expected queued diagnostic, got {other:?}"),
+    };
+    let code1 = match &evs[1].payload {
+        TransactionEventPayload::Diagnostic(d) => d.diagnostic.code.as_str().to_string(),
+        other => panic!("expected parked diagnostic, got {other:?}"),
+    };
+    assert_eq!(code0, "queued", "first ordinary must be pre-queued");
+    assert_eq!(code1, "parked", "parked ordinary must appear before Ended");
+    assert!(matches!(
+        &evs[2].payload,
+        TransactionEventPayload::EndedEvent(_)
+    ));
+    assert_eq!(evs[0].sequence, 1);
+    assert_eq!(evs[1].sequence, 2);
+    assert_eq!(evs[2].sequence, 3);
+    assert!(receiver.events.try_recv().is_err(), "nothing after Ended");
+    drop(admit);
+    drop(seal_tx);
+    let _ = pub_task.await;
+}
+
+/// D-047: Seal fence drains a queued ordinary Publish before Ended (no silent loss).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d047_seal_fence_drains_queued_ordinary_before_ended() {
+    use super::event_publisher::{
+        run_event_publisher, EventPublisherCommand, SealCommand, TerminalPublicationResult,
+    };
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, SafeDiagnostic, TerminalEventDelivery,
+        TransactionDiagnostic, TransactionEndEvent, TransactionEndKind, TransactionEventPayload,
+        TransactionId, TransactionUsage,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    let (delivery, mut receiver) =
+        transaction_delivery(DeliveryLimits::try_new(64, 1024 * 1024).unwrap()).unwrap();
+    // Cap 8 so Seal + ordinary can both sit ready; biased Seal must still drain.
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
+    let (seal_tx, seal_rx) = mpsc::channel(1);
+    let cancel = Arc::new(crate::transaction::sticky_cancel::StickyCancel::new());
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel.clone(),
+        None,
+        delivery.event_tx,
+        cmd_rx,
+        admit.clone(),
+        seal_rx,
+        Arc::clone(&cancel),
+        std::time::Instant::now() + Duration::from_secs(30),
+    ));
+
+    // Pause the publisher briefly by not yielding work until both are queued.
+    let diag = TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+        diagnostic: SafeDiagnostic::try_new("pre-fence", Some("keep"), 64).unwrap(),
+    });
+    admit
+        .try_send(EventPublisherCommand::Publish(Box::new(diag)))
+        .expect("ordinary");
+    let (reply_tx, reply_rx) = oneshot::channel();
+    seal_tx
+        .try_send(SealCommand {
+            terminal: TransactionEndEvent {
+                transaction_id: tx_id,
+                session_id: None,
+                channel_id: channel,
+                kind: TransactionEndKind::Completed,
+                emitted_events: 0,
+                usage: TransactionUsage::default(),
+                diagnostics: vec![],
+            },
+            reply: reply_tx,
+            deadline: std::time::Instant::now() + Duration::from_secs(2),
+        })
+        .expect("seal");
+
+    let mut evs = Vec::new();
+    let res: TerminalPublicationResult = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::pin!(reply_rx);
+        loop {
+            tokio::select! {
+                biased;
+                reply = &mut reply_rx => break reply.expect("seal reply"),
+                ev = receiver.events.recv() => evs.push(ev.expect("event")),
+            }
+        }
+    })
+    .await
+    .expect("timeout");
+    while let Ok(ev) = receiver.events.try_recv() {
+        evs.push(ev);
+    }
+
+    assert_eq!(res.delivery, TerminalEventDelivery::Published);
+    assert_eq!(evs.len(), 2, "ordinary + Ended only");
+    assert!(matches!(
+        evs[0].payload,
+        TransactionEventPayload::Diagnostic(_)
+    ));
+    assert!(matches!(
+        evs[1].payload,
+        TransactionEventPayload::EndedEvent(_)
+    ));
+    assert_eq!(evs[0].sequence, 1);
+    assert_eq!(evs[1].sequence, 2);
+    drop(admit);
+    drop(seal_tx);
+    let _ = pub_task.await;
+}
+
+/// P2: configured `terminal_event_delivery_deadline` is honored exactly (no silent floor).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d047_terminal_deadline_uses_configured_value_exactly() {
+    use super::event_publisher::{run_event_publisher, SealCommand, TerminalPublicationResult};
+    use monoloop_contracts::{
+        transaction_delivery, DeliveryLimits, TerminalEventDelivery, TransactionEndEvent,
+        TransactionEndKind, TransactionId, TransactionUsage,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    let tx_id = TransactionId::generate();
+    let channel = ChannelId::try_new("llm").unwrap();
+    // Full host mailbox — Seal enqueue must wait.
+    let (delivery, _receiver) =
+        transaction_delivery(DeliveryLimits::try_new(1, 64 * 1024).unwrap()).unwrap();
+    {
+        use monoloop_contracts::{
+            SafeDiagnostic, TransactionDiagnostic, TransactionEvent, TransactionEventPayload,
+        };
+        delivery
+            .event_tx
+            .try_send(TransactionEvent {
+                transaction_id: tx_id,
+                channel_id: channel.clone(),
+                session_id: SessionId::try_new("s").unwrap(),
+                sequence: 1,
+                payload: TransactionEventPayload::Diagnostic(TransactionDiagnostic {
+                    diagnostic: SafeDiagnostic::try_new("occupy", Some("x"), 64).unwrap(),
+                }),
+            })
+            .expect("occupy");
+    }
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
+    let (seal_tx, seal_rx) = mpsc::channel(1);
+    let cancel = Arc::new(crate::transaction::sticky_cancel::StickyCancel::new());
+    let pub_task = tokio::spawn(run_event_publisher(
+        tx_id,
+        channel.clone(),
+        None,
+        delivery.event_tx,
+        cmd_rx,
+        admit.clone(),
+        seal_rx,
+        Arc::clone(&cancel),
+        std::time::Instant::now() + Duration::from_secs(600),
+    ));
+
+    // Caller-configured 1ms — must not be silently raised to 50ms.
+    let configured = Duration::from_millis(1);
+    let seal_deadline = std::time::Instant::now() + configured;
+    let started = std::time::Instant::now();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    seal_tx
+        .try_send(SealCommand {
+            terminal: TransactionEndEvent {
+                transaction_id: tx_id,
+                session_id: None,
+                channel_id: channel,
+                kind: TransactionEndKind::Completed,
+                emitted_events: 0,
+                usage: TransactionUsage::default(),
+                diagnostics: vec![],
+            },
+            reply: reply_tx,
+            deadline: seal_deadline,
+        })
+        .expect("seal");
+
+    let res: TerminalPublicationResult = tokio::time::timeout(Duration::from_millis(200), reply_rx)
+        .await
+        .expect("must conclude near the 1ms budget, not a 50ms floor")
+        .expect("reply");
+    let elapsed = started.elapsed();
+    assert_eq!(res.delivery, TerminalEventDelivery::DeadlineExceeded);
+    assert!(
+        elapsed < Duration::from_millis(40),
+        "exact 1ms budget must not be clamped to 50ms; elapsed={elapsed:?}"
+    );
     drop(seal_tx);
     let _ = pub_task.await;
 }
@@ -4421,7 +4794,7 @@ async fn d047_seal_uses_terminal_deadline_not_transaction_deadline() {
             .try_send(occupy)
             .expect("occupy host slot");
     }
-    let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
     let (seal_tx, seal_rx) = mpsc::channel(1);
     let cancel = Arc::new(crate::transaction::sticky_cancel::StickyCancel::new());
     // Ordinary transaction deadline is long — must NOT govern Seal.
@@ -4432,6 +4805,7 @@ async fn d047_seal_uses_terminal_deadline_not_transaction_deadline() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::clone(&cancel),
         long_tx_deadline,
@@ -4491,7 +4865,7 @@ async fn s22_6_session_established_is_sequence_one() {
     let channel = ChannelId::try_new("llm").unwrap();
     let (delivery, mut receiver) =
         transaction_delivery(DeliveryLimits::try_new(16, 64 * 1024).unwrap()).unwrap();
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
     let (_seal_tx, seal_rx) = mpsc::channel(1);
     let pub_task = tokio::spawn(run_event_publisher(
         tx_id,
@@ -4499,13 +4873,14 @@ async fn s22_6_session_established_is_sequence_one() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
         std::time::Instant::now() + Duration::from_secs(30),
     ));
 
     let external = ExternalSessionId::try_new("grok-ext-1").unwrap();
-    cmd_tx
+    admit
         .send(EventPublisherCommand::EstablishExternal(external.clone()))
         .await
         .unwrap();
@@ -4520,7 +4895,7 @@ async fn s22_6_session_established_is_sequence_one() {
         other => panic!("expected SessionEstablished, got {other:?}"),
     }
 
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(
             TransactionEventPayload::Diagnostic(TransactionDiagnostic {
                 diagnostic: SafeDiagnostic::try_new("noop", Some("x"), 64).unwrap(),
@@ -4538,7 +4913,7 @@ async fn s22_6_session_established_is_sequence_one() {
         second.payload,
         TransactionEventPayload::Diagnostic(_)
     ));
-    drop(cmd_tx);
+    drop(admit);
     drop(_seal_tx);
     let _ = pub_task.await;
 }
@@ -4558,7 +4933,7 @@ async fn s22_6_concurrent_producers_contiguous_sequence() {
     let channel = ChannelId::try_new("llm").unwrap();
     let (delivery, mut receiver) =
         transaction_delivery(DeliveryLimits::try_new(n + 8, 1024 * 1024).unwrap()).unwrap();
-    let (cmd_tx, cmd_rx) = mpsc::channel(n);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(n);
     let (_seal_tx, seal_rx) = mpsc::channel(1);
     let pub_task = tokio::spawn(run_event_publisher(
         tx_id,
@@ -4566,6 +4941,7 @@ async fn s22_6_concurrent_producers_contiguous_sequence() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
         std::time::Instant::now() + Duration::from_secs(30),
@@ -4573,7 +4949,7 @@ async fn s22_6_concurrent_producers_contiguous_sequence() {
 
     let mut joins = Vec::new();
     for i in 0..n {
-        let tx = cmd_tx.clone();
+        let tx = admit.clone();
         joins.push(tokio::spawn(async move {
             tx.send(EventPublisherCommand::Publish(Box::new(
                 TransactionEventPayload::Diagnostic(TransactionDiagnostic {
@@ -4588,7 +4964,7 @@ async fn s22_6_concurrent_producers_contiguous_sequence() {
     for j in joins {
         j.await.unwrap();
     }
-    drop(cmd_tx);
+    drop(admit);
     drop(_seal_tx); // close seal channel so publisher can exit without Seal
 
     let mut seqs = Vec::new();
@@ -4706,7 +5082,7 @@ async fn s22_6_establish_external_capacity_fail_does_not_steal_seq1() {
         })
         .unwrap();
 
-    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (admit, cmd_rx) = super::event_publisher::OrdinaryCmdAdmit::channel(8);
     let (_seal_tx, seal_rx) = mpsc::channel(1);
     let pub_task = tokio::spawn(run_event_publisher(
         tx_id,
@@ -4714,13 +5090,14 @@ async fn s22_6_establish_external_capacity_fail_does_not_steal_seq1() {
         None,
         delivery.event_tx,
         cmd_rx,
+        admit.clone(),
         seal_rx,
         Arc::new(crate::transaction::sticky_cancel::StickyCancel::new()),
         std::time::Instant::now() + Duration::from_secs(30),
     ));
 
     let external = ExternalSessionId::try_new("grok-retry").unwrap();
-    cmd_tx
+    admit
         .send(EventPublisherCommand::EstablishExternal(external.clone()))
         .await
         .unwrap();
@@ -4730,7 +5107,7 @@ async fn s22_6_establish_external_capacity_fail_does_not_steal_seq1() {
     let pre = receiver.events.recv().await.expect("prefill");
     assert_eq!(pre.sequence, 0);
 
-    cmd_tx
+    admit
         .send(EventPublisherCommand::EstablishExternal(external.clone()))
         .await
         .unwrap();
@@ -4741,7 +5118,7 @@ async fn s22_6_establish_external_capacity_fail_does_not_steal_seq1() {
         TransactionEventPayload::SessionEstablished { .. }
     ));
 
-    cmd_tx
+    admit
         .send(EventPublisherCommand::Publish(Box::new(
             TransactionEventPayload::Diagnostic(TransactionDiagnostic {
                 diagnostic: SafeDiagnostic::try_new("noop", Some("after"), 64).unwrap(),
@@ -4751,7 +5128,7 @@ async fn s22_6_establish_external_capacity_fail_does_not_steal_seq1() {
         .unwrap();
     let second = receiver.events.recv().await.expect("ordinary");
     assert_eq!(second.sequence, 2);
-    drop(cmd_tx);
+    drop(admit);
     drop(_seal_tx);
     let _ = pub_task.await;
 }
@@ -5040,13 +5417,12 @@ fn ready_tool_unit() -> monoloop_contracts::CanonicalUnitEvent {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_empty_loop_ready_under_task_spawner() {
-    use super::event_publisher::EventPublisherCommand;
+    use super::event_publisher::{EventPublisherCommand, OrdinaryCmdAdmit};
     use super::loop_dispatch::run_supervised_empty_loop;
     use super::task_spawner::TransactionTaskSpawner;
     use super::task_supervisor::TaskSupervisor;
     use crate::transaction::sticky_cancel::StickyCancel;
     use monoloop_contracts::{ChannelId, ExchangeId, TransactionEventPayload, TransactionId};
-    use tokio::sync::mpsc;
 
     let (spawner, mut spawn_rx) = TransactionTaskSpawner::channel(8);
     let pump = tokio::spawn(async move {
@@ -5058,7 +5434,7 @@ async fn supervised_empty_loop_ready_under_task_spawner() {
         let _ = tasks.abort_and_drain().await;
     });
 
-    let (publish_tx, mut publish_rx) = mpsc::channel::<EventPublisherCommand>(16);
+    let (publish_tx, mut publish_rx) = OrdinaryCmdAdmit::channel(16);
     let collector = tokio::spawn(async move {
         let mut tool_lifecycle = 0u32;
         while let Some(cmd) = publish_rx.recv().await {
@@ -5097,7 +5473,7 @@ async fn supervised_empty_loop_ready_under_task_spawner() {
 /// Non-empty HostToolRegistry: Ready tool completes via supervised HostToolRuntime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_non_empty_loop_dispatches_registered_tool() {
-    use super::event_publisher::EventPublisherCommand;
+    use super::event_publisher::{EventPublisherCommand, OrdinaryCmdAdmit};
     use super::loop_dispatch::run_supervised_tool_loop;
     use super::task_spawner::TransactionTaskSpawner;
     use super::task_supervisor::TaskSupervisor;
@@ -5113,7 +5489,6 @@ async fn supervised_non_empty_loop_dispatches_registered_tool() {
         ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract,
         TransactionEventPayload, TransactionId,
     };
-    use tokio::sync::mpsc;
 
     let schema = JsonSchema::try_new(serde_json::json!({
         "type": "object",
@@ -5182,7 +5557,7 @@ async fn supervised_non_empty_loop_dispatches_registered_tool() {
         let _ = tasks.abort_and_drain().await;
     });
 
-    let (publish_tx, mut publish_rx) = mpsc::channel::<EventPublisherCommand>(16);
+    let (publish_tx, mut publish_rx) = OrdinaryCmdAdmit::channel(16);
     let collector = tokio::spawn(async move {
         let mut completed_ok = 0u32;
         while let Some(cmd) = publish_rx.recv().await {
@@ -5234,13 +5609,12 @@ async fn supervised_non_empty_loop_dispatches_registered_tool() {
 /// LAW 25: cancel before any Loop waiter must not report success/Drained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervised_empty_loop_cancel_before_waiter_is_cancelled() {
-    use super::event_publisher::EventPublisherCommand;
+    use super::event_publisher::OrdinaryCmdAdmit;
     use super::loop_dispatch::{run_supervised_empty_loop, LoopDispatchError};
     use super::task_spawner::TransactionTaskSpawner;
     use super::task_supervisor::TaskSupervisor;
     use crate::transaction::sticky_cancel::StickyCancel;
     use monoloop_contracts::{ChannelId, ExchangeId, TransactionId};
-    use tokio::sync::mpsc;
 
     let (spawner, mut spawn_rx) = TransactionTaskSpawner::channel(8);
     let pump = tokio::spawn(async move {
@@ -5252,7 +5626,7 @@ async fn supervised_empty_loop_cancel_before_waiter_is_cancelled() {
         let _ = tasks.abort_and_drain().await;
     });
 
-    let (publish_tx, mut publish_rx) = mpsc::channel::<EventPublisherCommand>(8);
+    let (publish_tx, mut publish_rx) = OrdinaryCmdAdmit::channel(8);
     let drain_pub = tokio::spawn(async move { while publish_rx.recv().await.is_some() {} });
 
     let cancel = Arc::new(StickyCancel::new());

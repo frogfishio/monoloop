@@ -15,7 +15,7 @@ use monoloop_connector::{
 use monoloop_contracts::{
     CanonicalUnitEvent, ConnectionId, EffectiveConfig, ExchangeId, ExchangeInputPolicy,
     InterpretationEnd, InterpretationEndKind, InterpretationId, InterpretationLimits,
-    OutboundDialectEncoder, TransactionEndKind, TransactionId,
+    OutboundDialectEncoder, ToolSpec, TransactionEndKind, TransactionId,
 };
 use monoloop_interpreter::{InterpreterFactory, StartInterpretation};
 use std::sync::Arc;
@@ -149,6 +149,7 @@ pub async fn run_direct_llm_exchange(
     max_remaining_provider_input_bytes: usize,
     session_attachment: Option<std::sync::Arc<SessionAttachment>>,
     prompt_ready: Option<PromptReadyGate>,
+    tools: &[ToolSpec],
 ) -> DirectExchangeOutcome {
     match run_inner(
         transaction_id,
@@ -169,6 +170,7 @@ pub async fn run_direct_llm_exchange(
         max_remaining_provider_input_bytes,
         session_attachment,
         prompt_ready,
+        tools,
     )
     .await
     {
@@ -207,6 +209,7 @@ async fn run_inner(
     max_remaining_provider_input_bytes: usize,
     session_attachment: Option<std::sync::Arc<SessionAttachment>>,
     prompt_ready: Option<PromptReadyGate>,
+    tools: &[ToolSpec],
 ) -> Result<
     (
         Vec<CanonicalUnitEvent>,
@@ -220,7 +223,7 @@ async fn run_inner(
             exchange_id: &exchange_id,
             input,
             config,
-            tools: &[],
+            tools,
         })
         .map_err(|_| ExchangeFailure::EncodingFailed)?;
     if encoded.bytes.len() > max_encoded_exchange_bytes {

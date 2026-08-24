@@ -1,6 +1,6 @@
 //! Per-transaction coordinator (v2 §11) — supervised exchange + Loop tools.
 
-use super::event_publisher::EventPublisherCommand;
+use super::event_publisher::{EventPublisherCommand, OrdinaryCmdAdmit};
 use super::exchange::{
     run_direct_llm_exchange, DirectExchangeOutcome, PromptProceedError, PromptReadyGate,
 };
@@ -22,9 +22,10 @@ use crate::transaction::sticky_cancel::StickyCancel;
 use crate::transaction::tool_capacity::SharedToolCapacity;
 use monoloop_connector::SessionAttachRequest;
 use monoloop_contracts::{
-    merge_effective_config, CanonicalInput, ChannelId, ChannelKind, ExchangeId, ExtensionLimits,
-    InvocationConfig, McpConfigurationCapability, SessionConfig, SessionId, SessionKey,
-    ToolExecutionMode, ToolId, TransactionEndKind, TransactionEventPayload, TransactionId,
+    merge_effective_config, CanonicalInput, ChannelId, ChannelKind, ContinuationPolicy, ExchangeId,
+    ExtensionLimits, InvocationConfig, McpConfigurationCapability, SessionConfig, SessionId,
+    SessionKey, ToolExecutionMode, ToolId, TransactionEndKind, TransactionEventPayload,
+    TransactionId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,8 +62,8 @@ pub struct CoordinatorParams {
     pub session_config: Option<SessionConfig>,
     /// Live channel map.
     pub channels: Arc<HashMap<ChannelId, LiveChannel>>,
-    /// Event publisher commands.
-    pub publish_tx: mpsc::Sender<EventPublisherCommand>,
+    /// Event publisher ordinary-command admit gate.
+    pub publish_tx: OrdinaryCmdAdmit,
     /// Worker → supervisor.
     pub worker_tx: mpsc::Sender<WorkerMessage>,
     /// Task supervisor spawn proxy.
@@ -93,10 +94,19 @@ pub struct CoordinatorParams {
 pub async fn run_coordinator(params: CoordinatorParams) {
     let transaction_id = params.transaction_id;
     let worker_tx = params.worker_tx.clone();
+    let shared = Arc::clone(&params.shared);
     let proposal = execute(params).await;
+    // Park the authoritative proposal on the ledger before notify/exit so
+    // `on_task_exit` cannot invent InvariantFailed over a lost `try_send`
+    // (concurrent DirectLlm: units published, completion still InvariantFailed).
+    {
+        let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = ledger.get_mut(&transaction_id) {
+            entry.pending_worker_proposal = Some(proposal.clone());
+        }
+    }
     // Non-blocking: supervisor may be in abort_and_drain and not polling
-    // `worker_rx`. A lost message is recovered in `on_task_exit` for
-    // `TransactionCoordinator` so every admission still gets one terminal.
+    // `worker_rx`. Lost notify is recovered from `pending_worker_proposal`.
     let _ = worker_tx.try_send(WorkerMessage::WorkerExited {
         transaction_id,
         proposal,
@@ -329,6 +339,10 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             (Some(external), true)
         };
 
+        let tool_specs: Vec<_> = selected_tools
+            .iter()
+            .filter_map(|id| tools_registry.get_spec(id).cloned())
+            .collect();
         let exchange_fut = run_direct_llm_exchange(
             transaction_id,
             exchange_id,
@@ -348,6 +362,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             max_provider_input,
             Some(attachment),
             prompt_ready,
+            &tool_specs,
         );
 
         let (outcome, gate_result) = tokio::join!(exchange_fut, gate_task);
@@ -362,6 +377,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             outcome,
             established_before_prompt,
             tool_mode,
+            invocation_config.continuation_policy,
             &publish_tx,
             &cancel,
             &tasks,
@@ -386,6 +402,10 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         return TerminalProposal::new(TransactionEndKind::InvariantFailed);
     }
 
+    let tool_specs: Vec<_> = selected_tools
+        .iter()
+        .filter_map(|id| tools_registry.get_spec(id).cloned())
+        .collect();
     let outcome = run_direct_llm_exchange(
         transaction_id,
         exchange_id,
@@ -405,6 +425,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         max_provider_input,
         None,
         None,
+        &tool_specs,
     )
     .await;
 
@@ -412,6 +433,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         outcome,
         false,
         tool_mode,
+        invocation_config.continuation_policy,
         &publish_tx,
         &cancel,
         &tasks,
@@ -433,7 +455,8 @@ async fn finish_after_exchange(
     outcome: DirectExchangeOutcome,
     already_established: bool,
     tool_mode: ToolExecutionMode,
-    publish_tx: &mpsc::Sender<EventPublisherCommand>,
+    continuation_policy: ContinuationPolicy,
+    publish_tx: &OrdinaryCmdAdmit,
     cancel: &Arc<StickyCancel>,
     tasks: &TransactionTaskSpawner,
     transaction_id: TransactionId,
@@ -546,7 +569,20 @@ async fn finish_after_exchange(
             .await
         };
         match loop_result {
-            Ok(_report) => {}
+            Ok(_report) => {
+                // WP-10 / Phase B: CallerControlled tool exchange ends without a
+                // second provider open — host continues via ContinuationRequired.
+                if matches!(terminal, TransactionEndKind::Completed)
+                    && continuation_policy == ContinuationPolicy::CallerControlled
+                {
+                    terminal = TransactionEndKind::ContinuationRequired;
+                } else if matches!(terminal, TransactionEndKind::Completed)
+                    && continuation_policy == ContinuationPolicy::InlineToolContinuation
+                {
+                    // Inline model/tool/model not wired yet — fail closed (honest).
+                    terminal = TransactionEndKind::InvariantFailed;
+                }
+            }
             Err(LoopDispatchError::Cancelled) => {
                 terminal = TransactionEndKind::Cancelled;
             }

@@ -305,6 +305,12 @@ fn s23_adversarial_lifecycle_subprocess_harness_inventory() {
             "MONOLOOP_S22_4_JOIN_ONLY_SPILL_CHILD",
             "recv_timeout",
         ),
+        (
+            "tests/d048_process_isolated_sacrificial.rs",
+            "d048_process_isolated_sacrificial_abort_park_then_pid_not_waitable",
+            "MONOLOOP_D048_PROCESS_ISOLATED_CHILD",
+            "recv_timeout",
+        ),
     ];
     for (rel, test_fn, child_env, timeout_api) in harnesses {
         let path = root.join(rel);

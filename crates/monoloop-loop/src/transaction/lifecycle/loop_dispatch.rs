@@ -6,7 +6,7 @@
 //! `tool_unavailable`. Non-empty composition uses [`ResolvedToolRegistry`] +
 //! [`HostToolRuntime`] (supervisor-owned tool workers).
 
-use super::event_publisher::EventPublisherCommand;
+use super::event_publisher::{EventPublisherCommand, OrdinaryCmdAdmit};
 use super::session_identity::session_key_for;
 use super::task_spawner::{SpawnReject, TransactionTaskSpawner};
 use super::task_supervisor::TaskClass;
@@ -22,7 +22,6 @@ use monoloop_contracts::{
     ToolId, ToolLifecycleEvent, ToolRequestState, TransactionEventPayload, TransactionId,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 /// Report from one supervised Loop pass over exchange units.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -71,7 +70,7 @@ pub async fn run_supervised_empty_loop(
     session_id: Option<SessionId>,
     exchange_id: ExchangeId,
     units: Vec<CanonicalUnitEvent>,
-    publish_tx: mpsc::Sender<EventPublisherCommand>,
+    publish_tx: OrdinaryCmdAdmit,
     cancel: Arc<StickyCancel>,
 ) -> Result<LoopDispatchReport, LoopDispatchError> {
     run_supervised_loop(
@@ -98,7 +97,7 @@ pub async fn run_supervised_tool_loop(
     session_id: Option<SessionId>,
     exchange_id: ExchangeId,
     units: Vec<CanonicalUnitEvent>,
-    publish_tx: mpsc::Sender<EventPublisherCommand>,
+    publish_tx: OrdinaryCmdAdmit,
     cancel: Arc<StickyCancel>,
     tool_registry: Arc<dyn ToolRegistry>,
     tool_runtime: Arc<dyn ToolRuntime>,
@@ -126,7 +125,7 @@ async fn run_supervised_loop(
     session_id: Option<SessionId>,
     exchange_id: ExchangeId,
     units: Vec<CanonicalUnitEvent>,
-    publish_tx: mpsc::Sender<EventPublisherCommand>,
+    publish_tx: OrdinaryCmdAdmit,
     cancel: Arc<StickyCancel>,
     tool_registry: Arc<dyn ToolRegistry>,
     tool_runtime: Arc<dyn ToolRuntime>,

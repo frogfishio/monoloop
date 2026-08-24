@@ -29,7 +29,7 @@ pub use delivery::{
     adapt_completion_callback, adapt_event_sink, HostCompletionAdapter, HostEventAdapter,
 };
 #[allow(unused_imports)]
-pub use event_publisher::{EventPublisherCommand, TerminalPublicationResult};
+pub use event_publisher::{EventPublisherCommand, OrdinaryCmdAdmit, TerminalPublicationResult};
 pub use ledger::{LedgerEntry, LifecycleLedger, TransactionPhase};
 pub use owner::{RuntimeOwner, StartedRuntime, TransactionRuntimeHandle};
 pub use shutdown::ShutdownTicket;

@@ -196,6 +196,7 @@ pub(crate) fn admit(
         session_key: session_key.clone(),
         phase: TransactionPhase::Queued,
         terminal: None,
+        pending_worker_proposal: None,
         event_sequence: 0,
         delivery: Some(request.delivery),
         completion_tx: None,
