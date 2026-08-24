@@ -89,7 +89,5 @@ pub use transaction::{
     TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionEventSink,
     TransactionSelector, TransactionSubmitRequest, TransactionUsage,
 };
-#[allow(deprecated)]
-pub use transaction::{TransactionRequest, TransactionRuntime};
 
 pub use bytes::Bytes;

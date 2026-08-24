@@ -7,10 +7,10 @@ use monoloop_contracts::{
     TransactionId,
 };
 use monoloop_loop::{
-    dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, HostToolRegistry, ImmediateToolHandler,
-    IsolatedKillableToolHandler, LinkedToolExecutionHandle, OrphanToolPermitSet,
-    ProcessIsolatedToolHandler, RegisteredTool, ResolvedToolSet, SharedToolCapacity,
-    ToolExecutionCompletion, ToolExecutionControl, ToolHandler, ToolKillHandle,
+    dispatch_ready_tool, AsyncToolHandler, DispatchOutcome, DispatcherLimits, HostToolRegistry,
+    ImmediateToolHandler, IsolatedKillableToolHandler, LinkedToolExecutionHandle,
+    OrphanToolPermitSet, ProcessIsolatedToolHandler, RegisteredTool, ResolvedToolSet,
+    SharedToolCapacity, ToolExecutionCompletion, ToolExecutionControl, ToolHandler, ToolKillHandle,
     TransactionToolDispatcher,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -183,7 +183,6 @@ async fn s22_4_cooperative_ack_cancel_joins() {
         "expected cancel/deadline join path, got {out:?}"
     );
     // Acknowledging cooperative work should not leave capacity orphaned.
-    d.reap_vault();
     assert_eq!(
         d.vault_pending_permits(),
         0,
@@ -235,7 +234,6 @@ async fn s22_4_cooperative_ignore_cancel_keeps_capacity_pending() {
         ),
         "expected deadline_exceeded for non-ack cooperative, got {out:?}"
     );
-    d.reap_vault();
     assert!(
         d.vault_pending_permits() >= 1,
         "non-ack cooperative must vault join+permit until join (vault={}, active={})",
@@ -315,10 +313,8 @@ async fn s22_4_abortable_permit_held_until_join() {
     // Post-return: reap finished joins; capacity must be free once joins observed.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while shared.active() > 0 && tokio::time::Instant::now() < deadline {
-        d.reap_vault();
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    d.reap_vault();
     assert_eq!(
         shared.active(),
         0,
@@ -570,8 +566,12 @@ async fn s22_4_orphan_permits_are_runtime_scoped_not_process_global() {
         ResolvedToolSet::from_registered(vec![tool]),
         Arc::clone(&shared),
         Arc::clone(&orphans_a),
-        4,
-        8,
+        DispatcherLimits {
+            max_concurrent_tools: 4,
+            max_queued_tools: 8,
+            max_tool_payload_bytes: usize::MAX,
+            max_tool_output_bytes: usize::MAX,
+        },
     );
     let out = dispatch_ready_tool(
         &d,
@@ -590,7 +590,6 @@ async fn s22_4_orphan_permits_are_runtime_scoped_not_process_global() {
         ),
         "expected deadline_exceeded, got {out:?}"
     );
-    d.reap_vault();
     assert!(
         orphans_a.pending_permits() >= 1,
         "non-ack capacity must park on the runtime orphan set"

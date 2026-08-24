@@ -28,34 +28,29 @@ Prefer the façade crate `monoloop` unless you need this crate as a direct depen
 Do not recreate the deleted v1 files (`runtime`, `admission`, `actor`,
 `finalization`, `callback_service`, `executor_spawn`, `tool_join_vault`).
 Follow the seven-stage plan in the v2 spec. M5.4 delete-vaults: joins are
-TaskSupervisor-owned (not vaulted). `OrphanToolPermitSet` (alias
-`OrphanToolPermitSet`; deprecated alias `RuntimeToolSpill`) holds only capacity orphans for §22.4 non-ack / Process
-mid-drop — not JoinHandles. JoinOnly Stopped inject is supervisor
-park/unpark. Production handlers drive inline. §23 gates live in
-`tests/s23_forbidden_patterns.rs`.
+TaskSupervisor-owned (not vaulted). `OrphanToolPermitSet` holds only capacity
+orphans for §22.4 non-ack / Process mid-drop — not JoinHandles. JoinOnly
+Stopped inject is supervisor park/unpark. Production handlers drive inline.
+§23 gates live in `tests/s23_forbidden_patterns.rs`.
 
 **M0–M5 landed** (DEFECTS D-042 / D-043 / D-044). **M6 §22 closed enough**
 (D-045): §22.1–§22.7 proofs landed (host-adapter proofs outside core);
 MCP RuntimeService + CreationOnly + `TaskClass::McpRequest` ownership landed.
-Join vault retired to `OrphanToolPermitSet` (`RuntimeToolSpill` deprecated alias);
-`Stopped` is TaskSupervisor-empty after orphan release. Refreshable MCP
-**deferred** for initial profiles (**DECISIONS D-042** / WP12).
+Join vault retired to `OrphanToolPermitSet`; `Stopped` is TaskSupervisor-empty
+after orphan release. Refreshable MCP **deferred** for initial profiles
+(**DECISIONS D-042** / WP12).
 
 **M7 façade landed (D-038 Fixed):** `StartedRuntime` + `TransactionSubmitRequest`
-is the assembler recipe; deprecated sink-shaped `TransactionRequest` /
-`TransactionRuntime` trait are not core submit APIs. Host adapters
-`adapt_event_sink` / `adapt_completion_callback` stay (outside the kernel).
+is the assembler recipe. Host adapters `adapt_event_sink` /
+`adapt_completion_callback` stay (outside the kernel; M1 / §22.7).
 **D-053 Fixed:** legacy v1 integration suites were deleted (coverage map
 `doc/D053_COVERAGE_REPLACEMENT.md`); `autotests` / `autoexamples` are enabled
 so every on-disk suite and example is compiled by `--all-targets`.
-**Not Golden / §25 DoD** while remaining §23 extras, independent review, and
-compatibility-alias cleanup remain open. D-039 / D-040 / D-041 Fixed.
-
-**D-054 (partial):** obsolete uncompiled v1 modules (`active_registry`,
-`events`, `exchange`, `spawn_gate`) **deleted**. Host adapters
-`adapt_event_sink` / `adapt_completion_callback` and deprecated aliases
-(`RuntimeToolSpill`, sink-shaped `TransactionRequest`) remain as an explicit
-compatibility phase — not claimed as full M7 deletion.
+**D-054 / D-060:** obsolete uncompiled v1 modules deleted; deprecated aliases
+(`TransactionRequest`, `TransactionRuntime`, `RuntimeToolSpill`) **removed**.
+**Not Golden / §25 DoD** while remaining §23 extras (Open/Partial limits,
+race/load, live Grok) and independent review remain open. D-039 / D-040 /
+D-041 Fixed.
 
 ## Agent assembly recipe (v2 / M2)
 

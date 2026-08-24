@@ -5,13 +5,16 @@ D-003; D-042; D-043; D-044 Fixed). **M6 §22 matrix closed enough** (D-045):
 §22.1–§22.7 proofs landed (host adapters outside core); MCP RuntimeService +
 CreationOnly + `TaskClass::McpRequest` ownership landed. Refreshable MCP
 **deferred** for initial profiles (**DECISIONS D-042** / WP12). **M7 façade
-cutover landed** (D-038 Fixed); **M7 deletion incomplete** (D-054): obsolete
-uncompiled v1 modules deleted, but host callback adapters and deprecated
-aliases remain in an explicit compatibility phase. **§23 core commands** (fmt /
-clippy / test / doc -D warnings) observed green after D-052 via `make gates`.
-D-053 Fixed (`autotests`/`autoexamples`; `doc/D053_COVERAGE_REPLACEMENT.md`).
-Remaining §23 extras + §25 DoD + independent review still open. **Not** Golden /
-§25. D-039 / D-040 / D-041 Fixed.
+cutover landed** (D-038 Fixed). **M7 deletion / deprecated-alias cut executed**
+(D-054 Silver + **DECISIONS D-060**): obsolete uncompiled v1 modules deleted;
+`TransactionRequest` / `TransactionRuntime` / `RuntimeToolSpill` removed.
+Host helpers `adapt_event_sink` / `adapt_completion_callback` **retained**
+(outside the kernel executor; M1 / §22.7) — optional later move out of
+`monoloop-loop`. **§23 core commands** (fmt / clippy / test / doc -D warnings)
+observed green after D-052 via `make gates`. D-053 Fixed (`autotests` /
+`autoexamples`; `doc/D053_COVERAGE_REPLACEMENT.md`). Remaining §23 extras
+(Open/Partial limits, race/load, live Grok) + §25 DoD + independent review
+still open. **Not** Golden / §25. D-039 / D-040 / D-041 Fixed.
 
 **Scope:** Component 3 transaction lifecycle and its Connector/tool ownership seams
 
@@ -178,7 +181,7 @@ Requirements:
 ### 6.2 Request and receipt
 
 ```rust
-pub struct TransactionRequest {
+pub struct TransactionSubmitRequest {
     pub channel_id: ChannelId,
     pub session_id: Option<SessionId>,
     pub input: CanonicalInput,
@@ -905,8 +908,9 @@ Delete or permanently retire:
 - `spawn_gate.rs` — **deleted** (D-054);
 - obsolete uncompiled `events.rs` / v1 `exchange.rs` — **deleted** (D-054);
   live exchange is `lifecycle/exchange.rs`;
-- callback-based core traits after compatibility migration
-  (**compatibility phase** — not yet the breaking cut; D-054);
+- deprecated sink-shaped core aliases (`TransactionRequest`,
+  `TransactionRuntime`, `RuntimeToolSpill`) — **removed** (D-060);
+  host `adapt_*` helpers retained outside the kernel;
 - `FinalizationGuard` and any equivalent actor/supervisor shared CAS;
 - reaper tasks;
 - callback services inside the runtime; and
@@ -1084,10 +1088,10 @@ Additional gates:
 1. Move the public façade to runtime v2. **Done** (D-038 / `StartedRuntime`).
 2. Port examples and testkit adapters. **Done** for intended suites (D-053).
 3. Remove callback-based core APIs and compatibility aliases on the planned
-   breaking-version boundary. **Incomplete — compatibility phase** (D-054):
-   `adapt_event_sink` / `adapt_completion_callback` and deprecated aliases
-   (`RuntimeToolSpill`, sink-shaped `TransactionRequest` / `TransactionRuntime`)
-   remain exported until a deliberate breaking cut.
+   breaking-version boundary. **Done for deprecated-only surfaces** (D-060):
+   `TransactionRequest` / `TransactionRuntime` / `RuntimeToolSpill` removed.
+   Host helpers `adapt_event_sink` / `adapt_completion_callback` **retained**
+   (outside kernel; optional later crate move).
 4. Delete `active_registry.rs`, `spawn_gate.rs`, obsolete event delivery, and the
    unused duplicate Loop implementation only after behavior is consolidated.
    **Done for the four obsolete uncompiled files** (D-054); do not restore.

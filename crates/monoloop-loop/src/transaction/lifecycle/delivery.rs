@@ -11,12 +11,6 @@ use monoloop_contracts::{
 };
 use std::sync::Arc;
 
-/// Drain a completion receiver into a legacy one-shot callback (host executor).
-pub struct HostCompletionAdapter;
-
-/// Drain an event receiver into a legacy event sink (host executor).
-pub struct HostEventAdapter;
-
 /// Invoke a legacy completion callback after the runtime publishes once.
 ///
 /// Runs on the **caller**/host task — never on the runtime-owned executor.

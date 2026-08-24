@@ -25,9 +25,7 @@ mod task_supervisor;
 mod terminal;
 
 pub use capacity::{ReservationPool, ReservationPoolError, TransactionReservations};
-pub use delivery::{
-    adapt_completion_callback, adapt_event_sink, HostCompletionAdapter, HostEventAdapter,
-};
+pub use delivery::{adapt_completion_callback, adapt_event_sink};
 #[allow(unused_imports)]
 pub use event_publisher::{EventPublisherCommand, OrdinaryCmdAdmit, TerminalPublicationResult};
 pub use ledger::{LedgerEntry, LifecycleLedger, TransactionPhase};

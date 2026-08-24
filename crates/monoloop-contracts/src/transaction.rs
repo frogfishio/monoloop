@@ -10,8 +10,6 @@ use crate::tool::ToolLifecycleEvent;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
 
 /// Future returned by event delivery (no async_trait required).
@@ -56,35 +54,6 @@ where
     fn call(self: Box<Self>, end: TransactionEnd) -> CompletionDelivery {
         (self.0)(end)
     }
-}
-
-/// Deprecated v1 sink-shaped submit request (host callbacks in the request).
-///
-/// **M7:** Core assemblers MUST use [`TransactionSubmitRequest`] +
-/// [`crate::delivery::transaction_delivery`]. Host adapters
-/// (`adapt_event_sink` / `adapt_completion_callback` in `monoloop-loop`) may
-/// still drain push receivers into [`TransactionEventSink`] /
-/// [`CompletionCallback`] **outside** the runtime.
-#[deprecated(
-    note = "use TransactionSubmitRequest with transaction_delivery(); sink/callback fields are not a core submit API (M7)"
-)]
-pub struct TransactionRequest {
-    /// Explicit Channel selection.
-    pub channel_id: ChannelId,
-    /// Existing session when known; `None` for new external create or direct-LLM generate.
-    pub session_id: Option<SessionId>,
-    /// Canonical input messages.
-    pub input: CanonicalInput,
-    /// Optional external-agent session configuration.
-    pub session_config: Option<SessionConfig>,
-    /// Invocation configuration.
-    pub invocation_config: InvocationConfig,
-    /// Selected host tool ids (deduplicated at admission).
-    pub tools: Vec<ToolId>,
-    /// Host event sink (v1; not accepted by `StartedRuntime` / `TransactionRuntimeHandle`).
-    pub events: Arc<dyn TransactionEventSink>,
-    /// Host completion callback (v1; not accepted by `StartedRuntime` / `TransactionRuntimeHandle`).
-    pub completion: Box<dyn CompletionCallback>,
 }
 
 /// Runtime v2 submission request — concrete mailboxes, no host traits in-core.
@@ -213,29 +182,6 @@ pub struct ShutdownDisposition {
     pub invariant_failed: u64,
 }
 
-/// Deprecated v1 runtime port (sink-shaped [`TransactionRequest`] submit).
-///
-/// **M7:** Production code uses `StartedRuntime` /
-/// `TransactionRuntimeHandle::submit(TransactionSubmitRequest)` in
-/// `monoloop-loop`. No live v2 type implements this trait.
-#[deprecated(
-    note = "use StartedRuntime / TransactionRuntimeHandle with TransactionSubmitRequest (M7)"
-)]
-pub trait TransactionRuntime: Send + Sync {
-    /// Synchronously admit a transaction or return a typed error.
-    #[allow(deprecated)]
-    fn submit(&self, request: TransactionRequest) -> Result<AdmissionReceipt, AdmissionError>;
-
-    /// Request cancellation or forced termination.
-    fn terminate(
-        &self,
-        selector: TransactionSelector,
-        mode: TerminationMode,
-    ) -> TerminationDisposition;
-
-    /// Drain and stop the runtime.
-    fn shutdown(&self, deadline: Duration) -> Shutdown;
-}
 
 /// Ordered transaction event.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -558,6 +504,7 @@ pub enum AdmissionErrorKind {
 mod tests {
     use super::*;
     use crate::input::user_text_input;
+    use std::sync::Arc;
 
     #[test]
     fn end_kind_round_trip() {

@@ -36,9 +36,10 @@ let input = user_text_input("hello")?;
 
 Full wiring: `monoloop` `examples/fake_echo.rs`.
 
-**Do not** build core submits with deprecated `TransactionRequest { events, completion }`
-or the deprecated `TransactionRuntime` trait. Those shapes are not accepted by
-`StartedRuntime`.
+Core submits use `TransactionSubmitRequest` + `transaction_delivery` only.
+The former sink-shaped `TransactionRequest` / `TransactionRuntime` trait were
+**removed** (DECISIONS D-060). Host traits `TransactionEventSink` /
+`CompletionCallback` remain for out-of-kernel adapters.
 
 ## Key modules
 
