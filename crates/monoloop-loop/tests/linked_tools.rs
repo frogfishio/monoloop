@@ -435,10 +435,12 @@ async fn transaction_limits_max_queued_tools_plus_one_rejects() {
         host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone(),
     ];
     let resolved = ResolvedToolSet::from_registered(tools);
-    let mut tx_limits = TransactionLimits::default();
     // Concurrent=1 so the hold keeps the sole running slot; queued=1 is the cell.
-    tx_limits.max_concurrent_tools_per_transaction = 1;
-    tx_limits.max_queued_tools_per_transaction = 1;
+    let tx_limits = TransactionLimits {
+        max_concurrent_tools_per_transaction: 1,
+        max_queued_tools_per_transaction: 1,
+        ..TransactionLimits::default()
+    };
     let limits = TransactionToolDispatcher::limits_from_transaction(&tx_limits);
     assert_eq!(limits.max_queued_tools, 1);
     assert_eq!(limits.max_concurrent_tools, 1);
@@ -559,9 +561,11 @@ async fn transaction_limits_max_concurrent_tools_plus_one_rejects() {
         host.get(&ToolId::try_new("echo").unwrap()).unwrap().clone(),
     ];
     let resolved = ResolvedToolSet::from_registered(tools);
-    let mut tx_limits = TransactionLimits::default();
-    tx_limits.max_concurrent_tools_per_transaction = 1;
-    tx_limits.max_queued_tools_per_transaction = 8;
+    let tx_limits = TransactionLimits {
+        max_concurrent_tools_per_transaction: 1,
+        max_queued_tools_per_transaction: 8,
+        ..TransactionLimits::default()
+    };
     let limits = TransactionToolDispatcher::limits_from_transaction(&tx_limits);
     assert_eq!(limits.max_concurrent_tools, 1);
     let shared = SharedToolCapacity::new(8);

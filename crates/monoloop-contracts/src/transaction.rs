@@ -182,7 +182,6 @@ pub struct ShutdownDisposition {
     pub invariant_failed: u64,
 }
 
-
 /// Ordered transaction event.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TransactionEvent {

@@ -24,10 +24,9 @@ use crate::transaction::sticky_cancel::StickyCancel;
 use crate::transaction::tool_capacity::SharedToolCapacity;
 use monoloop_connector::{Connector, SessionAttachRequest};
 use monoloop_contracts::{
-    merge_effective_config, CanonicalAssistantToolCall, CanonicalInput, CanonicalMessage,
-    CanonicalToolOutput, CanonicalToolResult, CanonicalToolResultOutcome, CanonicalUnit,
-    CanonicalUnitEvent, ChannelId, ChannelKind, ContinuationContext, ContinuationPolicy,
-    EffectiveConfig, ExchangeId, ExtensionLimits, InputLimits, InvocationConfig,
+    CanonicalAssistantToolCall, CanonicalInput, CanonicalMessage, CanonicalToolOutput,
+    CanonicalToolResult, CanonicalToolResultOutcome, CanonicalUnit, CanonicalUnitEvent, ChannelId,
+    ChannelKind, ContinuationContext, ContinuationPolicy, EffectiveConfig, ExchangeId, InputLimits,
     McpConfigurationCapability, OutboundDialectEncoder, SessionConfig, SessionId, SessionKey,
     TextPart, ToolExecutionMode, ToolId, ToolName, ToolRequestState, ToolSpec, TransactionEndKind,
     TransactionEventPayload, TransactionId,
@@ -48,7 +47,8 @@ struct InlineContinuationDeps<'a> {
     endpoint_ref: &'a str,
     credential_ref: Option<&'a str>,
     tool_specs: &'a [ToolSpec],
-    deadline: Duration,
+    /// Absolute transaction deadline (shared across all continuation exchanges).
+    deadline: Instant,
     cleanup_deadline: Duration,
     max_encoded: usize,
     max_retained: usize,
@@ -91,10 +91,10 @@ pub struct CoordinatorParams {
     pub session_id: Option<SessionId>,
     /// Canonical input.
     pub input: CanonicalInput,
-    /// Invocation config.
-    pub invocation_config: InvocationConfig,
-    /// Session config.
+    /// Optional session configuration (ExternalAgent attach labels).
     pub session_config: Option<SessionConfig>,
+    /// Validated effective configuration from synchronous admission (§9.2).
+    pub effective_config: EffectiveConfig,
     /// Live channel map.
     pub channels: Arc<HashMap<ChannelId, LiveChannel>>,
     /// Event publisher ordinary-command admit gate.
@@ -103,8 +103,8 @@ pub struct CoordinatorParams {
     pub worker_tx: mpsc::Sender<WorkerMessage>,
     /// Task supervisor spawn proxy.
     pub tasks: TransactionTaskSpawner,
-    /// Transaction deadline.
-    pub deadline: Duration,
+    /// Absolute transaction deadline (Instant; remaining time derived per phase).
+    pub deadline: Instant,
     /// Cleanup join grace for exchange children.
     pub cleanup_deadline: Duration,
     /// Admitted tool ids for this transaction.
@@ -155,8 +155,8 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         channel_id,
         mut session_id,
         input,
-        invocation_config,
         session_config,
+        effective_config,
         channels,
         publish_tx,
         worker_tx: _,
@@ -177,18 +177,11 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         return TerminalProposal::new(TransactionEndKind::InvariantFailed);
     };
 
-    let extension_limits = ExtensionLimits::default();
-    let config = match merge_effective_config(
-        &live.binding.defaults,
-        session_config.as_ref(),
-        None,
-        &invocation_config,
-        &live.binding.capabilities.option_policy,
-        &extension_limits,
-    ) {
-        Ok(c) => c,
-        Err(_) => return TerminalProposal::new(TransactionEndKind::InvariantFailed),
-    };
+    // EffectiveConfig was validated synchronously at admission (§9.2).
+    let config = effective_config;
+    if Instant::now() >= deadline {
+        return TerminalProposal::new(TransactionEndKind::DeadlineExceeded);
+    }
 
     let max_encoded = live.binding.limits.max_encoded_exchange_bytes;
     let max_retained = live
@@ -274,7 +267,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             requested_session_id: session_id.clone(),
             session_config: session_config.clone().unwrap_or_default(),
             initial_mcp,
-            deadline: Instant::now() + deadline,
+            deadline,
         };
         let pending_attach = match sessions.begin_attach(attach_req) {
             Ok(p) => p,
@@ -446,7 +439,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
             outcome,
             established_before_prompt,
             tool_mode,
-            invocation_config.continuation_policy,
+            config.continuation_policy,
             &publish_tx,
             &cancel,
             &tasks,
@@ -532,7 +525,7 @@ async fn execute(params: CoordinatorParams) -> TerminalProposal {
         outcome,
         false,
         tool_mode,
-        invocation_config.continuation_policy,
+        config.continuation_policy,
         &publish_tx,
         &cancel,
         &tasks,
@@ -758,16 +751,14 @@ async fn run_inline_tool_continuation(
     let mut provider_output_used = deps.provider_output_used;
 
     for _round in 1..=deps.max_continuations {
+        if Instant::now() >= deps.deadline {
+            return Err(TransactionEndKind::DeadlineExceeded);
+        }
         if exchanges_used >= deps.max_provider_exchanges {
             return Err(TransactionEndKind::LimitExceeded);
         }
         append_tool_round(&mut messages, &ready_units, &tool_results)
             .map_err(|_| TransactionEndKind::EncodingFailed)?;
-        let estimated = estimate_continuation_messages_bytes(&messages)
-            .map_err(|_| TransactionEndKind::EncodingFailed)?;
-        if estimated > deps.max_continuation_context_bytes {
-            return Err(TransactionEndKind::LimitExceeded);
-        }
         let context = ContinuationContext::try_new(messages.clone())
             .map_err(|_| TransactionEndKind::EncodingFailed)?;
 
@@ -799,6 +790,7 @@ async fn run_inline_tool_continuation(
             deps.deadline,
             deps.cleanup_deadline,
             deps.max_encoded,
+            deps.max_continuation_context_bytes,
             deps.max_retained,
             remaining_input,
             remaining_output,
@@ -921,45 +913,54 @@ fn append_tool_round(
     results: &[CanonicalToolResult],
 ) -> Result<(), ()> {
     let limits = InputLimits::default();
+    let mut assistant_content = Vec::new();
     let mut tool_calls = Vec::new();
     for unit in units {
         let snap = unit.snapshot();
-        let CanonicalUnit::Tool(t) = &snap.unit else {
-            continue;
-        };
-        if t.request_state != ToolRequestState::Ready {
-            continue;
+        match &snap.unit {
+            CanonicalUnit::Text(t) => {
+                let part = TextPart::try_new(t.content.clone(), limits.max_text_part_bytes)
+                    .map_err(|_| ())?;
+                assistant_content.push(part);
+            }
+            CanonicalUnit::Tool(t) => {
+                if t.request_state != ToolRequestState::Ready {
+                    continue;
+                }
+                let Some(name) = t.tool_name.as_deref() else {
+                    return Err(());
+                };
+                let Some(payload) = t.request_payload.as_deref() else {
+                    return Err(());
+                };
+                let exchange_id = results.first().map(|r| r.exchange_id);
+                let provider_id = results
+                    .iter()
+                    .find(|r| r.tool_action_id == t.tool_action_id)
+                    .map(|r| r.provider_tool_call_id.clone())
+                    .or_else(|| {
+                        exchange_id.and_then(|eid| {
+                            provider_tool_call_id_from_action(eid, &t.tool_action_id)
+                                .map(str::to_string)
+                        })
+                    })
+                    .unwrap_or_else(|| t.tool_action_id.as_str().to_string());
+                let arguments = serde_json::from_str(payload).map_err(|_| ())?;
+                let tool_name = ToolName::try_new(name).map_err(|_| ())?;
+                tool_calls.push(CanonicalAssistantToolCall {
+                    tool_call_id: provider_id,
+                    tool_name,
+                    arguments,
+                });
+            }
+            _ => {}
         }
-        let Some(name) = t.tool_name.as_deref() else {
-            return Err(());
-        };
-        let Some(payload) = t.request_payload.as_deref() else {
-            return Err(());
-        };
-        let exchange_id = results.first().map(|r| r.exchange_id);
-        let provider_id = results
-            .iter()
-            .find(|r| r.tool_action_id == t.tool_action_id)
-            .map(|r| r.provider_tool_call_id.clone())
-            .or_else(|| {
-                exchange_id.and_then(|eid| {
-                    provider_tool_call_id_from_action(eid, &t.tool_action_id).map(str::to_string)
-                })
-            })
-            .unwrap_or_else(|| t.tool_action_id.as_str().to_string());
-        let arguments = serde_json::from_str(payload).map_err(|_| ())?;
-        let tool_name = ToolName::try_new(name).map_err(|_| ())?;
-        tool_calls.push(CanonicalAssistantToolCall {
-            tool_call_id: provider_id,
-            tool_name,
-            arguments,
-        });
     }
     if tool_calls.is_empty() {
         return Err(());
     }
     messages.push(CanonicalMessage::Assistant {
-        content: vec![],
+        content: assistant_content,
         tool_calls,
     });
     for result in results {
@@ -984,7 +985,9 @@ fn append_tool_round(
     Ok(())
 }
 
-/// Byte estimate for cumulative continuation transcript (mirrors admission estimate).
+/// Payload-only byte estimate (non-normative). Enforcement uses encoded
+/// `encode_tool_continuation` size against `max_continuation_context_bytes`.
+#[allow(dead_code)]
 fn estimate_continuation_messages_bytes(messages: &[CanonicalMessage]) -> Result<usize, ()> {
     let mut total = 0usize;
     for msg in messages {

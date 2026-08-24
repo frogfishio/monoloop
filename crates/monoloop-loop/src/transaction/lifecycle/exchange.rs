@@ -158,7 +158,7 @@ pub async fn run_direct_llm_exchange(
     input: &monoloop_contracts::CanonicalInput,
     config: &EffectiveConfig,
     cancel: Arc<StickyCancel>,
-    deadline: Duration,
+    deadline: Instant,
     cleanup_deadline: Duration,
     max_encoded_exchange_bytes: usize,
     max_retained_unit_bytes: usize,
@@ -221,9 +221,10 @@ pub async fn run_direct_llm_continuation(
     config: &EffectiveConfig,
     tools: &[ToolSpec],
     cancel: Arc<StickyCancel>,
-    deadline: Duration,
+    deadline: Instant,
     cleanup_deadline: Duration,
     max_encoded_exchange_bytes: usize,
+    max_continuation_context_bytes: usize,
     max_retained_unit_bytes: usize,
     max_remaining_provider_input_bytes: usize,
     max_remaining_provider_output_bytes: usize,
@@ -241,6 +242,10 @@ pub async fn run_direct_llm_continuation(
             return failed_outcome(exchange_id, TransactionEndKind::EncodingFailed);
         }
     };
+    // Normative: max_continuation_context_bytes is an *encoded* byte ceiling.
+    if encoded.bytes.len() > max_continuation_context_bytes {
+        return failed_outcome(exchange_id, TransactionEndKind::LimitExceeded);
+    }
     if encoded.bytes.len() > max_encoded_exchange_bytes {
         return failed_outcome(exchange_id, TransactionEndKind::EncodingFailed);
     }
@@ -304,7 +309,7 @@ async fn run_inner(
     input: &monoloop_contracts::CanonicalInput,
     config: &EffectiveConfig,
     cancel: Arc<StickyCancel>,
-    deadline: Duration,
+    deadline: Instant,
     cleanup_deadline: Duration,
     max_encoded_exchange_bytes: usize,
     max_retained_unit_bytes: usize,
@@ -368,15 +373,17 @@ async fn run_encoded_exchange(
     credential_ref: Option<&str>,
     encoded: EncodedExchange,
     cancel: Arc<StickyCancel>,
-    deadline: Duration,
+    deadline: Instant,
     cleanup_deadline: Duration,
     max_retained_unit_bytes: usize,
     max_remaining_provider_output_bytes: usize,
     session_attachment: Option<std::sync::Arc<SessionAttachment>>,
     prompt_ready: Option<PromptReadyGate>,
 ) -> Result<EncodedExchangeOk, ExchangeFailure> {
-    let started = Instant::now();
-    let remaining = || deadline.saturating_sub(started.elapsed());
+    if Instant::now() >= deadline {
+        return Err(ExchangeFailure::DeadlineExceeded);
+    }
+    let remaining = || deadline.saturating_duration_since(Instant::now());
     let encoded_input_bytes = encoded.bytes.len();
 
     let connection_id = ConnectionId::generate();
@@ -726,8 +733,7 @@ async fn run_encoded_exchange(
         units: collected,
         external_session_id,
         encoded_input_bytes,
-        received_output_bytes: received_output_bytes
-            .load(std::sync::atomic::Ordering::Relaxed),
+        received_output_bytes: received_output_bytes.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
 

@@ -4,8 +4,8 @@ use super::capacity::TransactionReservations;
 use super::terminal::TerminalDecision;
 use crate::transaction::sticky_cancel::StickyCancel;
 use monoloop_contracts::{
-    CanonicalInput, ChannelId, InvocationConfig, SessionConfig, SessionKey, ToolId,
-    TransactionCompletionSender, TransactionDelivery, TransactionId, TransactionUsage,
+    CanonicalInput, ChannelId, EffectiveConfig, InvocationConfig, SessionConfig, SessionKey,
+    ToolId, TransactionCompletionSender, TransactionDelivery, TransactionId, TransactionUsage,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,10 +52,12 @@ pub struct LedgerEntry {
     pub publisher_seal_tx: Option<tokio::sync::mpsc::Sender<super::event_publisher::SealCommand>>,
     /// Canonical input captured at admission.
     pub input: CanonicalInput,
-    /// Invocation configuration.
+    /// Invocation configuration (raw admit request; validated into `effective_config`).
     pub invocation_config: InvocationConfig,
-    /// Optional session configuration.
+    /// Optional session configuration (raw admit request).
     pub session_config: Option<SessionConfig>,
+    /// Validated effective configuration (computed synchronously at admission, §9.2).
+    pub effective_config: EffectiveConfig,
     /// Selected tool ids.
     pub tools: Vec<ToolId>,
     /// RAII reservations.

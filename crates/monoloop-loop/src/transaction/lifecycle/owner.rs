@@ -355,9 +355,7 @@ impl RuntimeOwner {
 
     /// Live ConnectorOwner tasks (register-before-I/O; Hang-ready observation).
     pub fn live_connector_owners(&self) -> u32 {
-        self.shared
-            .live_connector_owners
-            .load(Ordering::SeqCst)
+        self.shared.live_connector_owners.load(Ordering::SeqCst)
     }
 
     /// Runtime-scoped tool spill pending count (joins + orphans; §22.4 / Stopped gate).

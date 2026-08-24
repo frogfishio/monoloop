@@ -501,17 +501,13 @@ pub(crate) async fn run_supervisor(
 
 fn note_connector_owner_spawn(shared: &RuntimeShared, class: &TaskClass) {
     if matches!(class, TaskClass::ConnectorOwner(_, _)) {
-        shared
-            .live_connector_owners
-            .fetch_add(1, Ordering::SeqCst);
+        shared.live_connector_owners.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 fn note_connector_owner_exit(shared: &RuntimeShared, class: &TaskClass) {
     if matches!(class, TaskClass::ConnectorOwner(_, _)) {
-        shared
-            .live_connector_owners
-            .fetch_sub(1, Ordering::SeqCst);
+        shared.live_connector_owners.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -582,10 +578,10 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         channel_id,
         session_id,
         input,
-        invocation_config,
         session_config,
+        effective_config,
         event_tx,
-        deadline,
+        absolute_deadline,
         selected_tools,
     ) = {
         let mut ledger = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
@@ -602,15 +598,24 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         entry.phase = TransactionPhase::Running;
         let session_id = entry.session_key.as_ref().map(|k| k.session_id.clone());
         let selected_tools = entry.tools.clone();
+        // One absolute transaction deadline: invocation may shorten, not exceed
+        // RuntimeShared.default_deadline (== TransactionLimits.transaction_deadline).
+        let ceiling = shared.default_deadline;
+        let base = entry
+            .effective_config
+            .deadline
+            .unwrap_or(ceiling)
+            .min(ceiling);
+        let absolute_deadline = std::time::Instant::now() + base;
         (
             Arc::clone(&entry.resources.cancel),
             entry.channel_id.clone(),
             session_id,
             entry.input.clone(),
-            entry.invocation_config.clone(),
             entry.session_config.clone(),
+            entry.effective_config.clone(),
             delivery.event_tx,
-            shared.default_deadline,
+            absolute_deadline,
             selected_tools,
         )
     };
@@ -629,7 +634,7 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
     let channel_id_pub = channel_id.clone();
     let session_id_pub = session_id.clone();
     let cancel_pub = Arc::clone(&cancel);
-    let deadline_pub = std::time::Instant::now() + deadline;
+    let deadline_pub = absolute_deadline;
     let admit_pub = pub_admit.clone();
     // Do not retain a Sender inside the publisher task — that prevented natural
     // channel closure after Finalizer took the seal sender (D-047).
@@ -655,13 +660,13 @@ fn handle_start(shared: &Arc<RuntimeShared>, tasks: &mut TaskSupervisor, tx: Tra
         channel_id,
         session_id,
         input,
-        invocation_config,
         session_config,
+        effective_config,
         channels: Arc::clone(&shared.channels),
         publish_tx: pub_admit,
         worker_tx: shared.worker_tx.clone(),
         tasks: shared.task_spawner.clone(),
-        deadline,
+        deadline: absolute_deadline,
         cleanup_deadline: shared.cleanup_deadline,
         selected_tools,
         tools_registry: shared.tools_registry.clone(),

@@ -48,6 +48,36 @@ fn is_documented_exception(rel: &str, line: &str) -> bool {
     false
 }
 
+/// Read a proof file, or the composed `lifecycle/tests/` corpus when the
+/// legacy `lifecycle/tests.rs` path is referenced after the LOC split.
+fn read_proof_text(root: &Path, rel: &str) -> String {
+    let path = root.join(rel);
+    if rel == "src/transaction/lifecycle/tests.rs" || rel.ends_with("lifecycle/tests.rs") {
+        let dir = root.join("src/transaction/lifecycle/tests");
+        assert!(
+            dir.is_dir(),
+            "lifecycle tests must be composed under src/transaction/lifecycle/tests/ (LOC split)"
+        );
+        let mut files = Vec::new();
+        collect_rs_files(&dir, &mut files);
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "expected .rs files under src/transaction/lifecycle/tests/"
+        );
+        let mut corpus = String::new();
+        for f in files {
+            corpus.push_str(
+                &fs::read_to_string(&f).unwrap_or_else(|e| panic!("read {}: {e}", f.display())),
+            );
+            corpus.push('\n');
+        }
+        return corpus;
+    }
+    assert!(path.is_file(), "missing limit-proof file {rel}");
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+}
+
 #[test]
 fn s23_no_undocumented_ambient_tokio_spawn_in_production_src() {
     let root = crate_src();
@@ -62,7 +92,8 @@ fn s23_no_undocumented_ambient_tokio_spawn_in_production_src() {
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| path.display().to_string());
         // Lifecycle unit-test module is compiled into the lib; allow its harness spawns.
-        if rel.contains("lifecycle/tests.rs") {
+        // Composed as `lifecycle/tests/*.rs` (was a single `tests.rs` monolith).
+        if rel.contains("lifecycle/tests.rs") || rel.contains("lifecycle/tests/") {
             continue;
         }
         let Ok(text) = fs::read_to_string(path) else {
@@ -383,14 +414,49 @@ fn s23_exact_limit_plus_one_inventory_present() {
         ),
     ];
     for (rel, needle) in required {
-        let path = root.join(rel);
-        assert!(path.is_file(), "missing limit-proof file {rel}");
-        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let text = read_proof_text(&root, rel);
         assert!(
             text.contains(needle),
             "limit-proof `{needle}` missing from {rel}"
         );
     }
+}
+
+/// Advisor LOC bar: composed lifecycle test modules stay under 3000 lines each.
+#[test]
+fn s23_lifecycle_tests_composed_under_loc_threshold() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/transaction/lifecycle/tests");
+    assert!(
+        dir.is_dir(),
+        "lifecycle tests must be a composed directory (not a single tests.rs monolith)"
+    );
+    let legacy =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/transaction/lifecycle/tests.rs");
+    assert!(
+        !legacy.is_file(),
+        "lifecycle/tests.rs monolith must not return; keep proofs under lifecycle/tests/"
+    );
+    const MAX_LOC: usize = 3000;
+    let mut files = Vec::new();
+    collect_rs_files(&dir, &mut files);
+    assert!(
+        !files.is_empty(),
+        "expected composed lifecycle test modules"
+    );
+    let mut offenders = Vec::new();
+    for path in files {
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let loc = text.lines().count();
+        if loc > MAX_LOC {
+            offenders.push(format!("{}: {loc} LOC", path.display()));
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "lifecycle test module(s) exceed {MAX_LOC} LOC — prefer further composition:\n{}",
+        offenders.join("\n")
+    );
 }
 
 /// §23 named Fake race/load inventory gate (not exhaustive; not live Grok).
@@ -424,10 +490,8 @@ fn s23_race_load_inventory_present() {
             "S23_RACE_LOAD_INVENTORY.md must name race needle `{needle}`"
         );
     }
-    let lifecycle = root.join("src/transaction/lifecycle/tests.rs");
-    let life_text =
-        fs::read_to_string(&lifecycle).unwrap_or_else(|e| panic!("read lifecycle tests: {e}"));
-    // Deleting these fns from tests.rs must fail this gate (not inventory-only).
+    // Composed `lifecycle/tests/` corpus (LOC split); deleting a listed fn fails.
+    let life_text = read_proof_text(&root, "src/transaction/lifecycle/tests.rs");
     for needle in [
         "concurrent_hang_terminate_storm_all_cancelled",
         "concurrent_hang_force_terminate_storm_all_terminated",

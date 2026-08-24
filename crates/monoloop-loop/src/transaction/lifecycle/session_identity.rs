@@ -15,10 +15,10 @@ pub(crate) fn tool_action_id_for_exchange(
 /// Inverse of [`tool_action_id_for_exchange`]: strip `{exchange_id}:` prefix.
 ///
 /// Returns `None` when the action id is not scoped to this exchange.
-pub(crate) fn provider_tool_call_id_from_action<'a>(
+pub(crate) fn provider_tool_call_id_from_action(
     exchange_id: ExchangeId,
-    tool_action_id: &'a ToolActionId,
-) -> Option<&'a str> {
+    tool_action_id: &ToolActionId,
+) -> Option<&str> {
     let prefix = format!("{exchange_id}:");
     tool_action_id
         .as_str()

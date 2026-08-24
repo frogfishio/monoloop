@@ -30,7 +30,6 @@ struct OrphanPermit {
 /// Deprecated name for [`OrphanToolPermitSet`] (M5.4 delete-vaults).
 ///
 /// This is **not** a join vault. Prefer [`OrphanToolPermitSet`].
-
 impl OrphanToolPermitSet {
     /// Create an empty orphan-permit set.
     pub fn new() -> Self {

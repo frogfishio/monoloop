@@ -93,8 +93,10 @@ async fn scripted_sequence_advances_per_open_and_fails_closed_when_exhausted() {
     }
     assert_eq!(sequence.opens(), 2);
 
-    let mut pending =
-        connector.begin_open(OpenConnection::new(ConnectionId::new("seq-exhausted"), "seq"));
+    let mut pending = connector.begin_open(OpenConnection::new(
+        ConnectionId::new("seq-exhausted"),
+        "seq",
+    ));
     drive_pending(&mut pending);
     let err = match pending.opened.await {
         Err(e) => e,

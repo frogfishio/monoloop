@@ -27,7 +27,8 @@ Aggregate `owned_task_count` is **not** used — InterpreterOwner inflation made
 
 Inventory gate: `crates/monoloop-loop/tests/s23_forbidden_patterns.rs` →
 `s23_race_load_inventory_present` requires this file **and** the named race
-needles to remain in `lifecycle/tests.rs` (deleting a listed fn fails the gate).
+needles to remain under `lifecycle/tests/` (composed modules; deleting a listed
+fn fails the gate).
 
 ## Explicitly not claimed
 

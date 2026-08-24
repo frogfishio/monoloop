@@ -4,9 +4,10 @@ use super::capacity::ReservationPool;
 use super::ledger::{LedgerEntry, LedgerInsertError, ResourceControls, TransactionPhase};
 use super::supervisor::{RuntimeShared, StartCommand, STATE_ACCEPTING};
 use monoloop_contracts::{
-    estimate_canonical_input_bytes, AdmissionError, AdmissionErrorKind, AdmissionReceipt,
-    CanonicalMessage, ChannelId, McpConfigurationCapability, SessionKey, ToolExecutionMode,
-    TransactionId, TransactionSubmitRequest, TransactionUsage,
+    estimate_canonical_input_bytes, merge_effective_config, AdmissionError, AdmissionErrorKind,
+    AdmissionReceipt, CanonicalMessage, ChannelDefaults, ChannelId, ConfigError, ExtensionLimits,
+    McpConfigurationCapability, OptionPolicy, SessionKey, ToolExecutionMode, TransactionId,
+    TransactionSubmitRequest, TransactionUsage,
 };
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -24,6 +25,12 @@ pub(crate) trait ChannelIndex {
 
     /// `ChannelLimits.max_distinct_sessions` when known (`None` = do not enforce).
     fn max_distinct_sessions(&self, id: &ChannelId) -> Option<usize> {
+        let _ = id;
+        None
+    }
+
+    /// Channel defaults + option policy for synchronous EffectiveConfig merge (§9.2).
+    fn defaults_and_policy(&self, id: &ChannelId) -> Option<(ChannelDefaults, OptionPolicy)> {
         let _ = id;
         None
     }
@@ -52,6 +59,19 @@ impl ChannelIndex for HashMap<ChannelId, super::super::channel_registry::LiveCha
         self.get(id)
             .map(|live| live.binding.limits.max_distinct_sessions)
     }
+
+    fn defaults_and_policy(&self, id: &ChannelId) -> Option<(ChannelDefaults, OptionPolicy)> {
+        self.get(id).map(|live| {
+            (
+                live.binding.defaults.clone(),
+                live.binding.capabilities.option_policy.clone(),
+            )
+        })
+    }
+}
+
+fn config_error_to_admission(err: ConfigError) -> AdmissionError {
+    AdmissionError::new(AdmissionErrorKind::InvalidConfiguration, err.to_string())
 }
 
 /// Perform synchronous admission (no spawn, no executor wait).
@@ -165,6 +185,31 @@ pub(crate) fn admit(
         ));
     }
 
+    // 2–4. Compute + validate EffectiveConfig synchronously before reservations
+    // or ledger insert (V2 §9.2). Unsupported options/extensions fail closed here.
+    let (defaults, option_policy) = channels
+        .defaults_and_policy(&request.channel_id)
+        .ok_or_else(|| {
+            AdmissionError::new(AdmissionErrorKind::UnknownChannel, "unknown channel")
+        })?;
+    let effective_config = merge_effective_config(
+        &defaults,
+        request.session_config.as_ref(),
+        None,
+        &request.invocation_config,
+        &option_policy,
+        &ExtensionLimits::default(),
+    )
+    .map_err(config_error_to_admission)?;
+    if let Some(d) = effective_config.deadline {
+        if d.is_zero() {
+            return Err(AdmissionError::new(
+                AdmissionErrorKind::InvalidConfiguration,
+                "invocation deadline must be non-zero",
+            ));
+        }
+    }
+
     // 5. Allocate ids / session key when known.
     let transaction_id = TransactionId::generate();
     let session_key = request.session_id.as_ref().map(|sid| SessionKey {
@@ -219,6 +264,7 @@ pub(crate) fn admit(
         input: request.input,
         invocation_config: request.invocation_config,
         session_config: request.session_config,
+        effective_config,
         tools: request.tools,
         reservations: Some(reservations),
         resources: ResourceControls::default(),

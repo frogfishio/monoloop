@@ -797,11 +797,14 @@ rejected.
 **Acceptance criteria:**
 
 - [x] Empty allowlist denies extensions
-      (`empty_extension_allowlist_denies`,
-      `unknown_extension_rejected_at_admission`).
+      (`empty_extension_allowlist_denies` in contracts;
+      `unknown_extension_rejected_at_admission` on `StartedRuntime` admit path).
 - [x] Channel defaults seed `allowed_extension_keys` at admission.
 - [x] Per-Channel distinct option matrices (`direct_llm` vs `external_agent`)
       and OpenAI/ACP encoder round-trip / fail-closed for extensions.
+- [x] EffectiveConfig is computed/validated **synchronously at admission**
+      (V2 §9.2) before reservations/ledger insert — not only in the async
+      coordinator.
 
 ## D-024: Declared tool cancellation policy is not enforced by handler registration or cleanup
 
@@ -5634,3 +5637,147 @@ present — **or** further named Fake race (e.g. Session-selector storm) — **o
 human D-025 Sign-off on `doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025
 last unless a human is actually signing. Do not invent diagnostic/callback
 waits.
+
+**Lifecycle tests LOC composition (2026-08-24):** Closed Advisor BAD
+`LOC=6382` on `lifecycle/tests.rs` (threshold 3000). Split into composed
+`lifecycle/tests/` modules (each ≤1369 LOC): `common`, `admission_limits`,
+`admission_capacity`, `exchange_shutdown`, `race_load`, `public_limits`,
+`mcp_external`, `s22_finalization`, `s22_isolation_loop`. s23 gates read the
+composed corpus; `s23_lifecycle_tests_composed_under_loc_threshold` locks the
+bar. Verified: lifecycle lib tests **92 ok**; s23 suite green. **Not** Golden /
+§25 / D-025.
+
+**Advisor (2026-08-24, lifecycle tests LOC composition):**
+**PASS — Silver** for this **hygiene / composition leftover**. Quality tier
+**unchanged** (Silver hygiene fix, **not** Golden). Does **not** meet Golden /
+§25 and does **not** close D-025 / §23 independent review. This is **not** a
+Sign-off self-sign.
+
+Independently re-checked this tree: monolith `lifecycle/tests.rs` **deleted**;
+composed `lifecycle/tests/` = `mod` + `common` + 8 thematic modules, max
+**1369** LOC (`s22_finalization`), all ≤3000; lifecycle lib tests **92 ok**;
+s23 **6/6** including `s23_lifecycle_tests_composed_under_loc_threshold`,
+`s23_race_load_inventory_present`, and `s23_exact_limit_plus_one_inventory_present`
+(corpus via `read_proof_text`). `GROK_AGENT_SECRET` unset. Sign-off table
+`_TBD_`.
+
+| Claim | Verdict |
+|---|---|
+| Composition vs monolith | **Closed.** Directory composition replaces 6k+ `tests.rs`; gate forbids monolith return and locks ≤3000 LOC/file. |
+| Three-component / product→testkit | **PASS.** `monoloop-loop` (and sibling product crates) have **no** testkit dep; helpers stay on Fake/Hang in-loop. |
+| Spec drift / invented waits / scope | **In bar.** Pure split + gate/inventory path retarget; race waits remain `live_connector_owners` Hang-ready (no new diagnostic/callback waits). |
+| Gate honesty (race + limit needles) | **Preserved.** Inventory + exact-limit gates read composed corpus; deleting a listed fn still fails; inventory doc says `lifecycle/tests/`. |
+| Overclaim | **None material.** Agent claim stays Silver / Not Golden / Not D-025. Stale historical path strings in older DEFECTS/WP12 rows are standing doc hygiene only (gates resolve). |
+
+Do **not** re-pick this LOC composition leftover.
+
+Standing (not a fail of this leftover): named table ≠ exhaustive §23 race/load;
+matrix still-open; unsigned D-025 pack; live Grok still open when secret
+present; some older docs still spell `lifecycle/tests.rs` while gates/corpus
+alias the composed tree.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` is actually
+present — **or** further named Fake race — **or** human D-025 Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025 last unless a human is
+actually signing. Do not invent diagnostic/callback waits.
+
+**Expert (2026-08-24, lifecycle tests LOC composition):**
+**PASS** for the leftover as implemented. Composition is sound: test identity
+preserved, s23 honesty still fail-closed on needle deletion, no holey async /
+import / product-bleed defect introduced by the split. **Not** Golden / §25 /
+D-025. This is **not** a Sign-off self-sign. Do **not** reopen Hang-ready /
+Cancel×Force / D-060 / D-058 / D-059 (unaffected).
+
+Independently re-checked this tree:
+- `wc -l …/lifecycle/tests/*.rs` → max **1369** (`s22_finalization.rs`); all
+  ≤3000; monolith `lifecycle/tests.rs` **absent** on disk.
+- `cargo test -p monoloop-loop --lib transaction::lifecycle::tests -- --test-threads=1`
+  → **92 ok**.
+- `cargo test -p monoloop-loop --test s23_forbidden_patterns -- --test-threads=1`
+  → **6/6**.
+- `#[test]` / `#[tokio::test]` name inventory vs last-known monolith
+  (`git show HEAD:…/lifecycle/tests.rs`): **92 = 92**, empty only-in-OLD /
+  only-in-NEW (helpers moved to `common.rs` as `pub(super)` — not deletions).
+
+| Question | Verdict |
+|---|---|
+| 1. Composition preserved test identity/behavior (no accidental deletions, visibility breaks, wrong `super::` rewrites)? | **Yes.** Exact 92↔92 `#[test]`/`#[tokio::test]` fn-name match vs monolith. `lifecycle/mod.rs` still `#[cfg(test)] mod tests;` → `tests/mod.rs`. Child modules use `super::common::*` (`pub(super)` helpers) and `super::super::{…}` / `super::super::event_publisher` (lifecycle parent) — correct one-level deeper paths. No visibility/compile breaks (92 green). Behavior-critical storm asserts (`live_connector_owners`, EmptyToolRegistry / Hang, Cancelled/Terminated, `completions_published`) remain in `race_load.rs`. |
+| 2. s23 honesty gates still fail-closed if a race/limit needle fn is deleted? | **Yes — same honesty class as pre-split.** `read_proof_text` concatenates sorted `lifecycle/tests/**/*.rs` when the legacy `lifecycle/tests.rs` path is cited; empty dir / missing dir asserts. `s23_race_load_inventory_present` and `s23_exact_limit_plus_one_inventory_present` `contains` every listed needle in that corpus; spot-checked race needles appear **once** as `fn <needle>`. Deleting the fn fails the gate. New `s23_lifecycle_tests_composed_under_loc_threshold` fail-closes monolith return and >3000 LOC/file. Ambient-spawn exemption covers `lifecycle/tests/`. Standing (not this leftover): gates are substring `contains`, not `fn `-anchored / not live `#[test]` discovery. |
+| 3. Holey async / product bleed / import path bugs introduced? | **No material defect from this split.** Harness `tokio::spawn` stays inside `#[cfg(test)]` composed modules (exempted). Sync tests still use local `current_thread` + `block_on`; publisher/isolation proofs keep prior `#[tokio::test(flavor = "multi_thread", …)]` — pre-existing patterns, not new nest-runtime holes. Helpers are Fake/Hang in-loop; no product→testkit dep introduced. `common` is `pub(super)` only (no product export). |
+| 4. Standing residuals vs FAIL? | **Standing only — not a FAIL of this leftover.** Named race table ≠ exhaustive §23; matrix still-open; unsigned D-025 pack; live Grok blocked without `GROK_AGENT_SECRET`; older paper paths in WP12 / D053 / historical DEFECTS rows still spell `lifecycle/tests.rs` while gates alias the composed corpus. Do **not** re-pick this LOC composition leftover. |
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` is actually
+present — **or** further named Fake race — **or** human D-025 Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md`. Independent D-025 last unless a human is
+actually signing. Do not invent diagnostic/callback waits. Do not re-pick
+Hang-ready / 3N / begin_shutdown / Cancel×Force / D-060 / D-058 / D-059 / this
+LOC composition leftover.
+
+**Acceptance P1/P2 closeout (2026-08-24):** Closed acceptance REJECT leftovers:
+
+1. Sync EffectiveConfig at admission (§9.2) + `unknown_extension_rejected_at_admission`.
+2. Absolute `Instant` transaction deadline from effective config (invocation may
+   shorten, not exceed runtime ceiling); continuations reuse the same Instant.
+3. Multi-round final-text race: hardened event/completion drain + 20× HTTP
+   regression (`inline_multi_round_tool_continuation_repeated_keeps_final_text`).
+4. `max_continuation_context_bytes` enforced on encoded continuation bytes.
+5. Mixed assistant text preserved in `append_tool_round`; stronger transcript order asserts.
+6. fmt + Clippy green for monoloop-loop.
+7. WP12 R-001 + D-023 evidence retargeted to sync admission.
+
+**Not** Golden / §25 / D-025.
+
+**Advisor (2026-08-24, acceptance REJECT P1/P2 closeout):** **PASS — Silver**
+for this **acceptance leftover closeout**. Quality tier **unchanged** (Silver
+acceptance fix, **not** Golden). Does **not** meet Golden / §25 and does **not**
+close D-025 / §23 independent review. This is **not** a Sign-off self-sign.
+
+Independently re-checked this tree:
+
+| Claim | Verdict |
+|---|---|
+| §9.2 sync EffectiveConfig at admit | **PASS.** `admit` calls `merge_effective_config` **before** reservations/ledger insert; ledger stores `effective_config`; coordinator consumes admitted config (no async re-merge). Needle `unknown_extension_rejected_at_admission` → `InvalidConfiguration`, ledger_len 0. D-023 checkbox + WP12 R-001 cite sync admission. |
+| Absolute `Instant` deadline | **PASS.** Supervisor: `base = effective.deadline.unwrap_or(ceiling).min(ceiling)`; one `Instant` shared by publisher + coordinator + continuations (`run_encoded_exchange` uses `saturating_duration_since`). `invocation_deadline_override_hang_ends_deadline_exceeded` + Covered Hang `transaction_deadline` green. |
+| Encoded continuation context bytes | **PASS.** Pre-encode estimate removed from hot path; `run_direct_llm_continuation` fail-closes `LimitExceeded` on `encoded.bytes.len() > max_continuation_context_bytes`. Fake + HTTP context-byte needles green. |
+| Multi-round final-text drain + 20× | **PASS with standing flake caveat.** Drain waits for Ended∧completion + 50ms grace. `inline_multi_round_*` + full HTTP e2e **16/16** and Fake **18/18** green on clean runs; 20× stress alone 3/3. Early Advisor spot-check saw rare harness-class `Cancelled` under cargo contention (suite documents shared `test_rt` for that class) — standing, not a closeout FAIL. |
+| Mixed transcript + stronger asserts | **PASS code; weak dedicated mixed-text needle.** `append_tool_round` keeps `CanonicalUnit::Text` in assistant `content`. Multi-round bodies assert call/result order. No SSE fixture that emits text+tool_calls in one turn and asserts content bytes on the wire — standing evidence gap, not a reopen of the drop bug. |
+| fmt / Clippy / boundaries | **PASS.** `cargo fmt -p monoloop-loop --check` clean; `clippy -p monoloop-loop --all-targets -- -D warnings` clean. Product crates ↛ testkit. s23 **6/6**. No invented D-058/D-059 waits. |
+| Overclaim | **None material.** Agent stamp stays Not Golden / Not §25 / Not D-025. Ceiling-cap (invocation longer than `transaction_deadline`) is code-true (`.min(ceiling)`) without a dedicated exceed-cap Hang twin — standing only. |
+
+Do **not** re-pick this acceptance P1/P2 closeout leftover.
+
+Standing (not a fail of this leftover): named race/load ≠ exhaustive §23;
+matrix still-open (`max_diagnostic_*` D-058, `callback_deadline` D-059,
+`cleanup_deadline` Partial); unsigned D-025 pack; live Grok blocked without
+`GROK_AGENT_SECRET`; rare HTTP multi-round `Cancelled` under harness contention;
+mixed-text lacks a dedicated content+tools fixture; no Hang twin that proves
+over-ceiling invocation is capped.
+
+Do **not** promote Golden / §25 / D-025. Agents must not self-sign.
+
+**Next pick:** live Grok multi-session **when** `GROK_AGENT_SECRET` is actually
+present — **or** further named Fake race — **or** human D-025 Sign-off on
+`doc/SECURITY_REVIEW_CHECKLIST.md` — **or** optional mixed-text / over-ceiling
+deadline evidence polish. Independent D-025 last unless a human is actually
+signing. Do not invent diagnostic/callback waits. Do not re-pick Hang-ready /
+3N / begin_shutdown / Cancel×Force / D-060 / D-058 / D-059 / LOC composition /
+this acceptance P1/P2 closeout.
+
+**Expert (2026-08-24, Acceptance P1/P2 closeout):** **PASS — Silver.**
+Admission sync EffectiveConfig; absolute Instant deadline; encoded context;
+multi-round drain+20×; mixed transcript; fmt/clippy. Independently: unknown_extension
+1/1; invocation_deadline 1/1; Fake 18/18; HTTP 16/16; s23 6/6. Standing: in-flight
+tool uses ToolLimits.execution_deadline not tx Instant; final-text harden is
+harness drain. **Not** Golden / §25 / D-025.
+
+**Advisor (2026-08-24, acceptance REJECT P1/P2 closeout):** **PASS — Silver.**
+§9.2 / Instant / encoded context / multi-round / docs in bar. Standing: rare
+HTTP Cancelled under harness contention; mixed-text lacks dedicated SSE fixture;
+no over-ceiling Hang twin. **Not** Golden / §25 / D-025.
+
+**Next pick:** live Grok when `GROK_AGENT_SECRET` present — or further Fake race —
+or human D-025 Sign-off. Do not re-pick this acceptance closeout.

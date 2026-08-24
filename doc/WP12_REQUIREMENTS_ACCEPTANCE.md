@@ -37,7 +37,7 @@ cargo doc --workspace --no-deps
 |---|---|---|
 | Explicit Channel select | Pass | Admission unknown channel; no fallback |
 | Shared OpenAI path for compatible providers | Pass | interpreter OpenAI SSE; lifecycle Fake DirectLlm (`fake_echo_exchange_*`); see `doc/D053_COVERAGE_REPLACEMENT.md` |
-| Canonical input + invocation config | Pass | contracts + merge_effective_config |
+| Canonical input + invocation config | Pass | contracts + sync admission `merge_effective_config` (`unknown_extension_rejected_at_admission`) |
 | Credentials via resolver only | Pass | streaming HTTP; Debug redaction; Z.ai `-k` removed |
 | Streaming SSE assembly | Pass | interpreter OpenAI dialect tests |
 
@@ -46,7 +46,7 @@ cargo doc --workspace --no-deps
 | Criterion | Status | Evidence |
 |---|---|---|
 | SessionKey isolation | Pass | duplicate reject; same string different channels |
-| Generated + supplied DirectLlm sessions | Pass | `lifecycle/tests.rs` admission + session isolation |
+| Generated + supplied DirectLlm sessions | Pass | `lifecycle/tests/` admission + session isolation |
 | Shutdown finalizes callbacks | Pass | lifecycle shutdown / `Stopped` proofs |
 | External create/reuse (Fake) | Pass | FakeSessionAdapter + actor attach |
 | Live multi-exchange per agent profile | Partial | Qualification / environment (not Fake gate) |

@@ -12,8 +12,8 @@ use monoloop_contracts::{
     DialectDescriptor, ExchangeMode, InvocationConfig, JsonSchema, McpConfigurationCapability,
     McpReachability, OptionPolicy, SessionMode, ShutdownWaitOutcome, ToolCompletion,
     ToolExecutionClass, ToolExecutionMode, ToolId, ToolLifecycleEvent, ToolLimits, ToolName,
-    ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEndKind, TransactionEventPayload,
-    TransactionLimits, TransactionReceiver, TransactionSubmitRequest,
+    ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEndKind, TransactionEvent,
+    TransactionEventPayload, TransactionLimits, TransactionReceiver, TransactionSubmitRequest,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
@@ -105,7 +105,6 @@ fn echo_tool_registry() -> HostToolRegistry {
     )])
     .unwrap()
 }
-
 
 struct FakeOpenAiChannel {
     binding: ChannelBinding,
@@ -220,48 +219,79 @@ async fn drain_until_completed(
     let mut texts = Vec::new();
     let mut labels = Vec::new();
     let mut payloads = Vec::new();
-    let push_label = |labels: &mut Vec<&'static str>, ev: &TransactionEventPayload| {
-        labels.push(match ev {
+    let mut saw_ended = false;
+    let mut completion = None;
+    let push_event = |labels: &mut Vec<&'static str>,
+                      texts: &mut Vec<String>,
+                      payloads: &mut Vec<TransactionEventPayload>,
+                      saw_ended: &mut bool,
+                      ev: TransactionEvent| {
+        let label = match &ev.payload {
             TransactionEventPayload::SessionEstablished { .. } => "session",
             TransactionEventPayload::CanonicalUnit(u) => u.snapshot().unit.kind_label(),
             TransactionEventPayload::ToolLifecycle(_) => "tool_life",
             TransactionEventPayload::Diagnostic(_) => "diag",
             TransactionEventPayload::Ended(_) => "ended",
             TransactionEventPayload::EndedEvent(_) => "ended_event",
-        });
-    };
-    let completion = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            tokio::select! {
-                biased;
-                c = &mut completion_fut => {
-                    break c.expect("completion channel closed");
-                }
-                ev = events.recv() => {
-                    if let Some(ev) = ev {
-                        push_label(&mut labels, &ev.payload);
-                        if let TransactionEventPayload::CanonicalUnit(unit) = &ev.payload {
-                            if let CanonicalUnit::Text(t) = &unit.snapshot().unit {
-                                texts.push(t.content.clone());
-                            }
-                        }
-                        payloads.push(ev.payload);
-                    }
-                }
-            }
+        };
+        if matches!(
+            &ev.payload,
+            TransactionEventPayload::Ended(_) | TransactionEventPayload::EndedEvent(_)
+        ) {
+            *saw_ended = true;
         }
-    })
-    .await
-    .expect("completion timed out");
-    while let Ok(ev) = events.try_recv() {
-        push_label(&mut labels, &ev.payload);
+        labels.push(label);
         if let TransactionEventPayload::CanonicalUnit(unit) = &ev.payload {
             if let CanonicalUnit::Text(t) = &unit.snapshot().unit {
                 texts.push(t.content.clone());
             }
         }
         payloads.push(ev.payload);
-    }
+    };
+    let completion = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if completion.is_some() && saw_ended {
+                break;
+            }
+            tokio::select! {
+                c = &mut completion_fut, if completion.is_none() => {
+                    completion = Some(c.expect("completion channel closed"));
+                }
+                ev = events.recv() => {
+                    match ev {
+                        Some(ev) => push_event(
+                            &mut labels,
+                            &mut texts,
+                            &mut payloads,
+                            &mut saw_ended,
+                            ev,
+                        ),
+                        None => {
+                            if completion.is_none() {
+                                completion = Some(
+                                    completion_fut.await.expect("completion channel closed"),
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let grace = tokio::time::Instant::now() + Duration::from_millis(50);
+        while tokio::time::Instant::now() < grace {
+            match events.try_recv() {
+                Ok(ev) => push_event(&mut labels, &mut texts, &mut payloads, &mut saw_ended, ev),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        completion.expect("completion")
+    })
+    .await
+    .expect("completion timed out");
     (completion, texts, labels, payloads)
 }
 
@@ -442,7 +472,7 @@ fn fake_inline_tool_continuation_second_exchange_emits_text() {
         completion.end.kind
     );
     assert!(
-        labels.iter().any(|l| *l == "tool_life"),
+        labels.contains(&"tool_life"),
         "expected ToolLifecycle after Ready dispatch; labels={labels:?}"
     );
     let joined = texts.join("");
@@ -562,10 +592,7 @@ fn fake_concurrent_admits_are_isolated() {
         BTreeSet::from([ContinuationPolicy::CallerControlled]),
         false,
     );
-    let started = start_runtime(
-        vec![ch_a.binding, ch_b.binding],
-        HostToolRegistry::empty(),
-    );
+    let started = start_runtime(vec![ch_a.binding, ch_b.binding], HostToolRegistry::empty());
     let handle = started.handle.clone();
     let (delivery_a, receiver_a) =
         transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
@@ -610,8 +637,16 @@ fn fake_concurrent_admits_are_isolated() {
         )
     });
 
-    assert_eq!(comp_a.end.kind, TransactionEndKind::Completed, "{labels_a:?}");
-    assert_eq!(comp_b.end.kind, TransactionEndKind::Completed, "{labels_b:?}");
+    assert_eq!(
+        comp_a.end.kind,
+        TransactionEndKind::Completed,
+        "{labels_a:?}"
+    );
+    assert_eq!(
+        comp_b.end.kind,
+        TransactionEndKind::Completed,
+        "{labels_b:?}"
+    );
     assert_eq!(comp_a.end.transaction_id, receipt_a.transaction_id);
     assert_eq!(comp_b.end.transaction_id, receipt_b.transaction_id);
     assert_ne!(receipt_a.transaction_id, receipt_b.transaction_id);
@@ -714,7 +749,11 @@ fn fake_reused_provider_call_id_across_admits_distinct_action_ids() {
             "labels={labels:?}"
         );
         let results = completed_tool_results(&payloads);
-        assert_eq!(results.len(), 1, "expected one Completed tool; labels={labels:?}");
+        assert_eq!(
+            results.len(),
+            1,
+            "expected one Completed tool; labels={labels:?}"
+        );
         action_ids.push(results[0].0.clone());
         provider_ids.push(results[0].1.clone());
     }
@@ -931,10 +970,7 @@ fn fake_inline_cumulative_output_budget_exhausted_blocks_second_open() {
     let ch = openai_fake_channel(
         "fake-cum-out",
         "gpt-test",
-        vec![
-            round0,
-            fragmented_text_sse("should never be reached"),
-        ],
+        vec![round0, fragmented_text_sse("should never be reached")],
         BTreeSet::from([
             ContinuationPolicy::CallerControlled,
             ContinuationPolicy::InlineToolContinuation,
@@ -994,8 +1030,11 @@ fn fake_inline_cumulative_input_budget_exhausted_blocks_second_open() {
         true,
     );
     let probe_log = probe.input_log.clone().expect("input log");
-    let started_probe =
-        start_runtime_with_limits(vec![probe.binding], echo_tool_registry(), default_tx_limits());
+    let started_probe = start_runtime_with_limits(
+        vec![probe.binding],
+        echo_tool_registry(),
+        default_tx_limits(),
+    );
     let handle = started_probe.handle.clone();
     let (delivery, receiver) =
         transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();

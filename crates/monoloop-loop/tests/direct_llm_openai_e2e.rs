@@ -22,7 +22,8 @@ use monoloop_contracts::{
     McpConfigurationCapability, McpReachability, OptionPolicy, SessionMode, ShutdownWaitOutcome,
     ToolCompletion, ToolExecutionClass, ToolExecutionMode, ToolId, ToolLifecycleEvent, ToolLimits,
     ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEndKind,
-    TransactionEventPayload, TransactionLimits, TransactionReceiver, TransactionSubmitRequest,
+    TransactionEvent, TransactionEventPayload, TransactionLimits, TransactionReceiver,
+    TransactionSubmitRequest,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
@@ -305,48 +306,83 @@ async fn drain_until_completed_detailed(
     let mut texts = Vec::new();
     let mut labels = Vec::new();
     let mut payloads = Vec::new();
-    let push_label = |labels: &mut Vec<&'static str>, ev: &TransactionEventPayload| {
-        labels.push(match ev {
+    let mut saw_ended = false;
+    let mut completion = None;
+    let push_event = |labels: &mut Vec<&'static str>,
+                      texts: &mut Vec<String>,
+                      payloads: &mut Vec<TransactionEventPayload>,
+                      saw_ended: &mut bool,
+                      ev: TransactionEvent| {
+        let label = match &ev.payload {
             TransactionEventPayload::SessionEstablished { .. } => "session",
             TransactionEventPayload::CanonicalUnit(u) => u.snapshot().unit.kind_label(),
             TransactionEventPayload::ToolLifecycle(_) => "tool_life",
             TransactionEventPayload::Diagnostic(_) => "diag",
             TransactionEventPayload::Ended(_) => "ended",
             TransactionEventPayload::EndedEvent(_) => "ended_event",
-        });
-    };
-    let completion = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            tokio::select! {
-                biased;
-                c = &mut completion_fut => {
-                    break c.expect("completion channel closed");
-                }
-                ev = events.recv() => {
-                    if let Some(ev) = ev {
-                        push_label(&mut labels, &ev.payload);
-                        if let TransactionEventPayload::CanonicalUnit(unit) = &ev.payload {
-                            if let CanonicalUnit::Text(t) = &unit.snapshot().unit {
-                                texts.push(t.content.clone());
-                            }
-                        }
-                        payloads.push(ev.payload);
-                    }
-                }
-            }
+        };
+        if matches!(
+            &ev.payload,
+            TransactionEventPayload::Ended(_) | TransactionEventPayload::EndedEvent(_)
+        ) {
+            *saw_ended = true;
         }
-    })
-    .await
-    .expect("completion timed out");
-    while let Ok(ev) = events.try_recv() {
-        push_label(&mut labels, &ev.payload);
+        labels.push(label);
         if let TransactionEventPayload::CanonicalUnit(unit) = &ev.payload {
             if let CanonicalUnit::Text(t) = &unit.snapshot().unit {
                 texts.push(t.content.clone());
             }
         }
         payloads.push(ev.payload);
-    }
+    };
+    // Prefer draining the event stream (including Ended) alongside completion so a
+    // late final Text unit is not lost when completion races ahead of mailbox delivery.
+    let completion = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if completion.is_some() && saw_ended {
+                break;
+            }
+            tokio::select! {
+                c = &mut completion_fut, if completion.is_none() => {
+                    completion = Some(c.expect("completion channel closed"));
+                }
+                ev = events.recv() => {
+                    match ev {
+                        Some(ev) => push_event(
+                            &mut labels,
+                            &mut texts,
+                            &mut payloads,
+                            &mut saw_ended,
+                            ev,
+                        ),
+                        None => {
+                            // Event stream closed — wait for completion if still pending.
+                            if completion.is_none() {
+                                completion = Some(
+                                    completion_fut.await.expect("completion channel closed"),
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Grace drain: absorb trailing CanonicalUnits that land after Ended/completion.
+        let grace = tokio::time::Instant::now() + Duration::from_millis(50);
+        while tokio::time::Instant::now() < grace {
+            match events.try_recv() {
+                Ok(ev) => push_event(&mut labels, &mut texts, &mut payloads, &mut saw_ended, ev),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        completion.expect("completion")
+    })
+    .await
+    .expect("completion timed out");
     (completion, texts, labels, payloads)
 }
 
@@ -670,7 +706,7 @@ fn inline_tool_continuation_second_exchange_emits_text() {
         completion.end.kind
     );
     assert!(
-        labels.iter().any(|l| *l == "tool_life"),
+        labels.contains(&"tool_life"),
         "expected ToolLifecycle after Ready dispatch; labels={labels:?}"
     );
     let joined = texts.join("");
@@ -788,14 +824,110 @@ fn inline_multi_round_tool_continuation_completes_after_second_tool() {
         "expected two continuation request bodies; got {}",
         bodies.len()
     );
-    for (i, body) in bodies.iter().enumerate() {
-        assert!(
-            body.contains("\"role\":\"tool\"") || body.contains("\"role\": \"tool\""),
-            "continuation POST {i} must include role:tool; body={body}"
-        );
-    }
+    // First continuation carries call_a + its tool result in order (no call_b yet).
+    let b0 = &bodies[0];
+    let call_a = b0
+        .find("\"id\":\"call_a\"")
+        .or_else(|| b0.find("\"id\": \"call_a\""))
+        .expect("first continuation must include assistant tool_calls id call_a");
+    let tool_a = b0[call_a..]
+        .find("\"tool_call_id\":\"call_a\"")
+        .or_else(|| b0[call_a..].find("\"tool_call_id\": \"call_a\""))
+        .expect("first continuation must include tool result for call_a after the call");
+    assert!(
+        !b0.contains("call_b"),
+        "first continuation must not yet include call_b; body={b0}"
+    );
+    let _ = tool_a;
+    // Second continuation retains both prior pairs in order (call then result each).
+    let b1 = &bodies[1];
+    let a_call = b1
+        .find("\"id\":\"call_a\"")
+        .or_else(|| b1.find("\"id\": \"call_a\""))
+        .expect("second continuation must retain call_a");
+    let a_res = b1[a_call..]
+        .find("\"tool_call_id\":\"call_a\"")
+        .or_else(|| b1[a_call..].find("\"tool_call_id\": \"call_a\""))
+        .expect("second continuation must retain tool result for call_a");
+    let b_call = b1
+        .find("\"id\":\"call_b\"")
+        .or_else(|| b1.find("\"id\": \"call_b\""))
+        .expect("second continuation must include call_b");
+    let b_res = b1[b_call..]
+        .find("\"tool_call_id\":\"call_b\"")
+        .or_else(|| b1[b_call..].find("\"tool_call_id\": \"call_b\""))
+        .expect("second continuation must include tool result for call_b");
+    assert!(
+        a_call < a_res + a_call && a_call < b_call && b_call < b_res + b_call,
+        "expected call_a < result_a < call_b < result_b ordering; body={b1}"
+    );
 
     finish_http_test(started, rt, vec![server]);
+}
+
+/// Repeated multi-round HTTP continuation must not Complete with empty final text.
+#[test]
+fn inline_multi_round_tool_continuation_repeated_keeps_final_text() {
+    for i in 0..20 {
+        let _guard = suite_lock();
+        let rt = test_rt();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let posts_c = Arc::clone(&posts);
+        let script = Arc::new(move |_body: String| {
+            let n = posts_c.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => fragmented_tool_call_sse("call_a", "echo", r#"{"q":"a"}"#),
+                1 => fragmented_tool_call_sse("call_b", "echo", r#"{"q":"b"}"#),
+                _ => fragmented_text_sse("done after two tools"),
+            }
+        });
+        let server = rt.block_on(bind_fragmented_openai_sse(script));
+        let endpoint = server.endpoint();
+        let started = start_openai_runtime_with_tools(
+            vec![openai_http_channel_with_policies(
+                "openai-inline-multi-stress",
+                endpoint,
+                "gpt-test",
+                BTreeSet::from([
+                    ContinuationPolicy::CallerControlled,
+                    ContinuationPolicy::InlineToolContinuation,
+                ]),
+            )],
+            echo_tool_registry(),
+        );
+        let handle = started.handle.clone();
+        let (delivery, receiver) =
+            transaction_delivery(DeliveryLimits::try_new(64, 256 * 1024).unwrap()).unwrap();
+        handle
+            .submit(TransactionSubmitRequest {
+                channel_id: ChannelId::try_new("openai-inline-multi-stress").unwrap(),
+                session_id: None,
+                input: user_text_input("Use the echo tool twice.").unwrap(),
+                session_config: None,
+                invocation_config: InvocationConfig {
+                    deadline: Some(Duration::from_secs(5)),
+                    continuation_policy: ContinuationPolicy::InlineToolContinuation,
+                    ..Default::default()
+                },
+                tools: vec![ToolId::try_new("echo").unwrap()],
+                delivery,
+            })
+            .expect("admit");
+        let (completion, texts, labels) = rt.block_on(drain_until_completed(receiver));
+        let joined = texts.join("");
+        assert!(
+            joined.contains("done"),
+            "iteration {i}: expected final text containing done; texts={texts:?} labels={labels:?} kind={:?}",
+            completion.end.kind
+        );
+        assert_eq!(
+            completion.end.kind,
+            TransactionEndKind::Completed,
+            "iteration {i}: must Complete; got {:?} labels={labels:?} texts={texts:?}",
+            completion.end.kind
+        );
+        finish_http_test(started, rt, vec![server]);
+    }
 }
 
 /// Same provider call id across sequential admits yields distinct action ids.
