@@ -13,17 +13,18 @@ use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
 use monoloop_connector::{
-    AnonymousCredentialResolver, StreamingHttpConfig, StreamingHttpConnectorFactory,
+    AnonymousCredentialResolver, ConnectorTargetResolver, ResolvedConnectorTarget,
+    ResolvedCredential, StreamingHttpConfig, StreamingHttpConnectorFactory,
 };
 use monoloop_contracts::{
     transaction_delivery, user_text_input, CanonicalToolOutput, CanonicalUnit, ChannelCapabilities,
-    ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ContinuationPolicy, DeliveryLimits,
-    DialectBinding, DialectDescriptor, ExchangeMode, InvocationConfig, JsonSchema,
-    McpConfigurationCapability, McpReachability, OptionPolicy, SessionMode, ShutdownWaitOutcome,
-    ToolCompletion, ToolExecutionClass, ToolExecutionMode, ToolId, ToolLifecycleEvent, ToolLimits,
-    ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract, TransactionEndKind,
-    TransactionEvent, TransactionEventPayload, TransactionLimits, TransactionReceiver,
-    TransactionSubmitRequest,
+    ChannelDefaults, ChannelId, ChannelKind, ChannelLimits, ConnectorError, ContinuationPolicy,
+    DeliveryLimits, DialectBinding, DialectDescriptor, ExchangeMode, InvocationConfig, JsonSchema,
+    McpConfigurationCapability, McpReachability, OptionPolicy, SessionConfig, SessionMode,
+    ShutdownWaitOutcome, ToolCompletion, ToolExecutionClass, ToolExecutionMode, ToolId,
+    ToolLifecycleEvent, ToolLimits, ToolName, ToolOutputContract, ToolSpec, ToolSuccessContract,
+    TransactionEndKind, TransactionEvent, TransactionEventPayload, TransactionLimits,
+    TransactionReceiver, TransactionSubmitRequest,
 };
 use monoloop_interpreter::DefaultInterpreterFactory;
 use monoloop_loop::{
@@ -470,6 +471,133 @@ fn text_only_http_openai_emits_text_and_completed() {
     );
 
     finish_http_test(started, rt, vec![server]);
+}
+
+/// D-064: one Channel, many equivalent backends. `SessionConfig::connector_ref`
+/// carried per-transaction — not the Channel's fixed `endpoint_ref` — decides
+/// which of two independent mock servers each turn actually reaches, proving
+/// "Direct" no longer needs one Channel per backend to serve many otherwise-
+/// identical OpenAI-compatible providers.
+struct TwoServerResolver {
+    a_endpoint: String,
+    b_endpoint: String,
+}
+
+impl ConnectorTargetResolver for TwoServerResolver {
+    fn resolve(&self, connector_ref: &str) -> Result<ResolvedConnectorTarget, ConnectorError> {
+        let endpoint = match connector_ref {
+            "server-a" => self.a_endpoint.clone(),
+            "server-b" => self.b_endpoint.clone(),
+            other => {
+                return Err(ConnectorError::configuration_invalid(format!(
+                    "unknown connector_ref: {other}"
+                )))
+            }
+        };
+        Ok(ResolvedConnectorTarget {
+            endpoint,
+            credential: ResolvedCredential::bearer(format!("key-for-{connector_ref}")),
+        })
+    }
+}
+
+#[test]
+fn one_dynamic_channel_routes_by_connector_ref_per_transaction() {
+    let _guard = suite_lock();
+    let rt = test_rt();
+    let script_a = Arc::new(|_body: String| fragmented_text_sse("Hello from server A."));
+    let script_b = Arc::new(|_body: String| fragmented_text_sse("Hello from server B."));
+    let server_a = rt.block_on(bind_fragmented_openai_sse(script_a));
+    let server_b = rt.block_on(bind_fragmented_openai_sse(script_b));
+
+    let d = DialectDescriptor::openai_chat_completions("v1");
+    let resolver = Arc::new(TwoServerResolver {
+        a_endpoint: server_a.endpoint(),
+        b_endpoint: server_b.endpoint(),
+    });
+    let binding = ChannelBinding {
+        id: ChannelId::try_new("direct").unwrap(),
+        kind: ChannelKind::DirectLlm,
+        tool_mode: ToolExecutionMode::None,
+        // Fixed endpoint_ref is never used when connector_ref resolves —
+        // deliberately unreachable, to prove nothing falls back to it.
+        connector_factory: Arc::new(StreamingHttpConnectorFactory::new_dynamic(
+            StreamingHttpConfig {
+                dialect: DialectBinding::fixed(d.clone()),
+                require_https: false,
+                ..Default::default()
+            },
+            Arc::new(AnonymousCredentialResolver),
+            resolver,
+        )),
+        encoder: Arc::new(OpenAiChatCompletionsEncoder::new(OpenAiEncoderOptions {
+            use_max_completion_tokens: false,
+            allow_reasoning_effort: false,
+            max_encoded_bytes: 1024 * 1024,
+        })),
+        interpreter: Arc::new(DefaultInterpreterFactory::new()),
+        endpoint_ref: "http://unreachable.invalid/should-never-be-used".into(),
+        credential_ref: None,
+        defaults: ChannelDefaults {
+            model: Some("gpt-test".into()),
+            ..Default::default()
+        },
+        capabilities: ChannelCapabilities {
+            session_mode: SessionMode::Stateless,
+            mcp_configuration: McpConfigurationCapability::None,
+            mcp_reachability: McpReachability::None,
+            exchange_mode: ExchangeMode::RequestResponse,
+            continuation_policies: BTreeSet::from([ContinuationPolicy::CallerControlled]),
+            supports_distinct_session_concurrency: true,
+            input_dialect: d.clone(),
+            output_dialect: d,
+            option_policy: OptionPolicy::direct_llm(),
+        },
+        limits: ChannelLimits::default(),
+    };
+
+    let started = start_openai_runtime(vec![binding]);
+    let handle = started.handle.clone();
+
+    let submit_to = |connector_ref: &str| {
+        let (delivery, receiver) =
+            transaction_delivery(DeliveryLimits::try_new(32, 64 * 1024).unwrap()).unwrap();
+        handle
+            .submit(TransactionSubmitRequest {
+                channel_id: ChannelId::try_new("direct").unwrap(),
+                session_id: None,
+                input: user_text_input("Say hi.").unwrap(),
+                session_config: Some(SessionConfig {
+                    connector_ref: Some(connector_ref.to_string()),
+                    ..Default::default()
+                }),
+                invocation_config: InvocationConfig {
+                    deadline: Some(Duration::from_secs(5)),
+                    continuation_policy: ContinuationPolicy::CallerControlled,
+                    ..Default::default()
+                },
+                tools: vec![],
+                delivery,
+            })
+            .expect("admit");
+        receiver
+    };
+
+    let (completion_a, texts_a, _) = rt.block_on(drain_until_completed(submit_to("server-a")));
+    let (completion_b, texts_b, _) = rt.block_on(drain_until_completed(submit_to("server-b")));
+
+    assert_eq!(completion_a.end.kind, TransactionEndKind::Completed);
+    assert_eq!(completion_b.end.kind, TransactionEndKind::Completed);
+    assert!(
+        texts_a.join("").contains("server A"),
+        "connector_ref=server-a must reach server A; got {texts_a:?}"
+    );
+    assert!(
+        texts_b.join("").contains("server B"),
+        "connector_ref=server-b must reach server B; got {texts_b:?}"
+    );
+
+    finish_http_test(started, rt, vec![server_a, server_b]);
 }
 
 #[test]

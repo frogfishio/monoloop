@@ -94,6 +94,12 @@ pub struct StreamingHttpConnector {
     config: StreamingHttpConfig,
     client: reqwest::Client,
     credentials: Arc<dyn CredentialResolver>,
+    /// When set, a transaction that carries `SessionConfig::connector_ref`
+    /// gets its endpoint + credential resolved dynamically through this
+    /// instead of the fixed `endpoint_ref`/`credentials` above — see
+    /// [`crate::ConnectorTargetResolver`]. `None` preserves the original
+    /// fixed-single-backend behavior exactly.
+    target_resolver: Option<Arc<dyn crate::credential::ConnectorTargetResolver>>,
     instance_id: ConnectorInstanceId,
 }
 
@@ -109,10 +115,31 @@ impl fmt::Debug for StreamingHttpConnector {
 }
 
 impl StreamingHttpConnector {
-    /// Build a connector with an injected credential resolver.
+    /// Build a connector with an injected credential resolver (fixed single
+    /// backend — `endpoint_ref` always comes from the Channel).
     pub fn try_new(
         config: StreamingHttpConfig,
         credentials: Arc<dyn CredentialResolver>,
+    ) -> Result<Self, ConnectorBuildError> {
+        Self::try_new_inner(config, credentials, None)
+    }
+
+    /// Build a connector that resolves endpoint + credential dynamically,
+    /// per transaction, through `target_resolver` — see
+    /// [`crate::ConnectorTargetResolver`]. `credentials` remains the
+    /// fallback for a transaction that leaves `connector_ref` unset.
+    pub fn try_new_dynamic(
+        config: StreamingHttpConfig,
+        credentials: Arc<dyn CredentialResolver>,
+        target_resolver: Arc<dyn crate::credential::ConnectorTargetResolver>,
+    ) -> Result<Self, ConnectorBuildError> {
+        Self::try_new_inner(config, credentials, Some(target_resolver))
+    }
+
+    fn try_new_inner(
+        config: StreamingHttpConfig,
+        credentials: Arc<dyn CredentialResolver>,
+        target_resolver: Option<Arc<dyn crate::credential::ConnectorTargetResolver>>,
     ) -> Result<Self, ConnectorBuildError> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
@@ -140,6 +167,7 @@ impl StreamingHttpConnector {
             config,
             client,
             credentials,
+            target_resolver,
             instance_id: ConnectorInstanceId::generate(),
         })
     }
@@ -162,6 +190,7 @@ impl Connector for StreamingHttpConnector {
         let client = self.client.clone();
         let config = self.config.clone();
         let credentials = Arc::clone(&self.credentials);
+        let target_resolver = self.target_resolver.clone();
         let control_for_open = control.clone();
         let control_state_for_open = Arc::clone(&control_state);
         let instance_id = self.instance_id.clone();
@@ -173,6 +202,7 @@ impl Connector for StreamingHttpConnector {
                 client,
                 config,
                 credentials,
+                target_resolver,
                 control_for_open,
                 control_state_for_open,
                 instance_id,
@@ -186,14 +216,33 @@ impl Connector for StreamingHttpConnector {
 pub struct StreamingHttpConnectorFactory {
     config: StreamingHttpConfig,
     credentials: Arc<dyn CredentialResolver>,
+    target_resolver: Option<Arc<dyn crate::credential::ConnectorTargetResolver>>,
 }
 
 impl StreamingHttpConnectorFactory {
-    /// Construct a factory.
+    /// Construct a factory (fixed single backend — `endpoint_ref` always
+    /// comes from the Channel, `credential_ref` always resolved by `credentials`).
     pub fn new(config: StreamingHttpConfig, credentials: Arc<dyn CredentialResolver>) -> Self {
         Self {
             config,
             credentials,
+            target_resolver: None,
+        }
+    }
+
+    /// Construct a factory that resolves endpoint + credential dynamically,
+    /// per transaction, whenever `SessionConfig::connector_ref` is set — see
+    /// [`crate::ConnectorTargetResolver`]. `credentials` is the fallback for
+    /// a transaction that leaves `connector_ref` unset.
+    pub fn new_dynamic(
+        config: StreamingHttpConfig,
+        credentials: Arc<dyn CredentialResolver>,
+        target_resolver: Arc<dyn crate::credential::ConnectorTargetResolver>,
+    ) -> Self {
+        Self {
+            config,
+            credentials,
+            target_resolver: Some(target_resolver),
         }
     }
 }
@@ -203,14 +252,18 @@ impl fmt::Debug for StreamingHttpConnectorFactory {
         f.debug_struct("StreamingHttpConnectorFactory")
             .field("config", &self.config)
             .field("credentials", &"<injected>")
+            .field("dynamic", &self.target_resolver.is_some())
             .finish()
     }
 }
 
 impl ConnectorFactory for StreamingHttpConnectorFactory {
     fn create(&self) -> Result<ConnectorInstance, ConnectorBuildError> {
-        let connector =
-            StreamingHttpConnector::try_new(self.config.clone(), Arc::clone(&self.credentials))?;
+        let connector = StreamingHttpConnector::try_new_inner(
+            self.config.clone(),
+            Arc::clone(&self.credentials),
+            self.target_resolver.clone(),
+        )?;
         let id = connector.instance_id().clone();
         Ok(ConnectorInstance::new(id, Arc::new(connector), None))
     }
@@ -261,27 +314,50 @@ pub fn validate_endpoint_url(
     Ok(url)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_http(
     request: OpenConnection,
     client: reqwest::Client,
     config: StreamingHttpConfig,
     credentials: Arc<dyn CredentialResolver>,
+    target_resolver: Option<Arc<dyn crate::credential::ConnectorTargetResolver>>,
     control: ConnectionControlHandle,
     control_state: Arc<ControlState>,
     instance_id: ConnectorInstanceId,
 ) -> Result<(OpenedRawConnection, ConnectionOwnerWork), ConnectorError> {
     validate_open_attachment_owner(&instance_id, request.session_attachment.as_deref())?;
 
-    let url = validate_endpoint_url(&request.endpoint_ref, config.require_https)
-        .map_err(|e| e.with_connection_id(request.connection_id.as_str()))?;
+    // A transaction that set SessionConfig::connector_ref (and a Connector
+    // built via `new_dynamic`/`try_new_dynamic`) resolves its endpoint +
+    // credential together, dynamically, overriding the Channel's fixed
+    // endpoint_ref/credential_ref for this connection only — see
+    // ConnectorTargetResolver. Everything else keeps the original fixed
+    // single-backend behavior exactly.
+    let dynamic_target = match (&target_resolver, &request.session_config.connector_ref) {
+        (Some(resolver), Some(connector_ref)) => Some(
+            resolver
+                .resolve(connector_ref)
+                .map_err(|e| e.with_connection_id(request.connection_id.as_str()))?,
+        ),
+        _ => None,
+    };
 
-    // Resolve credentials at open (fail closed before accepting body).
-    let resolved = if let Some(ref cred_ref) = request.credential_ref {
-        credentials
-            .resolve(cred_ref)
-            .map_err(|e| e.with_connection_id(request.connection_id.as_str()))?
+    let (url, resolved) = if let Some(target) = dynamic_target {
+        let url = validate_endpoint_url(&target.endpoint, config.require_https)
+            .map_err(|e| e.with_connection_id(request.connection_id.as_str()))?;
+        (url, target.credential)
     } else {
-        ResolvedCredential::none()
+        let url = validate_endpoint_url(&request.endpoint_ref, config.require_https)
+            .map_err(|e| e.with_connection_id(request.connection_id.as_str()))?;
+        // Resolve credentials at open (fail closed before accepting body).
+        let resolved = if let Some(ref cred_ref) = request.credential_ref {
+            credentials
+                .resolve(cred_ref)
+                .map_err(|e| e.with_connection_id(request.connection_id.as_str()))?
+        } else {
+            ResolvedCredential::none()
+        };
+        (url, resolved)
     };
 
     if let Some(err) = control.interrupt_error() {

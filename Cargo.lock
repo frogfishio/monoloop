@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "monoloop-connector",
  "monoloop-connector-agy",
@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-connector"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum",
  "bytes",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-connector-agy"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "monoloop-connector",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-connector-claude"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "monoloop-connector",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-connector-codex"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "monoloop-connector",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-connector-cursor"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "monoloop-connector",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-connector-grok"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1238,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-connector-zai"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "monoloop-connector",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-contracts"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "serde",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-interpreter"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "monoloop-contracts",
@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-loop"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum",
  "bytes",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "monoloop-testkit"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "futures-util",

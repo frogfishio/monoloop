@@ -267,6 +267,7 @@ pub async fn run_direct_llm_continuation(
         endpoint_ref,
         credential_ref,
         encoded,
+        config.session.clone(),
         cancel,
         deadline,
         cleanup_deadline,
@@ -350,6 +351,7 @@ async fn run_inner(
         endpoint_ref,
         credential_ref,
         encoded,
+        config.session.clone(),
         cancel,
         deadline,
         cleanup_deadline,
@@ -372,6 +374,7 @@ async fn run_encoded_exchange(
     endpoint_ref: &str,
     credential_ref: Option<&str>,
     encoded: EncodedExchange,
+    session_config: monoloop_contracts::SessionConfig,
     cancel: Arc<StickyCancel>,
     deadline: Instant,
     cleanup_deadline: Duration,
@@ -391,6 +394,10 @@ async fn run_encoded_exchange(
 
     let mut open = OpenConnection::new(connection_id.clone(), endpoint_ref);
     open.credential_ref = credential_ref.map(|s| s.to_string());
+    // Channel-agnostic: reaches the Connector even when there is no
+    // SessionAttachment (DirectLlm never has one — see OpenConnection's
+    // session_config field doc).
+    open = open.with_session_config(session_config);
     if let Some(attachment) = session_attachment {
         open = open.with_session_attachment(attachment);
     }

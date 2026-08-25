@@ -4,7 +4,7 @@ use crate::control::ConnectionControlHandle;
 use crate::handles::{ConnectionCompletionHandle, RawInputHandle, RawOutputHandle};
 use crate::session::SessionAttachment;
 use monoloop_contracts::{
-    ConnectionId, ConnectorError, ConnectorLimits, DialectBinding, ExternalSessionId,
+    ConnectionId, ConnectorError, ConnectorLimits, DialectBinding, ExternalSessionId, SessionConfig,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -62,6 +62,20 @@ pub struct OpenConnection {
     pub required_dialect: Option<String>,
     /// Limits for this open.
     pub limits: ConnectorLimits,
+    /// The submitting transaction's session configuration — always present
+    /// (default when the caller set none), unconditionally, regardless of
+    /// Channel kind or whether a `SessionAdapter`/`SessionAttachment` exists.
+    ///
+    /// Unlike `session_attachment` (only populated for `ExternalAgent`
+    /// Channels with a claimed SessionKey), this is the one channel-agnostic
+    /// way for per-transaction data to reach `Connector::begin_open` —
+    /// notably for `DirectLlm`/stateless Channels, which never get a
+    /// `SessionAttachment` (`coordinator.rs` passes `None` on that path) but
+    /// still admit and merge a `SessionConfig` per submission. Never
+    /// wire-visible: encoders read `EffectiveConfig.extensions` (validated,
+    /// encode-or-reject), never `.session` directly, so nothing here needs
+    /// an encoder-recognized shape — it exists purely for the connector.
+    pub session_config: SessionConfig,
 }
 
 impl OpenConnection {
@@ -75,6 +89,7 @@ impl OpenConnection {
             credential_ref: None,
             required_dialect: None,
             limits: ConnectorLimits::default(),
+            session_config: SessionConfig::default(),
         }
     }
 
@@ -88,6 +103,13 @@ impl OpenConnection {
             self.external_session_id = Some(attachment.external_session_id.clone());
         }
         self.session_attachment = Some(attachment);
+        self
+    }
+
+    /// Carry the submitting transaction's `SessionConfig` through to the
+    /// connector, regardless of Channel kind (see field doc on `session_config`).
+    pub fn with_session_config(mut self, session_config: SessionConfig) -> Self {
+        self.session_config = session_config;
         self
     }
 }

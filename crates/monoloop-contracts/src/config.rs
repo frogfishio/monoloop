@@ -129,6 +129,16 @@ pub struct SessionConfig {
     pub permission_profile: Option<String>,
     /// Namespaced extensions.
     pub extensions: BTreeMap<ExtensionKey, VersionedExtension>,
+    /// Opaque, connector-resolved target reference for this transaction —
+    /// e.g. which of several equivalent backends (same wire protocol,
+    /// different endpoint/credential) a `DirectLlm` Channel should route to.
+    /// Connector-only: never encoded onto the wire, never validated against
+    /// `OptionPolicy::allowed_extension_keys` (unlike `extensions`, which
+    /// *is* wire-visible and must be encoded or rejected — D-023). A
+    /// Connector that supports dynamic targets reads this from
+    /// `OpenConnection::session_config`; one that doesn't (a fixed
+    /// single-backend Channel) simply never looks at it.
+    pub connector_ref: Option<String>,
 }
 
 /// Channel default invocation values.

@@ -4,6 +4,96 @@ Explicit project decisions that change contracts, MSRV, or delivery assumptions.
 Normative behavior still lives under `doc/`; this file records *why* a deliberate
 change was made.
 
+## D-064 — `DirectLlm` Channels can resolve endpoint + credential per transaction
+
+**Date:** 2026-08-25
+
+**Context:** Found while wiring real LLM-provider support into Tinker
+(frogfish.io product). Tinker needed one Channel per OpenAI-compatible
+provider (OpenAI, xAI, Groq, …) purely because `ChannelBinding.endpoint_ref`
+and `credential_ref` are fixed at Channel construction — `StartedRuntime`
+takes its Channel list once, at process startup, and there is no way to add
+one later. For 13+ providers that meant either restarting the process to
+pick up every newly configured provider, or registering all known presets
+speculatively up front as a workaround. Neither is what "Direct" should
+require: unlike `ExternalAgent` Channels (Grok, Cursor, Codex, Claude — each
+a genuinely distinct stateful protocol, where "one Channel = one fixed
+backend" is forced by the protocol), `DirectLlm`/HTTP backends speaking the
+*same* wire format differ only in endpoint + credential — plain
+configuration, not protocol identity. `ChannelBinding`'s shape was inherited
+from the stateful connectors and never given a more flexible variant for the
+genuinely stateless HTTP case.
+
+Investigated whether the existing `SessionConfig.extensions` mechanism (used
+for e.g. Grok's per-turn `cwd`, D-063 era work) could carry a "which
+backend" selector instead. It cannot: `OpenAiChatCompletionsEncoder`'s
+`encode_openai_extensions` (D-023: encode-or-reject) validates every
+extension against a closed allowlist of actual Chat Completions body fields
+(`seed`, `user`, `top_p`, …) — a routing selector has no representation
+there and would hard-fail the encode. Extensions are for wire-visible
+per-turn data; connector routing needed a separate, connector-only channel
+that never reaches the encoder.
+
+Also found: `DirectLlm` transactions never receive a `SessionAttachment` at
+all — `coordinator.rs`'s DirectLlm branch calls `run_direct_llm_exchange`
+with `session_attachment: None` unconditionally (only the `ExternalAgent`
+branch, via a claimed SessionKey, ever populates one). So even
+connector-only data had no channel-agnostic path to `Connector::begin_open`
+before this decision — `EffectiveConfig` (which does carry the merged
+`SessionConfig` in its own `.session` field) was never forwarded into
+`OpenConnection` at all.
+
+**Decision:** Add a genuinely new, connector-only, channel-agnostic path:
+
+- `SessionConfig` gains `connector_ref: Option<String>` — opaque, never
+  merged into `EffectiveConfig.extensions`, never wire-visible, never
+  subject to D-023 encode-or-reject.
+- `OpenConnection` gains `session_config: SessionConfig` — always present
+  (default when unset), populated in `run_inner`/`run_encoded_exchange`
+  from `EffectiveConfig.session` for *every* Channel kind, not gated behind
+  `SessionAttachment`. This is the fix for the "DirectLlm never gets
+  per-transaction data" gap above.
+- New `monoloop_connector::ConnectorTargetResolver` trait (sibling to
+  `CredentialResolver`): `resolve(connector_ref) -> {endpoint, credential}`.
+- `StreamingHttpConnectorFactory::new_dynamic` / `StreamingHttpConnector::
+  try_new_dynamic`: when the submitting transaction sets
+  `session_config.connector_ref`, `open_http` resolves endpoint +
+  credential together through the new resolver, overriding the Channel's
+  fixed `endpoint_ref`/`credential_ref` for that connection only. A
+  transaction that leaves `connector_ref` unset gets the original fixed
+  behavior exactly — `new`/`try_new` (no resolver) are untouched and still
+  the right choice for a Channel that only ever needs one backend.
+
+**Consequences:**
+
+- `crates/monoloop-contracts/src/config.rs`: `SessionConfig::connector_ref`.
+- `crates/monoloop-connector/src/open.rs`: `OpenConnection::session_config`
+  + `with_session_config`.
+- `crates/monoloop-connector/src/credential.rs`: `ConnectorTargetResolver`,
+  `ResolvedConnectorTarget`.
+- `crates/monoloop-connector/src/http.rs`: `StreamingHttpConnector::
+  try_new_dynamic`, `StreamingHttpConnectorFactory::new_dynamic`, `open_http`
+  resolves dynamically when both a resolver and a `connector_ref` are present.
+- `crates/monoloop-loop/src/transaction/lifecycle/exchange.rs`:
+  `run_encoded_exchange` takes `session_config: SessionConfig` explicitly
+  (it has no `EffectiveConfig` in scope — only pre-encoded bytes); both
+  callers (`run_inner`, `run_direct_llm_continuation`) pass
+  `config.session.clone()`.
+- New proof: `crates/monoloop-loop/tests/direct_llm_openai_e2e.rs`
+  `one_dynamic_channel_routes_by_connector_ref_per_transaction` — one
+  Channel, two independent mock servers, each turn's `connector_ref`
+  deterministically reaches the right one.
+- Fully backward compatible: no existing `OpenConnection`/`SessionConfig`
+  construction site is exhaustive (all use `::new`/`..Default::default()`),
+  and `new`/`try_new` callers are unaffected — this is additive.
+- Verified: `make gates` green (fmt / clippy `-D warnings` / test
+  `--all-targets --all-features` / rustdoc `-D warnings`), full suite 62/62
+  binaries, including the new test.
+- Does not change `ExternalAgent` Channels (Grok, Cursor, Codex, Claude) at
+  all — `SessionAttachment` and the fixed-backend model remain exactly
+  right for those; this decision only gives `DirectLlm` an escape hatch it
+  was missing.
+
 ## D-063 — `bind_session` rejected a transaction's own admission-time SessionKey
 
 **Date:** 2026-08-25

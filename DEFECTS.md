@@ -5950,3 +5950,33 @@ package dry-run, CLI checks. All 12 workspace crates published in
 unchanged from D-062 (**Silver / Golden-ready — Not Golden**); this is a
 defect-fix patch release, not a new Golden-ready acceptance pass. **Not**
 Golden / §25 / D-025 Sign-off.
+
+**D-064 (2026-08-25, DirectLlm dynamic Channel target):** Found while
+wiring real LLM providers into Tinker — every OpenAI-compatible provider
+needed its own Channel purely because `endpoint_ref`/`credential_ref` were
+fixed at Channel construction, and `StartedRuntime` takes its Channel list
+once at process startup with no way to add to it later. Correctly called
+out (by the same user this session, in the product conversation) as
+inherited rigidity from the stateful `ExternalAgent` connectors (Grok,
+Cursor, Codex, Claude — genuinely one-fixed-backend-per-protocol) leaking
+into `DirectLlm`, which only differs by endpoint + credential — plain
+config, not protocol identity. See **DECISIONS D-064** for the full
+investigation, including why `SessionConfig.extensions` could not carry a
+backend selector (D-023 encode-or-reject on `OpenAiChatCompletionsEncoder`
+closes that door — extensions are for wire-visible data only) and the
+separate gap it surfaced (`DirectLlm` transactions never got a
+`SessionAttachment` at all, so there was no channel-agnostic path for
+per-transaction data to reach `Connector::begin_open` before this).
+
+Fix: `SessionConfig::connector_ref` (opaque, connector-only, never
+wire-visible) + `OpenConnection::session_config` (always populated, every
+Channel kind) + `ConnectorTargetResolver` (resolves `connector_ref` to
+`{endpoint, credential}`, same shape as `CredentialResolver`) +
+`StreamingHttpConnectorFactory::new_dynamic`. A Channel built the old way
+(`new`/`try_new`) is completely unaffected — additive only. Proof:
+`one_dynamic_channel_routes_by_connector_ref_per_transaction` — one Channel,
+two independent mock servers, each transaction's `connector_ref` reaches
+the correct one. `make gates` green; full suite 62/62 binaries (17/17 on
+`direct_llm_openai_e2e.rs`, the +1 being this test). This log entry does
+not claim Golden / §25 / D-025 Sign-off and is not an Expert/Advisor
+review — plain defect-fix record only.

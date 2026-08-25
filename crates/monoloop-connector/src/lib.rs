@@ -27,7 +27,8 @@ pub use control::{
     TerminationReason,
 };
 pub use credential::{
-    AnonymousCredentialResolver, CredentialResolver, MapCredentialResolver, ResolvedCredential,
+    AnonymousCredentialResolver, ConnectorTargetResolver, CredentialResolver,
+    MapCredentialResolver, ResolvedConnectorTarget, ResolvedCredential,
 };
 pub use descriptor::{ConnectorDescriptor, ConnectorKind, ControlCapabilities, RawBoundary};
 pub use fake::{FakeConnector, FakeConnectorConfig, FakeEndpoint};

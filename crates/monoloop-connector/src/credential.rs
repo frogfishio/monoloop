@@ -114,3 +114,31 @@ impl CredentialResolver for AnonymousCredentialResolver {
         Ok(ResolvedCredential::none())
     }
 }
+
+/// One resolved destination: where to send the request, and how to
+/// authenticate to it.
+pub struct ResolvedConnectorTarget {
+    /// Full URL this connection should POST/PUT to, overriding the
+    /// Channel's own `endpoint_ref` for this transaction.
+    pub endpoint: String,
+    /// Transport credentials for that endpoint (see [`ResolvedCredential`]).
+    pub credential: ResolvedCredential,
+}
+
+/// Host-injected resolver for `OpenConnection.session_config.connector_ref`
+/// (see [`monoloop_contracts::SessionConfig::connector_ref`]).
+///
+/// Lets one Channel serve many otherwise-equivalent backends — same wire
+/// protocol, different endpoint/credential per transaction — instead of
+/// needing one Channel per backend. A Channel built with
+/// [`crate::StreamingHttpConnectorFactory::new_dynamic`] consults this
+/// *instead of* its fixed `endpoint_ref`/`CredentialResolver` whenever the
+/// submitting transaction set a `connector_ref`; Channels that never set one
+/// keep behaving exactly as before (fixed endpoint, `CredentialResolver` by
+/// `credential_ref`).
+pub trait ConnectorTargetResolver: Send + Sync {
+    /// Resolve an opaque `connector_ref` to a concrete endpoint + credential.
+    ///
+    /// Failures MUST NOT include secret material in the error message.
+    fn resolve(&self, connector_ref: &str) -> Result<ResolvedConnectorTarget, ConnectorError>;
+}
