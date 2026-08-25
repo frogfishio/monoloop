@@ -5980,3 +5980,11 @@ the correct one. `make gates` green; full suite 62/62 binaries (17/17 on
 `direct_llm_openai_e2e.rs`, the +1 being this test). This log entry does
 not claim Golden / §25 / D-025 Sign-off and is not an Expert/Advisor
 review — plain defect-fix record only.
+
+**Release (2026-08-25):** D-064 packaged as crates.io **0.1.4**
+(`VERSION`/`BUILD` → `0.1.4`+build-6). `make dist` gates passed (fmt /
+clippy `-D warnings` / test --all-targets / rustdoc -D warnings), release
+build, package dry-run, CLI checks. All 12 workspace crates published in
+`PUBLISHING.md` order. Quality tier unchanged from D-062/D-063 (**Silver /
+Golden-ready — Not Golden**); a feature/defect-fix patch release, not a new
+Golden-ready acceptance pass. **Not** Golden / §25 / D-025 Sign-off.
